@@ -15,7 +15,10 @@ it was built from. What the build compiles in from the pin:
 - the briefs promoted out of draft (none yet).
 
 `spec/bundle/cors-probe.sh` and `spec/prototypes/spec-checks/` run from the pinned tree as this
-repository's CI gate (spec `CNF-1`–`CNF-4`).
+repository's CI gate. The probe is spec `CNF-4`, "The CORS probe runs on every push (`ARC-34`),
+and its failure fails the build"; the disk checks are evidence for spec `CNF-85` and for nothing
+else. Until this pin both were labelled `CNF-1`–`CNF-4`, which the specification's own task list
+records as a mislabel to correct here.
 
 Start reading at [`spec/00-overview.md`](./spec/00-overview.md). What to build first is
 [`spec/06-first-stage.md`](./spec/06-first-stage.md); what it must demonstrate is the
