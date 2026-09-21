@@ -1,0 +1,38 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  # The specification's own checks, run from the pinned tree. They are its facts; the
+  # build-failing gate is this one (ADR-0031, "checks live here, gates live there").
+  spec-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          fetch-depth: 0 # --baseline below reads the spec repository's history
+      - name: CORS probe (CNF-4)
+        run: spec/bundle/cors-probe.sh
+      - name: install-disk selection (evidence for CNF-85)
+        run: python3 spec/prototypes/spec-checks/check-install-disks.py
+      - name: the disk check still fails on the reviewed pre-fix brief
+        run: |
+          if python3 spec/prototypes/spec-checks/check-install-disks.py --baseline; then
+            echo "--baseline passed: the check no longer catches the pre-fix brief"
+            exit 1
+          fi
+
+  # The job is CNF-1: a clean checkout, built with no manual step and nothing resolved that
+  # Cargo.lock does not already pin.
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - run: cargo fmt --check # CNF-2
+      - run: cargo clippy --locked --all-targets -- -D warnings # CNF-2
+      - run: cargo test --locked # runs build.rs, so the pin and bundle gates run here
