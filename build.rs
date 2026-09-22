@@ -5,8 +5,6 @@
 //! briefs promoted out of draft — today none, brief 1 is a draft. Every failure here is a
 //! build failure on purpose; none of them has an override.
 
-use std::path::Path;
-
 fn git(args: &[&str]) -> String {
     let out = std::process::Command::new("git")
         .args(args)
@@ -48,22 +46,36 @@ fn pinned_spec_commit() -> String {
     pin
 }
 
-/// Names under `dir`, sorted, so two machines generate the same build.
-fn entries(dir: &str) -> Vec<String> {
-    let mut names: Vec<String> = std::fs::read_dir(dir)
-        .unwrap_or_else(|e| panic!("reading {dir} from the pinned tree: {e}"))
-        .map(|entry| {
-            entry
-                .unwrap_or_else(|e| panic!("reading {dir}: {e}"))
-                .file_name()
-        })
-        .map(|name| {
-            name.into_string()
-                .unwrap_or_else(|name| panic!("{dir}: {name:?} is not UTF-8"))
-        })
+/// What the pin records at `path`, as paths inside `spec/`, sorted so two machines generate the
+/// same build. The tree and never the directory: a file the specification's own `.gitignore`
+/// covers is absent from `git status --porcelain` above, so a filesystem scan would compile in
+/// something the pinned commit does not contain and the cleanliness check would not notice.
+fn pinned(path: &str) -> Vec<String> {
+    let mut names: Vec<String> = git(&["-C", "spec", "ls-tree", "-r", "--name-only", "HEAD", path])
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
         .collect();
     names.sort();
     names
+}
+
+/// A file of the pinned tree, by its path inside `spec/`.
+fn read(path: &str) -> String {
+    std::fs::read_to_string(format!("spec/{path}")).unwrap_or_else(|e| panic!("spec/{path}: {e}"))
+}
+
+/// One `&[(&str, &str)]` of pinned files, as source for the crate to `include!`.
+fn emit(out: &mut String, root: &str, doc: &str, name: &str, items: &[(String, String)]) {
+    out.push_str(&format!(
+        "/// {doc}\npub const {name}: &[(&str, &str)] = &[\n"
+    ));
+    for (key, path) in items {
+        let file = format!("{root}/spec/{path}");
+        // `{:?}` on a str is a Rust string literal, which is what this is generating.
+        out.push_str(&format!("    ({key:?}, include_str!({file:?})),\n"));
+    }
+    out.push_str("];\n");
 }
 
 fn main() {
@@ -77,19 +89,22 @@ fn main() {
     println!("cargo::rerun-if-changed=.git/HEAD");
     println!("cargo::rerun-if-changed=.git/index");
 
-    // Every file under bundle/ is compiled in, so every file under bundle/ must parse — a
-    // fourth input added there is gated the day it lands, not the day someone remembers it.
-    // The two publisher decisions must have been taken: an empty model or provider fails the
-    // build rather than letting it guess one (ARC-31, STG-17).
-    let mut parsed = 0;
-    for name in entries("spec/bundle") {
-        if !name.ends_with(".toml") {
-            continue; // cors-probe.sh and README.md are not compiled-in inputs
+    // Every input under bundle/ is compiled in, so every one of them must parse and every one
+    // of them is embedded — a fourth input added there is gated and shipped the day it lands,
+    // not the day someone remembers it. The two publisher decisions must have been taken: an
+    // empty model or provider fails the build rather than letting it guess one (ARC-31, STG-17).
+    let mut bundle: Vec<(String, String)> = Vec::new();
+    for path in pinned("bundle/") {
+        if !path.ends_with(".toml") {
+            continue; // cors-probe.sh and README.md are checks and prose, not inputs
         }
-        parsed += 1;
-        let path = format!("spec/bundle/{name}");
-        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
-        let value: toml::Table = text.parse().unwrap_or_else(|e| panic!("{path}: {e}"));
+        let name = path
+            .rsplit('/')
+            .next()
+            .expect("a path has a last segment")
+            .to_string();
+        let text = read(&path);
+        let value: toml::Table = text.parse().unwrap_or_else(|e| panic!("spec/{path}: {e}"));
         if name == "inference.toml" {
             for key in ["model", "provider"] {
                 let taken = value
@@ -105,15 +120,23 @@ fn main() {
                 );
             }
         }
+        bundle.push((name, path));
     }
-    assert!(parsed > 0, "spec/bundle/ holds no .toml inputs");
+    assert!(
+        !bundle.is_empty(),
+        "the pin records no .toml inputs under bundle/"
+    );
 
-    // The tenant profiles, one directory each (ADR-0030); anything else there is not a tenant.
-    let tenants: Vec<String> = entries("spec/docs/tenants")
-        .into_iter()
-        .filter(|name| Path::new(&format!("spec/docs/tenants/{name}")).is_dir())
+    // One profile.md per tenant directory (ADR-0030); anything else there is not a tenant.
+    let tenant_files = pinned("docs/tenants/");
+    let profiles: Vec<(String, String)> = tenant_files
+        .iter()
+        .filter_map(|path| {
+            let (tenant, file) = path.strip_prefix("docs/tenants/")?.split_once('/')?;
+            (file == "profile.md").then(|| (tenant.to_string(), path.clone()))
+        })
         .collect();
-    assert!(!tenants.is_empty(), "spec/docs/tenants/ holds no profiles");
+    assert!(!profiles.is_empty(), "the pin records no tenant profiles");
 
     // Briefs ship compiled in once they leave draft (T29, `ARC-11`, ADR-0005), and today none
     // has: each says so in its own prose, which is the only marker the corpus carries. The
@@ -121,43 +144,43 @@ fn main() {
     // decides here, instead of a promoted brief silently not shipping.
     // ponytail: prose marker; a `status:` field in the brief would be sturdier.
     const DRAFT: &str = "not yet in the signed bundle";
-    let mut briefs: Vec<String> = entries("spec/docs/briefs")
-        .iter()
-        .map(|name| format!("spec/docs/briefs/{name}"))
-        .collect();
-    for tenant in &tenants {
-        let dir = format!("spec/docs/tenants/{tenant}/briefs");
-        if Path::new(&dir).is_dir() {
-            briefs.extend(entries(&dir).iter().map(|name| format!("{dir}/{name}")));
-        }
-    }
+    let briefs = pinned("docs/briefs/").into_iter().chain(
+        tenant_files
+            .iter()
+            .filter(|p| p.contains("/briefs/"))
+            .cloned(),
+    );
     for brief in briefs {
-        let text = std::fs::read_to_string(&brief).unwrap_or_else(|e| panic!("{brief}: {e}"));
         // The corpus hard-wraps its prose, so the sentence is matched across line breaks.
-        let prose = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let prose = read(&brief)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         assert!(
             prose.contains(DRAFT),
-            "{brief} no longer says it is \"{DRAFT}\": a brief out of draft is compiled into \
-             the build (`ARC-11`, ADR-0005), so wire it in here — or restore the sentence."
+            "spec/{brief} no longer says it is \"{DRAFT}\": a brief out of draft is compiled \
+             into the build (`ARC-11`, ADR-0005), so wire it in here — or restore the sentence."
         );
     }
 
     let root = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
-    let mut generated =
-        String::from("/// The tenant profiles compiled in from the pinned tree (ADR-0030).\n");
-    generated.push_str("pub const TENANT_PROFILES: &[(&str, &str)] = &[\n");
-    for tenant in &tenants {
-        let profile = format!("{root}/spec/docs/tenants/{tenant}/profile.md");
-        assert!(
-            Path::new(&profile).is_file(),
-            "spec/docs/tenants/{tenant}/ has no profile.md (ADR-0030)"
-        );
-        // `{:?}` on a str is a Rust string literal, which is what this is generating.
-        generated.push_str(&format!("    ({tenant:?}, include_str!({profile:?})),\n"));
-    }
-    generated.push_str("];\n");
+    let mut generated = String::new();
+    emit(
+        &mut generated,
+        &root,
+        "The publisher-chosen inputs under `bundle/`, by file name (ADR-0031).",
+        "BUNDLE",
+        &bundle,
+    );
+    emit(
+        &mut generated,
+        &root,
+        "The tenant profiles, by tenant (ADR-0030).",
+        "TENANT_PROFILES",
+        &profiles,
+    );
     let out = std::env::var("OUT_DIR").expect("OUT_DIR");
-    std::fs::write(format!("{out}/tenants.rs"), generated).expect("writing tenants.rs");
+    std::fs::write(format!("{out}/pinned.rs"), generated).expect("writing pinned.rs");
 
     println!("cargo::rustc-env=TAU_SPEC_COMMIT={pin}");
 }
