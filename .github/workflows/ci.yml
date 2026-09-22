@@ -2,6 +2,7 @@ name: ci
 
 on:
   push:
+    branches: [main] # a branch under review is covered by pull_request; both would run twice
   pull_request:
 
 jobs:
