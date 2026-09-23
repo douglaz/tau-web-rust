@@ -39,10 +39,11 @@ only in its own prose, the build watches that sentence: a brief that stops sayin
 yet in the signed bundle" stops the build, so promotion is decided here rather than shipping
 as nothing.
 
-**`cargo build` fails today, and should.** `bundle/inference.toml` carries an empty `model` and
-`provider`: publisher decisions the build must not guess (`ARC-31`, `STG-17`). Filling them is a
-commit to the specification repository and a pin bump here; until then the `build` job is red
-and the `spec-checks` job is not.
+**An empty `model` or `provider` fails the build, by design.** Both are publisher decisions the
+build must not guess (`ARC-31a`, `TRU-A1`), and until the pin at `dde9e14` they were empty, so
+the `build` job was red on purpose. They are filled now — `model` by ADR-0033's rule, `provider`
+after `CNF-78` was measured (spec `docs/findings/2026-09-22-provider-routing.md`) — and the
+gate stays: the next pin that empties either goes red again.
 
 `.github/workflows/ci.yml` runs, on every push and pull request:
 
