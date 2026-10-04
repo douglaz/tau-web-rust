@@ -6,3 +6,7 @@ publish = false
 
 [build-dependencies]
 toml = "1"
+
+# The tests run the gate `build.rs` runs, on TOML of their own.
+[dev-dependencies]
+toml = "1"

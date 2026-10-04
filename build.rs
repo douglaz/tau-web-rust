@@ -5,6 +5,8 @@
 //! briefs promoted out of draft — today none, brief 1 is a draft. Every failure here is a
 //! build failure on purpose; none of them has an override.
 
+mod session_gate;
+
 fn git(args: &[&str]) -> String {
     let out = std::process::Command::new("git")
         .args(args)
@@ -91,8 +93,10 @@ fn main() {
 
     // Every input under bundle/ is compiled in, so every one of them must parse and every one
     // of them is embedded — a fourth input added there is gated and shipped the day it lands,
-    // not the day someone remembers it. The two publisher decisions must have been taken: an
-    // empty model or provider fails the build rather than letting it guess one (ARC-31, STG-17).
+    // not the day someone remembers it. The publisher's decisions under `[session]` must have
+    // been taken: the candidate order with a provider on each entry, the allowlist, the context
+    // floor, the depth and the retention request. One the reference validator would refuse
+    // fails the build rather than letting it guess (ARC-31a, ARC-31b, TRU-A1a).
     let mut bundle: Vec<(String, String)> = Vec::new();
     for path in pinned("bundle/") {
         if !path.ends_with(".toml") {
@@ -106,19 +110,7 @@ fn main() {
         let text = read(&path);
         let value: toml::Table = text.parse().unwrap_or_else(|e| panic!("spec/{path}: {e}"));
         if name == "inference.toml" {
-            for key in ["model", "provider"] {
-                let taken = value
-                    .get("session")
-                    .and_then(|session| session.get(key))
-                    .and_then(|value| value.as_str())
-                    .is_some_and(|value| !value.is_empty());
-                assert!(
-                    taken,
-                    "bundle/inference.toml: [session].{key} is empty — a publisher decision \
-                     the build must not guess (ARC-31, STG-17). Fill it in the specification \
-                     repository and bump the pin."
-                );
-            }
+            session_gate::session_gate(&value).unwrap_or_else(|refusal| panic!("{refusal}"));
         }
         bundle.push((name, path));
     }
