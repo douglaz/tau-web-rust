@@ -4,8 +4,9 @@
 //! `m/707285'/1'/role'/index'` for roles 0–4.
 //!
 //! Built on every target. The local store (`src/store.rs`) generates the seed and keeps its
-//! mnemonic in its first record; allocation (twr-ggw.6) and binding (twr-ggw.11) wire in the
-//! child keys. No `wasm_bindgen` export returns or accepts a mnemonic, a seed or a child key.
+//! mnemonic in its first record; allocation (`src/allocation.rs`) issues the indices the child keys
+//! derive at, and binding (twr-ggw.11) wires the keys in. No `wasm_bindgen` export returns or
+//! accepts a mnemonic, a seed or a child key.
 //!
 //! Derivation refuses rather than aliases: an unknown version, a role outside 0–4, an index above
 //! 2^31−1 and an invalid BIP-32 step are each an error, and no step ever moves on to another index

@@ -2,9 +2,11 @@
 //! it compiles in from that pinned tree (ADR-0031, gated in `build.rs`), and the harness worker's
 //! wasm module: one recorded command over a pinned SSH connection through the relay
 //! (`harness`), the encrypted local store it records to (`store`), the operator seed and its
-//! child keys (`seed`), and the credential types with their `SEC-5` rows (`credential`).
+//! child keys (`seed`), the allocation of their indices (`allocation`), and the credential types
+//! with their `SEC-5` rows (`credential`).
 //! `testonly` is the tracer's, and only the `tracer` feature compiles it.
 
+pub mod allocation;
 pub mod credential;
 pub mod harness;
 pub mod relay_auth;

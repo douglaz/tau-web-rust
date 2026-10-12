@@ -22,12 +22,17 @@
 //!   failed append (whose move may still have landed) the store refuses further appends until
 //!   the worker restarts and re-reads the directory.
 //!
+//! - **Allocation** (`STA-22b`). Every allocation event is a record of its own, appended before it
+//!   is applied, and replay applies each through the same core (`crate::allocation`). A record
+//!   the core cannot apply stops replay and refuses the store.
+//!
 //! What it does not detect, as the format says: the rollback of the whole store, a missing tail
 //! of records included.
 //!
 //! The format and its validation are built on every target, so host tests run them on
 //! `MemoryStorage`; the browser's storage and KDF are `opfs` (wasm32 only).
 
+use crate::allocation::{self, Family, Identity, Metadata};
 use crate::credential::{DataKey, LocalPassphrase, WrappingKey};
 use crate::harness::{Entry, Journal};
 use crate::seed::Seed;
@@ -152,7 +157,8 @@ struct RecordJson {
     ciphertext: String,
 }
 
-/// What a record carries, encrypted. The first record is the seed, every later one a command.
+/// What a record carries, encrypted. The first record is the seed, every later one a command or
+/// an allocation event.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 enum Event {
@@ -160,6 +166,9 @@ enum Event {
     Seed { mnemonic: String },
     /// One box-plane command, recorded before it is sent (`ARC-8`): its bytes as hex.
     Command { machine: String, command: String },
+    /// One allocation event, recorded before it is applied: a reservation before any external
+    /// effect (`STA-22b`), with its seed identifier and derivation version (`STA-22a`).
+    Allocation(allocation::Event),
 }
 
 impl Drop for Event {
@@ -292,6 +301,8 @@ pub struct Store<S> {
     /// The content address of the record before `next`; zeros before the first.
     previous: Address,
     seed: Option<Seed>,
+    /// The allocation metadata, from the seed record on.
+    allocation: Option<Metadata>,
     commands: Vec<(u64, Entry)>,
     /// Set by a failed append, whose move may have landed: no append follows in this worker.
     failed: Option<String>,
@@ -405,6 +416,7 @@ impl<S: Storage> Store<S> {
             next: FIRST,
             previous: Address([0; 32]),
             seed: None,
+            allocation: None,
             commands: Vec::new(),
             failed: None,
         }
@@ -425,6 +437,42 @@ impl<S: Storage> Store<S> {
         FIRST..self.next
     }
 
+    /// The allocation metadata (`STA-22b`), as journaled.
+    pub fn allocation(&self) -> &Metadata {
+        self.allocation
+            .as_ref()
+            .expect("a created or unlocked store holds its seed")
+    }
+
+    /// Reserves `family`'s next unused index (`STA-22`, `STA-22b`): the core issues it, the
+    /// reservation is appended, applied once the append commits (`STA-3`), and only then
+    /// returned. The caller names no index, so no call reserves a recorded one (`CNF-72`).
+    pub async fn allocate(&mut self, family: Family) -> Result<Identity, String> {
+        let identity = self.allocation().issue(family).map_err(|e| e.to_string())?;
+        self.record(allocation::Event::Reserve(identity.clone()))
+            .await?;
+        Ok(identity)
+    }
+
+    /// Journals an adapter's observation of an identity: created, failed or destroyed. One the
+    /// metadata cannot apply is refused and never journaled.
+    pub async fn observe(&mut self, observation: allocation::Event) -> Result<(), String> {
+        use allocation::Event::{Created, Destroyed, Failed};
+        if !matches!(observation, Created(_) | Failed(_) | Destroyed(_)) {
+            return Err("only created, failed and destroyed are observations".into());
+        }
+        self.record(observation).await
+    }
+
+    /// Appends `event` if the core applies it, then applies it once committed.
+    async fn record(&mut self, event: allocation::Event) -> Result<(), String> {
+        let mut next = self.allocation().clone();
+        next.apply(&event).map_err(|e| e.to_string())?;
+        self.commit(&Event::Allocation(event)).await?;
+        self.allocation = Some(next);
+        Ok(())
+    }
+
     /// The recorded commands, by record number. None has a terminal record yet (twr-ggw.7), so
     /// every one of them may have been sent.
     pub fn commands(&self) -> &[(u64, Entry)] {
@@ -440,6 +488,7 @@ impl<S: Storage> Store<S> {
             mnemonic: seed.phrase().to_string(),
         })
         .await?;
+        self.allocation = Some(Metadata::new(seed.id()));
         self.seed = Some(seed);
         Ok(())
     }
@@ -470,9 +519,11 @@ impl<S: Storage> Store<S> {
                 .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
             match (number, &event) {
                 (FIRST, Event::Seed { mnemonic }) => {
-                    self.seed = Some(Seed::import(mnemonic).map_err(|e| {
+                    let seed = Seed::import(mnemonic).map_err(|e| {
                         format!("record {number}: the seed does not import ({e:?}); replay stopped")
-                    })?);
+                    })?;
+                    self.allocation = Some(Metadata::new(seed.id()));
+                    self.seed = Some(seed);
                 }
                 (FIRST, _) => return Err("the first record is not the seed; replay stopped".into()),
                 (_, Event::Command { machine, command }) => {
@@ -485,6 +536,23 @@ impl<S: Storage> Store<S> {
                             command,
                         },
                     ));
+                }
+                (_, Event::Allocation(event)) => {
+                    let allocation = self.allocation.as_mut().expect("record 0 is the seed");
+                    let applied = match event {
+                        // The store holds one seed, record 0's: a replace would move allocation
+                        // to a seed it cannot derive from (twr-ggw.29 opens this).
+                        allocation::Event::Replace { .. } => {
+                            Err("a replace, and the store holds one seed".to_string())
+                        }
+                        allocation::Event::Restore(export)
+                            if export.seed() != allocation.seed() =>
+                        {
+                            Err("a restore of another seed's metadata".to_string())
+                        }
+                        event => allocation.apply(event).map_err(|e| e.to_string()),
+                    };
+                    applied.map_err(|e| format!("record {number}: {e}; replay stopped"))?;
                 }
                 (_, Event::Seed { .. }) => {
                     return Err(format!(
@@ -865,6 +933,7 @@ pub fn block_on<F: std::future::Future>(future: F) -> F::Output {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+    use crate::allocation::tests::keys;
     use std::cell::{Cell, RefCell};
     use std::collections::{BTreeMap, HashMap};
 
@@ -1454,6 +1523,276 @@ mod tests {
         block_on(create(storage.clone(), &kdf(), pass(composed))).unwrap();
         assert!(reopen(&storage.files(), decomposed).is_err());
         assert!(reopen(&storage.files(), composed).is_ok());
+    }
+
+    /// A record the core never issued, committed with the data key as the store commits any.
+    fn craft(store: &mut Store<MemoryStorage>, event: allocation::Event) {
+        block_on(store.commit(&Event::Allocation(event))).unwrap();
+    }
+
+    /// `CNF-72` and `STA-22`: an identity allocated through the store derives the same keys
+    /// after a reopen, and another index different ones. Each family counts on its own.
+    #[test]
+    fn allocated_identities_derive_the_same_keys_after_a_reopen() {
+        let (storage, mut store) = store(PASS, 1);
+        let mut allocated = Vec::new();
+        for family in [
+            Family::Machines,
+            Family::Machines,
+            Family::Passes,
+            Family::Handoffs,
+            Family::Passes,
+        ] {
+            allocated.push(block_on(store.allocate(family)).unwrap());
+        }
+        let indices: Vec<_> = allocated.iter().map(|i| (i.family, i.index)).collect();
+        assert_eq!(
+            indices,
+            [
+                (Family::Machines, 0),
+                (Family::Machines, 1),
+                (Family::Passes, 0),
+                (Family::Handoffs, 0),
+                (Family::Passes, 1)
+            ]
+        );
+        assert!(
+            allocated
+                .iter()
+                .all(|i| i.seed == store.seed().unwrap().id())
+        );
+        let reopened = reopen(&storage.files(), PASS).unwrap();
+        assert_eq!(reopened.allocation(), store.allocation());
+        assert_eq!(recorded(&reopened), [command(1)]);
+        for identity in &allocated {
+            let before = keys(store.seed().unwrap(), identity);
+            assert_eq!(
+                keys(reopened.seed().unwrap(), identity),
+                before,
+                "{identity:?}"
+            );
+            let other = Identity {
+                index: identity.index + 7,
+                ..identity.clone()
+            };
+            let others = keys(reopened.seed().unwrap(), &other);
+            assert!(
+                before.iter().zip(&others).all(|(a, b)| a != b),
+                "{identity:?}"
+            );
+        }
+    }
+
+    /// `CNF-72`: an observation the core cannot apply is refused and journals nothing.
+    #[test]
+    fn an_observation_that_does_not_apply_is_not_journaled() {
+        let (storage, mut store) = store(PASS, 0);
+        let created = block_on(store.allocate(Family::Machines)).unwrap();
+        block_on(store.observe(allocation::Event::Created(created.clone()))).unwrap();
+        let failed = block_on(store.allocate(Family::Machines)).unwrap();
+        block_on(store.observe(allocation::Event::Failed(failed.clone()))).unwrap();
+        let files = storage.files();
+        let metadata = store.allocation().clone();
+        for observation in [
+            allocation::Event::Created(created.clone()),
+            allocation::Event::Created(failed.clone()),
+            allocation::Event::Destroyed(failed.clone()),
+            allocation::Event::Failed(created.clone()),
+            allocation::Event::Reserve(created.clone()),
+            allocation::Event::Replace { seed: "x".into() },
+        ] {
+            assert!(
+                block_on(store.observe(observation.clone())).is_err(),
+                "{observation:?}"
+            );
+            assert_eq!(storage.files(), files, "{observation:?}: nothing journaled");
+            assert_eq!(*store.allocation(), metadata);
+        }
+        assert_eq!(reopen(&files, PASS).unwrap().allocation(), &metadata);
+    }
+
+    /// `CNF-72`: a journal that would put a second machine at a recorded identity, or skip an
+    /// index, or carry what this store cannot apply, is refused at unlock.
+    #[test]
+    fn a_reservation_the_core_did_not_issue_fails_closed_at_replay() {
+        let (storage, mut store) = store(PASS, 0);
+        let first = block_on(store.allocate(Family::Machines)).unwrap();
+        let files = storage.files();
+        let at = |index| Identity {
+            index,
+            ..first.clone()
+        };
+        let cases = [
+            ("not the next unused", allocation::Event::Reserve(at(0))),
+            ("not the next unused", allocation::Event::Reserve(at(2))),
+            (
+                "not the next unused",
+                allocation::Event::Reserve(Identity {
+                    seed: "0".repeat(64),
+                    ..at(1)
+                }),
+            ),
+            (
+                "unknown derivation version 2",
+                allocation::Event::Reserve(Identity {
+                    derivation_version: 2,
+                    ..at(1)
+                }),
+            ),
+            (
+                "a replace, and the store holds one seed",
+                allocation::Event::Replace {
+                    seed: "f".repeat(64),
+                },
+            ),
+            ("does not apply", allocation::Event::Created(at(5))),
+        ];
+        for (why, event) in cases {
+            let mut store = reopen(&files, PASS).unwrap();
+            craft(&mut store, event);
+            let (reason, _) = refused(&store.storage().files(), PASS);
+            assert!(
+                reason.starts_with("record 2: ") && reason.contains(why),
+                "{reason}"
+            );
+        }
+    }
+
+    /// `STA-3`, `STA-22b`: the reservation's move commits before the identity is returned.
+    #[test]
+    fn a_reservation_is_committed_before_its_identity_is_returned() {
+        let (storage, mut store) = store(PASS, 0);
+        storage.memory().log.clear();
+        let identity = block_on(store.allocate(Family::Passes)).unwrap();
+        assert_eq!(storage.memory().log, ["create", "close", "move"]);
+        let reopened = reopen(&storage.files(), PASS).unwrap();
+        assert_eq!(reopened.allocation().entries()[0].identity, identity);
+    }
+
+    /// A failed append returns no identity and moves no counter, in memory or on disk.
+    #[test]
+    fn a_failed_reservation_returns_no_identity_and_moves_no_counter() {
+        for at in 1..=3 {
+            let (storage, mut store) = store(PASS, 0);
+            let before = store.allocation().clone();
+            storage.fault(Fault::Fail(at));
+            assert!(
+                block_on(store.allocate(Family::Machines)).is_err(),
+                "op {at}"
+            );
+            assert_eq!(*store.allocation(), before, "op {at}: not applied");
+            let reopened = reopen(&storage.files(), PASS).unwrap();
+            assert_eq!(*reopened.allocation(), before, "op {at}: nothing replayed");
+        }
+    }
+
+    /// A move that lands and reports failure: no identity now, and the index is consumed after
+    /// the restart, so the next allocation takes the following one.
+    #[test]
+    fn a_reservation_that_landed_but_reported_failure_stays_consumed() {
+        let (storage, mut store) = store(PASS, 0);
+        storage.fault(Fault::LandThenFail(3));
+        assert!(block_on(store.allocate(Family::Handoffs)).is_err());
+        assert_eq!(store.allocation().next_unused().handoffs, 0, "not applied");
+        let mut reopened = reopen(&storage.files(), PASS).unwrap();
+        let entries = reopened.allocation().entries().to_vec();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            (entries[0].identity.index, entries[0].status),
+            (0, allocation::Status::Reserved)
+        );
+        assert_eq!(
+            block_on(reopened.allocate(Family::Handoffs)).unwrap().index,
+            1
+        );
+    }
+
+    /// A reservation committed and then the worker killed, before any observation: consumed.
+    #[test]
+    fn a_reservation_never_observed_stays_consumed_after_a_kill() {
+        let (storage, mut store) = store(PASS, 0);
+        let reserved = block_on(store.allocate(Family::Machines)).unwrap();
+        storage.fault(Fault::Die(1));
+        assert!(block_on(store.observe(allocation::Event::Created(reserved.clone()))).is_err());
+        let mut reopened = reopen(&storage.files(), PASS).unwrap();
+        assert_eq!(
+            reopened.allocation().entries(),
+            [allocation::Entry {
+                identity: reserved,
+                status: allocation::Status::Reserved
+            }]
+        );
+        assert_eq!(
+            block_on(reopened.allocate(Family::Machines)).unwrap().index,
+            1
+        );
+    }
+
+    /// `STA-22b`: failed and destroyed entries are tombstones, before and after a reopen.
+    #[test]
+    fn failed_and_destroyed_indices_are_never_issued_again() {
+        let (storage, mut store) = store(PASS, 0);
+        let failed = block_on(store.allocate(Family::Machines)).unwrap();
+        block_on(store.observe(allocation::Event::Failed(failed.clone()))).unwrap();
+        let destroyed = block_on(store.allocate(Family::Machines)).unwrap();
+        block_on(store.observe(allocation::Event::Created(destroyed.clone()))).unwrap();
+        block_on(store.observe(allocation::Event::Destroyed(destroyed.clone()))).unwrap();
+        assert_eq!(block_on(store.allocate(Family::Machines)).unwrap().index, 2);
+        let mut reopened = reopen(&storage.files(), PASS).unwrap();
+        let statuses: Vec<_> = reopened
+            .allocation()
+            .entries()
+            .iter()
+            .map(|e| (e.identity.index, e.status))
+            .collect();
+        use allocation::Status::{Destroyed, Failed, Reserved};
+        assert_eq!(statuses, [(0, Failed), (1, Destroyed), (2, Reserved)]);
+        assert!(block_on(reopened.observe(allocation::Event::Created(failed))).is_err());
+        assert_eq!(
+            block_on(reopened.allocate(Family::Machines)).unwrap().index,
+            3
+        );
+    }
+
+    /// The consultation's condition on criterion 3: a restore event is an ordinary allocation
+    /// record, so it goes through the store's encoding and back into the core, and the restriction
+    /// holds after replay. No store method writes one: durable import is twr-ggw.27's.
+    #[test]
+    fn a_journaled_restore_refuses_allocation_in_every_family_after_replay() {
+        let (storage, mut ours) = store(PASS, 0);
+        for family in Family::ALL {
+            block_on(ours.allocate(family)).unwrap();
+        }
+        let export = ours.allocation().export();
+        craft(&mut ours, allocation::Event::Restore(export.clone()));
+        let files = storage.files();
+        let mut reopened = reopen(&files, PASS).unwrap();
+        assert!(reopened.allocation().restored_from_import());
+        assert_eq!(reopened.allocation().entries(), export.entries());
+        let storage = reopened.storage().clone();
+        for family in Family::ALL {
+            let refused = block_on(reopened.allocate(family)).unwrap_err();
+            assert!(refused.contains("restored"), "{family:?}: {refused}");
+        }
+        assert_eq!(storage.files(), files, "nothing appended");
+        // Observations still apply under the restriction, which survives them.
+        let machine = export.entries()[0].identity.clone();
+        block_on(reopened.observe(allocation::Event::Created(machine))).unwrap();
+        let mut again = reopen(&storage.files(), PASS).unwrap();
+        assert!(block_on(again.allocate(Family::Machines)).is_err());
+        // A reservation journaled after the restore is refused at unlock.
+        let next = Identity {
+            index: 1,
+            ..export.entries()[0].identity.clone()
+        };
+        craft(&mut again, allocation::Event::Reserve(next));
+        let (reason, _) = refused(&again.storage().files(), PASS);
+        assert!(reason.contains("restored"), "{reason}");
+        // So is a restore of another seed's metadata.
+        let (storage, mut other) = store(PASS, 0);
+        craft(&mut other, allocation::Event::Restore(export));
+        let (reason, _) = refused(&storage.files(), PASS);
+        assert!(reason.contains("another seed"), "{reason}");
     }
 
     /// Every way the item could be written in a file: raw, hex in either case, base64, base64url,

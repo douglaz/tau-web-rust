@@ -142,7 +142,8 @@ There are two builds of the same page, both release builds:
 
 The local store generates the seed in the worker and keeps its mnemonic in its first record
 (below). No `wasm_bindgen` export takes or returns a mnemonic, a seed or a key. Allocation
-(twr-ggw.6) and binding the keys to sessions (twr-ggw.11) come next.
+(twr-ggw.6, below) issues the indices the keys derive at; binding the keys to sessions
+(twr-ggw.11) comes next.
 
 The tests hold it to the specification's v1 known answers, `credential-vectors-v1.json`, read
 from `spec/` at the pin. They also check the upstream vectors vendored in `tests/vectors/` (see
@@ -181,13 +182,20 @@ the host tests run.
 - **What the records carry.** Each record's plaintext is one event, compact JSON:
   - record 0, the seed, generated in the worker: `{"seed":{"mnemonic":"…"}}`, the mnemonic's
     words;
-  - every later record, one command appended before it is sent:
+  - a later record, one command appended before it is sent:
     `{"command":{"machine":"…","command":"<hex>"}}`, its machine and its bytes in lowercase hex.
-  - None has a terminal record yet (twr-ggw.7). Every recorded command is therefore unresolved
+    None has a terminal record yet (twr-ggw.7). Every recorded command is therefore unresolved
     after replay: it reads back under its number, and nothing re-sends it, marks it done or
     marks it failed.
+  - a later record, one allocation event appended before it is applied ("Allocation", below):
+    `{"allocation":{"reserve":{"seed":"<seed identifier>","derivation_version":1,"family":"machines","index":0}}}`;
+    `created`, `failed` and `destroyed` carry the same identity; `restore` carries an export,
+    `{"seed":…,"derivation_version":1,"next_unused":{"machines":…,"passes":…,"handoffs":…},"entries":[{"identity":{…},"status":"reserved"}],"restored_from_import":…}`;
+    `replace` carries `{"seed":…}`. The seed identifier is in the clear only inside the
+    encrypted record, where credential format v1 puts it.
 
-  The independent reader in the tracer crate reads exactly these two shapes.
+  The independent reader in the tracer crate decrypts every record and reads the seed and
+  command shapes; it does not interpret an allocation record.
 - **`staging`**, the one staging name, which is never a record name or the envelope's.
 
 **The commit boundary.**
@@ -221,7 +229,8 @@ the host tests run.
   - a record that fails to parse, decrypt or chain;
   - a number missing before a later record;
   - a record of another store;
-  - a record of type `snapshot` (unsupported) or of an unknown type.
+  - a record of type `snapshot` (unsupported) or of an unknown type;
+  - an allocation record the allocation core does not apply ("Allocation", below).
 - **Records without an envelope** are refused too.
 - **A refusal is final for that worker.** It dispatches nothing, appends nothing and uses no
   partial state. The page shows the reason and offers no Create; a reload tries again.
@@ -339,8 +348,128 @@ one, as a killed worker does. They show, for `CNF-82` and `CNF-15`:
 
 In the tracer crate, the independent reader reads a store the harness wrote, and the harness
 unlocks and replays a store the reader built. Decrypted, the seed is in the seed record alone,
-and no other secret is in any record. A record the harness cannot read is refused with a reason
-that quotes none of its plaintext, since the reason reaches the page.
+and no other secret is in any record of that store, which holds seed and command records only.
+A record the harness cannot read is refused with a reason that quotes none of its plaintext,
+since the reason reaches the page.
+
+### Allocation
+
+`src/allocation.rs` is spec `STA-22b`'s allocation metadata and the one core every allocation
+event goes through, in the local store and in the companion comparison alike. It is pure and
+synchronous, built on every target, and holds no seed and no key: a seed is known by its
+identifier.
+
+- **The metadata.** The seed identifier, the derivation version (1), the next unused index of
+  each family — machines, passes, handoffs — and the allocated entries, oldest first. Each entry
+  is an identity (seed identifier, derivation version, family, index) with a status: `reserved`,
+  `created`, `failed` or `destroyed`. Beside them, whether the metadata was imported after loss
+  of the canonical journal with no Replace since.
+- **Families.** Roles 0–2 share the machine index; role 3 takes a pass index and role 4 a handoff
+  index (`STA-22`; credential format v1's role table). Each family has its own counter.
+- **Allocate** issues the family's next unused index as a reserved entry. Indices are monotonic
+  and run from 0 through 2^31−1; once 2^31−1 is issued the family refuses, and it never wraps
+  (credential format v1, "Seed and child keys").
+- **Observations.** `created` moves a reserved entry to created, `failed` a reserved one to
+  failed, `destroyed` a created one to destroyed. Failed and destroyed are `STA-22b`'s
+  tombstones: never revived, and their index never issued again. An observation the metadata
+  cannot apply — `created` for an identity never reserved, already created or tombstoned,
+  `destroyed` for one never created — is refused and changes nothing.
+- **Export** is the whole metadata. The sheet's export time and journal sequence are twr-ggw.27's.
+- **Restore** is an event that takes an export. The listed identities come back, and every
+  allocation, in every family, is refused until a Replace: `STA-22b`'s "a seed imported after
+  loss of the canonical journal may restore listed identities but MUST NOT allocate new ones". An
+  export recording a derivation version other than 1 is refused (`STA-22a`).
+- **Replace** is an event that takes a freshly generated seed's identifier. The restriction
+  clears, each family starts at 0 under the new seed, which has derived nothing, and the old
+  entries are retained under the old seed's identifier (`STA-22b`: "old records are retained
+  until migration is complete"). A Replace to the current seed, or to one an entry already names,
+  is refused: it would issue a recorded identity again.
+
+**Journaled in the local store.** Each allocation event is a record of its own ("What the records
+carry", above).
+
+- **Append before apply** (`STA-3`). `Store::allocate` takes a family and no index. It asks the
+  core what it would issue, appends the reservation, applies it once the append commits, and
+  only then returns the identity. A failed append returns no identity and moves no counter. A
+  move that landed but reported failure is replayed after the restart, so its index stays
+  consumed and is never issued again.
+- **Observations** are journaled the same way, so tombstones survive a restart. One the core
+  cannot apply is refused and never journaled.
+- **Replay** rebuilds the core from record 0's seed identifier and applies each allocation record
+  through it. A record that does not apply stops replay and refuses the store, as corruption
+  does:
+  - a reservation of a recorded identity, of an index other than the family's next unused one,
+    under another seed or an unknown derivation version, or under the restriction;
+  - an observation that does not apply;
+  - a replace record: the store holds one seed, record 0's, and a replace would move allocation
+    to a seed it cannot derive from (twr-ggw.29 opens this when the store gains a second seed);
+  - a restore of another seed's metadata.
+
+  A restore record of the store's own seed is applied, so the restriction holds after every
+  replay. No store method writes a restore or a replace record.
+
+**Not here: durable import.** A store created from an imported seed and its sheet, the recovery
+sheet itself and `CNF-84`'s import refusals are twr-ggw.27's. This ticket shows the restriction
+on the core — the seed's mnemonic imported with `Seed::import`, the core's own export restored,
+the same keys re-derived, allocation refused in all three families until a Replace — and through
+a restore record crafted with the data key and replayed. Neither is evidence that a store can be
+created from an imported seed today. No `wasm_bindgen` export, UI or page message reaches
+allocation, since nothing calls it yet.
+
+**The tests** (`cargo test`). On the core: each family's own counter; a recorded identity never
+reserved again or revived; tombstones never reissued; exhaustion, started at 2^31−1; an unknown
+derivation version; and the import after loss above. On `MemoryStorage` stores: roles 0–4 derive
+the same keys at an allocated identity after a reopen, and different keys at another index
+(`CNF-72`); an observation that does not apply journals nothing; each crafted record listed under
+Replay refuses the store at unlock; the reservation's move commits before the identity returns; a
+failed append, a move that lands then fails, and a worker killed after the commit; failed and
+destroyed indices never reissued across a reopen; and the journaled restore.
+
+**The companion comparison** (spec ADR-0032, "How the implementation is compared").
+`src/allocation/comparison.rs`, a host test, reads `spec/docs/design/allocation-witnesses-v1.json`
+from the pinned tree at run time with `std::fs`. It is never compiled in (ADR-0031), so a missing
+file is a red test.
+
+- **The header.** Schema 1, module `allocation`, non-empty `witnesses` and `enumeration`, and an
+  enumeration of exactly every trace of at most `bound.events` events over `bound.alphabet`,
+  each once: Σ|alphabet|^k traces for k = 0…events, every event from the alphabet, no sequence
+  twice, each starting from the initial journal: seed ordinal 0, derivation version 1, every
+  family's `next_unused` 0, no entries and `restored_from_import` false. A named witness starts
+  where the file says. A truncated file fails.
+- **Every trace**, all 6 witnesses and all 400 enumerated traces, drives the production core from
+  the trace's `start`. Seed ordinals map to seed identifiers the driver generates, in order;
+  `export_sheet` keeps the core's export, and `restore` passes the latest one, or with none
+  restores nothing. After each step it compares the outcome (`allocation`, and `identity` when
+  admitted) and the `journal` projection with what the core says and holds.
+- **The pair.** A trace under `restoredAllocatesNone: true` must match at every step. The core
+  has no switch for that guard, so the pair's admitted side, under `false`, must differ from the
+  core at some step, and the refused side it names must match: the negative control.
+- **Anything unknown fails**: an event kind, provenance, family, status, outcome, assumption or
+  member. Every failure names its trace — a witness by its declarations, an enumerated trace as
+  `enumeration[i]` — and its step, with the expected and actual values.
+- **Its own negative controls.** Unit tests build `CNF-3`'s three breaks in memory from the
+  pinned file — an outcome flipped; empty bytes and an absent file; an unknown event kind and an
+  unknown outcome — plus a truncated enumeration, an unknown member, a pair without its admitted
+  side, and an enumerated trace starting elsewhere than the initial journal, both the empty
+  trace and one with steps, and each must fail naming the trace.
+
+The core was written from the requirement text before the comparison existed, and the
+comparison raised no disagreement with it. Its record, printed on success
+(`cargo test --locked allocation::comparison -- --nocapture`), names the file, its bound, what
+was compared, the pair and the spec commit; the implementation revision is the commit the test
+ran at:
+
+```
+allocation companion comparison: passed
+  file: <checkout>/spec/docs/design/allocation-witnesses-v1.json
+  schema 1, module allocation, bound: 3 events over an alphabet of 7
+  compared: 6 witnesses and 400 enumerated traces, every step
+  pair: TauWeb.Allocation.stale_sheet_refused matched; TauWeb.Allocation.stale_sheet_admitted differed at step 7
+  spec commit: 1cc84987d76a5e9237e9e8a09287dc5e9e4c5ac4
+```
+
+A pass is evidence about harness knowledge alone: never about external state, about whether an
+effect ran before its append returned, or about concurrency (ADR-0032, "Evidence").
 
 ### The tracer
 
@@ -623,7 +752,7 @@ rest of `CNF-88` has no code here yet.
 | `spec-checks` | `spec/bundle/cors-probe.sh` | `CNF-4` |
 | | `spec/prototypes/spec-checks/check-install-disks.py`, and `--baseline`, which must fail | evidence for `CNF-85` |
 | `build` (the job is `CNF-1`) | `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings` | `CNF-2`, at that strictness |
-| | `cargo test --locked` | runs `build.rs`, so the gates above run here, and the `[session]` fixtures (`CNF-88`'s build fixtures); the relay matrix, `CNF-87`'s fixture half; the seed's tests, `CNF-83`'s derivation tests and `CNF-13`'s tests; and the local store's, `CNF-82`'s and `CNF-15`'s host half (below) |
+| | `cargo test --locked` | runs `build.rs`, so the gates above run here, and the `[session]` fixtures (`CNF-88`'s build fixtures); the relay matrix, `CNF-87`'s fixture half; the seed's tests, `CNF-83`'s derivation tests and `CNF-13`'s tests; the local store's, `CNF-82`'s and `CNF-15`'s host half (below); and allocation's, `CNF-72`'s tests and the companion comparison against the allocation witness file (ADR-0032), with `CNF-3`'s three breaks as its unit tests |
 | `web` (the job is `CNF-1` for the browser build) | `cargo clippy -D warnings` on wasm32, the served and the tracer build | `CNF-2`, on the new target |
 | | `scripts/check-adr-0024.sh` | spec ADR-0024's build check |
 | | `scripts/build-web.sh served`, then `tracer check-absence dist/served` | the served build (`ARC-32`) carries no test key, pin source or test switch |
@@ -638,8 +767,26 @@ version and checksum, with no manual step; the browser is the runner's Chrome.
 `CNF-3` in its general form — "The test suite fails when a test is deliberately broken" — was
 verified by hand on 2026-09-21, against a temporary pin filling the inference slugs: the one
 test was broken deliberately, `cargo test` went red naming it, the restored test went green.
-The three further breaks `CNF-3` names are the companion comparison's (ADR-0032), and wait on
-the test that reads a witness file, which does not exist here yet.
+The three further breaks `CNF-3` names are the companion comparison's (ADR-0032). They were made
+by hand on 2026-10-12 against `allocation::comparison::the_allocation_core_passes_the_companion_comparison`,
+its path edited temporarily to a scratch copy of the witness file outside `spec/` (inside it,
+`build.rs` refuses the build, which would be red for the wrong reason). Green against the
+unmodified copy first; then:
+
+- **One expected outcome flipped**: `TauWeb.Allocation.successful_trace`, step 1, `allocation`
+  from `admitted` with its identity to `refused`. Red: "TauWeb.Allocation.successful_trace,
+  step 1 (allocate): allocation: expected refused, actual admitted".
+- **The file missing, then empty.** Red, naming the path: "…/allocation-witnesses-v1.json: No
+  such file or directory (os error 2)", then "…/allocation-witnesses-v1.json: not a JSON
+  document: EOF while parsing a value at line 1 column 0".
+- **Unrecognised.** `enumeration[1]`'s event kind from `allocate` to `reallocate`. Red:
+  "enumeration[1], step 1: not an event of the alphabet" and "enumeration[1], step 1: event:
+  unknown variant `reallocate`". Then its outcome from `admitted` to `granted`. Red:
+  "enumeration[1], step 1: unknown variant `granted`, expected `admitted` or `refused`".
+
+Restored, the copy byte-identical to the pinned file, it went green, and the path edit was
+undone, the test file byte-identical to its saved copy. The same three breaks stay as the
+comparator's unit tests.
 The tracer was broken the same way on 2026-10-12: case 1 was made to expect exit status 8 where
 the fixture sshd answers the command with 7. `scripts/tracer.sh` (the `web` job's command, run
 locally, not on GitHub) exited 1, naming case 1 and the assertion "the output and exit status came back". Restored, it
