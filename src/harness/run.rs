@@ -265,7 +265,7 @@ pub async fn run_command(
         machine: target.machine.clone(),
         command: command.to_vec(),
     };
-    let seq = journal.append(&entry).map_err(Refusal::Journal)?;
+    let seq = journal.append(&entry).await.map_err(Refusal::Journal)?;
     channel
         .exec(true, entry.command.clone())
         .await
@@ -289,7 +289,7 @@ pub async fn run_command(
         .await;
 
     // CNF-30: the transcript reconciles against what was sent.
-    let recorded = journal.read(seq);
+    let recorded = journal.read(seq).await;
     match recorded {
         Some(recorded) if recorded.command == sent && recorded.machine == target.machine => {
             Ok(Done {

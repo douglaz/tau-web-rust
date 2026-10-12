@@ -36,6 +36,18 @@ pub struct RelayKey(pub(crate) [u8; 32]);
 /// Role 4: a declared handoff's post-harness credential, an RFC 8032 Ed25519 seed.
 pub struct PostHarnessCredential(pub(crate) [u8; 32]);
 
+/// The local unlock passphrase (`STA-23`): the UTF-8 bytes the worker received, neither
+/// normalized nor trimmed. Zeroized on drop, which comes as soon as the KDF has run.
+pub struct LocalPassphrase(pub(crate) Vec<u8>);
+
+/// The wrapping key PBKDF2 derives from the local passphrase. Zeroized on drop, right after the
+/// data key is wrapped or unwrapped.
+pub struct WrappingKey(pub(crate) [u8; 32]);
+
+/// The local store's data key, which encrypts its journal; only its wrapped copy persists.
+/// Zeroized on drop, when the store is dropped or its worker ends.
+pub struct DataKey(pub(crate) [u8; 32]);
+
 /// A machine's host-key pin: the `SHA256:…` fingerprint of its host key. An integrity
 /// reference, not a secret: what the row says it authorizes is "Nothing — integrity reference".
 #[derive(Debug, PartialEq, Eq)]
@@ -81,6 +93,52 @@ impl sealed::Sealed for HostKeyPin {}
 impl Credential for HostKeyPin {
     const ROW: u8 = 5;
     const NAME: &'static str = "Host-key pins";
+}
+
+impl sealed::Sealed for LocalPassphrase {}
+impl Credential for LocalPassphrase {
+    const ROW: u8 = 18;
+    const NAME: &'static str = "Local unlock passphrase";
+}
+
+impl sealed::Sealed for WrappingKey {}
+impl Credential for WrappingKey {
+    const ROW: u8 = 19;
+    const NAME: &'static str = "Wrapping key";
+}
+
+impl sealed::Sealed for DataKey {}
+impl Credential for DataKey {
+    const ROW: u8 = 20;
+    const NAME: &'static str = "Data-encryption key";
+}
+
+impl LocalPassphrase {
+    /// Takes the bytes as received; the caller clears any other copy it holds.
+    pub fn new(bytes: Vec<u8>) -> LocalPassphrase {
+        LocalPassphrase(bytes)
+    }
+}
+
+// `SEC-5` rows 18–20: "Input and buffers cleared after use", "Cleared after wrap/unwrap",
+// "Cleared on lock/end". Best effort, as `STA-23` says ("Clearing buffers is best effort in a
+// browser"): a copy the allocator moved is not reached.
+impl Drop for LocalPassphrase {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
+
+impl Drop for WrappingKey {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
+
+impl Drop for DataKey {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
 }
 
 /// The Ed25519 public key of a 32-byte RFC 8032 seed, never an already-expanded scalar: the
@@ -178,6 +236,24 @@ impl fmt::Debug for PostHarnessCredential {
     }
 }
 
+impl fmt::Debug for LocalPassphrase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        redacted("LocalPassphrase", f)
+    }
+}
+
+impl fmt::Debug for WrappingKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        redacted("WrappingKey", f)
+    }
+}
+
+impl fmt::Debug for DataKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        redacted("DataKey", f)
+    }
+}
+
 /// `CNF-13`: "Every credential the implementation handles appears as a row in `SEC-5`." Host
 /// only: the scan parses with `syn`, a host-only dev-dependency.
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -187,8 +263,20 @@ mod tests {
     use syn::visit::{self, Visit};
 
     /// Types the scan finds holding key material that are no credential, each with its reason.
-    /// None today.
-    const EXEMPT: &[(&str, &str)] = &[];
+    const EXEMPT: &[(&str, &str)] = &[
+        (
+            "StoreId",
+            "the local store's ID: persisted in the clear in its envelope, and bound into every AAD",
+        ),
+        (
+            "Salt",
+            "the PBKDF2 salt: persisted in the clear in the envelope, as the format says",
+        ),
+        (
+            "Address",
+            "a record's content address, SHA-256 of its stored ciphertext record: persisted in the next record",
+        ),
+    ];
 
     /// Every type implementing `Credential`: its bare name, row and `NAME`.
     fn registered() -> Vec<(&'static str, u8, &'static str)> {
@@ -204,6 +292,9 @@ mod tests {
             entry::<RelayKey>(),
             entry::<PostHarnessCredential>(),
             entry::<HostKeyPin>(),
+            entry::<LocalPassphrase>(),
+            entry::<WrappingKey>(),
+            entry::<DataKey>(),
         ]
     }
 

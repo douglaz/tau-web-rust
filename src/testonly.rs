@@ -1,18 +1,20 @@
-//! The tracer's test-only parts (twr-ggw.2, twr-ggw.3): the test keys, the host-key pin source,
-//! the in-memory journal, and the test switches the browser test sets on a request
-//! (`fail_append`, `tamper_auth`, `test_relay_key`). The harness worker's `run_command` runs on
-//! these in the tracer build; the served build runs it on nothing stored. Compiled only with the
-//! `tracer` feature; `tracer check-absence` reads the served directory for every one of them,
-//! through the markers, switch names and key encodings below.
+//! The tracer's test-only parts (twr-ggw.2, twr-ggw.3, twr-ggw.5): the test keys, the host-key
+//! pin source, and the test switches the browser test sets on a request (`fail_append`,
+//! `tamper_auth`, `test_relay_key`). The harness worker's `run_command` runs on these and on the
+//! local store's journal in the tracer build; the served build runs it on nothing stored. Compiled
+//! only with the `tracer` feature; `tracer check-absence` reads the served directory for every one
+//! of them, through the marker, switch names and key encodings below.
 //!
 //! The keys are test keys, not derived from a seed: derivation exists (`crate::seed`), and
 //! twr-ggw.11 binds its keys in their place. They are built as the credential types a derived key
-//! is (`crate::credential`). The journal is memory, nothing durable (twr-ggw.5's).
+//! is (`crate::credential`).
 
 use crate::credential::HostKeyPin;
 #[cfg(target_arch = "wasm32")]
 use crate::credential::{RelayKey, SshClientKey};
-use crate::harness::{Entry, Journal, PinSource};
+use crate::harness::PinSource;
+#[cfg(target_arch = "wasm32")]
+use crate::harness::{Entry, Journal};
 
 /// The test SSH client key: an ed25519 seed. The fixture sshd authorizes its public half.
 pub const SSH_CLIENT_SEED: [u8; 32] = [
@@ -62,9 +64,6 @@ pub const SSH_USER: &str = "tracer";
 /// Marks the pin source in a build; `tracer check-absence` refuses a served build holding it.
 pub const PIN_SOURCE_MARKER: &str = "tau-web test-only host-key pin source";
 
-/// Marks the in-memory journal in a build; `tracer check-absence` refuses it too.
-pub const JOURNAL_MARKER: &str = "tau-web test-only in-memory journal";
-
 /// The host-key pins, by machine: `fixture` is the fixture sshd's pinned host key; any other
 /// machine, `unpinned` in the tracer, has none.
 pub const PINS: &[(&str, &str)] = &[(
@@ -83,24 +82,16 @@ impl PinSource for TestPins {
     }
 }
 
-/// The journal stand-in: entries in memory, and an append that can be made to fail.
-pub struct MemoryJournal {
-    pub entries: Vec<Entry>,
-    pub refuse_appends: bool,
-}
-
-impl Journal for MemoryJournal {
-    fn append(&mut self, entry: &Entry) -> Result<u64, String> {
-        if self.refuse_appends {
-            return Err(format!("{JOURNAL_MARKER}: append refused (made to fail)"));
-        }
-        self.entries.push(entry.clone());
-        Ok(self.entries.len() as u64 - 1)
-    }
-
-    fn read(&self, seq: u64) -> Option<Entry> {
-        self.entries.get(usize::try_from(seq).ok()?).cloned()
-    }
+/// What `fail_append` needs of the journal: to make its next append fail at a real storage call,
+/// and the commands it holds, so the report can name those this request appended.
+#[cfg(target_arch = "wasm32")]
+#[allow(
+    async_fn_in_trait,
+    reason = "used generically and only on one thread: the browser's worker"
+)]
+pub trait FailAppend {
+    async fn fail_next_append(&self, fail: bool);
+    async fn commands(&self) -> Vec<(u64, Entry)>;
 }
 
 /// The test SSH client key, and the test relay key the request selected, as the role 0 and
@@ -122,18 +113,19 @@ impl crate::harness::Credentials for TestCredentials {
     }
 }
 
-/// One attempt on the test sources. `request` sets the test switches: `test_relay_key` names
-/// the test relay key the AUTH is signed with, one of `RELAY_KEYS`, and any other value, or
-/// none, or a key that does not derive its recorded public half, fails the request before any
-/// contact; `fail_append` makes the journal refuse its
-/// append; `tamper_auth` sends a wrongly signed AUTH. The key is chosen by name only: no key
-/// material comes from the request. The report adds the journal's entries and the pin source's
-/// view afterwards, for the tracer to check.
+/// One attempt on the test sources and the store's journal. `request` sets the test switches:
+/// `test_relay_key` names the test relay key the AUTH is signed with, one of `RELAY_KEYS`, and
+/// any other value, or none, or a key that does not derive its recorded public half, fails the
+/// request before any contact; `fail_append` makes the store's append fail at its move, a real
+/// OPFS call; `tamper_auth` sends a wrongly signed AUTH. The key is chosen by name only: no key
+/// material comes from the request. The report adds the commands this request appended and the
+/// pin source's view afterwards, for the tracer to check.
 #[cfg(target_arch = "wasm32")]
 pub async fn run(
     target: &crate::harness::Target,
     command: &[u8],
     request: &serde_json::Value,
+    journal: &mut (impl Journal + FailAppend),
 ) -> Result<serde_json::Value, String> {
     use serde_json::json;
     let selector = &request["test_relay_key"];
@@ -155,13 +147,13 @@ pub async fn run(
                 ))
             }
         })?;
-    let mut journal = MemoryJournal {
-        entries: Vec::new(),
-        refuse_appends: request["fail_append"] == json!(true),
-    };
+    let before = journal.commands().await.len();
+    journal
+        .fail_next_append(request["fail_append"] == json!(true))
+        .await;
     let outcome = crate::harness::run_command(
         &TestPins,
-        &mut journal,
+        journal,
         &TestCredentials {
             ssh: SshClientKey(SSH_CLIENT_SEED),
             relay,
@@ -171,11 +163,15 @@ pub async fn run(
         request["tamper_auth"] == json!(true),
     )
     .await;
+    journal.fail_next_append(false).await;
+    let appended = journal.commands().await;
     Ok(json!({
         "pin_source": PIN_SOURCE_MARKER,
-        "journal": JOURNAL_MARKER,
         "outcome": crate::harness::report(&outcome),
-        "journal_entries": journal.entries.iter().map(|e| hex::encode(&e.command)).collect::<Vec<_>>(),
+        "journal_entries": appended[before.min(appended.len())..]
+            .iter()
+            .map(|(_, e)| hex::encode(&e.command))
+            .collect::<Vec<_>>(),
         "pinned_after": TestPins.pin(&target.machine).map(|pin| pin.0),
     }))
 }

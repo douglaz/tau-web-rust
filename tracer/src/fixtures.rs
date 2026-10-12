@@ -104,12 +104,14 @@ impl Sshd {
     }
 }
 
-/// The one command the fixture sshd answers, and its answer. It runs nothing.
+/// The one command the fixture sshd answers, and its answer. It runs nothing. It never answers
+/// `hold`: that command's channel stays open until the client goes, a command in flight.
 pub struct Answer {
     pub command: &'static str,
     pub stdout: &'static str,
     pub stderr: &'static str,
     pub exit_status: u32,
+    pub hold: &'static str,
 }
 
 /// What the fixture sshd answers any other command with.
@@ -266,6 +268,9 @@ impl server::Handler for SshSession {
     ) -> Result<(), Self::Error> {
         observe(&self.seen, |s| s.ssh_exec.push(data.to_vec()));
         session.channel_success(channel)?;
+        if data == self.answer.hold.as_bytes() {
+            return Ok(());
+        }
         let (stdout, stderr, status) = if data == self.answer.command.as_bytes() {
             (
                 self.answer.stdout,
@@ -478,6 +483,8 @@ pub enum Event {
     /// A frame the client sent other than the AUTH and forwarded bytes: `text`, `binary`,
     /// `close`, `ping` or `pong`.
     Frame(&'static str),
+    /// The client's connection ended with no close frame, after OK.
+    Ended,
     CloseSent(u16),
 }
 
@@ -866,7 +873,10 @@ async fn relay_connection(mut ws: Ws, path: &str, state: &RelayState, log: &Log)
                     break None;
                 }
                 Some(Ok(_)) => {}
-                _ => break None,
+                _ => {
+                    log.event(Event::Ended);
+                    break None;
+                }
             },
             read = tcp.read(&mut buffer) => match read {
                 Ok(n) if n > 0 => {
@@ -892,45 +902,72 @@ async fn relay_connection(mut ws: Ws, path: &str, state: &RelayState, log: &Log)
 // The HTTPS static server
 // ---------------------------------------------------------------------------------------------
 
-/// Serves `root` over HTTPS on an ephemeral port; its origin, `https://127.0.0.1:<port>`.
-/// `worker_policy`, when given, is sent as the worker script's `Content-Security-Policy` header:
-/// a dedicated worker takes its policy from its own response, not from the page.
-pub async fn https(root: PathBuf, tls: TlsAcceptor, worker_policy: Option<String>) -> String {
+/// Every request an HTTPS server received, its request line, headers and body, byte for byte.
+pub type Requests = Arc<Mutex<Vec<Vec<u8>>>>;
+
+/// Serves `root` over HTTPS on an ephemeral port; its origin, `https://127.0.0.1:<port>`, and
+/// its log of requests. `worker_policy`, when given, is sent as the worker script's
+/// `Content-Security-Policy` header: a dedicated worker takes its policy from its own response,
+/// not from the page.
+pub async fn https(
+    root: PathBuf,
+    tls: TlsAcceptor,
+    worker_policy: Option<String>,
+) -> (String, Requests) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("https bind");
     let origin = format!(
         "https://127.0.0.1:{}",
         listener.local_addr().expect("https address").port()
     );
     let (root, worker_policy) = (Arc::new(root), Arc::new(worker_policy));
+    let requests = Requests::default();
+    let log = requests.clone();
     tokio::spawn(async move {
         loop {
             let Ok((tcp, _)) = listener.accept().await else {
                 continue;
             };
             let (tls, root, worker_policy) = (tls.clone(), root.clone(), worker_policy.clone());
+            let log = log.clone();
             tokio::spawn(async move {
                 if let Ok(stream) = tls.accept(tcp).await {
-                    let _ = serve(stream, &root, worker_policy.as_deref()).await;
+                    let _ = serve(stream, &root, worker_policy.as_deref(), &log).await;
                 }
             });
         }
     });
-    origin
+    (origin, requests)
 }
 
 async fn serve(
     mut stream: tokio_rustls::server::TlsStream<TcpStream>,
     root: &std::path::Path,
     worker_policy: Option<&str>,
+    log: &Requests,
 ) -> std::io::Result<()> {
     let mut head = Vec::new();
     let mut byte = [0u8; 1];
     while !head.ends_with(b"\r\n\r\n") && head.len() < 16 * 1024 {
         if stream.read(&mut byte).await? == 0 {
+            log.lock().expect("requests lock").push(head);
             return Ok(());
         }
         head.push(byte[0]);
     }
+    // The body too, if the request declares one: what the no-plaintext case reads.
+    let length = String::from_utf8_lossy(&head)
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())?
+        })
+        .unwrap_or(0);
+    let mut request = head.clone();
+    let mut body = vec![0; length.min(1 << 20)];
+    stream.read_exact(&mut body).await?;
+    request.extend_from_slice(&body);
+    log.lock().expect("requests lock").push(request);
     let head = String::from_utf8_lossy(&head);
     let target = head.split(' ').nth(1).unwrap_or("/");
     let path = target.split(['?', '#']).next().unwrap_or("/");

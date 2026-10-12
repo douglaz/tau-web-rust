@@ -15,8 +15,9 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [features]
-# The tracer's test-only parts: the test keys, the host-key pin source, the in-memory journal
-# and the test switches. Never in the served build (`scripts/build-web.sh served`).
+# The tracer's test-only parts: the test keys, the host-key pin source and the test switches,
+# one of which makes the local store's append fail. Never in the served build
+# (`scripts/build-web.sh served`).
 tracer = []
 
 [dependencies]
@@ -35,6 +36,14 @@ hmac = "0.13"
 pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
 ed25519-dalek = { version = "3", default-features = false }
 getrandom = "0.4"
+# The local store (`STA-23`, credential format v1, "Local encryption envelope", `src/store.rs`):
+# AES-256-GCM in Rust on every target, the same code the host tests run, and already in the
+# wasm32 graph through russh; WebCrypto runs only the PBKDF2 on wasm32. The envelope and records
+# are strict JSON with unpadded base64url fields. The secret types zeroize on drop.
+aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc", "zeroize"] }
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+serde = { version = "1", features = ["derive"] }
+zeroize = "1"
 
 # ADR-0024's configuration, as it compiled. `scripts/check-adr-0024.sh` refuses what it keeps
 # out: tokio `net` and `rt-multi-thread`, and any russh crypto backend but `ring`.
@@ -50,6 +59,13 @@ wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 console_error_panic_hook = "0.1"
+# The local store's browser half: the origin-private file system and WebCrypto's PBKDF2.
+web-sys = { version = "0.3", features = [
+  "Blob", "Crypto", "CryptoKey", "FileSystemDirectoryHandle", "FileSystemFileHandle",
+  "FileSystemGetDirectoryOptions", "FileSystemGetFileOptions", "FileSystemWritableFileStream",
+  "Pbkdf2Params", "StorageManager", "SubtleCrypto", "WorkerGlobalScope", "WorkerNavigator",
+  "WritableStream",
+] }
 
 [build-dependencies]
 toml = "1"

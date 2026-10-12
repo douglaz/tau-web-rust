@@ -2060,6 +2060,8 @@ dependencies = [
 name = "tau-web"
 version = "0.0.0"
 dependencies = [
+ "aes-gcm",
+ "base64",
  "bip32",
  "bip39",
  "bs58",
@@ -2075,6 +2077,7 @@ dependencies = [
  "pharos",
  "ring",
  "russh",
+ "serde",
  "serde_json",
  "sha2 0.11.0",
  "syn 2.0.119",
@@ -2082,7 +2085,9 @@ dependencies = [
  "toml",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "web-sys",
  "ws_stream_wasm",
+ "zeroize",
 ]
 
 [[package]]
@@ -2234,10 +2239,13 @@ name = "tracer"
 version = "0.0.0"
 dependencies = [
  "base64",
+ "bip32",
+ "bip39",
  "futures-util",
  "hex",
  "k256",
  "rcgen",
+ "ring",
  "russh",
  "serde_json",
  "sha2 0.10.9",

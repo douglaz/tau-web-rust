@@ -21,3 +21,8 @@ k256 = { version = "0.13", default-features = false, features = ["schnorr"] }
 sha2 = "0.10"
 base64 = "0.22"
 hex = "0.4"
+# The local store's independent reader (`src/reader.rs`): ring's PBKDF2, AES-256-GCM and SHA-256,
+# not the RustCrypto crates the harness runs, and the seed's keys from bip39 and bip32.
+ring = "0.17"
+bip39 = { version = "2", default-features = false }
+bip32 = { version = "0.5", default-features = false, features = ["secp256k1"] }

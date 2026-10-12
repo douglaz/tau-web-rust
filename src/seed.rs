@@ -3,9 +3,9 @@
 //! mnemonic with the empty BIP-39 passphrase, and hardened BIP-32 derivation at
 //! `m/707285'/1'/role'/index'` for roles 0–4.
 //!
-//! Built on every target. Nothing calls it at runtime yet: the local store (twr-ggw.5),
-//! allocation (twr-ggw.6) and binding (twr-ggw.11) wire it in. No `wasm_bindgen` export returns or
-//! accepts a mnemonic, a seed or a child key.
+//! Built on every target. The local store (`src/store.rs`) generates the seed and keeps its
+//! mnemonic in its first record; allocation (twr-ggw.6) and binding (twr-ggw.11) wire in the
+//! child keys. No `wasm_bindgen` export returns or accepts a mnemonic, a seed or a child key.
 //!
 //! Derivation refuses rather than aliases: an unknown version, a role outside 0–4, an index above
 //! 2^31−1 and an invalid BIP-32 step are each an error, and no step ever moves on to another index
@@ -94,10 +94,6 @@ pub enum ImportError {
 
 /// The operator seed (`SEC-5` row 15): its mnemonic and the 64-byte BIP-39 seed derived from it.
 pub struct Seed {
-    #[allow(
-        dead_code,
-        reason = "the seed backup ceremony (STA-23) shows the words; only tests read them yet"
-    )]
     words: [&'static str; 12],
     bytes: [u8; 64],
 }
@@ -158,6 +154,14 @@ impl Seed {
         let mut bytes = [0u8; 64];
         pbkdf2::pbkdf2_hmac::<Sha512>(words.join(" ").as_bytes(), b"mnemonic", 2048, &mut bytes);
         Seed { words, bytes }
+    }
+
+    /// The mnemonic, the words joined by single spaces: what the local store's seed record
+    /// carries (`src/store.rs`), so a seed-backup ceremony can show the words. Nothing displays
+    /// it yet (`STA-23`: "The mnemonic may be displayed only in the dedicated seed-backup
+    /// ceremony").
+    pub(crate) fn phrase(&self) -> zeroize::Zeroizing<String> {
+        zeroize::Zeroizing::new(self.words.join(" "))
     }
 
     /// The seed identifier: lowercase hex SHA-256 of `tau-web seed id v1`, one zero byte and the

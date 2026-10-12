@@ -11,13 +11,18 @@ mod run;
 #[cfg(target_arch = "wasm32")]
 pub use run::*;
 
-/// Where the session's durable record goes. Box-plane work is recorded per command before
-/// transmission (`ARC-8`), and a failed append means the command is not sent (`STA-3`).
+/// Where the session's durable record goes: the local store's journal (`crate::store`). Box-plane
+/// work is recorded per command before transmission (`ARC-8`), and a failed append means the
+/// command is not sent (`STA-3`).
+#[allow(
+    async_fn_in_trait,
+    reason = "used generically and only on one thread: the browser's worker, or a host test"
+)]
 pub trait Journal {
-    /// Append one command's record; its sequence number, or why it was refused.
-    fn append(&mut self, entry: &Entry) -> Result<u64, String>;
-    /// The record appended under `seq`, as stored.
-    fn read(&self, seq: u64) -> Option<Entry>;
+    /// Append one command's record, durably; its record number, or why it was refused.
+    async fn append(&mut self, entry: &Entry) -> Result<u64, String>;
+    /// The record appended under `seq`, as replayed or applied.
+    async fn read(&self, seq: u64) -> Option<Entry>;
 }
 
 /// Where host-key pins come from. Read-only here: no path in this module stores a key it was

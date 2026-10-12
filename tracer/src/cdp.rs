@@ -172,25 +172,6 @@ impl Browser {
         }
     }
 
-    /// Waits up to `seconds` for an event `matches` accepts, among those after `from`.
-    pub async fn wait_for(
-        &self,
-        from: usize,
-        seconds: u64,
-        matches: impl Fn(&Value) -> bool,
-    ) -> Option<Value> {
-        for _ in 0..seconds * 10 {
-            if let Some(event) = self.events.lock().expect("events lock")[from..]
-                .iter()
-                .find(|e| matches(e))
-            {
-                return Some(event.clone());
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        None
-    }
-
     pub fn event_count(&self) -> usize {
         self.events.lock().expect("events lock").len()
     }

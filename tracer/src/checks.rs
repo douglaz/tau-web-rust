@@ -7,8 +7,7 @@ use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use tau_web::testonly::{
-    JOURNAL_MARKER, PIN_SOURCE_MARKER, PINS, RELAY_SECRET, RELAY_SECRET_WITHOUT_PASS,
-    SSH_CLIENT_SEED,
+    PIN_SOURCE_MARKER, PINS, RELAY_SECRET, RELAY_SECRET_WITHOUT_PASS, SSH_CLIENT_SEED,
 };
 
 /// The files the served build is: the page, its script, the worker script and the wasm
@@ -33,9 +32,10 @@ pub const ARC_33: &[(&str, &[&str])] = &[
 ];
 
 /// What `check-absence` looks for: each test key's private and public half as raw bytes, hex and
-/// base64, the SSH client key in OpenSSH's encoding, the pins and the two markers, and the test
-/// switches a request can set.
-fn needles() -> Vec<(String, Vec<u8>)> {
+/// base64, the SSH client key in OpenSSH's encoding, the pins and the pin source's marker, and the
+/// test switches a request can set (`fail_append` among them, which makes the store's append
+/// fail).
+pub fn needles() -> Vec<(String, Vec<u8>)> {
     let mut needles = Vec::new();
     for (key, private, public) in [
         ("SSH client key", SSH_CLIENT_SEED, ssh_client_public()),
@@ -77,10 +77,6 @@ fn needles() -> Vec<(String, Vec<u8>)> {
         "pin source: its marker".into(),
         PIN_SOURCE_MARKER.as_bytes().to_vec(),
     ));
-    needles.push((
-        "in-memory journal: its marker".into(),
-        JOURNAL_MARKER.as_bytes().to_vec(),
-    ));
     for switch in ["fail_append", "tamper_auth", "test_relay_key"] {
         needles.push((format!("test switch: {switch}"), switch.as_bytes().to_vec()));
     }
@@ -114,7 +110,7 @@ fn require_served_files(dir: &Path) -> Result<(), String> {
     }
 }
 
-/// AC5: the test keys, the pin source, the in-memory journal and the test switches are absent
+/// AC5: the test keys, the pin source and the test switches are absent
 /// from every file under `dir`. Each finding names the file and what was found.
 pub fn absence(dir: &Path) -> Result<(), String> {
     require_served_files(dir)?;
