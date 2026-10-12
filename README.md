@@ -5,9 +5,9 @@ browser and provisions real infrastructure on its operator's behalf. Rust, compi
 WebAssembly, following the configuration the specification records.
 
 **The specification lives in [`douglaz/tau-web-spec`](https://github.com/douglaz/tau-web-spec)
-and is vendored here at `spec/`, pinned to an exact commit** (spec ADR-0031). The build refuses
-to run if the checked-out tree does not match the pin, and every release records the spec commit
-it was built from. What the build compiles in from the pin:
+and is vendored here at `spec/`, pinned to an exact commit, today `1cc8498`** (spec ADR-0031).
+The build refuses to run if the checked-out tree does not match the pin, and every release
+records the spec commit it was built from. What the build compiles in from the pin:
 
 - `spec/bundle/` — the artifact pin and accepted signers, the inference target, the named
   timings, and the CORS probe;
@@ -17,12 +17,15 @@ it was built from. What the build compiles in from the pin:
 `spec/bundle/cors-probe.sh` and `spec/prototypes/spec-checks/` run from the pinned tree as this
 repository's CI gate. The probe is spec `CNF-4`, "The CORS probe runs on every push (`ARC-34`),
 and its failure fails the build"; the disk checks are evidence for spec `CNF-85` and for nothing
-else. Until this pin both were labelled `CNF-1`–`CNF-4`, which the specification's own task list
-records as a mislabel to correct here.
+else. Both were once labelled `CNF-1`–`CNF-4`; the specification's own task list (T29) records
+that mislabel as corrected on 2026-09-21, at the pin bump that took this repository to the
+commit closing the formal companion.
 
 Start reading at [`spec/00-overview.md`](./spec/00-overview.md). What to build first is
 [`spec/06-first-stage.md`](./spec/06-first-stage.md); what it must demonstrate is the
-first-stage row of [`spec/07-conformance.md`](./spec/07-conformance.md).
+"Stage 1" rows of the stage applicability table in
+[`spec/07-conformance.md`](./spec/07-conformance.md), and its "Before declaring stage 1
+complete" paragraph.
 
 No harness code yet: `src/lib.rs` holds the pinned inputs and nothing else.
 
