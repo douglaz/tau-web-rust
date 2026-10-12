@@ -6,8 +6,10 @@ Issues, specs and tickets for this repo live in beads: `.beads/issues.jsonl`, co
 ## Conventions
 
 - A spec is one issue of type `epic`; its tickets are issues created with `--parent <epic>`.
-- Blocking is native: `br dep add <ticket> <blocker>`. `br ready` lists open, unblocked, undeferred
-  work; it is the frontier, worked in id order.
+- Blocking is native: `br dep add <ticket> <blocker>`. `br ready --sort oldest` lists open,
+  unblocked, undeferred work in creation order, which is the order a plan was published in; it is
+  the frontier, and its first entry is the next ticket. (`br ready` alone sorts by its hybrid
+  policy, not by creation.)
 - Triage state is a label (see `triage-labels.md`): `br label add <id> <label>`.
 - Never hand-edit `issues.jsonl`: `updated_at` goes stale and the next `br update` or `br close`
   silently reverts the edit. Every change goes through `br`.
@@ -31,7 +33,7 @@ Used by `/wayfinder`. The **map** is an `epic`; each **child** is an issue under
 - **Child ticket**: `br create --parent <map> --labels type:<research|prototype|grilling|task>`
   with the question as the description.
 - **Blocking**: `br dep add <child> <blocker>`; a child is unblocked when every blocker is closed.
-- **Frontier**: `br ready`, filtered to the map's children; lowest id wins.
+- **Frontier**: `br ready --sort oldest`, filtered to the map's children; the first entry wins.
 - **Claim**: `br update <id> --status in_progress` before any work.
 - **Resolve**: `br comments add <id> "<answer>"`, `br close <id>`, then append a one-line pointer
   (gist plus the child's id) to the map's description with `br update <map> --description-file`.
