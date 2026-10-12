@@ -1,8 +1,10 @@
 //! The attempt itself, on the browser's WebSocket: wasm32 only.
 
 use super::{Entry, Journal, PinSource};
+use crate::credential::{RelayKey, SshClientKey};
 use futures_util::{SinkExt, StreamExt};
 use pharos::{Observable, ObserveConfig};
+use russh::keys::ssh_key::private::{Ed25519Keypair, KeypairData};
 use russh::keys::{HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
 use russh::{ChannelMsg, client};
 use serde_json::{Value, json};
@@ -23,8 +25,8 @@ pub struct Target {
 /// Where the credentials an attempt uses come from: the SSH client key and the relay key. They
 /// stay inside the module; nothing here returns them.
 pub trait Credentials {
-    fn ssh_key(&self) -> Option<PrivateKey>;
-    fn relay_key(&self) -> Option<[u8; 32]>;
+    fn ssh_key(&self) -> Option<&SshClientKey>;
+    fn relay_key(&self) -> Option<&RelayKey>;
 }
 
 /// What a completed command returns, including the journal read-back it was reconciled with.
@@ -148,10 +150,16 @@ pub async fn run_command(
     #[cfg(feature = "tracer")] tamper_auth: bool,
 ) -> Result<Done, Refusal> {
     // CHN-R4: with no pin there is nothing to check a key against, so nothing is contacted.
-    let pinned = pins.pin(&target.machine).ok_or(Refusal::NoPin)?;
+    let pinned = pins.pin(&target.machine).ok_or(Refusal::NoPin)?.0;
     let (Some(ssh_key), Some(relay_key)) = (credentials.ssh_key(), credentials.relay_key()) else {
         return Err(Refusal::NoCredentials);
     };
+    // Role 0's child secret is an RFC 8032 Ed25519 seed (credential format v1).
+    let ssh_key = PrivateKey::new(
+        KeypairData::Ed25519(Ed25519Keypair::from_seed(&ssh_key.0)),
+        "",
+    )
+    .map_err(|e| Refusal::Failed(format!("ssh client key: {e}")))?;
 
     let url = format!("{}v1/tcp/{}/{}", target.relay, target.host, target.port);
     let (mut meta, mut ws) = WsMeta::connect(&url, None)
@@ -174,7 +182,7 @@ pub async fn run_command(
     let created_at = (js_sys::Date::now() / 1000.0) as u64;
     #[cfg_attr(not(feature = "tracer"), allow(unused_mut))]
     let mut auth = crate::relay_auth::auth_event(
-        &relay_key,
+        &relay_key.0,
         &target.relay,
         challenge,
         &target.host,

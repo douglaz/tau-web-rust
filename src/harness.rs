@@ -23,8 +23,8 @@ pub trait Journal {
 /// Where host-key pins come from. Read-only here: no path in this module stores a key it was
 /// shown, so a first contact through the relay can never pin one (`CHN-R4`).
 pub trait PinSource {
-    /// The pinned SHA-256 fingerprint (`SHA256:…`) of `machine`'s host key, if one is stored.
-    fn pin(&self, machine: &str) -> Option<String>;
+    /// The pin of `machine`'s host key, its SHA-256 fingerprint (`SHA256:…`), if one is stored.
+    fn pin(&self, machine: &str) -> Option<crate::credential::HostKeyPin>;
 }
 
 /// One command's record: what is sent, to which machine.

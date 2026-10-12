@@ -39,9 +39,11 @@ passes the worker no request; today only the tracer calls it there (below). Anot
 script could still load its own copy of the module and call it; in the served build that copy
 refuses every machine for want of a pin, before any contact. The pins, keys and journal never
 come from the request. The tracer build runs on test ones. The served build
-runs on what it has stored, which is nothing until the local store and the seed-derived keys exist
-(twr-ggw.5, twr-ggw.11), so it refuses every machine at the first step, before any contact. The
-whole harness is still in the served wasm, which is what the absence check below reads.
+runs on what it has stored, which is nothing until the local store exists and the seed-derived
+keys are bound to sessions (twr-ggw.5, twr-ggw.11), so it refuses every machine at the first
+step, before any contact. The connection path below is still whole in the served wasm, which is
+what the absence check below reads. The seed code (below) has no caller yet, so the release build
+drops it.
 `src/harness/run.rs` does it in this order:
 
 - **Pin first.** It looks up the machine's host-key pin, and with none it contacts nothing.
@@ -82,7 +84,64 @@ There are two builds of the same page, both release builds:
     append; `tamper_auth` sends a wrongly signed AUTH. twr-ggw.11 replaces the test relay keys
     with the relay key derived from the seed.
 
-  Seed-derived keys and a durable journal belong to later tickets.
+  Binding seed-derived keys in place of the test keys (twr-ggw.11) and a durable journal
+  (twr-ggw.5) belong to later tickets. Derivation itself exists, below.
+
+### The seed
+
+`src/seed.rs` holds the operator seed and its child keys, credential format v1 (spec `STA-22`,
+`STA-22a`, and `spec/docs/design/credential-format-v1.md`, "Seed and child keys"):
+
+- **Generate and import.** Generate draws 16 bytes from the CSPRNG (the browser's in the worker,
+  the OS's on the host; a failure is an error) and encodes them as 12 English BIP-39 words.
+  Import takes exactly 12 words, each exactly a word of the vendored English list, with a valid
+  checksum. It tolerates ASCII whitespace around and between the words, and nothing else: no
+  case folding, no prefixes, no other language, no non-ASCII separator. No refusal echoes a
+  word, and a refused word is named by its position.
+- **The seed.** PBKDF2-HMAC-SHA512 over the words joined by single spaces, salt `mnemonic`: the
+  empty BIP-39 passphrase. No function takes a BIP-39 passphrase, so the local unlock passphrase
+  can never become one (`CNF-83`). The seed identifier is the companion's: hex SHA-256 over
+  `tau-web seed id v1`, a zero byte and the seed.
+- **Roles 0–4** at `m/707285'/1'/role'/index'`, every step hardened: the SSH client key, the
+  attest sender and recipient keys, the relay key and the post-harness credential. Roles 0 and 4
+  are Ed25519 seeds, roles 1–3 secp256k1 secrets with BIP-340 x-only public keys. Derivation
+  refuses, and never aliases, a version other than 1, a role outside 0–4, an index above
+  2^31−1, and an invalid BIP-32 first step or child; it never moves on to another index. No
+  chain code or extended key leaves it.
+- **The credential types** are in `src/credential.rs`. A sealed `Credential` trait gives each one
+  its `SEC-5` row and the name that row's credential cell carries:
+
+  | Type | `SEC-5` row |
+  |---|---|
+  | `Seed`, the mnemonic and the 64-byte seed | 15, Operator seed |
+  | `SshClientKey` (role 0) | 3 |
+  | `AttestSenderKey` (role 1) | 7 |
+  | `AttestRecipientKey` (role 2) | 16 |
+  | `RelayKey` (role 3) | 4 |
+  | `PostHarnessCredential` (role 4) | 17 |
+  | `HostKeyPin` | 5 |
+
+  `Credentials` hands out the role 0 and role 3 types and `PinSource` the pin type, and the
+  tracer's test keys are built as them. The secret types print nothing of the secret, implement
+  neither `Clone` nor `Serialize`, and keep their bytes inside the crate (`OVR-3`, spec
+  ADR-0024). `CNF-13`'s tests read `SEC-5` from the pinned tree and fail on a type whose row is
+  absent, struck through, not derivable today (row 22) or does not name it. A scan of every
+  file under `src/` (with `syn`) fails on a type that holds key material by its field types
+  (16-, 32- or 64-byte arrays, arrays whose length is not a literal, or a k256, ed25519-dalek,
+  russh or ssh-key secret type) and has no row. It knows types by name, so it also fails when
+  such a name, or a registered one, is defined by more than one type. The scan is a guardrail,
+  not a proof: it cannot see a key carried in a `String`.
+
+Nothing calls it at runtime yet, so the release build leaves it out of the served wasm, and no
+`wasm_bindgen` export takes or returns a mnemonic, a seed or a key. The local store
+(twr-ggw.5), allocation (twr-ggw.6) and binding the keys to sessions (twr-ggw.11) come next.
+
+The tests hold it to the specification's v1 known answers, `credential-vectors-v1.json`, read
+from `spec/` at the pin. They also check the upstream vectors vendored in `tests/vectors/` (see
+its `README.md`): BIP-32's test vectors 1, 3, 4 and 5, RFC 8032's Ed25519 vectors, BIP-340's
+public keys and the BIP-39 reference vectors. And a second implementation, the `bip39` and
+`bip32` crates, agrees with it on 18 entropies, every role and indices up to 2^31−1. Those two
+crates, `bs58` and `syn` are host-only dev-dependencies.
 
 ### The tracer
 
@@ -287,7 +346,7 @@ rest of `CNF-88` has no code here yet.
 | `spec-checks` | `spec/bundle/cors-probe.sh` | `CNF-4` |
 | | `spec/prototypes/spec-checks/check-install-disks.py`, and `--baseline`, which must fail | evidence for `CNF-85` |
 | `build` (the job is `CNF-1`) | `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings` | `CNF-2`, at that strictness |
-| | `cargo test --locked` | runs `build.rs`, so the gates above run here, and the `[session]` fixtures (`CNF-88`'s build fixtures); and the relay matrix, `CNF-87`'s fixture half |
+| | `cargo test --locked` | runs `build.rs`, so the gates above run here, and the `[session]` fixtures (`CNF-88`'s build fixtures); the relay matrix, `CNF-87`'s fixture half; and the seed's tests, `CNF-83`'s derivation tests and `CNF-13`'s tests |
 | `web` (the job is `CNF-1` for the browser build) | `cargo clippy -D warnings` on wasm32, the served and the tracer build | `CNF-2`, on the new target |
 | | `scripts/check-adr-0024.sh` | spec ADR-0024's build check |
 | | `scripts/build-web.sh served`, then `tracer check-absence dist/served` | the served build (`ARC-32`) carries no test key, pin source, journal or test switch |

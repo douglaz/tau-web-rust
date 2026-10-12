@@ -23,9 +23,18 @@ tracer = []
 # The relay AUTH (`WIR-5` of paid-tcp-relay at `844e834`): a NIP-01 event id and a BIP-340 signature. Pure Rust,
 # and no RNG of its own: the auxiliary randomness comes from getrandom 0.4 below.
 k256 = { version = "0.13", default-features = false, features = ["schnorr"] }
-sha2 = "0.10"
 serde_json = "1"
 hex = "0.4"
+# The seed and its child keys (`STA-22a`, `src/seed.rs`): one digest family, the one russh and
+# ssh-key already lock (sha2 0.11, which also hashes the relay AUTH's id, hmac 0.13 and pbkdf2
+# 0.13); k256 above for the BIP-32 scalar arithmetic; ed25519-dalek for the role 0 and role 4
+# public keys. getrandom draws the entropy: the OS on the host, the browser CSPRNG on wasm32
+# (`wasm_js`, below).
+sha2 = { version = "0.11", default-features = false }
+hmac = "0.13"
+pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
+ed25519-dalek = { version = "3", default-features = false }
+getrandom = "0.4"
 
 # ADR-0024's configuration, as it compiled. `scripts/check-adr-0024.sh` refuses what it keeps
 # out: tokio `net` and `rt-multi-thread`, and any russh crypto backend but `ring`.
@@ -48,6 +57,15 @@ toml = "1"
 # The tests run the gate `build.rs` runs, on TOML of their own.
 [dev-dependencies]
 toml = "1"
+
+# The second implementation `CNF-83` asks derivation to agree with, the BIP-32 vectors' Base58Check
+# decoder, and the `CNF-13` source scan's parser. Host only: the `web` job's wasm32 clippy compiles
+# test code too, so every test that uses them is `cfg(not(target_arch = "wasm32"))`.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+bip39 = { version = "2", default-features = false }
+bip32 = { version = "0.5", default-features = false, features = ["secp256k1"] }
+bs58 = { version = "0.5", default-features = false, features = ["alloc", "check"] }
+syn = { version = "2", features = ["full", "visit"] }
 
 [profile.release]
 opt-level = "s"

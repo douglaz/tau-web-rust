@@ -5,9 +5,13 @@
 //! `tracer` feature; `tracer check-absence` reads the served directory for every one of them,
 //! through the markers, switch names and key encodings below.
 //!
-//! The keys are test keys, nothing derived from a seed (that is twr-ggw.4's and twr-ggw.11's),
-//! and the journal is memory, nothing durable (twr-ggw.5's).
+//! The keys are test keys, not derived from a seed: derivation exists (`crate::seed`), and
+//! twr-ggw.11 binds its keys in their place. They are built as the credential types a derived key
+//! is (`crate::credential`). The journal is memory, nothing durable (twr-ggw.5's).
 
+use crate::credential::HostKeyPin;
+#[cfg(target_arch = "wasm32")]
+use crate::credential::{RelayKey, SshClientKey};
 use crate::harness::{Entry, Journal, PinSource};
 
 /// The test SSH client key: an ed25519 seed. The fixture sshd authorizes its public half.
@@ -72,10 +76,10 @@ pub const PINS: &[(&str, &str)] = &[(
 pub struct TestPins;
 
 impl PinSource for TestPins {
-    fn pin(&self, machine: &str) -> Option<String> {
+    fn pin(&self, machine: &str) -> Option<HostKeyPin> {
         PINS.iter()
             .find(|(name, _)| *name == machine)
-            .map(|(_, pin)| pin.to_string())
+            .map(|(_, pin)| HostKeyPin(pin.to_string()))
     }
 }
 
@@ -99,22 +103,22 @@ impl Journal for MemoryJournal {
     }
 }
 
-/// The test SSH client key, and the test relay key the request selected.
+/// The test SSH client key, and the test relay key the request selected, as the role 0 and
+/// role 3 types.
 #[cfg(target_arch = "wasm32")]
 struct TestCredentials {
-    relay: [u8; 32],
+    ssh: SshClientKey,
+    relay: RelayKey,
 }
 
 #[cfg(target_arch = "wasm32")]
 impl crate::harness::Credentials for TestCredentials {
-    fn ssh_key(&self) -> Option<russh::keys::PrivateKey> {
-        use russh::keys::ssh_key::private::{Ed25519Keypair, KeypairData};
-        let keypair = Ed25519Keypair::from_seed(&SSH_CLIENT_SEED);
-        russh::keys::PrivateKey::new(KeypairData::Ed25519(keypair), "").ok()
+    fn ssh_key(&self) -> Option<&SshClientKey> {
+        Some(&self.ssh)
     }
 
-    fn relay_key(&self) -> Option<[u8; 32]> {
-        Some(self.relay)
+    fn relay_key(&self) -> Option<&RelayKey> {
+        Some(&self.relay)
     }
 }
 
@@ -144,7 +148,7 @@ pub async fn run(
                 .to_bytes()
                 .into();
             if derived == *public {
-                Ok(*secret)
+                Ok(RelayKey(*secret))
             } else {
                 Err(format!(
                     "test_relay_key {name}: the secret is not its public half's"
@@ -158,7 +162,10 @@ pub async fn run(
     let outcome = crate::harness::run_command(
         &TestPins,
         &mut journal,
-        &TestCredentials { relay },
+        &TestCredentials {
+            ssh: SshClientKey(SSH_CLIENT_SEED),
+            relay,
+        },
         target,
         command,
         request["tamper_auth"] == json!(true),
@@ -169,6 +176,6 @@ pub async fn run(
         "journal": JOURNAL_MARKER,
         "outcome": crate::harness::report(&outcome),
         "journal_entries": journal.entries.iter().map(|e| hex::encode(&e.command)).collect::<Vec<_>>(),
-        "pinned_after": TestPins.pin(&target.machine),
+        "pinned_after": TestPins.pin(&target.machine).map(|pin| pin.0),
     }))
 }

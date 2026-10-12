@@ -1,10 +1,14 @@
 //! The tau-web harness: the build's pin on the specification and the publisher-chosen inputs
 //! it compiles in from that pinned tree (ADR-0031, gated in `build.rs`), and the harness worker's
 //! wasm module: one recorded command over a pinned SSH connection through the relay
-//! (`harness`). `testonly` is the tracer's, and only the `tracer` feature compiles it.
+//! (`harness`), the operator seed and its child keys (`seed`), and the credential types with
+//! their `SEC-5` rows (`credential`). `testonly` is the tracer's, and only the `tracer` feature
+//! compiles it.
 
+pub mod credential;
 pub mod harness;
 pub mod relay_auth;
+pub mod seed;
 #[cfg(feature = "tracer")]
 pub mod testonly;
 
@@ -80,7 +84,7 @@ mod worker {
 
     #[cfg(not(feature = "tracer"))]
     impl crate::harness::PinSource for NothingStored {
-        fn pin(&self, _machine: &str) -> Option<String> {
+        fn pin(&self, _machine: &str) -> Option<crate::credential::HostKeyPin> {
             None
         }
     }
@@ -98,11 +102,11 @@ mod worker {
 
     #[cfg(not(feature = "tracer"))]
     impl crate::harness::Credentials for NothingStored {
-        fn ssh_key(&self) -> Option<russh::keys::PrivateKey> {
+        fn ssh_key(&self) -> Option<&crate::credential::SshClientKey> {
             None
         }
 
-        fn relay_key(&self) -> Option<[u8; 32]> {
+        fn relay_key(&self) -> Option<&crate::credential::RelayKey> {
             None
         }
     }
