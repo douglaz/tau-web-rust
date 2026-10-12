@@ -12,6 +12,14 @@ specification repository, not into code here.
 them unpiped: a pipe reports the pipeline's status, not the gate's. `cargo test` runs `build.rs`,
 so the pin and bundle gates run with it.
 
+The `web` job's gates run the same way: `cargo clippy --locked -p tau-web --target
+wasm32-unknown-unknown --all-targets -- -D warnings`, with and without `--features tracer`;
+`scripts/check-adr-0024.sh`; `scripts/build-web.sh served`, then `cargo run --locked -p tracer --
+check-absence dist/served` and `cargo run --locked -p tracer -- check-csp dist/served`; and
+`CHROME=<chrome> scripts/tracer.sh`. They need the wasm32 target, the wasm-bindgen CLI at
+`Cargo.lock`'s version and a wasm32 clang for ring (`README.md`, "Building and checking it
+locally").
+
 ## Agent skills
 
 ### Issue tracker
