@@ -6,7 +6,10 @@ use base64::Engine;
 use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use tau_web::testonly::{JOURNAL_MARKER, PIN_SOURCE_MARKER, PINS, RELAY_SECRET, SSH_CLIENT_SEED};
+use tau_web::testonly::{
+    JOURNAL_MARKER, PIN_SOURCE_MARKER, PINS, RELAY_SECRET, RELAY_SECRET_WITHOUT_PASS,
+    SSH_CLIENT_SEED,
+};
 
 /// The files the served build is: the page, its script, the worker script and the wasm
 /// (`ARC-32`). A check over a directory missing one of them would pass on nothing.
@@ -36,7 +39,12 @@ fn needles() -> Vec<(String, Vec<u8>)> {
     let mut needles = Vec::new();
     for (key, private, public) in [
         ("SSH client key", SSH_CLIENT_SEED, ssh_client_public()),
-        ("relay key", RELAY_SECRET, relay_public()),
+        ("relay key", RELAY_SECRET, relay_public(&RELAY_SECRET)),
+        (
+            "relay key without a pass",
+            RELAY_SECRET_WITHOUT_PASS,
+            relay_public(&RELAY_SECRET_WITHOUT_PASS),
+        ),
     ] {
         for (half, bytes) in [("private", private), ("public", public)] {
             for (encoding, encoded) in [
@@ -73,7 +81,7 @@ fn needles() -> Vec<(String, Vec<u8>)> {
         "in-memory journal: its marker".into(),
         JOURNAL_MARKER.as_bytes().to_vec(),
     ));
-    for switch in ["fail_append", "tamper_auth"] {
+    for switch in ["fail_append", "tamper_auth", "test_relay_key"] {
         needles.push((format!("test switch: {switch}"), switch.as_bytes().to_vec()));
     }
     needles

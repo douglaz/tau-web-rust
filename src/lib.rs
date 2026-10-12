@@ -55,7 +55,9 @@ mod worker {
         };
         let command = text("command");
         #[cfg(feature = "tracer")]
-        let report = crate::testonly::run(&target, command.as_bytes(), &request).await;
+        let report = crate::testonly::run(&target, command.as_bytes(), &request)
+            .await
+            .map_err(|e| wasm_bindgen::JsValue::from_str(&e))?;
         #[cfg(not(feature = "tracer"))]
         let report = {
             let outcome = crate::harness::run_command(

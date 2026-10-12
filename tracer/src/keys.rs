@@ -4,7 +4,7 @@
 
 use russh::keys::ssh_key::private::{Ed25519Keypair, KeypairData};
 use russh::keys::{HashAlg, PrivateKey};
-use tau_web::testonly::{RELAY_SECRET, SSH_CLIENT_SEED};
+use tau_web::testonly::SSH_CLIENT_SEED;
 
 /// The host key the pin source pins for the machine `fixture`.
 pub const HOST_KEY_PINNED: [u8; 32] = [
@@ -35,10 +35,10 @@ pub fn ssh_client_public() -> [u8; 32] {
     Ed25519Keypair::from_seed(&SSH_CLIENT_SEED).public.0
 }
 
-/// The test relay key's public half: the x-only key an AUTH's `pubkey` carries.
-pub fn relay_public() -> [u8; 32] {
-    k256::schnorr::SigningKey::from_bytes(&RELAY_SECRET)
-        .expect("the test relay key is a valid secret")
+/// A relay key's public half: the x-only key an AUTH's `pubkey` carries.
+pub fn relay_public(secret: &[u8; 32]) -> [u8; 32] {
+    k256::schnorr::SigningKey::from_bytes(secret)
+        .expect("a valid secp256k1 secret")
         .verifying_key()
         .to_bytes()
         .into()
@@ -53,5 +53,12 @@ mod tests {
         let pins = tau_web::testonly::PINS;
         assert_eq!(pins, &[("fixture", fingerprint(&HOST_KEY_PINNED).as_str())]);
         assert_ne!(fingerprint(&HOST_KEY_PINNED), fingerprint(&HOST_KEY_OTHER));
+    }
+
+    #[test]
+    fn each_test_relay_key_derives_its_recorded_public_half() {
+        for (name, secret, public) in tau_web::testonly::RELAY_KEYS {
+            assert_eq!(relay_public(secret), *public, "{name}");
+        }
     }
 }

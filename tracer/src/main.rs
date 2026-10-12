@@ -1,6 +1,7 @@
 //! The tracer (twr-ggw.2): one recorded command over a pinned SSH connection through a relay
 //! fixture, run by the harness worker in headless Chrome, with each case asserted on what the
-//! fixtures observed. Also the served build's checks.
+//! fixtures observed; with the relay refusals a correct client meets (twr-ggw.3). Also the
+//! served build's checks, and, under `cargo test`, the relay matrix (`matrix`).
 //!
 //! ```text
 //! tracer run <served-dir> <tracer-dir>   the tracer; Chrome from $CHROME, which must be set
@@ -14,13 +15,15 @@ mod cdp;
 mod checks;
 mod fixtures;
 mod keys;
+#[cfg(test)]
+mod matrix;
 
-use fixtures::{Observed, Seen};
+use fixtures::{Event, Observed, Seen};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::time::Duration;
-use tau_web::testonly::{PINS, SSH_USER};
+use std::time::{Duration, SystemTime};
+use tau_web::testonly::{PINS, RELAY_SECRET, SSH_USER};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -101,12 +104,14 @@ async fn run(served: &Path, tracer: &Path) -> Result<(), String> {
         },
     )
     .await;
-    let relay = fixtures::relay(
-        seen.clone(),
-        tls.acceptor.clone(),
-        vec![("127.0.0.1".into(), sshd.port)],
-    )
-    .await;
+    // The test relay key's pass: the sshd's host, on any port, for an hour (PAS-6, paid-tcp-relay
+    // 844e834: a hand-recorded pass is never unbounded).
+    let pass = fixtures::Pass {
+        key: keys::relay_public(&RELAY_SECRET),
+        hosts: vec!["127.0.0.1".into()],
+        expires: SystemTime::now() + Duration::from_secs(3600),
+    };
+    let relay = fixtures::relay(seen.clone(), tls.acceptor.clone(), vec![pass], false).await;
     let served_origin = fixtures::https(
         served.to_path_buf(),
         tls.acceptor.clone(),
@@ -135,7 +140,7 @@ async fn run(served: &Path, tracer: &Path) -> Result<(), String> {
         &browser,
         &seen,
         &sshd,
-        &relay.url,
+        &relay,
         &served_origin,
         &tracer_origin,
         &served_policy,
@@ -171,6 +176,22 @@ fn take(seen: &Observed) -> Seen {
 
 fn show(seen: &Seen) {
     println!("   fixtures observed: {seen:?}");
+}
+
+/// Waits up to 5 s until `holds` holds of what the fixtures have observed so far.
+async fn settle(seen: &Observed, holds: impl Fn(&Seen) -> bool) {
+    for _ in 0..100 {
+        if holds(&seen.lock().expect("observations lock")) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Forgets the relay fixture's pace state, so a dialing case never meets a refusal for `pace`
+/// left by the one before it.
+fn fresh_pace(relay: &fixtures::Relay) {
+    relay.pace.lock().expect("pace lock").clear();
 }
 
 /// Opens `url` in a new page and waits for its harness worker to report ready; the page's
@@ -284,7 +305,7 @@ async fn cases(
     browser: &cdp::Browser,
     seen: &Observed,
     sshd: &fixtures::Sshd,
-    relay: &str,
+    relay: &fixtures::Relay,
     served_origin: &str,
     tracer_origin: &str,
     served_policy: &str,
@@ -298,13 +319,14 @@ async fn cases(
     let args = |machine: &str| {
         json!({
             "machine": machine,
-            "relay": relay,
+            "relay": relay.url,
             "host": "127.0.0.1",
             "port": sshd.port,
             "user": SSH_USER,
             "command": COMMAND,
             "fail_append": false,
             "tamper_auth": false,
+            "test_relay_key": "with-pass",
         })
     };
 
@@ -505,6 +527,7 @@ async fn cases(
 
     // Case 1 (AC1): recorded, then sent; and it reconciles.
     let mut case = Case::new("1. the command is recorded, then sent, and reconciles (AC1)");
+    fresh_pace(relay);
     let report = harness_run(browser, &worker, args("fixture")).await?;
     let observed = take(seen);
     show(&observed);
@@ -558,10 +581,27 @@ async fn cases(
         "the host key presented was the pin",
         outcome["host_key"] == pinned.as_str(),
     );
+    let logs = observed.relay_logs();
+    case.check(
+        "the relay fixture's log reads challenge sent, AUTH received, accepted, dial, OK sent, then the first forwarded byte (WIR-10, paid-tcp-relay 844e834)",
+        logs.len() == 1
+            && logs[0].get(..6).is_some_and(|first| {
+                first[..5]
+                    == [
+                        Event::ChallengeSent,
+                        Event::AuthReceived,
+                        Event::Accepted,
+                        Event::Dial(format!("127.0.0.1:{}", sshd.port)),
+                        Event::OkSent,
+                    ]
+                    && matches!(first[5], Event::Forwarded(..))
+            }),
+    );
 
     // ... and with the journal's append made to fail, nothing is sent.
     let mut failing = args("fixture");
     failing["fail_append"] = true.into();
+    fresh_pace(relay);
     let report = harness_run(browser, &worker, failing).await?;
     // Every byte the harness sent before it closed has reached the sshd once the connection has
     // ended there, so an exec sent before the append cannot still be in flight.
@@ -590,6 +630,7 @@ async fn cases(
     // Case 2 (AC2): a host key other than the pin halts, before authentication, once.
     let mut case = Case::new("2. a host key other than the pin halts the connection (AC2)");
     sshd.present_other.store(true, Ordering::SeqCst);
+    fresh_pace(relay);
     let report = harness_run(browser, &worker, args("fixture")).await?;
     tokio::time::sleep(Duration::from_secs(2)).await; // room for a reconnect, which must not come
     sshd.present_other.store(false, Ordering::SeqCst);
@@ -614,6 +655,81 @@ async fn cases(
             && observed.relay_dials.len() == 1
             && observed.ssh_connections == 1,
     );
+    cases.push(case);
+
+    // Cases 6–8 (twr-ggw.3): the relay refusals a correct client meets. Each is refused at its
+    // check of WIR-6 (paid-tcp-relay 844e834) with one frame and close 1008, before any dial.
+    let refused = |case: &mut Case, report: &Value, observed: &Seen, reason: &str, host: &str| {
+        case.check(
+            &format!("the harness reported {{\"refused\": \"relay\", \"reason\": \"{reason}\", \"close_code\": 1008}}"),
+            report["outcome"] == json!({ "refused": "relay", "reason": reason, "close_code": 1008 }),
+        );
+        case.check(
+            "the relay fixture accepted exactly one connection",
+            observed.relay_accepted == 1
+                && observed.relay_connections == [format!("/v1/tcp/{host}/{}", sshd.port)],
+        );
+        case.check(
+            "nothing was dialed, and the fixture sshd saw no connection",
+            observed.relay_dials.is_empty() && observed.ssh_connections == 0,
+        );
+        let logs = observed.relay_logs();
+        case.check(
+            "the relay fixture's log shows no frame from the client after its refusal, but the close",
+            logs.len() == 1
+                && logs[0]
+                    .iter()
+                    .position(|e| matches!(e, Event::Refused(r, _) if *r == reason))
+                    .is_some_and(|at| {
+                        logs[0][at + 1..].iter().all(|e| {
+                            matches!(e, Event::CloseSent(1008) | Event::Frame("close"))
+                        })
+                    }),
+        );
+    };
+    let closed = |s: &Seen| s.relay_log.iter().any(|(_, e)| *e == Event::Frame("close"));
+
+    let mut case = Case::new("6. a relay key with no pass is refused for `pass` (twr-ggw.3)");
+    let mut unknown = args("fixture");
+    unknown["test_relay_key"] = "no-such-key".into();
+    let failed = harness_run(browser, &worker, unknown).await;
+    let observed = take(seen);
+    println!("   an unrecognised test_relay_key: {failed:?}");
+    case.check(
+        "an unrecognised test_relay_key fails the request, and the relay fixture accepted no connection",
+        failed.is_err_and(|e| e.contains("test_relay_key")) && observed.relay_accepted == 0,
+    );
+    let mut without = args("fixture");
+    without["test_relay_key"] = "without-pass".into();
+    fresh_pace(relay);
+    let report = harness_run(browser, &worker, without).await?;
+    settle(seen, closed).await;
+    let observed = take(seen);
+    show(&observed);
+    refused(&mut case, &report, &observed, "pass", "127.0.0.1");
+    cases.push(case);
+
+    let mut case =
+        Case::new("7. an unrecorded destination is refused for `destination` (twr-ggw.3)");
+    let mut unrecorded = args("fixture");
+    unrecorded["host"] = "127.0.0.2".into();
+    fresh_pace(relay);
+    let report = harness_run(browser, &worker, unrecorded).await?;
+    settle(seen, closed).await;
+    let observed = take(seen);
+    show(&observed);
+    refused(&mut case, &report, &observed, "destination", "127.0.0.2");
+    cases.push(case);
+
+    let mut case = Case::new("8. a dial the pace does not allow is refused for `pace` (twr-ggw.3)");
+    // The sshd's host at its window cap, now: refused for a whole window, whatever the timing.
+    relay.pace.lock().expect("pace lock").arm("127.0.0.1");
+    let report = harness_run(browser, &worker, args("fixture")).await?;
+    settle(seen, closed).await;
+    fresh_pace(relay);
+    let observed = take(seen);
+    show(&observed);
+    refused(&mut case, &report, &observed, "pace", "127.0.0.1");
     cases.push(case);
 
     let both =

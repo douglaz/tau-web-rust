@@ -71,11 +71,16 @@ There are two builds of the same page, both release builds:
   It is what a static HTTPS host serves (`ARC-32`), with no test-only part.
 - **The tracer build**, `scripts/build-web.sh tracer`, written to `dist/tracer/`. It is the same
   build with the `tracer` feature, which compiles in `src/testonly.rs`:
-  - the test SSH client and relay keys;
+  - the test SSH client key, and two test relay keys, each with its public half recorded beside
+    it: one the relay fixture holds a pass for, and one it holds none for;
   - the host-key pin source;
   - the in-memory journal;
-  - the test switches a request can set: `fail_append` makes the journal refuse its append,
-    `tamper_auth` sends a wrongly signed AUTH.
+  - the test switches a request can set: `test_relay_key` names the test relay key the AUTH is
+    signed with, `with-pass` or `without-pass`, and any other value, or none, or a key whose
+    secret does not derive its recorded public half, fails the request before any contact (a
+    name, never key material); `fail_append` makes the journal refuse its
+    append; `tamper_auth` sends a wrongly signed AUTH. twr-ggw.11 replaces the test relay keys
+    with the relay key derived from the seed.
 
   Seed-derived keys and a durable journal belong to later tickets.
 
@@ -88,14 +93,32 @@ compiled for wasm32 and never served. It starts these fixtures on ephemeral loop
   authentication attempt and channel request, and the `exec` command byte for byte. It starts no
   process: it answers the tracer's one command with the stdout, stderr and exit status the tracer
   gives it, and any other command with a fixed failure.
-- **A relay fixture** over `wss:`, speaking paid-tcp-relay's happy path at `844e834`:
-  - a fresh challenge;
-  - checks 1–4 of paid-tcp-relay's `WIR-6` at `844e834`, in order, against the test relay key's
-    pass and a destination set holding the sshd;
-  - only then the dial, `{"ok": true}` and binary frames.
+- **A relay fixture** over `wss:`, speaking paid-tcp-relay's handshake at `844e834`, its
+  `WIR-4`–`WIR-10`:
+  - a fresh challenge (`WIR-4`);
+  - checks 1–4 and 6 of `WIR-6`, in order: shape, with `created_at` within `relay.auth_skew`;
+    signature, and the challenge is this connection's, so a replayed AUTH fails (`WIR-9`); pass,
+    against passes recorded by hand (`PAS-6`), each a relay key's public half, its destination
+    hosts and an expiry; destination, read at the host and not at the port (`PAS-4`, `DST-2`);
+    and pace, per recorded host across its ports: at least `relay.min_spacing` between dials
+    and at most `relay.window_cap` dials in any `relay.window`, a sliding window (`DST-3`);
+  - on a failed check, `{"ok": false, "reason": …}` and close 1008, before any dial (`WIR-7`);
+  - then the dial, `{"ok": true}` once it is up, and binary frames. A binary frame before OK, in
+    place of the AUTH or after it, or a text frame after OK, closes with 1002 (`WIR-8`);
+  - an ordered log per connection: challenge sent, AUTH received, accepted or refused (reason and
+    check), dial, OK sent, bytes forwarded each way, frames the client sent otherwise, and the
+    close code sent. It shows no dial before the AUTH is accepted and no byte forwarded, either
+    way, before OK (`WIR-10`).
 
-  It is not the relay product: it implements no pacing and no `DST-4`, paid-tcp-relay's address
-  rule at `844e834`, which refuses the fixture's loopback destination.
+  The limits are read from paid-tcp-relay's `bundle/timing.toml` at `844e834`, vendored under
+  `tests/vectors/`, where they live by name (its `OPR-7`). The tracer holds a pass for the test
+  relay key for the sshd's host, expiring in an hour, and resets the pace state before each case
+  that dials.
+
+  It is not the relay product. It does not implement check 5, `DST-4`, paid-tcp-relay's address
+  rule, which refuses the fixture's loopback destinations: checking a real relay's address policy
+  is twr-ggw.26's (`CNF-81`, `CHN-16a`). Nor does it implement the strict path grammar of
+  `WIR-1`–`WIR-3`, which is not among `CNF-87`'s items.
 - **An HTTPS server for each build.** The certificate is made per run, and Chrome is told to
   accept it by its key hash alone.
 
@@ -114,6 +137,44 @@ WebSocket upgrade:
 | 3. no pin, no contact (`CNF-23`'s no-pin case, `CHN-R4`) | no TCP connection accepted at the relay, none at the sshd, no dial, and nothing pinned afterwards |
 | 4. the policy is enforced (`ARC-33`) | the loaded page carries the served page's policy token for token. An injected inline script raises a `script-src` violation and does not run. A `ws:` socket raises a `connect-src` violation in the page and in the worker |
 | 5. the relay fixture's AUTH check is real | exactly one relay connection, and a wrongly signed AUTH gets `{"ok": false, "reason": "auth"}` and close 1008 at check 2, and nothing is dialed |
+| 6. a relay key with no pass (`CNF-87`) | an unrecognised `test_relay_key` fails the request with no relay connection. Signed by the key with no pass, the harness reports `{"refused": "relay", "reason": "pass", "close_code": 1008}` |
+| 7. an unrecorded destination (`CNF-87`) | the pinned machine `fixture` at `127.0.0.2`, a host the pass does not record: `destination` and 1008 |
+| 8. pace (`CNF-87`) | the tracer puts the sshd's host at its window cap just before the run, so the refusal holds whatever the timing: `pace` and 1008 |
+
+In cases 6–8 the relay fixture also accepted exactly one connection, dialed nothing, and its log
+shows no frame from the client after the refusal but the close; the sshd saw no connection.
+Case 1 also reads the order from the relay fixture's log: challenge sent, AUTH received,
+accepted, dial, OK sent, then the first forwarded byte.
+
+### The relay matrix
+
+The cases a correct client never produces run on the host instead, in `tracer/src/matrix.rs`:
+a native client over `wss:` (tokio-tungstenite on tokio-rustls, trusting the run's certificate)
+drives the relay fixture through the fixture half of `CNF-87`, misbehaviour included. It runs
+under `cargo test`, so in CI's `build` job. Each case starts its own relay fixture, asserts
+first on what is visible outside the relay (the frames, the reason, the close code, and what
+the test's own destination listeners accepted and received), then on the fixture's log. The
+cases are written against a description of the relay under test, for twr-ggw.26. The `WIR-*`,
+`PAS-*` and `DST-*` ids below are paid-tcp-relay's at `844e834`:
+
+| Case | What it shows |
+|---|---|
+| 1. fresh challenge | pairwise distinct challenges, each 32 bytes as base64url with no padding, naming the relay |
+| 2. stale challenge | an AUTH signed now by the key with the pass, for a recorded host, over an earlier connection's challenge: `auth`, 1008, check 2 |
+| 3. replayed signature | an accepted AUTH resent verbatim on a new connection: `auth`, 1008, check 2 (`WIR-9`) |
+| 4. skew | `created_at` beyond `relay.auth_skew` either way: `auth`, 1008; a minute inside it is accepted |
+| 5. unknown key, expired pass | a key with no pass, and a pass past its expiry: `pass`, 1008 |
+| 6. recorded destinations only | a recorded host on another port is dialed, and bytes reach it; `127.0.0.2`, unrecorded: `destination`, 1008 |
+| 7. pace | on another port within `relay.min_spacing`: `pace`, 1008; after it, accepted (the fixture's clock, frozen and moved). The window: the (`window_cap`+1)th dial in a window is refused, and accepted once the window has passed (on an injected clock) |
+| 8. order | challenge, then OK after the AUTH, then binary; the log reads challenge sent, AUTH received, accepted, dial, OK sent, first forwarded byte |
+| 9. a binary frame before OK | in place of the AUTH: 1002, no dial. After an accepted AUTH: 1002 and no OK, the destination receives no byte. The fixture holds OK until the frame has been read, one release per held connection. A frame ready when the dial completes is read first, which `the_pre_ok_step_reads_a_ready_frame_first` shows on the fixture's own pre-OK step, both ready at the first poll |
+| 10. a text frame after OK | 1002; the destination receives none of its bytes, and its TCP connection closes |
+| 11. a destination that speaks first | its bytes reach the client after `{"ok": true}`, and the log shows them forwarded after OK sent |
+
+Every refused case also asserts that the fixture's log has no dial for that connection and the
+listeners saw no connection and no byte. The limits are the bundle's, never shrunk to fit: the
+fixture reads them from the vendored file, and `the_limits_are_the_bundles` holds what it reads
+to that file's values.
 
 **Where the policy reaches.** The page carries it in its `<meta>` element, which is all the served
 build ships. A dedicated worker takes its policy from its own response, not from the page. The
@@ -141,7 +202,7 @@ cargo run --locked -p tracer -- check-csp dist/served
 CHROME=/path/to/chrome scripts/tracer.sh                # builds both directories, runs every case
 ```
 
-- `check-absence` reads every byte of the directory. It fails on either test key, private or
+- `check-absence` reads every byte of the directory. It fails on any test key, private or
   public half, as raw bytes, hex or base64 (and the SSH key in OpenSSH's encoding), on the pin
   source's pins and marker, on the journal's marker, and on the test switches' names. Run on
   `dist/tracer`, it fails and names each finding.
@@ -226,12 +287,12 @@ rest of `CNF-88` has no code here yet.
 | `spec-checks` | `spec/bundle/cors-probe.sh` | `CNF-4` |
 | | `spec/prototypes/spec-checks/check-install-disks.py`, and `--baseline`, which must fail | evidence for `CNF-85` |
 | `build` (the job is `CNF-1`) | `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings` | `CNF-2`, at that strictness |
-| | `cargo test --locked` | runs `build.rs`, so the gates above run here, and the `[session]` fixtures (`CNF-88`'s build fixtures) |
+| | `cargo test --locked` | runs `build.rs`, so the gates above run here, and the `[session]` fixtures (`CNF-88`'s build fixtures); and the relay matrix, `CNF-87`'s fixture half |
 | `web` (the job is `CNF-1` for the browser build) | `cargo clippy -D warnings` on wasm32, the served and the tracer build | `CNF-2`, on the new target |
 | | `scripts/check-adr-0024.sh` | spec ADR-0024's build check |
 | | `scripts/build-web.sh served`, then `tracer check-absence dist/served` | the served build (`ARC-32`) carries no test key, pin source, journal or test switch |
 | | `tracer check-csp dist/served` | `ARC-33`'s policy, exactly |
-| | `scripts/tracer.sh`, in headless Chrome | `CNF-30`, `CNF-21`, `CNF-23`'s no-pin case and `ARC-33`, as above |
+| | `scripts/tracer.sh`, in headless Chrome | `CNF-30`, `CNF-21`, `CNF-23`'s no-pin case and `ARC-33`, as above, and the relay refusals of `CNF-87` a correct client meets |
 
 Every job checks out the submodule; `spec-checks` takes the full history, which
 `check-install-disks.py --baseline` reads to reconstruct the pre-fix brief. `web` installs
