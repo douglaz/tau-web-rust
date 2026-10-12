@@ -10,7 +10,7 @@ Issues, specs and tickets for this repo live in beads: `.beads/issues.jsonl`, co
   unblocked, undeferred work in creation order, which is the order a plan was published in; it is
   the frontier, and its first entry is the next ticket. (`br ready` alone sorts by its hybrid
   policy, not by creation.)
-- Triage state is a label (see `triage-labels.md`): `br label add <id> <label>`.
+- Triage state is a label (see `triage-labels.md`): `br label add <id> --label <label>`.
 - Never hand-edit `issues.jsonl`: `updated_at` goes stale and the next `br update` or `br close`
   silently reverts the edit. Every change goes through `br`.
 - Before committing, `br sync --flush-only` so the JSONL matches the database; commit
@@ -36,4 +36,7 @@ Used by `/wayfinder`. The **map** is an `epic`; each **child** is an issue under
 - **Frontier**: `br ready --sort oldest`, filtered to the map's children; the first entry wins.
 - **Claim**: `br update <id> --status in_progress` before any work.
 - **Resolve**: `br comments add <id> "<answer>"`, `br close <id>`, then append a one-line pointer
-  (gist plus the child's id) to the map's description with `br update <map> --description-file`.
+  (gist plus the child's id) to the map's description. `--description-file` replaces the whole
+  description, so write the current one plus the new line and pass that:
+  `{ br show <map> --json | jq -r '.[0].description'; echo "- <gist> (<id>)"; } > map.md` then
+  `br update <map> --description-file map.md`.
