@@ -5,7 +5,7 @@ browser and provisions real infrastructure on its operator's behalf. Rust, compi
 WebAssembly, following the configuration the specification records.
 
 **The specification lives in [`douglaz/tau-web-spec`](https://github.com/douglaz/tau-web-spec)
-and is vendored here at `spec/`, pinned to an exact commit, today `1cc8498`** (spec ADR-0031).
+and is vendored here at `spec/`, pinned to an exact commit, today `ee133d0`** (spec ADR-0031).
 The build refuses to run if the checked-out tree does not match the pin, and every release
 records the spec commit it was built from. What the build compiles in from the pin:
 
@@ -465,7 +465,7 @@ allocation companion comparison: passed
   schema 1, module allocation, bound: 3 events over an alphabet of 7
   compared: 6 witnesses and 400 enumerated traces, every step
   pair: TauWeb.Allocation.stale_sheet_refused matched; TauWeb.Allocation.stale_sheet_admitted differed at step 7
-  spec commit: 1cc84987d76a5e9237e9e8a09287dc5e9e4c5ac4
+  spec commit: ee133d0e84622bf079b577576091277bce72214f
 ```
 
 A pass is evidence about harness knowledge alone: never about external state, about whether an
