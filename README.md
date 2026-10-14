@@ -89,6 +89,58 @@ There are two builds of the same page, both release builds:
   Binding seed-derived keys in place of the test keys belongs to twr-ggw.11. Derivation itself
   exists, below, and both builds journal to the local store.
 
+### Dispatch
+
+`src/dispatch.rs` is the shared, synchronous core, written from the pinned Markdown requirements.
+A call is unresolved after its approved intent, finished after its exit status's terminal record,
+disposed with outcome unknown after an accepted disposition, or cancelled when a new-format
+intent has no approval decision. These states are derived from committed records in journal
+order (`STA-3`, `STA-8`); the core takes no time input and no timer clears anything. Replay
+writes nothing, surfaces uncertain calls and never resumes or automatically reissues them
+(`STA-6`, `STA-7`). The cancellation branch is exercised only through an authenticated crafted
+record and a real unlock; no path in this build produces that record.
+
+Today the harness admits a machine for which it holds a host-key pin. The decision's identity
+will become the bound session's binding in twr-ggw.11 without changing the intent's shape.
+The resource here is an implementation reading: the machine name checked against the pin
+source, until approved machine entries exist in twr-ggw.10. There is no barrier between
+box-plane commands, including explicit reissues of the same bytes while another call is
+unresolved (`STA-24`'s box-plane carve-out).
+
+A disposition must name at least one call, each unresolved on its own resource or disposed by
+the disposition currently standing there. A subset leaves unnamed calls unresolved. One
+stands per machine, the latest accepted one, and the report shows what it replaces. Refusal
+writes nothing and shows why, any settling record, and the resource's unresolved calls.
+Destructive reinstall and abandonment refuse commands to that machine, before contact and
+again atomically at the intent append. Continuing as if done and as if not done restrict
+nothing, explicit reissues included; their recorded assumption is shown, never turned into an
+outcome. Here only replacement ends a destructive restriction: no operation dispatching its
+continuation exists yet. Later terminal evidence is recorded and shown without reopening the
+call or removing its disposition (`STA-24`).
+
+Replay tests dispositions in order with the same eligibility test. A refused one stays in the
+journal and is shown with its refusal report, but ends no call, restricts nothing and replaces
+nothing; it does not refuse the store. Parse, authentication and chain failures still do, as
+does a terminal naming no call, a cancelled call or an already finished call, or an intent whose
+identity is not its record number or whose command is not lowercase hex.
+`store_state` shows calls and their approval decisions and states, terminals, all disposition
+reports and the disposition standing per machine, without key material. No operator screen,
+page message or disposition export exists. The browser disposition case uses a store built by
+the independent reader, with no added request switch.
+
+`run_command` reports completion as `{"done":true,"seq":1,"call":1,"terminal":2,...}`,
+with output, exit status and the reconciled bytes. After an intent commits, an exec error,
+channel close without an exit status, exit signal alone, lost connection or terminal append
+failure reports `{"unresolved":true,"call":1,"why":"…"}`, never failed. An exit status
+is journaled on receipt. Pre-intent refusals keep their existing shape; a disposition refusal
+is `{"refused":"disposition","disposition":2,"continuation":"abandonment"}`.
+
+Typed cloud-plane operations and their barriers belong to twr-ggw.8; continuation dispatch to
+twr-ggw.40, twr-ggw.45 and twr-i6k.3; job records and waiting to twr-ggw.12; sessions and approved
+entries to twr-ggw.10, twr-ggw.11 and twr-ggw.22; inference records to twr-ggw.17. Disposition
+screens, snapshots, compaction and transcript retention are outside this change. The untyped
+vendor hold is stage 2. This change demonstrates the box-plane disposition rule of `STA-24`.
+
 ### The seed
 
 `src/seed.rs` holds the operator seed and its child keys, credential format v1 (spec `STA-22`,
@@ -182,11 +234,24 @@ the host tests run.
 - **What the records carry.** Each record's plaintext is one event, compact JSON:
   - record 0, the seed, generated in the worker: `{"seed":{"mnemonic":"…"}}`, the mnemonic's
     words;
-  - a later record, one command appended before it is sent:
-    `{"command":{"machine":"…","command":"<hex>"}}`, its machine and its bytes in lowercase hex.
-    None has a terminal record yet (twr-ggw.7). Every recorded command is therefore unresolved
-    after replay: it reads back under its number, and nothing re-sends it, marks it done or
-    marks it failed.
+  - an intent, immediately before one `exec`:
+    `{"intent":{"call":1,"machine":"fixture","command":"<lowercase hex>","approval":{"harness_pin":{"machine":"fixture","fingerprint":"SHA256:…"}}}}`.
+    The call identity is the intent's record number, unique and never reused. The approval
+    decision identifies the harness's admission using that machine's pin; it is not the
+    operator's approval of the command's contents. A new-format intent with `approval:null`
+    (or an absent approval member) means never dispatched. No path in this build writes one.
+  - a terminal record, only when an exit status arrives:
+    `{"terminal":{"call":1,"exit_status":7}}`. It carries no output; the command report carries
+    output. An exit signal alone leaves the call unresolved: `STA-20` says exit code present
+    means finished.
+  - an operator disposition:
+    `{"disposition":{"machine":"fixture","calls":[1],"continuation":"abandonment","uncertainty":"the command outcome is unknown"}}`.
+    The other continuation values are `destructive_reinstall`, `as_if_done` and `as_if_not_done`.
+    It carries the uncertainty accepted and no outcome.
+  - a pre-ticket `{"command":{"machine":"…","command":"<hex>"}}` record remains readable.
+    Its missing approval member proves nothing: it was written before transmission. It becomes
+    an unresolved call with its record number and the admission marker `legacy_command`, never
+    a cancelled call.
   - a later record, one allocation event appended before it is applied ("Allocation", below):
     `{"allocation":{"reserve":{"seed":"<seed identifier>","derivation_version":1,"family":"machines","index":0}}}`;
     `created`, `failed` and `destroyed` carry the same identity; `restore` carries an export,
@@ -194,8 +259,8 @@ the host tests run.
     `replace` carries `{"seed":…}`. The seed identifier is in the clear only inside the
     encrypted record, where credential format v1 puts it.
 
-  The independent reader in the tracer crate decrypts every record and reads the seed and
-  command shapes; it does not interpret an allocation record.
+  The independent reader in the tracer crate decrypts every record and reads the seed, legacy
+  command, intent, terminal and disposition shapes; it does not interpret allocation records.
 - **`staging`**, the one staging name, which is never a record name or the envelope's.
 
 **The commit boundary.**
@@ -348,7 +413,7 @@ one, as a killed worker does. They show, for `CNF-82` and `CNF-15`:
 
 In the tracer crate, the independent reader reads a store the harness wrote, and the harness
 unlocks and replays a store the reader built. Decrypted, the seed is in the seed record alone,
-and no other secret is in any record of that store, which holds seed and command records only.
+and no other secret is in any record of that store, which holds seed, intent, terminal and disposition records.
 A record the harness cannot read is refused with a reason that quotes none of its plaintext,
 since the reason reaches the page.
 
@@ -564,8 +629,9 @@ browser holds:
 - **OPFS.** It dumps and edits OPFS from the page's context, recursively from
   `navigator.storage.getDirectory()`.
 - **The replayed state.** It reads it in the worker's own context, through the module's
-  `store_state`, which returns whether the store is locked, the record numbers, and each
-  recorded command's machine and bytes as hex, and no key material.
+  `store_state`, which returns whether the store is locked, record numbers, calls and their
+  states, terminal evidence and disposition reports and standing continuations, with command
+  bytes as hex and no key material.
 - **The stores' contents.** It reads them with an independent reader, `tracer/src/reader.rs`.
   The reader is written from the format's text and never calls the harness's store code. It
   runs on `ring`'s PBKDF2, AES-256-GCM and SHA-256, and derives the seed's keys with the
@@ -580,7 +646,7 @@ The cases:
 |---|---|
 | the served build loads | its worker comes up and nothing errs, and the page has no `tauWeb` global and no global holding the worker. With no store, the page offers Create alone, and a request is refused before any contact. A store is created; then, called in its worker on the machine the tracer build pins, it refuses for the missing pin, the relay accepts no connection and the sshd sees none, and nothing is appended |
 | create and unlock (twr-ggw.5, `CNF-82`) | the page offers Create, stating the 16-character minimum and a password manager, and refuses 15 characters. The independent reader reads the store the browser created, from the passphrase alone: record 0, the seed. A store the reader built, put into OPFS, unlocks in the browser and replays its command, and the unlock writes nothing: WebCrypto's PBKDF2 agrees with the host's |
-| 1. recorded, then sent (`CNF-30`, `ARC-8`) | exactly one relay connection; the sshd received exactly the journal entry, which the replayed state holds as record 1, and the output and exit status came back. With the append made to fail, the sshd received no `exec`, read only once that SSH connection has ended at the sshd |
+| 1. recorded, then sent (`CNF-30`, `ARC-8`) | exactly one relay connection; the sshd received exactly the journal entry, which the replayed state holds as approved intent 1 and terminal 2 (exit status 7), and the output and exit status came back. With the append made to fail, the sshd received no `exec`, read only once that SSH connection has ended at the sshd |
 | a failed append is not applied (twr-ggw.5 AC2, `STA-3`) | that failed append failed at its `move()`, a real OPFS call; the replayed state has no record for it, and none appears after a reload and an unlock |
 | 2. a wrong host key halts (`CNF-21`, `SEC-11`) | no authentication attempt, no `exec`, no journal entry, and exactly one connection |
 | 3. no pin, no contact (`CNF-23`'s no-pin case, `CHN-R4`) | no TCP connection accepted at the relay, none at the sshd, no dial, and nothing pinned afterwards |
@@ -590,7 +656,9 @@ The cases:
 | 7. an unrecorded destination (`CNF-87`) | the pinned machine `fixture` at `127.0.0.2`, a host the pass does not record: `destination` and 1008 |
 | 8. pace (`CNF-87`) | the tracer puts the sshd's host at its window cap just before the run, so the refusal holds whatever the timing: `pace` and 1008 |
 | fail closed (twr-ggw.5 AC1, `CNF-82`) | five edits to OPFS: a wrong passphrase, one byte of the envelope's salt, one byte of record 1's ciphertext, another store's record at the same number, and an envelope of version 2. For each, unlock is refused and the page offers neither Create nor Unlock; for the first two it says "wrong passphrase, or the store was modified". A create request creates nothing, a request is refused before any contact, and OPFS is byte-identical afterwards |
-| reload, explicit lock, page hide and a killed worker (twr-ggw.5 AC3, `CNF-82`) | one case each. The old worker target is gone and one new harness worker exists. The page offers Unlock alone. A request is refused with no TCP connection at the relay. After an unlock, the replayed state lists every command recorded before. Explicit lock and page hide also catch a command in flight: once the sshd has its `exec`, the lock comes, the relay fixture sees the client's WebSocket end and the sshd its connection end, and after the unlock the held command is in the replayed state and the sshd receives no second `exec`. Before the Lock button is pressed, text is typed into both passphrase fields and never submitted; both are empty once it is pressed |
+| reload, explicit lock, page hide and a killed worker (twr-ggw.5 AC3, `CNF-82`) | one case each. The old worker target is gone and one new harness worker exists. The page offers Unlock alone. A request is refused with no TCP connection at the relay. After an unlock, the replayed state lists every command recorded before. Explicit lock, page hide and the killed worker also catch a held command: once the sshd has its `exec`, the lock comes, and the sshd sees its connection end; explicit lock and page hide also check that the relay fixture sees the client's WebSocket end. After the unlock the held command reads unresolved in the replayed state and the sshd receives no second `exec`. Before the Lock button is pressed, text is typed into both passphrase fields and never submitted; both are empty once it is pressed |
+| close without exit status (twr-ggw.7, `STA-8`) | the sshd closes without an exit status; the report names an unresolved call, replay preserves it, and no second exec occurs |
+| dispositions (twr-ggw.7, `STA-24`) | the independent reader builds a destructive disposition: the request is refused before contact, with no relay connection, SSH connection or append. Replacing it with a continuing disposition admits the command and journals its terminal record |
 | one writer (twr-ggw.5, `STA-1`, `STA-7`) | a second tab opens, which hides the first and restarts its worker, so either tab's worker may win the lock. The holder is the tab that offers Unlock while the other says it is waiting; the roles follow from that. The holder unlocks. The other says it is waiting for the store and offers neither Create nor Unlock; its worker has not read the store, runs nothing and appends nothing. Once the holder's tab closes, the other offers Unlock and unlocks the same store |
 | persistent storage (twr-ggw.5 AC6, `STA-23`) | with the `persistent-storage` permission denied, then granted, through `Browser.setPermission`: `navigator.storage.persisted()` reads false, then true, and the page shows the refusal, then "Persistent storage is granted." (`persisted()` already reads true, so that load makes no request), each with the statement that this is a request, not a guarantee |
 | no plaintext (twr-ggw.5 AC4 and AC5, `CNF-15`, `STG-10`), in each build | from the passphrase the tracer typed, the independent reader learns the wrapping key, the data key and the seed. None of these appears, raw, hex, HEX, base64 or base64url (whole, or inside a longer value at any byte alignment), in any OPFS file: the passphrase, the wrapping and data keys, the mnemonic, the entropy, the 64-byte seed, the seed identifier, and roles 0–4's private and public keys at indices 0 and 1, plus the test keys in the tracer build. Local storage, session storage, IndexedDB and Cache Storage hold nothing, and no service worker is registered. A passphrase reaches the worker only as the one create or unlock message, and no message from the worker carries any of the items, in its text or in a binary payload's bytes; any other passphrase occurrence, text or binary, is a finding. In the tracer build's case, the sixteen negative controls listed under "The messages" run first, through the same guarded serializer and the same check, and each must be reported for its own reason. The fields were empty after every submit. The HTTPS fixtures' requests and the console hold none |
@@ -752,7 +820,7 @@ rest of `CNF-88` has no code here yet.
 | `spec-checks` | `spec/bundle/cors-probe.sh` | `CNF-4` |
 | | `spec/prototypes/spec-checks/check-install-disks.py`, and `--baseline`, which must fail | evidence for `CNF-85` |
 | `build` (the job is `CNF-1`) | `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings` | `CNF-2`, at that strictness |
-| | `cargo test --locked` | runs `build.rs`, so the gates above run here, and the `[session]` fixtures (`CNF-88`'s build fixtures); the relay matrix, `CNF-87`'s fixture half; the seed's tests, `CNF-83`'s derivation tests and `CNF-13`'s tests; the local store's, `CNF-82`'s and `CNF-15`'s host half (below); and allocation's, `CNF-72`'s tests and the companion comparison against the allocation witness file (ADR-0032), with `CNF-3`'s three breaks as its unit tests |
+| | `cargo test --locked` | runs `build.rs`, so the gates above run here, and the `[session]` fixtures (`CNF-88`'s build fixtures); the relay matrix, `CNF-87`'s fixture half; the seed's tests, `CNF-83`'s derivation tests and `CNF-13`'s tests; the local store's, `CNF-82`'s and `CNF-15`'s host half (below); dispatch and journal recovery for `CNF-29`'s box-plane case, `CNF-30`, `CNF-39` and `STA-24` dispositions; and allocation's, `CNF-72`'s tests and the companion comparison against the allocation witness file (ADR-0032), with `CNF-3`'s three breaks as its unit tests |
 | `web` (the job is `CNF-1` for the browser build) | `cargo clippy -D warnings` on wasm32, the served and the tracer build | `CNF-2`, on the new target |
 | | `scripts/check-adr-0024.sh` | spec ADR-0024's build check |
 | | `scripts/build-web.sh served`, then `tracer check-absence dist/served` | the served build (`ARC-32`) carries no test key, pin source or test switch |

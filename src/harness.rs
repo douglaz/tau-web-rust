@@ -19,8 +19,16 @@ pub use run::*;
     reason = "used generically and only on one thread: the browser's worker, or a host test"
 )]
 pub trait Journal {
-    /// Append one command's record, durably; its record number, or why it was refused.
-    async fn append(&mut self, entry: &Entry) -> Result<u64, String>;
+    /// Check the standing disposition before any contact; repeated atomically at append.
+    async fn check(&self, machine: &str) -> Result<(), AppendRefusal>;
+    /// Commit an intent and its scope admission, returning its call identity only afterwards.
+    async fn append(
+        &mut self,
+        entry: &Entry,
+        approval: &crate::dispatch::Approval,
+    ) -> Result<u64, AppendRefusal>;
+    /// Commit the exit status's terminal record before reporting completion.
+    async fn terminal(&mut self, terminal: &crate::dispatch::Terminal) -> Result<u64, String>;
     /// The record appended under `seq`, as replayed or applied.
     async fn read(&self, seq: u64) -> Option<Entry>;
 }
@@ -37,4 +45,24 @@ pub trait PinSource {
 pub struct Entry {
     pub machine: String,
     pub command: Vec<u8>,
+}
+
+/// A policy refusal does not trip the store's failed-append latch.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AppendRefusal {
+    Storage(String),
+    Disposition(crate::dispatch::DispatchRefusal),
+}
+
+impl std::fmt::Display for AppendRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Storage(why) => f.write_str(why),
+            Self::Disposition(record) => write!(
+                f,
+                "disposition {}: {:?}",
+                record.disposition, record.continuation
+            ),
+        }
+    }
 }

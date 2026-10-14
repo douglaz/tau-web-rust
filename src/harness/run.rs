@@ -1,7 +1,8 @@
 //! The attempt itself, on the browser's WebSocket: wasm32 only.
 
-use super::{Entry, Journal, PinSource};
+use super::{AppendRefusal, Entry, Journal, PinSource};
 use crate::credential::{RelayKey, SshClientKey};
+use crate::dispatch::{Approval, ChannelDecision, ChannelEvent, ChannelFold, DispatchRefusal};
 use futures_util::{SinkExt, StreamExt};
 use pharos::{Observable, ObserveConfig};
 use russh::keys::ssh_key::private::{Ed25519Keypair, KeypairData};
@@ -36,7 +37,8 @@ pub struct Done {
     pub recorded: Entry,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
-    pub exit_status: Option<u32>,
+    pub exit_status: u32,
+    pub terminal: u64,
     pub host_key: String,
 }
 
@@ -54,13 +56,16 @@ pub enum Refusal {
         close_code: Option<u16>,
     },
     /// The presented host key is not the pin: halted in the key exchange (`SEC-11`).
-    HostKey { pinned: String, presented: String },
+    HostKey {
+        pinned: String,
+        presented: String,
+    },
     /// The journal refused the append, so no `exec` was sent (`STA-3`).
     Journal(String),
-    /// The transcript does not reconcile with what was sent (`CNF-30`).
-    Unreconciled {
-        sent: Vec<u8>,
-        recorded: Option<Entry>,
+    Disposition(DispatchRefusal),
+    Unresolved {
+        call: u64,
+        why: String,
     },
     /// Anything else: the transport, the protocol, authentication.
     Failed(String),
@@ -78,11 +83,12 @@ impl Refusal {
                 json!({ "refused": "host-key", "pinned": pinned, "presented": presented })
             }
             Refusal::Journal(why) => json!({ "refused": "journal", "why": why }),
-            Refusal::Unreconciled { sent, recorded } => json!({
-                "refused": "unreconciled",
-                "sent": hex::encode(sent),
-                "recorded": recorded.as_ref().map(|e| hex::encode(&e.command)),
-            }),
+            Refusal::Disposition(record) => {
+                json!({ "refused": "disposition", "disposition": record.disposition, "continuation": record.continuation })
+            }
+            Refusal::Unresolved { call, why } => {
+                json!({ "unresolved": true, "call": call, "why": why })
+            }
             Refusal::Failed(why) => json!({ "refused": "failed", "why": why }),
         }
     }
@@ -95,6 +101,8 @@ pub fn report(outcome: &Result<Done, Refusal>) -> Value {
         Ok(done) => json!({
             "done": true,
             "seq": done.seq,
+            "call": done.seq,
+            "terminal": done.terminal,
             "sent": hex::encode(&done.sent),
             "recorded": hex::encode(&done.recorded.command),
             "recorded_machine": done.recorded.machine,
@@ -104,6 +112,13 @@ pub fn report(outcome: &Result<Done, Refusal>) -> Value {
             "host_key": done.host_key,
         }),
         Err(refusal) => refusal.to_json(),
+    }
+}
+
+fn append_refusal(refusal: AppendRefusal) -> Refusal {
+    match refusal {
+        AppendRefusal::Storage(why) => Refusal::Journal(why),
+        AppendRefusal::Disposition(record) => Refusal::Disposition(record),
     }
 }
 
@@ -149,6 +164,10 @@ pub async fn run_command(
     command: &[u8],
     #[cfg(feature = "tracer")] tamper_auth: bool,
 ) -> Result<Done, Refusal> {
+    journal
+        .check(&target.machine)
+        .await
+        .map_err(append_refusal)?;
     // CHN-R4: with no pin there is nothing to check a key against, so nothing is contacted.
     let pinned = pins.pin(&target.machine).ok_or(Refusal::NoPin)?.0;
     let (Some(ssh_key), Some(relay_key)) = (credentials.ssh_key(), credentials.relay_key()) else {
@@ -265,44 +284,83 @@ pub async fn run_command(
         machine: target.machine.clone(),
         command: command.to_vec(),
     };
-    let seq = journal.append(&entry).await.map_err(Refusal::Journal)?;
-    channel
-        .exec(true, entry.command.clone())
+    let approval = Approval::HarnessPin {
+        machine: target.machine.clone(),
+        fingerprint: pinned,
+    };
+    let seq = journal
+        .append(&entry, &approval)
         .await
-        .map_err(|e| Refusal::Failed(format!("exec: {e}")))?;
+        .map_err(append_refusal)?;
+    if let Err(error) = channel.exec(true, entry.command.clone()).await {
+        return Err(Refusal::Unresolved {
+            call: seq,
+            why: format!("exec: {error}"),
+        });
+    }
     let sent = entry.command;
 
-    let (mut stdout, mut stderr, mut exit_status) = (Vec::new(), Vec::new(), None);
-    while let Some(message) = channel.wait().await {
-        match message {
-            ChannelMsg::Data { data } => stdout.extend_from_slice(&data),
-            ChannelMsg::ExtendedData { data, .. } => stderr.extend_from_slice(&data),
-            ChannelMsg::ExitStatus {
-                exit_status: status,
-            } => exit_status = Some(status),
-            ChannelMsg::Close => break,
-            _ => {}
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    let mut fold = ChannelFold::new(seq);
+    loop {
+        let event = match channel.wait().await {
+            Some(ChannelMsg::Data { data }) => {
+                stdout.extend_from_slice(&data);
+                None
+            }
+            Some(ChannelMsg::ExtendedData { data, .. }) => {
+                stderr.extend_from_slice(&data);
+                None
+            }
+            Some(ChannelMsg::ExitStatus { exit_status }) => {
+                Some(ChannelEvent::ExitStatus(exit_status))
+            }
+            Some(ChannelMsg::ExitSignal { .. }) => Some(ChannelEvent::ExitSignal),
+            Some(ChannelMsg::Close) => Some(ChannelEvent::Close),
+            None => Some(ChannelEvent::StreamEnd),
+            _ => None,
+        };
+        if let Some(event) = event {
+            if let Some(record) = fold.receive(event) {
+                fold.appended(journal.terminal(&record).await);
+            }
+            if matches!(event, ChannelEvent::Close | ChannelEvent::StreamEnd) {
+                break;
+            }
         }
     }
     let _ = ssh
         .disconnect(russh::Disconnect::ByApplication, "", "en")
         .await;
 
-    // CNF-30: the transcript reconciles against what was sent.
+    // CNF-30: read back even an unresolved call; a mismatch asserts no external outcome.
     let recorded = journal.read(seq).await;
-    match recorded {
+    let recorded = match recorded {
         Some(recorded) if recorded.command == sent && recorded.machine == target.machine => {
-            Ok(Done {
-                seq,
-                sent,
-                recorded,
-                stdout,
-                stderr,
-                exit_status,
-                host_key,
-            })
+            recorded
         }
-        recorded => Err(Refusal::Unreconciled { sent, recorded }),
+        _ => {
+            return Err(Refusal::Unresolved {
+                call: seq,
+                why: "transcript does not reconcile with command bytes".into(),
+            });
+        }
+    };
+    match fold.conclude() {
+        ChannelDecision::Finished {
+            exit_status,
+            terminal,
+        } => Ok(Done {
+            seq,
+            sent,
+            recorded,
+            stdout,
+            stderr,
+            exit_status,
+            terminal,
+            host_key,
+        }),
+        ChannelDecision::Unresolved(why) => Err(Refusal::Unresolved { call: seq, why }),
     }
 }
 

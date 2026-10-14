@@ -47,7 +47,11 @@ impl Opened {
             .iter()
             .filter_map(|(number, plaintext)| {
                 let event: Value = serde_json::from_slice(plaintext).ok()?;
-                let command = &event["command"];
+                let command = if event.get("intent").is_some() {
+                    &event["intent"]
+                } else {
+                    &event["command"]
+                };
                 Some((
                     *number,
                     command["machine"].as_str()?.to_string(),
@@ -56,6 +60,78 @@ impl Opened {
             })
             .collect()
     }
+}
+
+/// Reads the documented plaintext shapes independently of the harness's event types.
+fn check_event(number: u64, event: &Value) -> Result<(), String> {
+    let object = event.as_object().ok_or("event is not an object")?;
+    if object.len() != 1 {
+        return Err("event does not name exactly one kind".into());
+    }
+    let (kind, body) = object.iter().next().expect("one kind");
+    let text = |name: &str| {
+        body[name]
+            .as_str()
+            .ok_or_else(|| format!("{kind}: {name} is not text"))
+    };
+    match kind.as_str() {
+        "seed" => {
+            text("mnemonic")?;
+        }
+        "command" | "intent" => {
+            text("machine")?;
+            hex::decode(text("command")?).map_err(|_| "command is not hex")?;
+            if kind == "intent" {
+                if body["call"].as_u64() != Some(number) {
+                    return Err("intent identity differs from record number".into());
+                }
+                let approval = &body["approval"];
+                if !approval.is_null() {
+                    let pin = &approval["harness_pin"];
+                    if !approval.as_object().is_some_and(|fields| fields.len() == 1)
+                        || !pin.as_object().is_some_and(|fields| fields.len() == 2)
+                        || pin["machine"].as_str().is_none()
+                        || pin["fingerprint"].as_str().is_none()
+                    {
+                        return Err("intent admission has no machine or fingerprint".into());
+                    }
+                }
+            }
+        }
+        "terminal" => {
+            if body["call"].as_u64().is_none()
+                || body["exit_status"]
+                    .as_u64()
+                    .and_then(|status| u32::try_from(status).ok())
+                    .is_none()
+            {
+                return Err("terminal has no call identity or exit status".into());
+            }
+        }
+        "disposition" => {
+            text("machine")?;
+            text("uncertainty")?;
+            if ![
+                "destructive_reinstall",
+                "abandonment",
+                "as_if_done",
+                "as_if_not_done",
+            ]
+            .contains(&text("continuation")?)
+            {
+                return Err("unknown continuation".into());
+            }
+            if !body["calls"]
+                .as_array()
+                .is_some_and(|calls| calls.iter().all(|call| call.as_u64().is_some()))
+            {
+                return Err("disposition has no call identities".into());
+            }
+        }
+        "allocation" => {} // Outside this reader's interpretation.
+        _ => return Err(format!("unknown event kind {kind}")),
+    }
+    Ok(())
 }
 
 fn b64(field: &Value, name: &str) -> Result<Vec<u8>, String> {
@@ -171,6 +247,9 @@ pub fn read(files: &Files, passphrase: &str) -> Result<Opened, String> {
             &b64(&record, "ciphertext")?,
         )
         .map_err(|e| format!("record {number}: {e}"))?;
+        let event: Value =
+            serde_json::from_slice(&plaintext).map_err(|e| format!("record {number}: {e}"))?;
+        check_event(number, &event).map_err(|e| format!("record {number}: {e}"))?;
         records.push((number, plaintext));
         previous = address(bytes);
     }
@@ -388,13 +467,32 @@ mod tests {
         ))
         .unwrap();
         for n in 1..=2 {
-            block_on(store.append(&command(n))).unwrap();
+            block_on(store.append(
+                &command(n),
+                &tau_web::dispatch::Approval::HarnessPin {
+                    machine: "fixture".into(),
+                    fingerprint: "SHA256:test-pin".into(),
+                },
+            ))
+            .unwrap();
         }
+        block_on(store.terminal(&tau_web::dispatch::Terminal {
+            call: 1,
+            exit_status: 7,
+        }))
+        .unwrap();
+        block_on(store.dispose(tau_web::dispatch::Disposition {
+            machine: "fixture".into(),
+            calls: vec![2],
+            continuation: tau_web::dispatch::Continuation::AsIfNotDone,
+            uncertainty: "the command outcome is unknown".into(),
+        }))
+        .unwrap();
         let files = storage.files();
         let opened = read(&files, PASS).unwrap();
         assert_eq!(
             opened.records.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
-            [0, 1, 2]
+            [0, 1, 2, 3, 4]
         );
         assert_eq!(
             opened.commands(),
@@ -402,6 +500,14 @@ mod tests {
                 (1, "fixture".to_string(), b"echo 1".to_vec()),
                 (2, "fixture".to_string(), b"echo 2".to_vec())
             ]
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&opened.records[3].1).unwrap(),
+            json!({"terminal":{"call":1,"exit_status":7}})
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&opened.records[4].1).unwrap()["disposition"]["continuation"],
+            "as_if_not_done"
         );
         let mnemonic = opened.mnemonic().unwrap();
         assert_eq!(
@@ -472,6 +578,42 @@ mod tests {
             seed_secrets(&mnemonic).unwrap()[3].1
         );
         assert_eq!(storage.files(), files, "an unlock writes nothing");
+    }
+
+    #[test]
+    fn intent_approval_admits_only_a_pin_or_no_decision() {
+        let intent = json!({"intent": {
+            "call": 1, "machine": "private machine name", "command": "00"
+        }});
+        assert!(check_event(1, &intent).is_ok());
+        for approval in [
+            Value::Null,
+            json!({"harness_pin": {"machine": "m", "fingerprint": "SHA256:pin"}}),
+        ] {
+            let mut event = intent.clone();
+            event["intent"]["approval"] = approval;
+            assert!(check_event(1, &event).is_ok());
+        }
+        for approval in [
+            json!("legacy_command"),
+            json!({"harness_pin": {"machine": "m", "fingerprint": "f", "extra": "private"}}),
+            json!({"harness_pin": {"machine": "m", "fingerprint": "f"}, "extra": "private"}),
+        ] {
+            let mut event = intent.clone();
+            event["intent"]["approval"] = approval;
+            assert_eq!(
+                check_event(1, &event),
+                Err("intent admission has no machine or fingerprint".into())
+            );
+        }
+        let mnemonic = bip39::Mnemonic::from_entropy(&[7; 16]).unwrap().to_string();
+        let mut event = intent;
+        event["intent"]["approval"] = json!("legacy_command");
+        let files = build(PASS, &[json!({"seed": {"mnemonic": mnemonic}}), event]);
+        assert_eq!(
+            read(&files, PASS).err().unwrap(),
+            "record 1: intent admission has no machine or fingerprint"
+        );
     }
 
     /// An authentic record the harness cannot read is refused with a reason that quotes none of

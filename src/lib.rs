@@ -8,6 +8,7 @@
 
 pub mod allocation;
 pub mod credential;
+pub mod dispatch;
 pub mod harness;
 pub mod relay_auth;
 pub mod seed;
@@ -24,7 +25,8 @@ include!(concat!(env!("OUT_DIR"), "/pinned.rs"));
 #[cfg(target_arch = "wasm32")]
 mod worker {
     use crate::credential::LocalPassphrase;
-    use crate::harness::{Entry, Journal};
+    use crate::dispatch::{Approval, Terminal};
+    use crate::harness::{AppendRefusal, Entry, Journal};
     use crate::store::Local;
     use crate::store::opfs::{Opfs, WebCrypto};
     use js_sys::Uint8Array;
@@ -76,8 +78,8 @@ mod worker {
         local().lock().await.unlock(passphrase).await.to_string()
     }
 
-    /// The replayed state, for the tracer: whether the store is locked, its record numbers and
-    /// its recorded commands. No key material.
+    /// The replayed calls, terminal evidence and dispositions, with the store's lock state and
+    /// record numbers. No key material.
     #[wasm_bindgen]
     pub async fn store_state() -> String {
         local().lock().await.inspect().to_string()
@@ -95,10 +97,28 @@ mod worker {
     struct StoreJournal(Rc<Mutex<Harness>>);
 
     impl Journal for StoreJournal {
-        async fn append(&mut self, entry: &Entry) -> Result<u64, String> {
+        async fn check(&self, machine: &str) -> Result<(), AppendRefusal> {
             match self.0.lock().await.store() {
-                Some(store) => store.append(entry).await,
+                Some(store) => store.check(machine).await,
+                None => Err(AppendRefusal::Storage("the store is locked".into())),
+            }
+        }
+
+        async fn terminal(&mut self, terminal: &Terminal) -> Result<u64, String> {
+            match self.0.lock().await.store() {
+                Some(store) => store.terminal(terminal).await,
                 None => Err("the store is locked".into()),
+            }
+        }
+
+        async fn append(
+            &mut self,
+            entry: &Entry,
+            approval: &Approval,
+        ) -> Result<u64, AppendRefusal> {
+            match self.0.lock().await.store() {
+                Some(store) => store.append(entry, approval).await,
+                None => Err(AppendRefusal::Storage("the store is locked".into())),
             }
         }
 

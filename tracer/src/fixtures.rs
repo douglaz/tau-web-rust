@@ -271,6 +271,10 @@ impl server::Handler for SshSession {
         if data == self.answer.hold.as_bytes() {
             return Ok(());
         }
+        if data == b"close-without-status" {
+            session.eof(channel)?;
+            return session.close(channel);
+        }
         let (stdout, stderr, status) = if data == self.answer.command.as_bytes() {
             (
                 self.answer.stdout,

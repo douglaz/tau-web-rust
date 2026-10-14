@@ -851,7 +851,7 @@ async fn run_cases(
     case.check(
         "the worker's replayed state is record 0 alone",
         run.inspect(&worker).await?
-            == json!({ "state": "unlocked", "locked": false, "records": [0], "commands": [] }),
+            == json!({ "state": "unlocked", "locked": false, "records": [0], "commands": [], "calls": [], "terminals": [], "dispositions": [], "standing": {} }),
     );
     let host = reader::build(
         HOST_PASSPHRASE,
@@ -1081,10 +1081,16 @@ async fn run_cases(
     let replayed = run.inspect(&worker).await?;
     case.check(
         "the store's replayed state holds it as record 1",
-        replayed["records"] == json!([0, 1])
+        replayed["records"] == json!([0, 1, 2])
             && replayed["commands"]
                 == json!([{ "number": 1, "machine": "fixture", "command": hex::encode(COMMAND) }])
-            && outcome["seq"] == 1,
+            && outcome["seq"] == 1
+            && outcome["terminal"] == 2
+            && replayed["calls"][0]["approval"]["harness_pin"]["machine"] == "fixture"
+            && replayed["calls"][0]["approval"]["harness_pin"]["fingerprint"] == pinned.as_str()
+            && replayed["calls"][0]["state"] == "finished"
+            && replayed["terminals"]
+                == json!([{ "number": 2, "call": 1, "exit_status": EXIT_STATUS }]),
     );
     case.check(
         "the output and exit status came back",
@@ -1158,7 +1164,7 @@ async fn run_cases(
     );
     case.check(
         "the replayed state has no record for it",
-        after_failure == before_failure && after_failure["records"] == json!([0, 1]),
+        after_failure == before_failure && after_failure["records"] == json!([0, 1, 2]),
     );
     worker = run.reload(&tab, &worker).await?;
     run.submit(&tab, "unlock", PASSPHRASE).await?;
@@ -1166,6 +1172,114 @@ async fn run_cases(
         "after a reload and an unlock, none appears",
         run.inspect(&worker).await? == before_failure,
     );
+    cases.push(case);
+
+    let mut case = Case::new("close without exit status stays unresolved (twr-ggw.7, STA-8)");
+    fresh_pace(relay);
+    let mut closing = args("fixture");
+    closing["command"] = "close-without-status".into();
+    let report = run.harness_run(&worker, closing).await?;
+    let observed = take(seen);
+    let call = report["outcome"]["call"].clone();
+    let before = run.inspect(&worker).await?;
+    case.check(
+        "the close reports unresolved, with a call identity and no failed or done report",
+        report["outcome"]["unresolved"] == true
+            && call.as_u64().is_some()
+            && report["outcome"].get("refused").is_none()
+            && report["outcome"].get("done").is_none()
+            && observed.ssh_exec == [b"close-without-status".to_vec()]
+            && observed.ssh_exit.is_empty(),
+    );
+    case.check(
+        "the recorded call is unresolved and has no terminal",
+        before["calls"].as_array().is_some_and(|calls| {
+            calls
+                .iter()
+                .any(|c| c["call"] == call && c["state"] == "unresolved")
+        }) && before["terminals"]
+            .as_array()
+            .is_some_and(|ts| ts.iter().all(|t| t["call"] != call)),
+    );
+    worker = run.reload(&tab, &worker).await?;
+    run.submit(&tab, "unlock", PASSPHRASE).await?;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let observed = take(seen);
+    case.check(
+        "replay preserves the unresolved call and sends no second exec",
+        run.inspect(&worker).await? == before
+            && observed.ssh_exec.is_empty()
+            && observed.relay_accepted == 0,
+    );
+    cases.push(case);
+
+    let mut case = Case::new(
+        "dispositions refuse before contact and continuing permits dispatch (twr-ggw.7, STA-24)",
+    );
+    let original = store_files(&run.dump(&tab).await?);
+    let opened = reader::read(&original, PASSPHRASE)?;
+    let mut events: Vec<Value> = opened
+        .records
+        .iter()
+        .map(|(_, plaintext)| serde_json::from_slice(plaintext).map_err(|e| e.to_string()))
+        .collect::<Result<_, _>>()?;
+    let call = events.len() as u64;
+    events.push(json!({"intent":{"call":call,"machine":"fixture","command":hex::encode(COMMAND),"approval":{"harness_pin":{"machine":"fixture","fingerprint":pinned}}}}));
+    let destructive = events.len() as u64;
+    events.push(json!({"disposition":{"machine":"fixture","calls":[call],"continuation":"destructive_reinstall","uncertainty":"the command outcome is unknown"}}));
+    run.put(&tab, &reader::build(PASSPHRASE, &events)).await?;
+    worker = run.reload(&tab, &worker).await?;
+    run.submit(&tab, "unlock", PASSPHRASE).await?;
+    take(seen);
+    fresh_pace(relay);
+    let before = run.inspect(&worker).await?;
+    let files_before = store_files(&run.dump(&tab).await?);
+    let report = run.harness_run(&worker, args("fixture")).await?;
+    // If the pre-contact check is removed, the atomic append check still refuses, but the relay sees contact.
+    sshd.all_ended().await;
+    let observed = take(seen);
+    case.check("a destructive disposition is named, and the relay and sshd saw no connection",
+        report["outcome"] == json!({"refused":"disposition","disposition":destructive,"continuation":"destructive_reinstall"})
+        && observed.relay_accepted == 0 && observed.ssh_connections == 0);
+    case.check(
+        "the refusal appends nothing",
+        run.inspect(&worker).await? == before
+            && store_files(&run.dump(&tab).await?) == files_before,
+    );
+    events.push(json!({"disposition":{"machine":"fixture","calls":[call],"continuation":"as_if_not_done","uncertainty":"the command outcome is unknown"}}));
+    run.put(&tab, &reader::build(PASSPHRASE, &events)).await?;
+    worker = run.reload(&tab, &worker).await?;
+    run.submit(&tab, "unlock", PASSPHRASE).await?;
+    fresh_pace(relay);
+    let report = run.harness_run(&worker, args("fixture")).await?;
+    let observed = take(seen);
+    let after = run.inspect(&worker).await?;
+    case.check(
+        "a continuing replacement dispatches and commits the exit status terminal",
+        report["outcome"]["done"] == true
+            && observed.ssh_exec == [COMMAND.as_bytes().to_vec()]
+            && after["standing"]["fixture"]["continuation"] == "as_if_not_done"
+            && after["standing"]["fixture"]["report"]["replaces"] == destructive
+            && after["calls"].as_array().is_some_and(|calls| {
+                calls.iter().any(|c| {
+                    c["call"] == call && c["state"] == "disposed" && c["outcome"] == "unknown"
+                })
+            })
+            && after["terminals"].as_array().is_some_and(|ts| {
+                ts.iter().any(|t| {
+                    t["number"] == report["outcome"]["terminal"] && t["exit_status"] == EXIT_STATUS
+                })
+            }),
+    );
+    let files = store_files(&run.dump(&tab).await?);
+    case.check(
+        "the independent reader reads the browser terminal after the replacement",
+        reader::read(&files, PASSPHRASE).is_ok(),
+    );
+    run.put(&tab, &original).await?;
+    worker = run.reload(&tab, &worker).await?;
+    run.submit(&tab, "unlock", PASSPHRASE).await?;
+    take(seen);
     cases.push(case);
 
     // Case 2 (AC2): a host key other than the pin halts, before authentication, once.
@@ -1277,6 +1391,7 @@ async fn run_cases(
     // byte for byte as it was.
     let mut case = Case::new("fail closed (twr-ggw.5 AC1, CNF-82)");
     let baseline = store_files(&run.dump(&tab).await?);
+    let baseline_state = run.inspect(&worker).await?;
     let flip = |value: &mut Value, field: &str| {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         let mut bytes = URL_SAFE_NO_PAD
@@ -1384,7 +1499,7 @@ async fn run_cases(
     run.submit(&tab, "unlock", PASSPHRASE).await?;
     case.check(
         "the store put back unlocks",
-        run.inspect(&worker).await? == before_failure,
+        run.inspect(&worker).await? == baseline_state,
     );
     cases.push(case);
 
@@ -1494,7 +1609,19 @@ async fn run_cases(
     .await?;
     cases.push(case);
 
-    let mut case = Case::new("a killed worker requires unlock again (twr-ggw.5 AC3, CNF-82)");
+    let mut case = Case::new(
+        "a killed worker surfaces an unresolved command and requires unlock (twr-ggw.7, CNF-39)",
+    );
+    take(seen);
+    fresh_pace(relay);
+    let mut held = args("fixture");
+    held["command"] = HELD.into();
+    run.harness_start(&worker, held).await?;
+    let received = settle_for(seen, 20, |s| s.ssh_exec == [HELD.as_bytes().to_vec()]).await;
+    case.check(
+        "before Page.crash the sshd received the held exec",
+        received,
+    );
     let before = run.inspect(&worker).await?;
     run.collect(&tab).await?;
     // Neither the page nor the worker runs a handler: the renderer stops at once. In headless
@@ -1522,6 +1649,11 @@ async fn run_cases(
             json!({ "targetId": tab.target }),
         )
         .await?;
+    case.check(
+        "the killed command's SSH connection ended",
+        sshd.all_ended().await,
+    );
+    take(seen);
     let old = worker.clone();
     (tab, worker) = run.open(tracer_origin, false).await?;
     relocked(
@@ -1534,6 +1666,20 @@ async fn run_cases(
         &args("fixture"),
     )
     .await?;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let observed = take(seen);
+    let after = run.inspect(&worker).await?;
+    case.check(
+        "after the crash, the held call is surfaced as unresolved without another exec",
+        after["calls"]
+            .as_array()
+            .and_then(|calls| calls.last())
+            .is_some_and(|call| {
+                call["command"] == hex::encode(HELD) && call["state"] == "unresolved"
+            })
+            && observed.ssh_exec.is_empty()
+            && observed.relay_accepted == 0,
+    );
     cases.push(case);
 
     // One writer: while one tab holds the store, the other neither unlocks nor appends. Opening
@@ -2128,7 +2274,11 @@ async fn held_then(
         &format!("{how}: it was recorded before it was sent"),
         numbers
             .last()
-            .is_some_and(|c| c["command"] == hex::encode(HELD)),
+            .is_some_and(|c| c["command"] == hex::encode(HELD))
+            && before["calls"]
+                .as_array()
+                .and_then(|calls| calls.last())
+                .is_some_and(|c| c["state"] == "unresolved"),
     );
     lock.await?;
     let new = match run.worker(tab, Some(&worker), false).await {
