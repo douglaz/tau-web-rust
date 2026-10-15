@@ -27,6 +27,22 @@ Start reading at [`spec/00-overview.md`](./spec/00-overview.md). What to build f
 [`spec/07-conformance.md`](./spec/07-conformance.md), and its "Before declaring stage 1
 complete" paragraph.
 
+At the pin `ee133d0`, stage 1 is `STG-21`'s scenario:
+"One live LNVPS machine on catalogue plain Arch with no tenant", created through a typed
+adapter and paid by a Lightning invoice from the operator's own wallet. Hermes is installed
+with its own installer.
+LNVPS accepts no buyer boot configuration, so attest cannot run there (`STG-21`);
+first contact uses `CHN-R7`'s published-key route. The table's attest row does not gate
+LNVPS stage 1.
+
+The pinned table's CNF items are **Stage 1: required**
+`1–7, 10–17, 21, 23–26, 28–30, 32, 34–35, 37, 39–44, 49–56, 66–73, 78–79, 81–83, 87–91, 93–95, 99–104, 109–110`;
+**Stage 1: record measurements** `45–47`; **Stage 1: model-written check reports** `107`;
+**Stage 1: re-entry** `108`; and **Stage 1: recovery export/import and Replace** `19–20, 84`.
+The **Attest first-contact route** items `18, 23 (attest-window case), 61, 74–75` do not gate
+stage 1. These rows define completion requirements; the implementation described below is
+still under construction.
+
 ## The harness
 
 `src/` is the harness worker's wasm module, built for `wasm32-unknown-unknown` on spec ADR-0024's
