@@ -37,3 +37,53 @@ jobs:
       - run: cargo fmt --check # CNF-2
       - run: cargo clippy --locked --all-targets -- -D warnings # CNF-2
       - run: cargo test --locked # runs build.rs, so the pin and bundle gates run here
+
+  # The browser harness (twr-ggw.2), from a clean checkout with nothing manual (CNF-1): the wasm32
+  # build on ADR-0024's configuration and its checks, the served build (ARC-32) and its checks,
+  # and the tracer in headless Chrome.
+  web:
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: "1.97.1"
+      # The wasm-bindgen crate's version in Cargo.lock; scripts/build-web.sh refuses a mismatch.
+      WASM_BINDGEN_VERSION: "0.2.127"
+      WASM_BINDGEN_SHA256: 61d4a7dc85acfa0d2354ccc0b8361928c7e52a746d17f28ebaa795ed3dc1614a
+      # ring compiles C for wasm32 with a clang that targets it.
+      CC_wasm32_unknown_unknown: clang
+      AR_wasm32_unknown_unknown: llvm-ar
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: Rust, pinned, with the wasm32 target
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --target wasm32-unknown-unknown --component clippy
+      - name: clang and llvm-ar for ring's wasm32 C code
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm
+          clang --version
+          llvm-ar --version
+      - name: the wasm-bindgen CLI, pinned
+        run: |
+          name="wasm-bindgen-$WASM_BINDGEN_VERSION-x86_64-unknown-linux-musl"
+          curl -sSfL -o "$RUNNER_TEMP/$name.tar.gz" \
+            "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/$WASM_BINDGEN_VERSION/$name.tar.gz"
+          echo "$WASM_BINDGEN_SHA256  $RUNNER_TEMP/$name.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$name.tar.gz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/$name" >> "$GITHUB_PATH"
+      - name: clippy on wasm32, the served build (CNF-2)
+        run: cargo clippy --locked -p tau-web --target wasm32-unknown-unknown --all-targets -- -D warnings
+      - name: clippy on wasm32, the tracer build (CNF-2)
+        run: cargo clippy --locked -p tau-web --target wasm32-unknown-unknown --all-targets --features tracer -- -D warnings
+      - name: the wasm32 graph holds nothing ADR-0024 keeps out
+        run: scripts/check-adr-0024.sh
+      - name: the served build (ARC-32)
+        run: scripts/build-web.sh served
+      - name: no test key, pin source, journal or test switch in the served build
+        run: cargo run --locked -p tracer -- check-absence dist/served
+      - name: the served page's policy is ARC-33's
+        run: cargo run --locked -p tracer -- check-csp dist/served
+      - name: the tracer, in headless Chrome
+        run: |
+          chrome=$(command -v google-chrome)
+          CHROME="$chrome" scripts/tracer.sh

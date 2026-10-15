@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="script-src 'self' 'wasm-unsafe-eval'; object-src 'none'; base-uri 'self'; connect-src https: wss:">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tau-web</title>
+<link rel="icon" href="data:,">
+<script type="module" src="boot.js"></script>
+</head>
+<body>
+<p id="status" role="status">Starting the harness…</p>
+<section id="store" aria-live="polite">
+<p id="store-state"></p>
+<p id="create-help" hidden>Choose a local passphrase of at least 16 characters (Unicode code points). It unlocks this device's store and cannot be reset; a password manager is encouraged.</p>
+<p id="passphrase-field" hidden><label>Passphrase <input id="passphrase" type="password" autocomplete="current-password"></label></p>
+<p id="confirm-field" hidden><label>Confirm <input id="confirm" type="password" autocomplete="new-password"></label></p>
+<button id="create" type="button" hidden>Create</button>
+<button id="unlock" type="button" hidden>Unlock</button>
+<button id="lock" type="button" hidden>Lock</button>
+</section>
+<p id="persist" role="status"></p>
+</body>
+</html>

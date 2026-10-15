@@ -1,0 +1,12 @@
+# Every cadence and cap the relay enforces, by name. Rules cite the name (OPR-7, DST-3, WIR-5);
+# the numbers live only here. Values marked placeholder are replaced by the first integrated
+# run's measurement, in one commit.
+#
+# Moved from tau-web's bundle/timing.toml [relay] table on 2026-09-24.
+
+[relay]                    # placeholders
+auth_skew = "10m"          # AUTH event created_at must be within this of the relay's clock (WIR-5)
+min_spacing = "1s"         # per destination, minimum interval between dials (DST-3)
+window = "15m"             # per destination, the pacing window (DST-3)
+window_cap = 200           # per destination, dials allowed per window (DST-3)
+# max_destinations         # per pass, recorded destinations allowed: undecided (F5, PAS-8)

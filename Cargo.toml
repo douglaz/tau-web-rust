@@ -1,8 +1,71 @@
+[workspace]
+members = ["tracer"]
+# The tracer (fixtures, browser driver and the served build's checks) is linted and unit-tested
+# by the same `cargo clippy`/`cargo test` as the harness.
+default-members = [".", "tracer"]
+
 [package]
 name = "tau-web"
 version = "0.0.0"
 edition = "2024"
 publish = false
+
+[lib]
+# cdylib: the wasm module the harness worker loads; rlib: the tracer links the shared parts.
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# The tracer's test-only parts: the test keys, the host-key pin source and the test switches,
+# one of which makes the local store's append fail. Never in the served build
+# (`scripts/build-web.sh served`).
+tracer = []
+
+[dependencies]
+# The relay AUTH (`WIR-5` of paid-tcp-relay at `844e834`): a NIP-01 event id and a BIP-340 signature. Pure Rust,
+# and no RNG of its own: the auxiliary randomness comes from getrandom 0.4 below.
+k256 = { version = "0.13", default-features = false, features = ["schnorr"] }
+serde_json = "1"
+hex = "0.4"
+# The seed and its child keys (`STA-22a`, `src/seed.rs`): one digest family, the one russh and
+# ssh-key already lock (sha2 0.11, which also hashes the relay AUTH's id, hmac 0.13 and pbkdf2
+# 0.13); k256 above for the BIP-32 scalar arithmetic; ed25519-dalek for the role 0 and role 4
+# public keys. getrandom draws the entropy: the OS on the host, the browser CSPRNG on wasm32
+# (`wasm_js`, below).
+sha2 = { version = "0.11", default-features = false }
+hmac = "0.13"
+pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
+ed25519-dalek = { version = "3", default-features = false }
+getrandom = "0.4"
+# The local store (`STA-23`, credential format v1, "Local encryption envelope", `src/store.rs`):
+# AES-256-GCM in Rust on every target, the same code the host tests run, and already in the
+# wasm32 graph through russh; WebCrypto runs only the PBKDF2 on wasm32. The envelope and records
+# are strict JSON with unpadded base64url fields. The secret types zeroize on drop.
+aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc", "zeroize"] }
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+serde = { version = "1", features = ["derive"] }
+zeroize = "1"
+
+# ADR-0024's configuration, as it compiled. `scripts/check-adr-0024.sh` refuses what it keeps
+# out: tokio `net` and `rt-multi-thread`, and any russh crypto backend but `ring`.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+russh = { version = "0.63", default-features = false, features = ["ring"] } # no flate2, no rsa
+ring = { version = "0.17", features = ["wasm32_unknown_unknown_js"] }
+ws_stream_wasm = { version = "0.7", features = ["tokio_io"] }
+pharos = "0.5" # ws_stream_wasm's event stream, for the relay's close code (`WIR-7`, paid-tcp-relay `844e834`)
+getrandom = { version = "0.4", features = ["wasm_js"] }
+tokio = { version = "1", default-features = false, features = ["sync", "io-util"] }
+wasm-bindgen = "=0.2.127" # must equal the wasm-bindgen CLI exactly (the `web` CI job checks)
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+console_error_panic_hook = "0.1"
+# The local store's browser half: the origin-private file system and WebCrypto's PBKDF2.
+web-sys = { version = "0.3", features = [
+  "Blob", "Crypto", "CryptoKey", "FileSystemDirectoryHandle", "FileSystemFileHandle",
+  "FileSystemGetDirectoryOptions", "FileSystemGetFileOptions", "FileSystemWritableFileStream",
+  "Pbkdf2Params", "StorageManager", "SubtleCrypto", "WorkerGlobalScope", "WorkerNavigator",
+  "WritableStream",
+] }
 
 [build-dependencies]
 toml = "1"
@@ -10,3 +73,17 @@ toml = "1"
 # The tests run the gate `build.rs` runs, on TOML of their own.
 [dev-dependencies]
 toml = "1"
+
+# The second implementation `CNF-83` asks derivation to agree with, the BIP-32 vectors' Base58Check
+# decoder, and the `CNF-13` source scan's parser. Host only: the `web` job's wasm32 clippy compiles
+# test code too, so every test that uses them is `cfg(not(target_arch = "wasm32"))`.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+bip39 = { version = "2", default-features = false }
+bip32 = { version = "0.5", default-features = false, features = ["secp256k1"] }
+bs58 = { version = "0.5", default-features = false, features = ["alloc", "check"] }
+syn = { version = "2", features = ["full", "visit"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
