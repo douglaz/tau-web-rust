@@ -27,7 +27,7 @@ Start reading at [`spec/00-overview.md`](./spec/00-overview.md). What to build f
 [`spec/07-conformance.md`](./spec/07-conformance.md), and its "Before declaring stage 1
 complete" paragraph.
 
-At the pin `ee133d0`, stage 1 is `STG-21`'s scenario:
+At the pin `ee133d0`, stage 1 is `STG-21`'s scenario, which the "Stage 1: required" row states as
 "One live LNVPS machine on catalogue plain Arch with no tenant", created through a typed
 adapter and paid by a Lightning invoice from the operator's own wallet. Hermes is installed
 with its own installer.
