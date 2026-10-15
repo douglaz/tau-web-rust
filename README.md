@@ -203,10 +203,10 @@ vendor hold is stage 2. This change demonstrates the box-plane disposition rule 
   (16-, 32- or 64-byte arrays, arrays whose length is not a literal, or a k256, ed25519-dalek,
   russh or ssh-key secret type) and has no row. It knows types by name, so it also fails when
   such a name, or a registered one, is defined by more than one type. The scan is a guardrail,
-  not a proof: it cannot see a key carried in a `String`. Three types it flags are exempt, each
-  with its reason: the store's ID, the PBKDF2 salt and a record's content address, all
-  persisted in the clear by design. The three local-store types also zeroize their bytes on
-  drop.
+  not a proof: it cannot see a key carried in a `String` or a `Vec<u8>`, a union's fields, or a
+  key type imported under another name. Three types it flags are exempt, each with its reason:
+  the store's ID, the PBKDF2 salt and a record's content address, all persisted in the clear by
+  design. The three local-store types also zeroize their bytes on drop.
 
 The local store generates the seed in the worker and keeps its mnemonic in its first record
 (below). No `wasm_bindgen` export takes or returns a mnemonic, a seed or a key. Allocation

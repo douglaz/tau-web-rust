@@ -1,7 +1,8 @@
 //! The credential types the harness handles, each naming its row in `SEC-5`, the credential
 //! inventory: "Every credential the harness holds or places MUST appear in the table below".
 //! `CNF-13` blocks on a credential class with no row, and the tests below hold every type here to
-//! the pinned table, and fail on a type in `src/` that holds key material without a row.
+//! the pinned table, and fail on a type in `src/` whose field types reveal key material without
+//! a row, within the limits documented on `Scan` below.
 //!
 //! The secret-bearing types follow ADR-0024's discipline: no `Clone`, no `Serialize`, a `Debug`
 //! that prints no byte of the secret, and raw bytes reachable only inside the crate, so a
@@ -360,6 +361,9 @@ mod tests {
     /// `#[cfg(test)]` or `#[cfg(all(test, …))]` are skipped: they compile only into tests, and
     /// hold test code, not credentials the harness handles. A guardrail, not a proof: a key in a
     /// `String` or a `Vec<u8>` is not seen, which is why the pin type is registered by hand.
+    /// A union's fields are not checked; only its name is counted for the defined-twice rule.
+    /// A key type imported under another name (for example `use ed25519_dalek::SigningKey as Sk;`)
+    /// is not seen: key types are matched by the last segment of the path as written.
     ///
     /// Types are known by bare name, so a name defined twice is refused rather than resolved
     /// (`unregistered`): a second `RelayKey` cannot pass on the registered one's `impl`.
