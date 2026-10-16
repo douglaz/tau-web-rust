@@ -25,6 +25,8 @@ pub struct Intent {
     /// Exact command bytes in lowercase hex.
     pub command: String,
     pub approval: Option<Approval>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,6 +142,7 @@ pub struct Dispatch {
     pub terminals: Vec<TerminalRecord>,
     pub dispositions: Vec<DispositionRecord>,
     pub standing: BTreeMap<String, DispositionRecord>,
+    pub jobs: Vec<crate::jobs::Report>,
 }
 
 impl Dispatch {
@@ -162,6 +165,15 @@ impl Dispatch {
         let bytes = hex::decode(&intent.command).map_err(|_| "intent command is not hex")?;
         if hex::encode(bytes) != intent.command {
             return Err("intent command is not lowercase hex".into());
+        }
+        if let Some(job) = &intent.job
+            && (!crate::jobs::valid_id(job)
+                || self
+                    .calls
+                    .values()
+                    .any(|c| c.intent.job.as_ref() == Some(job)))
+        {
+            return Err("intent job identity is invalid or reused".into());
         }
         let state = if intent.approval.is_some() {
             CallState::Unresolved
@@ -192,6 +204,66 @@ impl Dispatch {
         // Later evidence is shown but cannot reopen a disposed call or remove its disposition.
         self.terminals.push(TerminalRecord { number, terminal });
         Ok(())
+    }
+
+    /// Unresolved calls and disposed calls without job evidence are eligible for collection.
+    pub fn collectable(&self, machine: &str) -> Vec<Intent> {
+        self.calls
+            .values()
+            .filter(|call| {
+                call.intent.machine == machine
+                    && call.intent.job.is_some()
+                    && (matches!(call.state, CallState::Unresolved)
+                        || (matches!(call.state, CallState::Disposed { .. })
+                            && !self
+                                .jobs
+                                .iter()
+                                .any(|r| r.evidence.call == call.intent.call)))
+            })
+            .map(|call| call.intent.clone())
+            .collect()
+    }
+
+    pub fn job_evidence(
+        &mut self,
+        number: u64,
+        evidence: crate::jobs::Evidence,
+        terminal: bool,
+    ) -> Result<crate::jobs::Report, String> {
+        use crate::jobs::State;
+        evidence.record.validate()?;
+        let call = self
+            .calls
+            .get(&evidence.call)
+            .ok_or("job evidence names no call")?;
+        if matches!(
+            call.state,
+            CallState::Cancelled | CallState::Finished { .. }
+        ) || self
+            .terminals
+            .iter()
+            .any(|t| t.terminal.call == evidence.call)
+        {
+            return Err("job evidence names a cancelled or already finished call".into());
+        }
+        if call.intent.job.as_ref() != Some(&evidence.job) {
+            return Err("job evidence identity differs from the intent".into());
+        }
+        let report = evidence.report(number, &call.intent.machine, &call.intent.command);
+        if terminal != (report.state == State::Finished) || report.state == State::Running {
+            return Err("job evidence kind differs from what the record establishes".into());
+        }
+        if terminal {
+            self.terminal(
+                number,
+                Terminal {
+                    call: evidence.call,
+                    exit_status: report.exit_status.expect("finished record"),
+                },
+            )?;
+        }
+        self.jobs.push(report.clone());
+        Ok(report)
     }
 
     /// The same test is used before recording and during replay (`STA-24`).
@@ -293,201 +365,5 @@ impl Dispatch {
         }
         self.dispositions.push(record);
         report
-    }
-}
-
-/// Relevant channel deliveries, in transport order. Output does not affect the decision.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ChannelEvent {
-    ExitStatus(u32),
-    ExitSignal,
-    Close,
-    StreamEnd,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ChannelDecision {
-    Finished { exit_status: u32, terminal: u64 },
-    Unresolved(String),
-}
-
-/// Requests the first exit status's terminal immediately, then folds its append result and
-/// channel endings. Neither a later status nor a failed append may request another terminal.
-pub struct ChannelFold {
-    call: u64,
-    exit_status: Option<u32>,
-    appended: Option<Result<u64, String>>,
-    exit_signal: bool,
-    closed: bool,
-}
-
-impl ChannelFold {
-    pub fn new(call: u64) -> Self {
-        Self {
-            call,
-            exit_status: None,
-            appended: None,
-            exit_signal: false,
-            closed: false,
-        }
-    }
-
-    pub fn receive(&mut self, event: ChannelEvent) -> Option<Terminal> {
-        match event {
-            ChannelEvent::ExitStatus(exit_status) if self.exit_status.is_none() => {
-                self.exit_status = Some(exit_status);
-                Some(Terminal {
-                    call: self.call,
-                    exit_status,
-                })
-            }
-            ChannelEvent::ExitSignal => {
-                self.exit_signal = true;
-                None
-            }
-            ChannelEvent::Close => {
-                self.closed = true;
-                None
-            }
-            ChannelEvent::ExitStatus(_) | ChannelEvent::StreamEnd => None,
-        }
-    }
-
-    /// The caller performs each requested append before delivering another channel event.
-    pub fn appended(&mut self, result: Result<u64, String>) {
-        self.appended = Some(result);
-    }
-
-    pub fn conclude(self) -> ChannelDecision {
-        match (self.exit_status, self.appended) {
-            (Some(exit_status), Some(Ok(terminal))) => ChannelDecision::Finished {
-                exit_status,
-                terminal,
-            },
-            (_, Some(Err(why))) => ChannelDecision::Unresolved(format!("terminal append: {why}")),
-            (Some(_), None) => {
-                ChannelDecision::Unresolved("terminal append did not complete".into())
-            }
-            _ => ChannelDecision::Unresolved(
-                if self.exit_signal {
-                    "exit signal without an exit status"
-                } else if self.closed {
-                    "channel closed without an exit status"
-                } else {
-                    "connection lost without an exit status"
-                }
-                .into(),
-            ),
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn fold(
-        events: &[ChannelEvent],
-        append: Result<u64, String>,
-    ) -> (Vec<Terminal>, ChannelDecision) {
-        let mut fold = ChannelFold::new(1);
-        let mut requests = Vec::new();
-        for event in events {
-            if let Some(record) = fold.receive(*event) {
-                requests.push(record);
-                fold.appended(append.clone());
-            }
-        }
-        (requests, fold.conclude())
-    }
-
-    fn finished(events: &[ChannelEvent], exit_status: u32) {
-        assert_eq!(
-            fold(events, Ok(2)),
-            (
-                vec![Terminal {
-                    call: 1,
-                    exit_status
-                }],
-                ChannelDecision::Finished {
-                    exit_status,
-                    terminal: 2
-                },
-            )
-        );
-    }
-
-    fn unresolved(events: &[ChannelEvent], why: &str) {
-        assert_eq!(
-            fold(events, Ok(2)),
-            (vec![], ChannelDecision::Unresolved(why.into()))
-        );
-    }
-
-    #[test]
-    fn exit_status_then_close_finishes_with_that_status() {
-        finished(&[ChannelEvent::ExitStatus(7), ChannelEvent::Close], 7);
-    }
-
-    #[test]
-    fn exit_status_then_stream_end_finishes_with_that_status() {
-        finished(&[ChannelEvent::ExitStatus(0), ChannelEvent::StreamEnd], 0);
-    }
-
-    #[test]
-    fn close_without_exit_status_stays_unresolved() {
-        unresolved(
-            &[ChannelEvent::Close],
-            "channel closed without an exit status",
-        );
-    }
-
-    #[test]
-    fn exit_signal_then_close_stays_unresolved() {
-        unresolved(
-            &[ChannelEvent::ExitSignal, ChannelEvent::Close],
-            "exit signal without an exit status",
-        );
-    }
-
-    #[test]
-    fn exit_signal_then_stream_end_stays_unresolved() {
-        unresolved(
-            &[ChannelEvent::ExitSignal, ChannelEvent::StreamEnd],
-            "exit signal without an exit status",
-        );
-    }
-
-    #[test]
-    fn empty_stream_end_stays_unresolved() {
-        unresolved(
-            &[ChannelEvent::StreamEnd],
-            "connection lost without an exit status",
-        );
-    }
-
-    #[test]
-    fn second_exit_status_requests_no_second_terminal() {
-        finished(
-            &[ChannelEvent::ExitStatus(3), ChannelEvent::ExitStatus(5)],
-            3,
-        );
-    }
-
-    #[test]
-    fn failed_terminal_append_stays_unresolved() {
-        assert_eq!(
-            fold(
-                &[ChannelEvent::ExitStatus(7), ChannelEvent::Close],
-                Err("move refused".into()),
-            ),
-            (
-                vec![Terminal {
-                    call: 1,
-                    exit_status: 7
-                }],
-                ChannelDecision::Unresolved("terminal append: move refused".into()),
-            )
-        );
     }
 }

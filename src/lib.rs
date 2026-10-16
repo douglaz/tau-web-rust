@@ -10,6 +10,7 @@ pub mod allocation;
 pub mod credential;
 pub mod dispatch;
 pub mod harness;
+pub mod jobs;
 pub mod relay_auth;
 pub mod seed;
 pub mod store;
@@ -128,6 +129,30 @@ mod worker {
                 None => None,
             }
         }
+
+        async fn intent(&self, call: u64) -> Option<crate::dispatch::Intent> {
+            match self.0.lock().await.store() {
+                Some(store) => store.intent(call).await,
+                None => None,
+            }
+        }
+
+        async fn collectable(&self, machine: &str) -> Result<Vec<crate::dispatch::Intent>, String> {
+            match self.0.lock().await.store() {
+                Some(store) => store.collectable(machine).await,
+                None => Err("the store is locked".into()),
+            }
+        }
+
+        async fn job_evidence(
+            &mut self,
+            evidence: &crate::jobs::Evidence,
+        ) -> Result<crate::jobs::Report, String> {
+            match self.0.lock().await.store() {
+                Some(store) => store.job_evidence(evidence).await,
+                None => Err("the store is locked".into()),
+            }
+        }
     }
 
     /// Runs one command: `request` is JSON naming the machine, the relay's URL, the destination,
@@ -140,6 +165,19 @@ mod worker {
     /// on what it has stored, which is none yet. The report is JSON and carries no key material.
     #[wasm_bindgen]
     pub async fn run_command(request: String) -> Result<String, wasm_bindgen::JsValue> {
+        request_operation(request, false).await
+    }
+
+    /// Read a machine's outstanding job records, waiting for its running commands.
+    #[wasm_bindgen]
+    pub async fn collect_jobs(request: String) -> Result<String, wasm_bindgen::JsValue> {
+        request_operation(request, true).await
+    }
+
+    async fn request_operation(
+        request: String,
+        collect: bool,
+    ) -> Result<String, wasm_bindgen::JsValue> {
         use crate::harness::Target;
         let request: serde_json::Value = serde_json::from_str(&request)
             .map_err(|e| wasm_bindgen::JsValue::from_str(&format!("request: {e}")))?;
@@ -161,11 +199,31 @@ mod worker {
         }
         let mut journal = StoreJournal(local);
         #[cfg(feature = "tracer")]
-        let report = crate::testonly::run(&target, command.as_bytes(), &request, &mut journal)
-            .await
-            .map_err(|e| wasm_bindgen::JsValue::from_str(&e))?;
+        let report =
+            crate::testonly::run(&target, command.as_bytes(), &request, &mut journal, collect)
+                .await
+                .map_err(|e| wasm_bindgen::JsValue::from_str(&e))?;
         #[cfg(not(feature = "tracer"))]
         let report = {
+            if collect {
+                return Ok(
+                    match crate::harness::collect_jobs(
+                        &NothingStored,
+                        &mut journal,
+                        &NothingStored,
+                        &target,
+                    )
+                    .await
+                    {
+                        Ok(records) => {
+                            serde_json::json!({"outcome":{"collected":records}}).to_string()
+                        }
+                        Err(refusal) => {
+                            serde_json::json!({"outcome":refusal.to_json()}).to_string()
+                        }
+                    },
+                );
+            }
             let outcome = crate::harness::run_command(
                 &NothingStored,
                 &mut journal,

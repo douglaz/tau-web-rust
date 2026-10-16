@@ -50,7 +50,7 @@ configuration, beside the pinned inputs above. It runs in a dedicated worker the
 because spec `STA-1` says "A single **harness worker** MUST be the only writer of durable state".
 What it does so far is the tracer bullet of twr-ggw.2, one command over a pinned SSH connection
 through the relay, recorded in the encrypted local store of twr-ggw.5 (below). The module exports
-`run_command`, the same entry point in both builds below. The page defines no global and holds
+`run_command` and `collect_jobs`, the same entry points in both builds below. The page defines no global and holds
 no reference to the worker's instance of the module. It sends the worker one kind of message, a
 passphrase to create or unlock the store, and no request; today only the tracer calls
 `run_command` there (below). Another same-origin script could still load its own copy of the
@@ -74,9 +74,10 @@ below is still whole in the served wasm, which is what the absence check below r
   checks the presented host key against the pin inside the key exchange, before authentication.
   A mismatch halts and names both fingerprints (`SEC-11`). Nothing reconnects (`ARC-41`: "the
   harness does not reconnect on its own").
-- **Record, then send.** It appends the command to the store's journal immediately before
-  sending it as one `exec`, sends nothing if the append fails, and reconciles the journal's
-  read-back against what was sent (`ARC-8`, `STA-3`, `STA-4`, `CNF-30`).
+- **Record, then send.** It appends the command and a fresh job identity to the store's journal
+  immediately before sending one composed job wrapper as one `exec`. A failed append sends
+  nothing. Recomposition from the journal's read-back must equal the transmitted wrapper bytes
+  (`ARC-8`, `STA-3`, `STA-4`, `CNF-30`).
 
 The page in `www/` holds no key, pin or record:
 
@@ -139,23 +140,123 @@ journal and is shown with its refusal report, but ends no call, restricts nothin
 nothing; it does not refuse the store. Parse, authentication and chain failures still do, as
 does a terminal naming no call, a cancelled call or an already finished call, or an intent whose
 identity is not its record number or whose command is not lowercase hex.
-`store_state` shows calls and their approval decisions and states, terminals, all disposition
-reports and the disposition standing per machine, without key material. No operator screen,
-page message or disposition export exists. The browser disposition case uses a store built by
+`store_state` shows calls and their job identities, approval decisions and states, terminals,
+job-record evidence and findings, all disposition reports and the disposition standing per
+machine, without key material. No operator screen, page message or disposition export exists. The browser disposition case uses a store built by
 the independent reader, with no added request switch.
 
 `run_command` reports completion as `{"done":true,"seq":1,"call":1,"terminal":2,...}`,
-with output, exit status and the reconciled bytes. After an intent commits, an exec error,
-channel close without an exit status, exit signal alone, lost connection or terminal append
-failure reports `{"unresolved":true,"call":1,"why":"…"}`, never failed. An exit status
-is journaled on receipt. Pre-intent refusals keep their existing shape; a disposition refusal
+with output, exit status, the exact wrapper bytes in `sent`, journal command bytes in
+`recorded`, and advisory `job_record` evidence. After an intent commits, an exec error,
+channel close without a complete record, lost connection or evidence append failure reports
+`{"unresolved":true,"call":1,"why":"…"}`, never failed. Whenever a valid job record was read,
+the unresolved response also includes `job_record`, with the same state, comparison, output
+and exit status as a finished response. Evidence whose append failed has `number:null`. The command's exit code is read from
+its job record and journaled before completion is reported; the SSH wrapper's own exit status
+never settles the command. Pre-intent refusals keep their existing shape; a disposition refusal
 is `{"refused":"disposition","disposition":2,"continuation":"abandonment"}`.
 
 Typed cloud-plane operations and their barriers belong to twr-ggw.8; continuation dispatch to
-twr-ggw.40, twr-ggw.45 and twr-i6k.3; job records and waiting to twr-ggw.12; sessions and approved
+twr-ggw.40, twr-ggw.45 and twr-i6k.3; sessions and approved
 entries to twr-ggw.10, twr-ggw.11 and twr-ggw.22; inference records to twr-ggw.17. Disposition
 screens, snapshots, compaction and transcript retention are outside this change. The untyped
 vendor hold is stage 2. This change demonstrates the box-plane disposition rule of `STA-24`.
+
+### Job records and collection
+
+`src/jobs.rs` composes the installed-system wrapper from the journal's command bytes. Its
+POSIX `sh` text receives command and machine bytes as octal `printf '%b'` operands, so quoting,
+newlines and non-ASCII bytes do not become wrapper syntax. Each intent has a fresh 192-bit
+random job identity, lowercase hex, recorded before transmission. It is independent of the
+store's record number and exposes no store-wide identifier. Older intents without a job
+identity remain unresolved and are not collected.
+
+The wrapper reserves `/var/lib/tau-web/jobs/<job>/` with `mkdir`, under `umask 077`: directories
+are 0700 and files 0600. It writes `command` (the bytes received), `machine`, and `boot` from
+`/proc/sys/kernel/random/boot_id`. `setsid` starts a detached runner with no SSH descriptors.
+The runner atomically records its own PID and Linux `/proc/<pid>/stat` start time in `runner`.
+A small interpreter atomically records its own PID and start time in `pid`, then uses
+`exec sh "$d/command"`: the command runs as its own script with that same PID and start time,
+without sharing wrapper variables or traps. Startup is marked with `ready`. The command's
+stdout and stderr go directly to the files `stdout` and `stderr`. The runner waits for that
+command alone. For a `wait` status of 0–128, it writes the exit code to `exit.pending` and
+renames it to `exit`. It never waits for background descendants. No standard
+input is written to disk; no command takes input yet. A connected exec reads these files as soon
+as the command ends, including when a background process retains stdout (`STA-20a`).
+
+An existing job directory is refused without changing its record. This is an implementation
+reading stricter than `STA-20` for an installed system, carried over from the rescue rule;
+normal operation never resends a wrapper. A wrapper refusal or setup failure leaves the call
+unresolved and never becomes a command exit code. The reason includes up to 2048 bytes of
+wrapper stderr, decoded lossily; a nonzero wrapper status never becomes a command exit code.
+
+`collect_jobs` takes the same target fields as `run_command`, without a command. It is refused
+while locked, and without a host-key pin before contact. It reads every unresolved call's job
+record on that machine, and disposed calls without job evidence. Each collection exec contains
+only read text and an identity, never the original command or launch text. Collection appends
+no intent, writes nothing on the machine and bypasses the command disposition check. Its
+`{"outcome":{"collected":[...]}}` report carries each call's evidence, state, output and exit
+code. Each call is independent: a read, parse, validation or append failure reports
+`{"call":1,"job":"…","failed":true,"why":"…"}` and collection proceeds to the next call.
+An append failure also retains the read evidence in `job_record` with `number:null`.
+Nothing is retried. If the connection ends, earlier outcomes remain in the response and the
+unreached calls are listed with `not_read:true`. Evidence is durably appended before the
+projection changes (`STA-3`).
+
+Waiting runs on the machine with shell sleeps and no browser or Tokio timer. An existing
+exit record is final and is read before any liveness wait. Both command and runner liveness
+require the recorded boot and PID start time to match, so a recycled PID establishes no
+liveness. If the command has ended but its original runner is still publishing its exit, the
+read lets publication complete and checks the exit file again after observing runner death.
+Scalar files are read with shell builtins and checked against their exact byte counts once,
+before waiting (or when an exit file appears); discarded bytes fail the read. Process liveness
+is read with shell builtins; a waiting pass spawns only
+one `sleep`. The first second uses 50 ms sleeps, the next two use 250 ms sleeps, then sleeps
+are one second. Output encoding runs only when returning the record.
+
+An exit code establishes `finished`, even after a reboot. **Only a `wait` status of 0–128 is
+recorded as an exit code.** POSIX `sh` cannot distinguish signal death from a genuine exit of
+129–255, so all those statuses read `ended`, stay unresolved with outcome unknown, and write
+no terminal record. This includes `exit 137` and a script whose last child was killed by a
+signal and which exits with that child's 128+n. This ceiling is chosen so that no signal death
+is ever recorded as an exit code.
+
+An unreadable or invalid required record file makes the whole read fail: the wrapper returns
+nonzero with the filename in stderr, and no record fields are reported. Missing output is
+never presented as empty output. Collection reports that failed read and continues to the
+next call.
+
+A changed boot or a gone command without an exit code likewise establishes `ended`, outcome
+unknown: **no terminal is written**. A missing record stays `missing`, unresolved, and is never
+proof of death. An interrupted launch can leave an `incomplete` record: any received machine
+and command bytes are retained as evidence, but it establishes no end or outcome. A record
+with no command PID and no exit code is also incomplete. Another machine's record settles
+nothing. Ended, missing and incomplete calls remain eligible for later collection. No timer
+ends a call or gives up on it.
+
+Every received command is compared with the journal, on the live path as well as collection
+(`CNF-56`, `STA-21`). Agreement is `advisory_match`; a mismatch is a `finding` carrying `journal`
+and `received` bytes. These are machine-reported evidence, with no claim against a machine that
+lies. **A mismatched record still settles the call** with its recorded exit code, beside the
+finding. The evidence and finding survive reload and unlock.
+
+Collection ends no restriction: a standing disposition stays standing and its call stays
+disposed, with the later evidence shown beside it (`STA-24`). A fresh `run_command` neither
+collects first nor waits on another job; the existing box-plane carve-out still applies.
+Sessions will call collection at re-entry in their own tickets. Rescue records and planned-reset
+handoff, service lifecycle and standard-input harness jobs are outside this change.
+
+The host wrapper suite in `tracer/src/machine.rs` runs against the real reader under bash
+and dash. `missing_record_files_fail_instead_of_fabricating_fields` covers absent files,
+directories and dangling links; `invalid_scalar_files_fail_without_malformed_output` covers
+malformed scalars. `nul_bytes_in_scalars_fail_instead_of_being_discarded` covers all five scalar
+sources, and `scalar_records_accept_only_exact_ascii_forms` checks exact spacing and optional
+newlines. `exit_file_above_128_fails_the_read`, the record validation test
+`exit_status_ceiling_is_128_in_records_and_deliveries`, and the store test
+`job_terminal_above_128_refuses_replay` enforce the same ceiling at each boundary.
+`incomplete_record_present_unreadable_files_fail_instead_of_null` distinguishes absent entries
+from unreadable ones. The signal-collision and background-output tests record their detached
+children's PID and start time and end them only while that identity still matches.
 
 ### The seed
 
@@ -251,15 +352,26 @@ the host tests run.
   - record 0, the seed, generated in the worker: `{"seed":{"mnemonic":"…"}}`, the mnemonic's
     words;
   - an intent, immediately before one `exec`:
-    `{"intent":{"call":1,"machine":"fixture","command":"<lowercase hex>","approval":{"harness_pin":{"machine":"fixture","fingerprint":"SHA256:…"}}}}`.
+    `{"intent":{"call":1,"machine":"fixture","command":"<lowercase hex>","approval":{"harness_pin":{"machine":"fixture","fingerprint":"SHA256:…"}},"job":"<48 lowercase hex digits>"}}`.
     The call identity is the intent's record number, unique and never reused. The approval
     decision identifies the harness's admission using that machine's pin; it is not the
     operator's approval of the command's contents. A new-format intent with `approval:null`
     (or an absent approval member) means never dispatched. No path in this build writes one.
-  - a terminal record, only when an exit status arrives:
+  - a legacy terminal record, still read and used by host dispatch tests:
     `{"terminal":{"call":1,"exit_status":7}}`. It carries no output; the command report carries
-    output. An exit signal alone leaves the call unresolved: `STA-20` says exit code present
-    means finished.
+    output. New command completion uses the job terminal below.
+  - a job terminal, carrying the machine-reported record and its output:
+    `{"job_terminal":{"call":1,"job":"<48 hex digits>","record":{"kind":"present","machine":"<hex>","command":"<hex>","boot":"…","current_boot":"…","pid":123,"alive":false,"exit_status":7,"stdout":"<hex>","stderr":"<hex>"}}}`.
+    The exit code is 0–128, following the rule under "Job records and collection". This is the terminal that settles an unresolved call; a disposed call
+    keeps its disposition. Replay derives the advisory comparison and any finding from it.
+  - a job observation, the same evidence envelope under `job_observation`: a present record
+    without an exit code establishes `ended` when the boot changed or the command is gone;
+    `{"kind":"missing"}` establishes no outcome; `{"kind":"incomplete","machine":null,"command":"<hex>"}`
+    preserves available startup bytes (each field may be null). A present record naming another
+    machine is an observation even if it has an exit code. None of these is a terminal, and
+    replay refuses an observation pretending to carry a same-machine finished or running job.
+    Both evidence shapes must name an eligible call and its exact job identity. Unknown,
+    cancelled and already finished calls, malformed bytes and mismatched identities refuse replay.
   - an operator disposition:
     `{"disposition":{"machine":"fixture","calls":[1],"continuation":"abandonment","uncertainty":"the command outcome is unknown"}}`.
     The other continuation values are `destructive_reinstall`, `as_if_done` and `as_if_not_done`.
@@ -276,7 +388,7 @@ the host tests run.
     encrypted record, where credential format v1 puts it.
 
   The independent reader in the tracer crate decrypts every record and reads the seed, legacy
-  command, intent, terminal and disposition shapes; it does not interpret allocation records.
+  command, intent, terminal, job terminal, job observation and disposition shapes; it does not interpret allocation records.
 - **`staging`**, the one staging name, which is never a record name or the envelope's.
 
 **The commit boundary.**
@@ -351,8 +463,8 @@ the host tests run.
   state by themselves. There is no grace timer, and
   nothing is journaled on the way out (`STA-23`: "No unload callback is relied on for
   journaling"). Terminating the worker ends everything inside it: its relay WebSocket, the SSH
-  connection that WebSocket carries, and any command in flight. After an unlock, the worker
-  replays the journal.
+  connection that WebSocket carries, and its exec. A detached job continues on the machine,
+  to be collected after unlock; the worker replays the journal.
 - **The single writer.** `worker.js` takes an exclusive Web Lock, `tau-web-store`, before the
   module reads the store, and holds it for the worker's whole life (`STA-1`, `STA-7`).
   - A worker that cannot get the lock queues for it, and the page says "Waiting for the local
@@ -558,9 +670,17 @@ effect ran before its append returned, or about concurrency (ADR-0032, "Evidence
 compiled for wasm32 and never served. It starts these fixtures on ephemeral loopback ports:
 
 - **A fixture sshd** (russh) whose host key the test chooses. It records every connection,
-  authentication attempt and channel request, and the `exec` command byte for byte. It starts no
-  process: it answers the tracer's one command with the stdout, stderr and exit status the tracer
-  gives it, and any other command with a fixed failure.
+  authentication attempt and channel request, and the `exec` command byte for byte, unmodified.
+  It runs that text in real POSIX shells, mapping only `/var/lib/tau-web/jobs` and the boot-id
+  file into a unique per-run scratch directory under `std::env::temp_dir()` (`TMPDIR` on
+  Unix). Both browser
+  builds send the same text; no path override reaches the served build. The fixture records
+  each job launch and end from its own files and process table. A dropped connection kills
+  each exec's recorded process group; detached jobs survive. A fixture reboot kills the job
+  groups it started, changes its boot identity and keeps the jobs directory. At shutdown it
+  signals a recorded group only while its leader's PID and start time still match, and removes
+  its exact scratch directory, leaving no shared scratch parent. The close-without-status
+  trigger matches the exact sentinel command operand, including no machine-name substring.
 - **A relay fixture** over `wss:`, speaking paid-tcp-relay's handshake at `844e834`, its
   `WIR-4`–`WIR-10`:
   - a fresh challenge (`WIR-4`);
@@ -590,12 +710,15 @@ compiled for wasm32 and never served. It starts these fixtures on ephemeral loop
 - **An HTTPS server for each build.** The certificate is made per run, and Chrome is told to
   accept it by its key hash alone. It logs every request line, header and body.
 
-The fixture sshd also never answers one command, which stays in flight until its client goes.
-The relay fixture logs a client connection that ends with no close frame.
+The held command is a finite 15-second sleep. Explicit-lock, visibility/pagehide and
+renderer-crash cases drop its connection while it runs; a reboot before the collection cases ends any
+remaining earlier jobs while keeping their records, so they cannot hang a later collection.
+The close-without-status case runs a real command but closes its channel without sending a
+status or record. The relay fixture logs a client connection that ends with no close frame.
 
 The tracer then drives headless Chrome over the DevTools protocol. It runs a request by evaluating
 in the harness worker's own context, over that worker's DevTools session: it imports the module
-the worker already loaded, by the same URL, and calls its `run_command`. Neither build's page holds
+the worker already loaded, by the same URL, and calls `run_command` or `collect_jobs`. Neither build's page holds
 a hook for it. Every case asserts on what the fixtures observed, not only on what the harness
 reports. The relay fixture counts every TCP connection it accepts, at `accept`, before TLS and the
 WebSocket upgrade.
@@ -646,7 +769,8 @@ browser holds:
   `navigator.storage.getDirectory()`.
 - **The replayed state.** It reads it in the worker's own context, through the module's
   `store_state`, which returns whether the store is locked, record numbers, calls and their
-  states, terminal evidence and disposition reports and standing continuations, with command
+  states, job identities, terminal and job evidence, findings, disposition reports and standing
+  continuations, with command
   bytes as hex and no key material.
 - **The stores' contents.** It reads them with an independent reader, `tracer/src/reader.rs`.
   The reader is written from the format's text and never calls the harness's store code. It
@@ -656,13 +780,15 @@ browser holds:
 In headless Chromium 154 a new tab hides the one before it, which then restarts its worker, as
 page hide must. The cases account for it.
 
+The full run has 30 cases.
+
 The cases:
 
 | Case | What the fixtures show |
 |---|---|
 | the served build loads | its worker comes up and nothing errs, and the page has no `tauWeb` global and no global holding the worker. With no store, the page offers Create alone, and a request is refused before any contact. A store is created; then, called in its worker on the machine the tracer build pins, it refuses for the missing pin, the relay accepts no connection and the sshd sees none, and nothing is appended |
 | create and unlock (twr-ggw.5, `CNF-82`) | the page offers Create, stating the 16-character minimum and a password manager, and refuses 15 characters. The independent reader reads the store the browser created, from the passphrase alone: record 0, the seed. A store the reader built, put into OPFS, unlocks in the browser and replays its command, and the unlock writes nothing: WebCrypto's PBKDF2 agrees with the host's |
-| 1. recorded, then sent (`CNF-30`, `ARC-8`) | exactly one relay connection; the sshd received exactly the journal entry, which the replayed state holds as approved intent 1 and terminal 2 (exit status 7), and the output and exit status came back. With the append made to fail, the sshd received no `exec`, read only once that SSH connection has ended at the sshd |
+| 1. recorded, then sent (`CNF-30`, `ARC-8`) | exactly one relay connection; the sshd received exactly the wrapper recomposed from the journal entry, and its job record holds exactly the journal command; the replayed state holds approved intent 1 and job terminal 2 (exit status 7), and the output and exit status came back. With the append made to fail, the sshd received no `exec`, read only once that SSH connection has ended at the sshd |
 | a failed append is not applied (twr-ggw.5 AC2, `STA-3`) | that failed append failed at its `move()`, a real OPFS call; the replayed state has no record for it, and none appears after a reload and an unlock |
 | 2. a wrong host key halts (`CNF-21`, `SEC-11`) | no authentication attempt, no `exec`, no journal entry, and exactly one connection |
 | 3. no pin, no contact (`CNF-23`'s no-pin case, `CHN-R4`) | no TCP connection accepted at the relay, none at the sshd, no dial, and nothing pinned afterwards |
@@ -677,6 +803,14 @@ The cases:
 | dispositions (twr-ggw.7, `STA-24`) | the independent reader builds a destructive disposition: the request is refused before contact, with no relay connection, SSH connection or append. Replacing it with a continuing disposition admits the command and journals its terminal record |
 | one writer (twr-ggw.5, `STA-1`, `STA-7`) | a second tab opens, which hides the first and restarts its worker, so either tab's worker may win the lock. The holder is the tab that offers Unlock while the other says it is waiting; the roles follow from that. The holder unlocks. The other says it is waiting for the store and offers neither Create nor Unlock; its worker has not read the store, runs nothing and appends nothing. Once the holder's tab closes, the other offers Unlock and unlocks the same store |
 | persistent storage (twr-ggw.5 AC6, `STA-23`) | with the `persistent-storage` permission denied, then granted, through `Browser.setPermission`: `navigator.storage.persisted()` reads false, then true, and the page shows the refusal, then "Persistent storage is granted." (`persisted()` already reads true, so that load makes no request), each with the statement that this is a request, not a guarantee |
+| job drop (`CNF-40`) | lock drops a several-second command after the fixture sees its launch; collection waits until its observed end, reads the record, launches nothing and never resends the command |
+| completed drop (`CNF-54`) | the job finishes while disconnected; collection immediately reads both streams and a nonzero exit from its persistent files |
+| reboot (`CNF-55`) | the persistent finished record still settles; a running old-boot command reads ended without a terminal; a removed record reads missing and stays unresolved; neither is waited on |
+| background stdout (`STA-20a`) | `sleep 30 & echo hi` returns promptly with output and exit 0; the fixture saw the command launch and end |
+| received-command finding (`CNF-56`) | the fixture changes the recorded command during a live job; the result still settles with its exit and output, and the advisory finding survives reload and unlock; the reader reads every new shape |
+| disposition collection (`CNF-110`, box-plane case) | all four continuations over a real dropped job: collection reaches the relay and sshd, launches nothing, appends evidence and no intent; disposition and disposed state stay unchanged; destructive continuations refuse commands before contact both before and after collection, continuing ones admit them |
+| live signal | a self-killed command returns unresolved with ended evidence, partial output and advisory agreement; no terminal is journaled |
+| collection after a bad record | a malformed first record reports its failure; the later finished job still returns its output and exit 23 and receives a terminal record |
 | no plaintext (twr-ggw.5 AC4 and AC5, `CNF-15`, `STG-10`), in each build | from the passphrase the tracer typed, the independent reader learns the wrapping key, the data key and the seed. None of these appears, raw, hex, HEX, base64 or base64url (whole, or inside a longer value at any byte alignment), in any OPFS file: the passphrase, the wrapping and data keys, the mnemonic, the entropy, the 64-byte seed, the seed identifier, and roles 0–4's private and public keys at indices 0 and 1, plus the test keys in the tracer build. Local storage, session storage, IndexedDB and Cache Storage hold nothing, and no service worker is registered. A passphrase reaches the worker only as the one create or unlock message, and no message from the worker carries any of the items, in its text or in a binary payload's bytes; any other passphrase occurrence, text or binary, is a finding. In the tracer build's case, the sixteen negative controls listed under "The messages" run first, through the same guarded serializer and the same check, and each must be reported for its own reason. The fields were empty after every submit. The HTTPS fixtures' requests and the console hold none |
 
 In cases 6–8 the relay fixture also accepted exactly one connection, dialed nothing, and its log
@@ -836,12 +970,12 @@ rest of `CNF-88` has no code here yet.
 | `spec-checks` | `spec/bundle/cors-probe.sh` | `CNF-4` |
 | | `spec/prototypes/spec-checks/check-install-disks.py`, and `--baseline`, which must fail | evidence for `CNF-85` |
 | `build` (the job is `CNF-1`) | `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings` | `CNF-2`, at that strictness |
-| | `cargo test --locked` | runs `build.rs`, so the gates above run here, and the `[session]` fixtures (`CNF-88`'s build fixtures); the relay matrix, `CNF-87`'s fixture half; the seed's tests, `CNF-83`'s derivation tests and `CNF-13`'s tests; the local store's, `CNF-82`'s and `CNF-15`'s host half (below); dispatch and journal recovery for `CNF-29`'s box-plane case, `CNF-30`, `CNF-39` and `STA-24` dispositions; and allocation's, `CNF-72`'s tests and the companion comparison against the allocation witness file (ADR-0032), with `CNF-3`'s three breaks as its unit tests |
+| | `cargo test --locked` | runs `build.rs`, so the gates above run here, and the `[session]` fixtures (`CNF-88`'s build fixtures); the relay matrix, `CNF-87`'s fixture half; the seed's tests, `CNF-83`'s derivation tests and `CNF-13`'s tests; the local store's, `CNF-82`'s and `CNF-15`'s host half (below); dispatch and journal recovery for `CNF-29`'s box-plane case, `CNF-30`, `CNF-39` and `STA-24` dispositions; job classification, channel deliveries, unresolved evidence, append failures, replay and all four dispositions, plus real-shell signals, high exit codes, missing and unreadable record files, NUL-corrupted scalars, exact scalar forms, the reader and replay exit ceiling, incomplete unreadable entries, owned-child cleanup, recycled PIDs, stale fixture groups, exact sentinel matching, drop, duplicate-id, boot, output and cross-store identity tests for `CNF-40`, `CNF-54`–`CNF-56` and `CNF-110`'s collection case; and allocation's, `CNF-72`'s tests and the companion comparison against the allocation witness file (ADR-0032), with `CNF-3`'s three breaks as its unit tests |
 | `web` (the job is `CNF-1` for the browser build) | `cargo clippy -D warnings` on wasm32, the served and the tracer build | `CNF-2`, on the new target |
 | | `scripts/check-adr-0024.sh` | spec ADR-0024's build check |
 | | `scripts/build-web.sh served`, then `tracer check-absence dist/served` | the served build (`ARC-32`) carries no test key, pin source or test switch |
 | | `tracer check-csp dist/served` | `ARC-33`'s policy, exactly |
-| | `scripts/tracer.sh`, in headless Chrome | `CNF-30`, `CNF-21`, `CNF-23`'s no-pin case and `ARC-33`, as above, the relay refusals of `CNF-87` a correct client meets, and the local store's `CNF-82` and `CNF-15` in the browser |
+| | `scripts/tracer.sh`, in headless Chrome | `CNF-30`, `CNF-21`, `CNF-23`'s no-pin case and `ARC-33`, as above, the relay refusals of `CNF-87` a correct client meets, and the local store's `CNF-82` and `CNF-15` in the browser; `CNF-40`, `CNF-54`–`CNF-56`, `STA-20a` and `CNF-110`'s box-plane collection case |
 
 Every job checks out the submodule; `spec-checks` takes the full history, which
 `check-install-disks.py --baseline` reads to reconstruct the pre-fix brief. `web` installs
@@ -872,6 +1006,6 @@ Restored, the copy byte-identical to the pinned file, it went green, and the pat
 undone, the test file byte-identical to its saved copy. The same three breaks stay as the
 comparator's unit tests.
 The tracer was broken the same way on 2026-10-12: case 1 was made to expect exit status 8 where
-the fixture sshd answers the command with 7. `scripts/tracer.sh` (the `web` job's command, run
+the fixture command exits with 7. `scripts/tracer.sh` (the `web` job's command, run
 locally, not on GitHub) exited 1, naming case 1 and the assertion "the output and exit status came back". Restored, it
 exited 0.

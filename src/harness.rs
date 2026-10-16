@@ -31,6 +31,13 @@ pub trait Journal {
     async fn terminal(&mut self, terminal: &crate::dispatch::Terminal) -> Result<u64, String>;
     /// The record appended under `seq`, as replayed or applied.
     async fn read(&self, seq: u64) -> Option<Entry>;
+    async fn intent(&self, call: u64) -> Option<crate::dispatch::Intent>;
+    /// A read bypasses dispositions and records no intent.
+    async fn collectable(&self, machine: &str) -> Result<Vec<crate::dispatch::Intent>, String>;
+    async fn job_evidence(
+        &mut self,
+        evidence: &crate::jobs::Evidence,
+    ) -> Result<crate::jobs::Report, String>;
 }
 
 /// Where host-key pins come from. Read-only here: no path in this module stores a key it was

@@ -2,8 +2,8 @@
 //!
 //! - **the fixture sshd**: a real SSH server (russh) whose host key the tracer chooses, which
 //!   admits the test client key and records every connection, authentication attempt and
-//!   channel request, the `exec` command byte for byte. It starts no process: it answers the
-//!   tracer's one command with the answer the tracer gives it, and any other with a failure;
+//!   channel request, the `exec` command byte for byte. It runs real POSIX shells with fixed
+//!   machine paths mapped into its own persistent scratch directory;
 //! - **the relay fixture**: paid-tcp-relay's handshake at `844e834` over `wss:`, `WIR-4`–`WIR-10`
 //!   — a fresh challenge (`WIR-4`); `WIR-6` checks 1–4 and 6 in order against hand-recorded
 //!   passes (`PAS-6`), each a key, its destination hosts and an expiry, with the limits of that
@@ -88,11 +88,25 @@ pub struct Sshd {
     /// connection from an earlier case that ends late is still counted against its own accept.
     pub accepted: Arc<AtomicU32>,
     pub ended: Arc<AtomicU32>,
+    pub machine: Arc<crate::machine::Machine>,
+    listener: tokio::task::JoinHandle<()>,
+    tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 impl Sshd {
     /// Waits up to 30 s until every connection the sshd accepted has ended, so everything the
     /// client sent before closing has been handled and recorded; whether they all ended.
+    pub async fn cleanup(&self) {
+        self.listener.abort();
+        self.machine.reboot();
+        self.all_ended().await;
+        let tasks = std::mem::take(&mut *self.tasks.lock().expect("exec tasks"));
+        for task in tasks {
+            let _ = task.await;
+        }
+        self.machine.cleanup();
+    }
+
     pub async fn all_ended(&self) -> bool {
         for _ in 0..600 {
             if self.ended.load(Ordering::SeqCst) == self.accepted.load(Ordering::SeqCst) {
@@ -104,28 +118,17 @@ impl Sshd {
     }
 }
 
-/// The one command the fixture sshd answers, and its answer. It runs nothing. It never answers
-/// `hold`: that command's channel stays open until the client goes, a command in flight.
-pub struct Answer {
-    pub command: &'static str,
-    pub stdout: &'static str,
-    pub stderr: &'static str,
-    pub exit_status: u32,
-    pub hold: &'static str,
-}
-
-/// What the fixture sshd answers any other command with.
-const UNKNOWN_COMMAND: &str = "fixture sshd: not the tracer's command\n";
-const UNKNOWN_EXIT_STATUS: u32 = 127;
-
-pub async fn sshd(seen: Observed, answer: Answer) -> Sshd {
+pub async fn sshd(seen: Observed) -> Sshd {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("sshd bind");
     let port = listener.local_addr().expect("sshd address").port();
     let present_other = Arc::new(AtomicBool::new(false));
     let (accepted, ended) = (Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0)));
     let (other, accepts, ends) = (present_other.clone(), accepted.clone(), ended.clone());
-    let answer = Arc::new(answer);
-    tokio::spawn(async move {
+    let machine = Arc::new(crate::machine::Machine::new());
+    let fixture = machine.clone();
+    let tasks = Arc::new(Mutex::new(Vec::new()));
+    let exec_tasks = tasks.clone();
+    let listener = tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 continue;
@@ -145,7 +148,9 @@ pub async fn sshd(seen: Observed, answer: Answer) -> Sshd {
             });
             let handler = SshSession {
                 seen: seen.clone(),
-                answer: answer.clone(),
+                machine: fixture.clone(),
+                execs: Arc::default(),
+                tasks: exec_tasks.clone(),
             };
             let ends = ends.clone();
             tokio::spawn(async move {
@@ -161,12 +166,17 @@ pub async fn sshd(seen: Observed, answer: Answer) -> Sshd {
         present_other,
         accepted,
         ended,
+        machine,
+        listener,
+        tasks,
     }
 }
 
 struct SshSession {
     seen: Observed,
-    answer: Arc<Answer>,
+    machine: Arc<crate::machine::Machine>,
+    execs: Arc<Mutex<Vec<crate::machine::ExecGroup>>>,
+    tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 impl SshSession {
@@ -268,28 +278,57 @@ impl server::Handler for SshSession {
     ) -> Result<(), Self::Error> {
         observe(&self.seen, |s| s.ssh_exec.push(data.to_vec()));
         session.channel_success(channel)?;
-        if data == self.answer.hold.as_bytes() {
-            return Ok(());
-        }
-        if data == b"close-without-status" {
-            session.eof(channel)?;
-            return session.close(channel);
-        }
-        let (stdout, stderr, status) = if data == self.answer.command.as_bytes() {
-            (
-                self.answer.stdout,
-                self.answer.stderr,
-                self.answer.exit_status,
-            )
-        } else {
-            ("", UNKNOWN_COMMAND, UNKNOWN_EXIT_STATUS)
-        };
-        observe(&self.seen, |s| s.ssh_exit.push(status));
-        session.data(channel, stdout.as_bytes().to_vec())?;
-        session.extended_data(channel, 1, stderr.as_bytes().to_vec())?;
-        session.exit_status_request(channel, status)?;
-        session.eof(channel)?;
-        session.close(channel)
+        let mapped = self.machine.map(data);
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", &mapped])
+            .process_group(0)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("fixture exec");
+        self.execs
+            .lock()
+            .expect("exec groups")
+            .push(crate::machine::ExecGroup::new(
+                child.id().expect("exec pid"),
+            ));
+        let close_without_status = closes_without_status(data);
+        let handle = session.handle();
+        let seen = self.seen.clone();
+        let machine = self.machine.clone();
+        let task = tokio::spawn(async move {
+            // Observe launches while the exec is waiting, not from the harness's report.
+            let mut stdout = child.stdout.take().expect("stdout");
+            let mut stderr = child.stderr.take().expect("stderr");
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            {
+                let output = async {
+                    tokio::try_join!(stdout.read_to_end(&mut out), stderr.read_to_end(&mut err))
+                };
+                tokio::pin!(output);
+                loop {
+                    tokio::select! {
+                        _ = &mut output => break,
+                        _ = tokio::time::sleep(Duration::from_millis(10)) => { machine.observe(); }
+                    }
+                }
+            }
+            let status = child.wait().await.expect("exec wait");
+            machine.observe();
+            if !close_without_status {
+                let status = status.code().unwrap_or(255) as u32;
+                observe(&seen, |s| s.ssh_exit.push(status));
+                let _ = handle.data(channel, out).await;
+                let _ = handle.extended_data(channel, 1, err).await;
+                let _ = handle.exit_status_request(channel, status).await;
+            }
+            let _ = handle.eof(channel).await;
+            let _ = handle.close(channel).await;
+        });
+        self.tasks.lock().expect("exec tasks").push(task);
+        Ok(())
     }
 }
 
@@ -1007,4 +1046,40 @@ async fn serve(
     };
     stream.write_all(&response).await?;
     stream.shutdown().await
+}
+
+fn closes_without_status(data: &[u8]) -> bool {
+    let sentinel = tau_web::jobs::launch(&"0".repeat(48), "", b"close-without-status");
+    let command_line = sentinel
+        .lines()
+        .find(|line| line.ends_with("> \"$d/command\" || exit 1"))
+        .expect("command operand");
+    data.starts_with(b"# tau-web job launch ")
+        && std::str::from_utf8(data).is_ok_and(|text| text.lines().any(|line| line == command_line))
+}
+
+#[cfg(test)]
+mod job_trigger_tests {
+    use super::*;
+
+    #[test]
+    fn close_without_status_requires_exact_command_operand() {
+        let id = "a".repeat(48);
+        assert!(closes_without_status(
+            tau_web::jobs::launch(&id, "fixture", b"close-without-status").as_bytes()
+        ));
+        for (machine, command) in [
+            ("close", "exit 0"),
+            ("close-without-status", "exit 0"),
+            ("fixture", "echo close-without-status"),
+            ("fixture", "close-without-status; exit 0"),
+        ] {
+            assert!(
+                !closes_without_status(
+                    tau_web::jobs::launch(&id, machine, command.as_bytes()).as_bytes()
+                ),
+                "{machine}: {command}"
+            );
+        }
+    }
 }

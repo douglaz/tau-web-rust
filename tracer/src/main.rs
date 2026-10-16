@@ -17,7 +17,9 @@
 mod cdp;
 mod checks;
 mod fixtures;
+mod job_cases;
 mod keys;
+mod machine;
 #[cfg(test)]
 mod matrix;
 mod reader;
@@ -57,16 +59,15 @@ async fn main() {
 }
 
 /// The command case 1 records and sends, with quoting and a non-ASCII byte sequence, so "byte
-/// for byte" bites. The fixture sshd runs nothing: it answers these exact bytes with the output
-/// below, both streams and a non-zero exit, and anything else with a failure, so "output and
-/// exit status" bites too.
+/// for byte" bites. The fixture runs these exact bytes in a real shell, yielding both streams
+/// and a nonzero exit, so "output and exit status" bites too.
 const COMMAND: &str =
     "printf '%s\\n' 'tau-web tracer — recorded, then sent'; echo 'to stderr' >&2; exit 7";
 const STDOUT: &str = "tau-web tracer — recorded, then sent\n";
 const STDERR: &str = "to stderr\n";
 const EXIT_STATUS: u32 = 7;
-/// A command the fixture sshd receives and never answers: a command in flight at a lock.
-const HELD: &str = "sleep infinity # tau-web tracer: held in flight";
+/// A finite command still in flight when the lock ends its connection.
+const HELD: &str = "sleep 15 # tau-web tracer: held in flight";
 
 /// The passphrases the tracer types. The tracer build's is not ASCII, so its UTF-8 bytes are what
 /// the worker counts and derives from.
@@ -114,17 +115,7 @@ async fn run(served: &Path, tracer: &Path) -> Result<(), String> {
 
     let seen = Observed::default();
     let tls = fixtures::tls();
-    let sshd = fixtures::sshd(
-        seen.clone(),
-        fixtures::Answer {
-            command: COMMAND,
-            stdout: STDOUT,
-            stderr: STDERR,
-            exit_status: EXIT_STATUS,
-            hold: HELD,
-        },
-    )
-    .await;
+    let sshd = fixtures::sshd(seen.clone()).await;
     // The test relay key's pass: the sshd's host, on any port, for an hour (PAS-6, paid-tcp-relay
     // 844e834: a hand-recorded pass is never unbounded).
     let pass = fixtures::Pass {
@@ -176,6 +167,7 @@ async fn run(served: &Path, tracer: &Path) -> Result<(), String> {
     )
     .await;
     browser.close().await;
+    sshd.cleanup().await;
 
     // The summary names every case that ran, even when one stopped the run.
     println!("\n== summary");
@@ -597,6 +589,15 @@ impl Run<'_> {
         Ok(report)
     }
 
+    async fn harness_collect(&self, worker: &Worker, args: Value) -> Result<Value, String> {
+        self.browser
+            .evaluate(
+                &worker.session,
+                &run_expression(&args).replace("module.run_command(", "module.collect_jobs("),
+            )
+            .await
+    }
+
     /// Starts one command in the worker and returns at once, leaving it in flight.
     async fn harness_start(&self, worker: &Worker, args: Value) -> Result<(), String> {
         self.browser
@@ -684,6 +685,17 @@ fn run_expression(args: &Value) -> String {
             return JSON.parse(await module.run_command({request}));
         }})()"
     )
+}
+
+fn replay_job(outcome: &Value) -> &str {
+    outcome["job_record"]["job"].as_str().unwrap_or("")
+}
+
+fn exec_command_is(seen: &Seen, command: &str) -> bool {
+    matches!(seen.ssh_exec.as_slice(), [bytes] if {
+        let id = std::str::from_utf8(bytes).ok().and_then(|s| s.lines().next()).and_then(|s| s.strip_prefix("# tau-web job launch "));
+        id.is_some_and(|id| tau_web::jobs::valid_id(id) && bytes == tau_web::jobs::launch(id, "fixture", command.as_bytes()).as_bytes())
+    })
 }
 
 /// The store's files from a dump of the whole file system.
@@ -786,6 +798,12 @@ async fn run_cases(
         "with no unlocked store, the served harness refuses before any contact (STA-23)",
         report == locked && observed.relay_accepted == 0 && observed.ssh_connections == 0,
     );
+    let report = run.harness_collect(&served_worker, args("fixture")).await?;
+    let observed = take(seen);
+    case.check(
+        "collection also refuses while locked before contact",
+        report == locked && observed.relay_accepted == 0 && observed.ssh_connections == 0,
+    );
     let view = run.submit(&served_tab, "create", SERVED_PASSPHRASE).await?;
     case.check(
         "a store is created in the served build, and the page offers Lock",
@@ -805,6 +823,15 @@ async fn run_cases(
     case.check(
         "nothing was appended: the store holds the seed record alone",
         run.inspect(&served_worker).await?["records"] == json!([0]),
+    );
+    let report = run.harness_collect(&served_worker, args("fixture")).await?;
+    let observed = take(seen);
+    case.check(
+        "served collection refuses the missing pin before contact or append",
+        report == json!({"outcome":{"refused":"no-pin"}})
+            && observed.relay_accepted == 0
+            && observed.ssh_connections == 0
+            && run.inspect(&served_worker).await?["records"] == json!([0]),
     );
     cases.push(case);
 
@@ -851,7 +878,7 @@ async fn run_cases(
     case.check(
         "the worker's replayed state is record 0 alone",
         run.inspect(&worker).await?
-            == json!({ "state": "unlocked", "locked": false, "records": [0], "commands": [], "calls": [], "terminals": [], "dispositions": [], "standing": {} }),
+            == json!({ "state": "unlocked", "locked": false, "records": [0], "commands": [], "calls": [], "terminals": [], "dispositions": [], "standing": {}, "jobs": [] }),
     );
     let host = reader::build(
         HOST_PASSPHRASE,
@@ -1043,6 +1070,28 @@ async fn run_cases(
     let report = run.harness_run(&worker, args("fixture")).await?;
     let observed = take(seen);
     show(&observed);
+    let journal = reader::read(&store_files(&run.dump(&tab).await?), PASSPHRASE)?;
+    let intent: Value = serde_json::from_slice(
+        &journal
+            .records
+            .iter()
+            .find(|(n, _)| *n == 1)
+            .ok_or("missing intent 1")?
+            .1,
+    )
+    .map_err(|e| e.to_string())?;
+    let journal_job = intent["intent"]["job"]
+        .as_str()
+        .ok_or("missing journal job identity")?;
+    let journal_machine = intent["intent"]["machine"]
+        .as_str()
+        .ok_or("missing journal machine")?;
+    let journal_command = hex::decode(
+        intent["intent"]["command"]
+            .as_str()
+            .ok_or("missing journal command")?,
+    )
+    .map_err(|e| e.to_string())?;
     let outcome = &report["outcome"];
     let recorded = outcome["recorded"]
         .as_str()
@@ -1064,7 +1113,16 @@ async fn run_cases(
     );
     case.check(
         "the fixture sshd received exactly the journal entry, byte for byte",
-        observed.ssh_exec == [recorded.clone()],
+        observed.ssh_exec
+            == [hex::decode(outcome["sent"].as_str().unwrap_or("")).unwrap_or_default()]
+            && outcome["sent"]
+                == hex::encode(tau_web::jobs::launch(
+                    journal_job,
+                    journal_machine,
+                    &journal_command,
+                ))
+            && std::fs::read(sshd.machine.path(journal_job, "command")).ok()
+                == Some(journal_command.clone()),
     );
     case.check(
         "the journal entry is the command",
@@ -1072,7 +1130,7 @@ async fn run_cases(
     );
     case.check(
         "the harness's read-back matches what it sent",
-        outcome["sent"] == outcome["recorded"] && outcome["recorded_machine"] == "fixture",
+        outcome["recorded"] == hex::encode(COMMAND) && outcome["recorded_machine"] == "fixture",
     );
     case.check(
         "the journal holds that one new entry",
@@ -1097,7 +1155,7 @@ async fn run_cases(
         outcome["stdout"] == STDOUT
             && outcome["stderr"] == STDERR
             && outcome["exit_status"] == EXIT_STATUS
-            && observed.ssh_exit == [EXIT_STATUS],
+            && observed.ssh_exit == [0],
     );
     case.check(
         "one exec on a channel: no pty, shell or subsystem (ARC-7)",
@@ -1188,7 +1246,7 @@ async fn run_cases(
             && call.as_u64().is_some()
             && report["outcome"].get("refused").is_none()
             && report["outcome"].get("done").is_none()
-            && observed.ssh_exec == [b"close-without-status".to_vec()]
+            && exec_command_is(&observed, "close-without-status")
             && observed.ssh_exit.is_empty(),
     );
     case.check(
@@ -1257,7 +1315,7 @@ async fn run_cases(
     case.check(
         "a continuing replacement dispatches and commits the exit status terminal",
         report["outcome"]["done"] == true
-            && observed.ssh_exec == [COMMAND.as_bytes().to_vec()]
+            && exec_command_is(&observed, COMMAND)
             && after["standing"]["fixture"]["continuation"] == "as_if_not_done"
             && after["standing"]["fixture"]["report"]["replaces"] == destructive
             && after["calls"].as_array().is_some_and(|calls| {
@@ -1520,9 +1578,8 @@ async fn run_cases(
     .await?;
     cases.push(case);
 
-    let mut case = Case::new(
-        "explicit lock requires unlock again, and ends a command in flight (twr-ggw.5 AC3, CNF-82)",
-    );
+    let mut case =
+        Case::new("explicit lock requires unlock again, and ends its exec (twr-ggw.5 AC3, CNF-82)");
     // Text typed in both fields and never submitted goes with the lock (SEC-5 row 18).
     let mut left = Value::Null;
     worker = held_then(run, &mut case, &tab, worker, &args, "Lock", async {
@@ -1547,9 +1604,8 @@ async fn run_cases(
     );
     cases.push(case);
 
-    let mut case = Case::new(
-        "page hide requires unlock again, and ends a command in flight (twr-ggw.5 AC3, CNF-82)",
-    );
+    let mut case =
+        Case::new("page hide requires unlock again, and ends its exec (twr-ggw.5 AC3, CNF-82)");
     browser
         .evaluate(
             &tab.session,
@@ -1617,7 +1673,7 @@ async fn run_cases(
     let mut held = args("fixture");
     held["command"] = HELD.into();
     run.harness_start(&worker, held).await?;
-    let received = settle_for(seen, 20, |s| s.ssh_exec == [HELD.as_bytes().to_vec()]).await;
+    let received = settle_for(seen, 20, |s| exec_command_is(s, HELD)).await;
     case.check(
         "before Page.crash the sshd received the held exec",
         received,
@@ -1844,6 +1900,7 @@ async fn run_cases(
         .await?;
     cases.push(case);
 
+    job_cases::run(run, &tab, worker, &args, cases).await?;
     // twr-ggw.5 AC4, AC5: no plaintext secret in any storage, message, request or log, in both builds.
     run.collect(&tab).await?;
     run.collect(&served_tab).await?;
@@ -2235,6 +2292,15 @@ async fn relocked(
         "a command is refused while locked, with no TCP connection at the relay",
         report == json!({ "outcome": { "refused": "locked" } }) && observed.relay_accepted == 0,
     );
+    let report = run.harness_collect(worker, request.clone()).await?;
+    let observed = take(run.seen);
+    case.check(
+        "collection is refused after lock without contact or evidence",
+        report == json!({"outcome":{"refused":"locked"}})
+            && observed.relay_accepted == 0
+            && observed.ssh_connections == 0
+            && run.inspect(worker).await?["locked"] == true,
+    );
     let view = run.submit(tab, "unlock", PASSPHRASE).await?;
     let replayed = run.inspect(worker).await?;
     println!("   replayed: {replayed}");
@@ -2245,8 +2311,7 @@ async fn relocked(
     Ok(())
 }
 
-/// Runs `HELD`, which the sshd never answers, locks by `how` once the sshd has its `exec`, and
-/// checks the lock ended it: the relay fixture sees the client's WebSocket close and the sshd its
+/// Runs `HELD`, locks by `how` once the sshd has its `exec`, and checks the connection ended: the relay fixture sees the client's WebSocket close and the sshd its
 /// connection end; then `relocked`, and the held command, in the replayed state, is never sent
 /// again. The new worker.
 async fn held_then(
@@ -2263,7 +2328,7 @@ async fn held_then(
     let mut held = args("fixture");
     held["command"] = HELD.into();
     run.harness_start(&worker, held.clone()).await?;
-    let received = settle_for(run.seen, 20, |s| s.ssh_exec == [HELD.as_bytes().to_vec()]).await;
+    let received = settle_for(run.seen, 20, |s| exec_command_is(s, HELD)).await;
     case.check(
         &format!("{how}: the sshd received the held command's exec"),
         received,
