@@ -277,6 +277,103 @@ mod tests {
         serde_json::from_slice(&output.stdout).unwrap_or_else(|e| panic!("{e}: {:?}", output))
     }
 
+    fn replace_once(text: &str, from: &str, to: &str) -> String {
+        assert_eq!(text.matches(from).count(), 1, "scratch anchor: {from}");
+        text.replace(from, to)
+    }
+
+    #[tokio::test]
+    async fn runner_rechecks_pid_after_fast_command_is_reaped() {
+        let machine = Machine::new();
+        let id = "a".repeat(48);
+        let original = include_str!("../../src/jobs/runner.sh");
+        // The interpreter cannot publish pid until the runner has entered the gap.
+        let runner = replace_once(
+            original,
+            "    d=$1\n",
+            "    d=$1\n    while [ ! -f \"$d/pid-gap\" ]; do sleep 0.01; done\n    sleep 0.05\n",
+        );
+        let runner = replace_once(
+            &runner,
+            "while [ ! -f \"$d/pid\" ]; do\n",
+            "while [ ! -f \"$d/pid\" ]; do\n    : > \"$d/pid-gap\"\n    sleep 0.2\n    while kill -0 \"$command_pid\" 2>/dev/null; do sleep 0.01; done\n",
+        );
+        let launch = replace_once(
+            &jobs::launch(&id, "fixture", b"exit 7"),
+            &shell_quote(original),
+            &shell_quote(&runner),
+        );
+        let (child, _guard) = start(&machine, &launch);
+        let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap();
+        let (read, _read_guard) = start(&machine, &jobs::collect(&id));
+        let record = result(read).await;
+        let ready = machine.path(&id, "ready").is_file();
+        let exit = std::fs::read_to_string(machine.path(&id, "exit")).ok();
+        println!(
+            "runner gap: wrapper={}, ready={ready}, exit={exit:?}, record={record:?}",
+            output.status
+        );
+        assert!(machine.path(&id, "pid-gap").is_file());
+        assert!(
+            ready,
+            "runner lost ready after the command published pid and ended"
+        );
+        assert_eq!(exit.as_deref(), Some("7\n"));
+        assert!(output.status.success());
+        assert_eq!(record.classify("fixture"), State::Finished);
+        assert!(matches!(
+            record,
+            Record::Present {
+                exit_status: Some(7),
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn launch_rechecks_ready_after_fast_runner_is_reaped() {
+        let machine = Machine::new();
+        let id = "b".repeat(48);
+        // The runner cannot start until the launch has entered its ready gap.
+        let launch = replace_once(
+            &jobs::launch(&id, "fixture", b"exit 7"),
+            "umask 077\nd=$1\n",
+            "umask 077\nd=$1\nwhile [ ! -f \"$d/ready-gap\" ]; do sleep 0.01; done\nsleep 0.05\n",
+        );
+        let launch = replace_once(
+            &launch,
+            "while [ ! -f \"$d/ready\" ]; do\n",
+            "while [ ! -f \"$d/ready\" ]; do\n    : > \"$d/ready-gap\"\n    sleep 0.2\n    while kill -0 \"$launcher\" 2>/dev/null; do sleep 0.01; done\n",
+        );
+        let (child, _guard) = start(&machine, &launch);
+        let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap();
+        println!(
+            "launch gap: wrapper={}, stdout={:?}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(machine.path(&id, "ready-gap").is_file());
+        assert!(
+            output.status.success(),
+            "launch lost the ready file: {output:?}"
+        );
+        let record: Record = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(record.classify("fixture"), State::Finished);
+        assert!(matches!(
+            record,
+            Record::Present {
+                exit_status: Some(7),
+                ..
+            }
+        ));
+    }
+
     async fn launched(machine: &Machine, id: &str) -> Job {
         for _ in 0..300 {
             if let Some(job) = machine.observe().get(id) {

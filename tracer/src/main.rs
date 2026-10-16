@@ -1031,6 +1031,68 @@ async fn run_cases(
     );
     cases.push(case);
 
+    let mut case = Case::new("oversized launch refuses before intent and contact (twr-ggw.71)");
+    let original = store_files(&run.dump(&tab).await?);
+    let before = run.inspect(&worker).await?;
+    let command = "x".repeat(30_000);
+    let bytes = tau_web::jobs::launch_size("fixture", command.as_bytes());
+    let mut oversized = args("fixture");
+    oversized["command"] = command.into();
+    take(seen);
+    fresh_pace(relay);
+    let report = run.harness_run(&worker, oversized).await?;
+    sshd.all_ended().await;
+    let observed = take(seen);
+    println!("   oversized launch outcome: {}", report["outcome"]);
+    case.check(
+        "the refusal explains the command is too long, with composed bytes and limit",
+        report["outcome"]
+            == json!({
+                "refused": "launch-too-long",
+                "why": "command is too long to launch; shorten the command",
+                "bytes": bytes,
+                "limit": 131071,
+            }),
+    );
+    case.check(
+        "no intent, call or record is journaled",
+        report["journal_entries"] == json!([])
+            && run.inspect(&worker).await? == before
+            && store_files(&run.dump(&tab).await?) == original,
+    );
+    case.check(
+        "the relay accepted no connection and the sshd received no connection or exec",
+        observed.relay_accepted == 0
+            && observed.relay_dials.is_empty()
+            && observed.ssh_connections == 0
+            && observed.ssh_exec.is_empty(),
+    );
+    let mut normal = args("fixture");
+    normal["command"] = "echo ok; exit 7".into();
+    fresh_pace(relay);
+    let report = run.harness_run(&worker, normal).await?;
+    let after = run.inspect(&worker).await?;
+    let observed = take(seen);
+    case.check(
+        "the same store admits the next command and records its exit and terminal",
+        report["outcome"]["done"] == true
+            && report["outcome"]["stdout"] == "ok\n"
+            && report["outcome"]["exit_status"] == 7
+            && report["journal_entries"] == json!([hex::encode("echo ok; exit 7")])
+            && exec_command_is(&observed, "echo ok; exit 7")
+            && after["terminals"].as_array().is_some_and(|terminals| {
+                terminals.iter().any(|terminal| {
+                    terminal["number"] == report["outcome"]["terminal"]
+                        && terminal["exit_status"] == 7
+                })
+            }),
+    );
+    run.put(&tab, &original).await?;
+    worker = run.reload(&tab, &worker).await?;
+    run.submit(&tab, "unlock", PASSPHRASE).await?;
+    take(seen);
+    cases.push(case);
+
     // Case 5: the relay fixture's AUTH check is real.
     let mut case = Case::new("5. a wrongly signed AUTH is refused, and nothing is dialed");
     let mut tampered = args("fixture");

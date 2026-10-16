@@ -154,7 +154,11 @@ the unresolved response also includes `job_record`, with the same state, compari
 and exit status as a finished response. Evidence whose append failed has `number:null`. The command's exit code is read from
 its job record and journaled before completion is reported; the SSH wrapper's own exit status
 never settles the command. Pre-intent refusals keep their existing shape; a disposition refusal
-is `{"refused":"disposition","disposition":2,"continuation":"abandonment"}`.
+is `{"refused":"disposition","disposition":2,"continuation":"abandonment"}`. An oversized
+launch is refused before contact or intent with
+`{"refused":"launch-too-long","why":"command is too long to launch; shorten the command","bytes":156406,"limit":131071}`
+(the composed `bytes` vary with the command and machine). It allocates no call and leaves the
+store able to admit the next command.
 
 Typed cloud-plane operations and their barriers belong to twr-ggw.8; continuation dispatch to
 twr-ggw.40, twr-ggw.45 and twr-i6k.3; sessions and approved
@@ -171,15 +175,26 @@ random job identity, lowercase hex, recorded before transmission. It is independ
 store's record number and exposes no store-wide identifier. Older intents without a job
 identity remain unresolved and are not collected.
 
+Before any contact or intent, the harness measures the whole composed launch, using a
+48-byte placeholder for the job identity. `MAX_LAUNCH_BYTES` is 131071: sshd runs this text as
+one `$SHELL -c` argument, and Linux `MAX_ARG_STRLEN` is 32 × `PAGE_SIZE`, or 131072 bytes at
+4 KiB pages, including the terminating NUL. Larger pages only raise that limit. A longer
+launch is refused with its size, limit and a request to shorten the command; nothing is
+journaled. This is a byte bound on the wrapper, including the octal-encoded machine and
+command and embedded scripts, rather than on the command alone.
+
 The wrapper reserves `/var/lib/tau-web/jobs/<job>/` with `mkdir`, under `umask 077`: directories
 are 0700 and files 0600. It writes `command` (the bytes received), `machine`, and `boot` from
 `/proc/sys/kernel/random/boot_id`. `setsid` starts a detached runner with no SSH descriptors.
 The runner atomically records its own PID and Linux `/proc/<pid>/stat` start time in `runner`.
 A small interpreter atomically records its own PID and start time in `pid`, then uses
 `exec sh "$d/command"`: the command runs as its own script with that same PID and start time,
-without sharing wrapper variables or traps. Startup is marked with `ready`. The command's
-stdout and stderr go directly to the files `stdout` and `stderr`. The runner waits for that
-command alone. For a `wait` status of 0–128, it writes the exit code to `exit.pending` and
+without sharing wrapper variables or traps. Startup is marked with `ready`. Both startup
+loops re-test their file (`pid` in the runner, `ready` in the launch) after `kill -0` fails:
+a fast child may have published it and ended between the first file test and the liveness
+test. The runner still waits for the command's saved exit status after the shell reaps it.
+The command's stdout and stderr go directly to the files `stdout` and `stderr`. The runner
+waits for that command alone. For a `wait` status of 0–128, it writes the exit code to `exit.pending` and
 renames it to `exit`. It never waits for background descendants. No standard
 input is written to disk; no command takes input yet. A connected exec reads these files as soon
 as the command ends, including when a background process retains stdout (`STA-20a`).
@@ -780,7 +795,7 @@ browser holds:
 In headless Chromium 154 a new tab hides the one before it, which then restarts its worker, as
 page hide must. The cases account for it.
 
-The full run has 30 cases.
+The full run has 31 cases.
 
 The cases:
 
@@ -792,6 +807,7 @@ The cases:
 | a failed append is not applied (twr-ggw.5 AC2, `STA-3`) | that failed append failed at its `move()`, a real OPFS call; the replayed state has no record for it, and none appears after a reload and an unlock |
 | 2. a wrong host key halts (`CNF-21`, `SEC-11`) | no authentication attempt, no `exec`, no journal entry, and exactly one connection |
 | 3. no pin, no contact (`CNF-23`'s no-pin case, `CHN-R4`) | no TCP connection accepted at the relay, none at the sshd, no dial, and nothing pinned afterwards |
+| oversized launch (twr-ggw.71) | a 30000-byte command is refused with the composed size and limit before intent or contact: no journal entry, changed store state, relay connection or sshd exec. The same store then runs `echo ok; exit 7` and records its terminal |
 | 4. the policy is enforced (`ARC-33`) | the loaded page carries the served page's policy token for token. An injected inline script raises a `script-src` violation and does not run. A `ws:` socket raises a `connect-src` violation in the page and in the worker |
 | 5. the relay fixture's AUTH check is real | exactly one relay connection, and a wrongly signed AUTH gets `{"ok": false, "reason": "auth"}` and close 1008 at check 2, and nothing is dialed |
 | 6. a relay key with no pass (`CNF-87`) | an unrecognised `test_relay_key` fails the request with no relay connection. Signed by the key with no pass, the harness reports `{"refused": "relay", "reason": "pass", "close_code": 1008}` |

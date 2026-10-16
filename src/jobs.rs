@@ -5,6 +5,25 @@ use serde::{Deserialize, Serialize};
 pub const DIRECTORY: &str = "/var/lib/tau-web/jobs";
 pub const BOOT_ID: &str = "/proc/sys/kernel/random/boot_id";
 
+// sshd runs the launch as one $SHELL -c argument. Linux MAX_ARG_STRLEN is
+// 32 × PAGE_SIZE: 131072 bytes at 4 KiB pages, including the terminating NUL.
+// The composed text may therefore be at most 131071 bytes.
+pub const MAX_LAUNCH_BYTES: usize = 131071;
+
+pub fn launch_fits(bytes: usize) -> bool {
+    bytes <= MAX_LAUNCH_BYTES
+}
+
+/// Job identities always have 48 ASCII bytes, so this is exact before an intent exists.
+pub fn launch_size(machine: &str, command: &[u8]) -> usize {
+    launch(
+        "000000000000000000000000000000000000000000000000",
+        machine,
+        command,
+    )
+    .len()
+}
+
 pub fn valid_id(id: &str) -> bool {
     id.len() == 48
         && id
@@ -27,7 +46,7 @@ pub fn launch(id: &str, machine: &str, command: &[u8]) -> String {
     assert!(valid_id(id));
     let runner = quote(include_str!("jobs/runner.sh"));
     format!(
-        "# tau-web job launch {id}\numask 077\nmkdir -p {DIRECTORY} || exit 1\nchmod 700 {DIRECTORY} || exit 1\nd={DIRECTORY}/{id}\nmkdir \"$d\" || {{ printf '%s\\n' \"refusing existing or unavailable job directory: $d\" >&2; exit 1; }}\nprintf '%b' '{}' > \"$d/command\" || exit 1\nprintf '%b' '{}' > \"$d/machine\" || exit 1\ncat {BOOT_ID} > \"$d/boot\" || exit 1\n: > \"$d/stdout\"\n: > \"$d/stderr\"\nsetsid sh -c {runner} sh \"$d\" </dev/null >/dev/null 2> \"$d/runner-stderr\" &\nlauncher=$!\nwhile [ ! -f \"$d/ready\" ]; do\n    kill -0 \"$launcher\" 2>/dev/null || {{ cat \"$d/runner-stderr\" >&2; exit 1; }}\n    # GNU coreutils (Arch) and busybox (Alpine) accept fractional sleep.\n    sleep 0.05\ndone\nwait_job=true\n{}",
+        "# tau-web job launch {id}\numask 077\nmkdir -p {DIRECTORY} || exit 1\nchmod 700 {DIRECTORY} || exit 1\nd={DIRECTORY}/{id}\nmkdir \"$d\" || {{ printf '%s\\n' \"refusing existing or unavailable job directory: $d\" >&2; exit 1; }}\nprintf '%b' '{}' > \"$d/command\" || exit 1\nprintf '%b' '{}' > \"$d/machine\" || exit 1\ncat {BOOT_ID} > \"$d/boot\" || exit 1\n: > \"$d/stdout\"\n: > \"$d/stderr\"\nsetsid sh -c {runner} sh \"$d\" </dev/null >/dev/null 2> \"$d/runner-stderr\" &\nlauncher=$!\nwhile [ ! -f \"$d/ready\" ]; do\n    kill -0 \"$launcher\" 2>/dev/null || {{ [ -f \"$d/ready\" ] && break; cat \"$d/runner-stderr\" >&2; exit 1; }}\n    # GNU coreutils (Arch) and busybox (Alpine) accept fractional sleep.\n    sleep 0.05\ndone\nwait_job=true\n{}",
         octal(command),
         octal(machine.as_bytes()),
         include_str!("jobs/read.sh")
@@ -268,6 +287,48 @@ impl Evidence {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launch_size_boundary_and_exact_composition() {
+        assert!(launch_fits(131071));
+        assert!(!launch_fits(131072));
+        for machine in ["fixture", "machine with 'quotes' and 日本語"] {
+            let base = launch_size(machine, b"");
+            let longest = vec![b'x'; (MAX_LAUNCH_BYTES - base) / 5];
+            let size = launch_size(machine, &longest);
+            assert_eq!(size, launch(&"a".repeat(48), machine, &longest).len());
+            assert!(launch_fits(size));
+            let mut larger = longest;
+            larger.push(b'x');
+            assert_eq!(launch_size(machine, &larger), size + 5);
+            assert!(!launch_fits(launch_size(machine, &larger)));
+            let bytes = b"'\n\xff";
+            assert_eq!(launch_size(machine, bytes), base + 5 * bytes.len());
+            assert_eq!(
+                launch_size(machine, bytes),
+                launch(&"b".repeat(48), machine, bytes).len()
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn launch_argument_limit_matches_kernel() {
+        use std::process::Command;
+
+        assert!(
+            Command::new("sh")
+                .args(["-c", "exit 0", "sh", &"x".repeat(MAX_LAUNCH_BYTES)])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let error = Command::new("sh")
+            .args(["-c", "exit 0", "sh", &"x".repeat(MAX_LAUNCH_BYTES + 1)])
+            .status()
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(7));
+    }
 
     pub fn record() -> Record {
         Record::Present {

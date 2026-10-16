@@ -24,7 +24,7 @@ sh -c '
 ' sh "$d" > "$d/stdout" 2> "$d/stderr" &
 command_pid=$!
 while [ ! -f "$d/pid" ]; do
-    kill -0 "$command_pid" 2>/dev/null || exit 1
+    kill -0 "$command_pid" 2>/dev/null || { [ -f "$d/pid" ] && break; exit 1; }
     # GNU coreutils (Arch) and busybox (Alpine) accept fractional sleep.
     sleep 0.05
 done

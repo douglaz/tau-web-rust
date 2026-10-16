@@ -65,6 +65,9 @@ pub enum Refusal {
     /// The journal refused the append, so no `exec` was sent (`STA-3`).
     Journal(String),
     Disposition(DispatchRefusal),
+    LaunchTooLong {
+        bytes: usize,
+    },
     Unresolved {
         call: u64,
         why: String,
@@ -77,6 +80,12 @@ pub enum Refusal {
 impl Refusal {
     pub fn to_json(&self) -> Value {
         match self {
+            Refusal::LaunchTooLong { bytes } => json!({
+                "refused": "launch-too-long",
+                "why": "command is too long to launch; shorten the command",
+                "bytes": bytes,
+                "limit": jobs::MAX_LAUNCH_BYTES,
+            }),
             Refusal::NoPin => json!({ "refused": "no-pin" }),
             Refusal::NoCredentials => json!({ "refused": "no-credentials" }),
             Refusal::Relay { reason, close_code } => {
@@ -174,6 +183,10 @@ pub async fn run_command(
         .check(&target.machine)
         .await
         .map_err(append_refusal)?;
+    let bytes = jobs::launch_size(&target.machine, command);
+    if !jobs::launch_fits(bytes) {
+        return Err(Refusal::LaunchTooLong { bytes });
+    }
     let (ssh, pinned, host_key) = connect(
         pins,
         credentials,
