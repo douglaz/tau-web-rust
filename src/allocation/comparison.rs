@@ -9,13 +9,13 @@
 use super::*;
 use crate::seed::Seed;
 use serde_json::Value;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 /// The file, under the pinned tree.
-const FILE: &str = "spec/docs/design/allocation-witnesses-v1.json";
+const FILE: &str = "spec/docs/design/allocation-witnesses-v2.json";
 
-/// The module's one guard parameter (witness-file-v1.md, "Both arrays hold traces").
-const GUARD: &str = "restoredAllocatesNone";
+/// The module's guard parameters, sorted (witness-file-v1.md).
+const GUARDS: [&str; 2] = ["backupRecorded", "restoredAllocatesNone"];
 
 /// The header's members, sorted: they are compared sorted, whatever order the map keeps.
 const HEADER: [&str; 6] = [
@@ -69,6 +69,8 @@ struct Step {
     allocation: Option<Outcome>,
     #[serde(default)]
     identity: Option<Projected>,
+    #[serde(default)]
+    recorded: Option<bool>,
     journal: Journal,
 }
 
@@ -83,6 +85,11 @@ enum Outcome {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum Witnessed {
+    SeedBackup {
+        provenance: Provenance,
+        completion: Completion,
+        append: Append,
+    },
     Allocate {
         provenance: Provenance,
         family: Family,
@@ -110,6 +117,13 @@ enum Witnessed {
     },
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Append {
+    provenance: Provenance,
+    durable: bool,
+}
+
 /// The provenances ADR-0032's closed vocabulary gives the allocation events.
 #[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
 enum Provenance {
@@ -121,6 +135,8 @@ enum Provenance {
     OperatorAct,
     #[serde(rename = "import or restore")]
     ImportOrRestore,
+    #[serde(rename = "storage outcome of an append")]
+    StorageOutcome,
 }
 
 impl Witnessed {
@@ -128,6 +144,7 @@ impl Witnessed {
     fn kind(&self) -> (&'static str, Provenance, Provenance) {
         use Provenance::*;
         match self {
+            Witnessed::SeedBackup { provenance, .. } => ("seed_backup", *provenance, OperatorAct),
             Witnessed::Allocate { provenance, .. } => ("allocate", *provenance, ModelRequest),
             Witnessed::Created { provenance, .. } => ("created", *provenance, AdapterObservation),
             Witnessed::Failed { provenance, .. } => ("failed", *provenance, AdapterObservation),
@@ -170,6 +187,26 @@ struct Journal {
     next_unused: NextUnused,
     entries: Vec<ProjectedEntry>,
     restored_from_import: bool,
+    seed_backup: Backup,
+}
+
+/// The projection represents absence as a string, rather than an absent member.
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Backup {
+    None,
+    FullReentry,
+    Skipped,
+}
+
+impl Backup {
+    fn completion(self) -> Option<Completion> {
+        match self {
+            Backup::None => None,
+            Backup::FullReentry => Some(Completion::FullReentry),
+            Backup::Skipped => Some(Completion::Skipped),
+        }
+    }
 }
 
 /// The seed identifiers the driver generates, by ordinal: generated on first use, so ordinal
@@ -230,6 +267,11 @@ impl Seeds {
                 })
                 .collect::<Result<_, String>>()?,
             restored_from_import: core.restored_from_import,
+            seed_backup: match core.seed_backup() {
+                None => Backup::None,
+                Some(Completion::FullReentry) => Backup::FullReentry,
+                Some(Completion::Skipped) => Backup::Skipped,
+            },
         })
     }
 
@@ -253,6 +295,7 @@ impl Seeds {
                 })
                 .collect(),
             restored_from_import: start.restored_from_import,
+            seed_backup: start.seed_backup.completion(),
         }
     }
 }
@@ -292,6 +335,40 @@ fn drive(label: &str, trace: &Trace, seeds: &mut Seeds) -> Result<Vec<(usize, St
             ));
         }
         let at = format!("{at} ({kind})");
+        if let Witnessed::SeedBackup {
+            completion, append, ..
+        } = &event
+        {
+            if step.allocation.is_some() || step.identity.is_some() {
+                return Err(format!("{at}: an allocation outcome on seed_backup"));
+            }
+            if append.provenance != Provenance::StorageOutcome {
+                return Err(format!(
+                    "{at}: append with provenance {:?}, not storage outcome of an append",
+                    append.provenance
+                ));
+            }
+            let expected = step
+                .recorded
+                .ok_or_else(|| format!("{at}: missing recorded outcome"))?;
+            let actual = append.durable
+                && core
+                    .apply(&Event::SeedBackup {
+                        seed: core.seed().into(),
+                        completion: *completion,
+                    })
+                    .is_ok();
+            if actual != expected {
+                differences.push((
+                    n,
+                    format!("{at}: recorded: expected {expected}, actual {actual}"),
+                ));
+            }
+        } else if step.recorded.is_some() {
+            return Err(format!(
+                "{at}: a recorded outcome on an event that has none"
+            ));
+        }
         if let Witnessed::Allocate { family, .. } = &event {
             let expected = match (step.allocation, step.identity) {
                 (Some(Outcome::Admitted), Some(identity)) => Some(identity),
@@ -323,7 +400,7 @@ fn drive(label: &str, trace: &Trace, seeds: &mut Seeds) -> Result<Vec<(usize, St
                     ),
                 ));
             }
-        } else {
+        } else if !matches!(event, Witnessed::SeedBackup { .. }) {
             if step.allocation.is_some() || step.identity.is_some() {
                 return Err(format!("{at}: an outcome member on an event that has none"));
             }
@@ -354,7 +431,7 @@ fn drive(label: &str, trace: &Trace, seeds: &mut Seeds) -> Result<Vec<(usize, St
                         seed: seeds.id(fresh - 1),
                     })
                 }
-                Witnessed::Allocate { .. } => unreachable!(),
+                Witnessed::Allocate { .. } | Witnessed::SeedBackup { .. } => unreachable!(),
             };
             drop(applied);
         }
@@ -379,8 +456,8 @@ struct Record {
     alphabet: usize,
     witnesses: usize,
     enumerated: usize,
-    /// The pair: the refused side's declaration, the admitted side's and its first differing step.
-    pair: (String, String, usize),
+    /// Each pair: the refused declaration, the admitted declaration and its first differing step.
+    pairs: Vec<(String, String, usize)>,
 }
 
 /// Compares the core with the witness file `bytes`. Every failure is listed, each naming its
@@ -396,8 +473,8 @@ fn compare(bytes: &[u8]) -> Result<Record, String> {
             "the header's members are {members:?}, not {HEADER:?}"
         ));
     }
-    if file["schema"] != 1 {
-        return Err(format!("schema {}, not 1", file["schema"]));
+    if file["schema"] != 2 {
+        return Err(format!("schema {}, not 2", file["schema"]));
     }
     if file["module"] != "allocation" {
         return Err(format!("module {}, not \"allocation\"", file["module"]));
@@ -431,12 +508,14 @@ fn compare(bytes: &[u8]) -> Result<Record, String> {
         },
         entries: Vec::new(),
         restored_from_import: false,
+        seed_backup: Backup::None,
     };
     let mut failures = Vec::new();
     let mut seeds = Seeds::default();
     let mut sequences = HashSet::new();
     // Per declaration of a paired trace: its side, the other side's name, and its differences.
     let mut pairs = BTreeMap::new();
+    let mut controlled = BTreeSet::new();
     let labelled = witnesses
         .iter()
         .enumerate()
@@ -487,10 +566,16 @@ fn compare(bytes: &[u8]) -> Result<Record, String> {
         let side = trace.pair.as_ref().map(|p| p.side);
         let admitted = side == Some(Side::Admitted);
         let names: Vec<&str> = trace.assumptions.keys().map(String::as_str).collect();
-        if names != [GUARD] || trace.assumptions[GUARD] != Value::Bool(!admitted) {
+        let values: Option<Vec<bool>> = trace.assumptions.values().map(Value::as_bool).collect();
+        if names != GUARDS
+            || values.as_ref().is_none_or(|values| {
+                values.iter().filter(|v| !**v).count() != usize::from(admitted)
+            })
+        {
             failures.push(format!(
-                "{label}: assumptions {:?}, not {{{GUARD:?}: {}}}",
-                trace.assumptions, !admitted
+                "{label}: assumptions {:?}: expected exactly {GUARDS:?}, with {} false",
+                trace.assumptions,
+                usize::from(admitted)
             ));
             continue;
         }
@@ -501,6 +586,9 @@ fn compare(bytes: &[u8]) -> Result<Record, String> {
                 continue;
             }
         };
+        if admitted && !differences.is_empty() {
+            controlled.extend(GUARDS.into_iter().find(|g| trace.assumptions[*g] == false));
+        }
         if let Some(pair) = &trace.pair {
             for name in &trace.declarations {
                 pairs.insert(
@@ -531,7 +619,7 @@ fn compare(bytes: &[u8]) -> Result<Record, String> {
 
     // ADR-0032: each side names the other, which names it back; the refused side matches (its
     // differences are failures above), and the admitted side must differ.
-    let mut found = None;
+    let mut found = Vec::new();
     for (name, (side, with, differs)) in &pairs {
         match pairs.get(with) {
             Some((other, back, _)) if other != side && back == name => {}
@@ -541,15 +629,18 @@ fn compare(bytes: &[u8]) -> Result<Record, String> {
         }
         match (side, differs) {
             (Side::Refused, _) => {}
-            (Side::Admitted, Some(step)) => found = Some((with.clone(), name.clone(), *step)),
+            (Side::Admitted, Some(step)) => found.push((with.clone(), name.clone(), *step)),
             (Side::Admitted, None) => failures.push(format!(
                 "{name}: the admitted side matches the core at every step, so the negative \
                  control shows nothing"
             )),
         }
     }
-    if !pairs.values().any(|(side, ..)| *side == Side::Admitted) {
-        failures.push("no admitted side: no negative control".into());
+    // Each guard has its own pair: an admitted side run without that guard alone, which differs.
+    for guard in GUARDS.into_iter().filter(|g| !controlled.contains(g)) {
+        failures.push(format!(
+            "no admitted side without {guard} differs: no negative control"
+        ));
     }
     if !failures.is_empty() {
         let shown = failures.iter().take(12).cloned().collect::<Vec<_>>();
@@ -565,7 +656,7 @@ fn compare(bytes: &[u8]) -> Result<Record, String> {
         alphabet: bound.alphabet.len(),
         witnesses: witnesses.len(),
         enumerated: enumeration.len(),
-        pair: found.expect("an admitted side that differed, or a failure above"),
+        pairs: found,
     })
 }
 
@@ -581,24 +672,25 @@ fn pinned_path() -> String {
     format!("{}/{FILE}", env!("CARGO_MANIFEST_DIR"))
 }
 
-/// The test record: the file, its bound, what was compared, the pair, and the spec commit. The
+/// The test record: the file, its bound, what was compared, both pairs, and the spec commit. The
 /// implementation revision is the commit the test ran at.
 #[test]
 fn the_allocation_core_passes_the_companion_comparison() {
     let path = pinned_path();
     let record = compare_file(&path).unwrap_or_else(|e| panic!("{e}"));
-    let (refused, admitted, step) = &record.pair;
     println!("allocation companion comparison: passed");
     println!("  file: {path}");
     println!(
-        "  schema 1, module allocation, bound: {} events over an alphabet of {}",
+        "  schema 2, module allocation, bound: {} events over an alphabet of {}",
         record.events, record.alphabet
     );
     println!(
         "  compared: {} witnesses and {} enumerated traces, every step",
         record.witnesses, record.enumerated
     );
-    println!("  pair: {refused} matched; {admitted} differed at step {step}");
+    for (refused, admitted, step) in &record.pairs {
+        println!("  pair: {refused} matched; {admitted} differed at step {step}");
+    }
     println!("  spec commit: {}", crate::SPEC_COMMIT);
 }
 
@@ -635,7 +727,19 @@ mod breaks {
     #[test]
     fn one_expected_outcome_flipped() {
         let mut file = pinned();
-        let witness = &mut file["witnesses"][0];
+        let witness = file["witnesses"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|w| {
+                w["pair"]["side"] != "admitted"
+                    && w["steps"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|s| s["allocation"] == "admitted")
+            })
+            .unwrap();
         let label = witness["declarations"][0].as_str().unwrap().to_string();
         let at = witness["steps"]
             .as_array()
@@ -689,8 +793,12 @@ mod breaks {
     #[test]
     fn a_truncated_file_or_an_unknown_member() {
         let mut file = pinned();
+        let count = file["enumeration"].as_array().unwrap().len();
         file["enumeration"].as_array_mut().unwrap().pop();
-        assert!(failure(&file).contains("the enumeration holds 399 traces, not the 400"));
+        assert!(failure(&file).contains(&format!(
+            "the enumeration holds {} traces, not the {count}",
+            count - 1
+        )));
 
         let mut file = pinned();
         let (trace, at) = allocating(&file);
@@ -757,6 +865,73 @@ mod breaks {
         witnesses.remove(admitted);
         let e = failure(&file);
         assert!(e.contains(&format!("{refused}: its pair names")), "{e}");
-        assert!(e.contains("no admitted side: no negative control"), "{e}");
+
+        let witnesses = file["witnesses"].as_array_mut().unwrap();
+        witnesses.retain(|w| w["pair"]["side"] != "admitted");
+        let e = failure(&file);
+        for guard in GUARDS {
+            assert!(
+                e.contains(&format!("no admitted side without {guard}")),
+                "{e}"
+            );
+        }
+    }
+
+    /// Each guard needs its own pair: dropping the ceremony gate's pair, or running its admitted
+    /// side without the other guard instead, leaves `backupRecorded` with no negative control.
+    #[test]
+    fn a_guard_without_its_own_pair() {
+        let mut file = pinned();
+        file["witnesses"].as_array_mut().unwrap().retain(|w| {
+            w["pair"]["with"]
+                .as_str()
+                .is_none_or(|n| !n.contains("backup_missing"))
+        });
+        let e = failure(&file);
+        assert!(e.contains("no admitted side without backupRecorded"), "{e}");
+        assert!(!e.contains("without restoredAllocatesNone"), "{e}");
+
+        let mut file = pinned();
+        let admitted = file["witnesses"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|w| w["declarations"][0] == "TauWeb.Allocation.backup_missing_admitted")
+            .unwrap();
+        admitted["assumptions"]["backupRecorded"] = true.into();
+        admitted["assumptions"]["restoredAllocatesNone"] = false.into();
+        let e = failure(&file);
+        assert!(e.contains("no admitted side without backupRecorded"), "{e}");
+    }
+
+    #[test]
+    fn an_unrecognised_completion_and_a_flipped_recorded_outcome() {
+        let mut file = pinned();
+        let label = file["witnesses"][0]["declarations"][0]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            file["witnesses"][0]["steps"][0]["event"]["kind"],
+            "seed_backup"
+        );
+        file["witnesses"][0]["steps"][0]["event"]["completion"] = "partial".into();
+        let e = failure(&file);
+        assert!(
+            e.contains(&format!(
+                "{label}, step 1: event: unknown variant `partial`"
+            )),
+            "{e}"
+        );
+        let mut file = pinned();
+        let recorded = file["witnesses"][0]["steps"][0]["recorded"]
+            .as_bool()
+            .unwrap();
+        file["witnesses"][0]["steps"][0]["recorded"] = (!recorded).into();
+        let e = failure(&file);
+        assert!(
+            e.contains(&format!("{label}, step 1 (seed_backup): recorded:")),
+            "{e}"
+        );
     }
 }

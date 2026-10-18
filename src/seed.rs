@@ -159,8 +159,7 @@ impl Seed {
 
     /// The mnemonic, the words joined by single spaces: what the local store's seed record
     /// carries (`src/store.rs`), so a seed-backup ceremony can show the words. Nothing displays
-    /// it yet (`STA-23`: "The mnemonic may be displayed only in the dedicated seed-backup
-    /// ceremony").
+    /// it yet (`STA-23`'s dedicated seed-backup ceremony is twr-ggw.58's).
     pub(crate) fn phrase(&self) -> zeroize::Zeroizing<String> {
         zeroize::Zeroizing::new(self.words.join(" "))
     }

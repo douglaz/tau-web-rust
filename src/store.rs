@@ -466,6 +466,16 @@ impl<S: Storage> Store<S> {
         Ok(identity)
     }
 
+    /// Journals the stated ceremony completion for this store's seed (`STA-23`, `STA-3`).
+    /// Display and checking of the ceremony are the caller's duty.
+    pub async fn seed_backup(&mut self, completion: allocation::Completion) -> Result<(), String> {
+        self.record(allocation::Event::SeedBackup {
+            seed: self.allocation().seed().into(),
+            completion,
+        })
+        .await
+    }
+
     /// Journals an adapter's observation of an identity: created, failed or destroyed. One the
     /// metadata cannot apply is refused and never journaled.
     pub async fn observe(&mut self, observation: allocation::Event) -> Result<(), String> {
@@ -1668,11 +1678,93 @@ mod tests {
         block_on(store.commit(&Event::Allocation(event))).unwrap();
     }
 
+    #[test]
+    fn allocation_needs_a_durable_ceremony_record_across_reopen() {
+        for completion in [
+            allocation::Completion::FullReentry,
+            allocation::Completion::Skipped,
+        ] {
+            let (storage, mut store) = store(PASS, 0);
+            let before = storage.files();
+            for family in Family::ALL {
+                assert!(
+                    block_on(store.allocate(family))
+                        .unwrap_err()
+                        .contains("seed-backup ceremony")
+                );
+            }
+            assert_eq!(storage.files(), before);
+            store = reopen(&before, PASS).unwrap();
+            for family in Family::ALL {
+                assert!(
+                    block_on(store.allocate(family))
+                        .unwrap_err()
+                        .contains("seed-backup ceremony")
+                );
+            }
+            block_on(store.seed_backup(completion)).unwrap();
+            for family in Family::ALL {
+                assert_eq!(block_on(store.allocate(family)).unwrap().index, 0);
+            }
+            store = reopen(&store.storage().files(), PASS).unwrap();
+            assert_eq!(store.allocation().seed_backup(), Some(completion));
+            for family in Family::ALL {
+                assert_eq!(block_on(store.allocate(family)).unwrap().index, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_ceremony_append_leaves_no_record_and_still_refuses_allocation() {
+        for at in 1..=3 {
+            let (storage, mut store) = store(PASS, 0);
+            let before = store.allocation().clone();
+            storage.fault(Fault::Fail(at));
+            assert!(
+                block_on(store.seed_backup(allocation::Completion::Skipped)).is_err(),
+                "op {at}"
+            );
+            assert_eq!(*store.allocation(), before, "op {at}: not applied");
+            let mut reopened = reopen(&storage.files(), PASS).unwrap();
+            assert_eq!(*reopened.allocation(), before, "op {at}: nothing replayed");
+            for family in Family::ALL {
+                assert!(
+                    block_on(store.allocate(family)).is_err(),
+                    "op {at}: {family:?}"
+                );
+                assert!(
+                    block_on(reopened.allocate(family))
+                        .unwrap_err()
+                        .contains("seed-backup ceremony"),
+                    "op {at}: reopened {family:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_completion_for_another_seed_refuses_replay() {
+        let (storage, mut store) = store(PASS, 0);
+        craft(
+            &mut store,
+            allocation::Event::SeedBackup {
+                seed: "other".into(),
+                completion: allocation::Completion::FullReentry,
+            },
+        );
+        let (reason, _) = refused(&storage.files(), PASS);
+        assert!(
+            reason.contains("seed-backup completion names another seed"),
+            "{reason}"
+        );
+    }
+
     /// `CNF-72` and `STA-22`: an identity allocated through the store derives the same keys
     /// after a reopen, and another index different ones. Each family counts on its own.
     #[test]
     fn allocated_identities_derive_the_same_keys_after_a_reopen() {
         let (storage, mut store) = store(PASS, 1);
+        block_on(store.seed_backup(allocation::Completion::FullReentry)).unwrap();
         let mut allocated = Vec::new();
         for family in [
             Family::Machines,
@@ -1725,6 +1817,7 @@ mod tests {
     #[test]
     fn an_observation_that_does_not_apply_is_not_journaled() {
         let (storage, mut store) = store(PASS, 0);
+        block_on(store.seed_backup(allocation::Completion::FullReentry)).unwrap();
         let created = block_on(store.allocate(Family::Machines)).unwrap();
         block_on(store.observe(allocation::Event::Created(created.clone()))).unwrap();
         let failed = block_on(store.allocate(Family::Machines)).unwrap();
@@ -1754,6 +1847,7 @@ mod tests {
     #[test]
     fn a_reservation_the_core_did_not_issue_fails_closed_at_replay() {
         let (storage, mut store) = store(PASS, 0);
+        block_on(store.seed_backup(allocation::Completion::FullReentry)).unwrap();
         let first = block_on(store.allocate(Family::Machines)).unwrap();
         let files = storage.files();
         let at = |index| Identity {
@@ -1790,7 +1884,7 @@ mod tests {
             craft(&mut store, event);
             let (reason, _) = refused(&store.storage().files(), PASS);
             assert!(
-                reason.starts_with("record 2: ") && reason.contains(why),
+                reason.starts_with("record 3: ") && reason.contains(why),
                 "{reason}"
             );
         }
@@ -1800,6 +1894,7 @@ mod tests {
     #[test]
     fn a_reservation_is_committed_before_its_identity_is_returned() {
         let (storage, mut store) = store(PASS, 0);
+        block_on(store.seed_backup(allocation::Completion::FullReentry)).unwrap();
         storage.memory().log.clear();
         let identity = block_on(store.allocate(Family::Passes)).unwrap();
         assert_eq!(storage.memory().log, ["create", "close", "move"]);
@@ -1812,6 +1907,7 @@ mod tests {
     fn a_failed_reservation_returns_no_identity_and_moves_no_counter() {
         for at in 1..=3 {
             let (storage, mut store) = store(PASS, 0);
+            block_on(store.seed_backup(allocation::Completion::FullReentry)).unwrap();
             let before = store.allocation().clone();
             storage.fault(Fault::Fail(at));
             assert!(
@@ -1829,6 +1925,7 @@ mod tests {
     #[test]
     fn a_reservation_that_landed_but_reported_failure_stays_consumed() {
         let (storage, mut store) = store(PASS, 0);
+        block_on(store.seed_backup(allocation::Completion::FullReentry)).unwrap();
         storage.fault(Fault::LandThenFail(3));
         assert!(block_on(store.allocate(Family::Handoffs)).is_err());
         assert_eq!(store.allocation().next_unused().handoffs, 0, "not applied");
@@ -1849,6 +1946,7 @@ mod tests {
     #[test]
     fn a_reservation_never_observed_stays_consumed_after_a_kill() {
         let (storage, mut store) = store(PASS, 0);
+        block_on(store.seed_backup(allocation::Completion::FullReentry)).unwrap();
         let reserved = block_on(store.allocate(Family::Machines)).unwrap();
         storage.fault(Fault::Die(1));
         assert!(block_on(store.observe(allocation::Event::Created(reserved.clone()))).is_err());
@@ -1870,6 +1968,7 @@ mod tests {
     #[test]
     fn failed_and_destroyed_indices_are_never_issued_again() {
         let (storage, mut store) = store(PASS, 0);
+        block_on(store.seed_backup(allocation::Completion::FullReentry)).unwrap();
         let failed = block_on(store.allocate(Family::Machines)).unwrap();
         block_on(store.observe(allocation::Event::Failed(failed.clone()))).unwrap();
         let destroyed = block_on(store.allocate(Family::Machines)).unwrap();
@@ -1898,6 +1997,7 @@ mod tests {
     #[test]
     fn a_journaled_restore_refuses_allocation_in_every_family_after_replay() {
         let (storage, mut ours) = store(PASS, 0);
+        block_on(ours.seed_backup(allocation::Completion::FullReentry)).unwrap();
         for family in Family::ALL {
             block_on(ours.allocate(family)).unwrap();
         }
