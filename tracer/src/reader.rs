@@ -82,6 +82,16 @@ fn check_event(number: u64, event: &Value) -> Result<(), String> {
             text("machine")?;
             hex::decode(text("command")?).map_err(|_| "command is not hex")?;
             if kind == "intent" {
+                if let Some(job) = body.get("job")
+                    && !job.as_str().is_some_and(|id| {
+                        id.len() == 48
+                            && id
+                                .bytes()
+                                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                    })
+                {
+                    return Err("intent has invalid job identity".into());
+                }
                 if body["call"].as_u64() != Some(number) {
                     return Err("intent identity differs from record number".into());
                 }
@@ -106,6 +116,59 @@ fn check_event(number: u64, event: &Value) -> Result<(), String> {
                     .is_none()
             {
                 return Err("terminal has no call identity or exit status".into());
+            }
+        }
+        "job_terminal" | "job_observation" => {
+            if body["call"].as_u64().is_none() {
+                return Err("job evidence has no call".into());
+            }
+            let id = text("job")?;
+            if id.len() != 48
+                || !id
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            {
+                return Err("job evidence has invalid identity".into());
+            }
+            let record = &body["record"];
+            match record["kind"].as_str() {
+                Some("missing") if kind == "job_observation" => {}
+                Some("incomplete") if kind == "job_observation" => {
+                    for field in ["machine", "command"] {
+                        if !record[field].is_null()
+                            && !record[field].as_str().is_some_and(|s| {
+                                hex::decode(s).is_ok() && s.to_ascii_lowercase() == s
+                            })
+                        {
+                            return Err("incomplete job bytes are not lowercase hex".into());
+                        }
+                    }
+                }
+                Some("present") => {
+                    for field in ["machine", "command", "stdout", "stderr"] {
+                        let value = record[field].as_str().ok_or("job bytes are not text")?;
+                        if hex::decode(value).is_err() || value.to_ascii_lowercase() != value {
+                            return Err("job bytes are not lowercase hex".into());
+                        }
+                    }
+                    for field in ["boot", "current_boot"] {
+                        if !record[field].as_str().is_some_and(|s| !s.is_empty()) {
+                            return Err("job has no boot identity".into());
+                        }
+                    }
+                    if record["pid"]
+                        .as_u64()
+                        .and_then(|p| u32::try_from(p).ok())
+                        .is_none()
+                        || record["alive"].as_bool().is_none()
+                        || (!record["exit_status"].is_null()
+                            && !record["exit_status"].as_u64().is_some_and(|s| s <= 128))
+                        || (kind == "job_terminal" && record["exit_status"].is_null())
+                    {
+                        return Err("job has invalid liveness or exit code".into());
+                    }
+                }
+                _ => return Err("unknown job record kind".into()),
             }
         }
         "disposition" => {
@@ -614,6 +677,33 @@ mod tests {
             read(&files, PASS).err().unwrap(),
             "record 1: intent admission has no machine or fingerprint"
         );
+    }
+
+    /// The reader's exit-status ceiling is the job record's own (`src/jobs.rs`): a status above
+    /// 128 is refused, as `Record::validate` refuses it.
+    #[test]
+    fn job_terminal_exit_status_ceiling_is_128() {
+        let terminal = |status: u64| {
+            json!({"job_terminal": {
+                "call": 1,
+                "job": "0".repeat(48),
+                "record": {
+                    "kind": "present", "machine": "6d", "command": "00", "stdout": "", "stderr": "",
+                    "boot": "b", "current_boot": "b", "pid": 7, "alive": false,
+                    "exit_status": status
+                }
+            }})
+        };
+        for status in [0, 1, 128] {
+            assert!(check_event(1, &terminal(status)).is_ok(), "status {status}");
+        }
+        for status in [129, 137, 255] {
+            assert_eq!(
+                check_event(1, &terminal(status)),
+                Err("job has invalid liveness or exit code".into()),
+                "status {status}"
+            );
+        }
     }
 
     /// An authentic record the harness cannot read is refused with a reason that quotes none of

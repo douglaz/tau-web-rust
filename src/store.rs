@@ -173,6 +173,8 @@ enum Event {
     },
     Intent(Intent),
     Terminal(Terminal),
+    JobTerminal(crate::jobs::Evidence),
+    JobObservation(crate::jobs::Evidence),
     Disposition(Disposition),
     /// One allocation event, recorded before it is applied: a reservation before any external
     /// effect (`STA-22b`), with its seed identifier and derivation version (`STA-22a`).
@@ -571,6 +573,7 @@ impl<S: Storage> Store<S> {
                             machine: machine.clone(),
                             command: command.clone(),
                             approval: Some(Approval::LegacyCommand),
+                            job: None,
                         },
                     )
                     .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
@@ -582,6 +585,15 @@ impl<S: Storage> Store<S> {
                     .dispatch
                     .terminal(number, terminal.clone())
                     .map_err(|e| format!("record {number}: {e}; replay stopped"))?,
+                (_, Event::JobTerminal(evidence) | Event::JobObservation(evidence)) => {
+                    self.dispatch
+                        .job_evidence(
+                            number,
+                            evidence.clone(),
+                            matches!(event, Event::JobTerminal(_)),
+                        )
+                        .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
+                }
                 (_, Event::Disposition(disposition)) => {
                     // A semantically refused disposition is shown, not corruption.
                     self.dispatch.disposition(number, disposition.clone());
@@ -725,6 +737,7 @@ impl<S: Storage> Journal for Store<S> {
             machine: entry.machine.clone(),
             command: hex::encode(&entry.command),
             approval: Some(approval.clone()),
+            job: Some(hex::encode(random::<24>().map_err(AppendRefusal::Storage)?)),
         };
         let number = self
             .commit(&Event::Intent(intent.clone()))
@@ -748,6 +761,37 @@ impl<S: Storage> Journal for Store<S> {
             .iter()
             .find(|(number, _)| *number == seq)
             .map(|(_, entry)| entry.clone())
+    }
+
+    async fn intent(&self, call: u64) -> Option<Intent> {
+        self.dispatch.calls.get(&call).map(|c| c.intent.clone())
+    }
+
+    async fn collectable(&self, machine: &str) -> Result<Vec<Intent>, String> {
+        Ok(self.dispatch.collectable(machine))
+    }
+
+    async fn job_evidence(
+        &mut self,
+        evidence: &crate::jobs::Evidence,
+    ) -> Result<crate::jobs::Report, String> {
+        let call = self
+            .dispatch
+            .calls
+            .get(&evidence.call)
+            .ok_or("job evidence names no call")?;
+        let terminal =
+            evidence.record.classify(&call.intent.machine) == crate::jobs::State::Finished;
+        let mut next = self.dispatch.clone();
+        let report = next.job_evidence(self.next, evidence.clone(), terminal)?;
+        let event = if terminal {
+            Event::JobTerminal(evidence.clone())
+        } else {
+            Event::JobObservation(evidence.clone())
+        };
+        self.commit(&event).await?;
+        self.dispatch = next;
+        Ok(report)
     }
 }
 
@@ -856,6 +900,8 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
                 serde_json::to_value(&store.dispatch.dispositions).expect("dispositions serialize");
             report["standing"] = serde_json::to_value(&store.dispatch.standing)
                 .expect("standing dispositions serialize");
+            report["jobs"] =
+                serde_json::to_value(&store.dispatch.jobs).expect("job evidence serializes");
             report["commands"] = store
                 .commands()
                 .iter()
@@ -2016,6 +2062,234 @@ mod tests {
         assert!(found.is_empty(), "{found:?}");
         assert!(needles.len() > 100);
     }
+    fn job_evidence(
+        store: &Store<MemoryStorage>,
+        call: u64,
+        status: Option<u32>,
+    ) -> crate::jobs::Evidence {
+        crate::jobs::Evidence {
+            call,
+            job: store.dispatch.calls[&call].intent.job.clone().unwrap(),
+            record: crate::jobs::Record::Present {
+                machine: hex::encode("fixture"),
+                command: store.dispatch.calls[&call].intent.command.clone(),
+                boot: "old-boot".into(),
+                current_boot: "new-boot".into(),
+                pid: 123,
+                alive: true,
+                exit_status: status,
+                stdout: hex::encode("from record\n"),
+                stderr: hex::encode("error output\n"),
+            },
+        }
+    }
+
+    #[test]
+    fn job_terminal_carries_output_and_finding_through_replay_and_settles_mismatch() {
+        use crate::jobs::{Comparison, Record};
+        let (storage, mut store) = store(PASS, 1);
+        let mut evidence = job_evidence(&store, 1, Some(7));
+        if let Record::Present { command, .. } = &mut evidence.record {
+            *command = hex::encode("truncated");
+        }
+        let report = block_on(store.job_evidence(&evidence)).unwrap();
+        assert_eq!(report.state, crate::jobs::State::Finished);
+        assert!(matches!(report.comparison, Comparison::Finding { .. }));
+        assert_eq!(report.stdout, "from record\n");
+        assert_eq!(report.stderr, "error output\n");
+        assert_eq!(report.exit_status, Some(7));
+        assert!(matches!(
+            state(&store, 1),
+            crate::dispatch::CallState::Finished { exit_status: 7, .. }
+        ));
+        let reopened = reopen(&storage.files(), PASS).unwrap();
+        assert_eq!(reopened.dispatch.jobs, store.dispatch.jobs);
+        assert_eq!(state(&reopened, 1), state(&store, 1));
+        assert!(
+            block_on(reopened.collectable("fixture"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn ended_missing_and_other_machine_observations_never_write_terminals() {
+        use crate::jobs::{Record, State};
+        for expected in [State::Ended, State::Missing, State::OtherMachine] {
+            let (storage, mut store) = store(PASS, 1);
+            let mut evidence = job_evidence(&store, 1, None);
+            match expected {
+                State::Missing => evidence.record = Record::Missing,
+                State::OtherMachine => {
+                    if let Record::Present {
+                        machine,
+                        exit_status,
+                        ..
+                    } = &mut evidence.record
+                    {
+                        *machine = hex::encode("another");
+                        *exit_status = Some(0);
+                    }
+                }
+                _ => {}
+            }
+            let report = block_on(store.job_evidence(&evidence)).unwrap();
+            assert_eq!(report.state, expected);
+            for s in [&store, &reopen(&storage.files(), PASS).unwrap()] {
+                assert_eq!(state(s, 1), crate::dispatch::CallState::Unresolved);
+                assert!(s.dispatch.terminals.is_empty());
+                assert_eq!(s.dispatch.jobs.as_slice(), std::slice::from_ref(&report));
+            }
+            assert_eq!(block_on(store.collectable("fixture")).unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn collection_evidence_preserves_all_four_dispositions_in_core_and_store() {
+        use crate::dispatch::Continuation::*;
+        for continuation in [DestructiveReinstall, Abandonment, AsIfDone, AsIfNotDone] {
+            let (storage, mut store) = store(PASS, 1);
+            accepted(&mut store, continuation, &[1]);
+            let standing = store.dispatch.standing.clone();
+            let before = state(&store, 1);
+            let verdict = store.dispatch.check_command("fixture");
+            assert_eq!(verdict.is_err(), continuation.destructive());
+            assert_eq!(block_on(store.collectable("fixture")).unwrap().len(), 1);
+            let evidence = job_evidence(&store, 1, Some(7));
+            let mut core = store.dispatch.clone();
+            core.job_evidence(3, evidence.clone(), true).unwrap();
+            let report = block_on(store.job_evidence(&evidence)).unwrap();
+            assert_eq!(report.number, Some(3));
+            assert_eq!(store.commands.len(), 1, "collection appended an intent");
+            for projection in [
+                &core,
+                &store.dispatch,
+                &reopen(&storage.files(), PASS).unwrap().dispatch,
+            ] {
+                assert_eq!(projection.standing, standing);
+                assert_eq!(projection.calls[&1].state, before);
+                assert_eq!(projection.check_command("fixture"), verdict);
+                assert_eq!(projection.jobs.as_slice(), std::slice::from_ref(&report));
+                assert!(projection.collectable("fixture").is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn job_evidence_append_failures_apply_nothing_and_landed_move_replays() {
+        for finished in [false, true] {
+            for fault in [
+                Fault::Fail(1),
+                Fault::Fail(2),
+                Fault::Fail(3),
+                Fault::LandThenFail(3),
+            ] {
+                let (storage, mut store) = store(PASS, 1);
+                let evidence = job_evidence(&store, 1, finished.then_some(7));
+                storage.fault(fault);
+                assert!(block_on(store.job_evidence(&evidence)).is_err());
+                assert!(
+                    store.dispatch.jobs.is_empty(),
+                    "evidence applied before append"
+                );
+                assert!(store.dispatch.terminals.is_empty());
+                assert_eq!(state(&store, 1), crate::dispatch::CallState::Unresolved);
+                let reopened = reopen(&storage.files(), PASS).unwrap();
+                let landed = matches!(fault, Fault::LandThenFail(_));
+                assert_eq!(reopened.dispatch.jobs.len(), usize::from(landed));
+                assert_eq!(
+                    reopened.dispatch.terminals.len(),
+                    usize::from(landed && finished)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_job_evidence_refuses_replay() {
+        use crate::jobs::Record;
+        for case in 0..9 {
+            let (storage, mut store) = store(PASS, 1);
+            let mut evidence = job_evidence(&store, 1, Some(0));
+            match case {
+                0 => evidence.call = 99,
+                1 => {
+                    store.dispatch.calls.get_mut(&1).unwrap().intent.approval = None;
+                    // Write the cancelled shape using authenticated records.
+                    let mut intent = store.dispatch.calls[&1].intent.clone();
+                    intent.call = 2;
+                    intent.job = Some("b".repeat(48));
+                    evidence.call = 2;
+                    evidence.job = intent.job.clone().unwrap();
+                    craft_dispatch(&mut store, Event::Intent(intent));
+                }
+                2 => {
+                    block_on(store.terminal(&terminal(1))).unwrap();
+                }
+                3 => evidence.job = "c".repeat(48),
+                4 => evidence.record = Record::Missing,
+                5 => {
+                    if let Record::Present { exit_status, .. } = &mut evidence.record {
+                        *exit_status = None;
+                    }
+                }
+                6 => {
+                    if let Record::Present { command, .. } = &mut evidence.record {
+                        *command = "FF".into();
+                    }
+                }
+                7 => {
+                    if let Record::Present { machine, .. } = &mut evidence.record {
+                        *machine = hex::encode("other");
+                    }
+                }
+                8 => {
+                    block_on(store.job_evidence(&evidence)).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            craft_dispatch(&mut store, Event::JobTerminal(evidence));
+            assert!(
+                reopen(&storage.files(), PASS).is_err(),
+                "malformed evidence case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn job_terminal_above_128_refuses_replay() {
+        let (storage, mut store) = store(PASS, 1);
+        let evidence = job_evidence(&store, 1, Some(137));
+        craft_dispatch(&mut store, Event::JobTerminal(evidence));
+        let why = reopen(&storage.files(), PASS)
+            .err()
+            .expect("invalid exit must refuse replay");
+        assert!(why.contains("invalid boot identity or exit code"), "{why}");
+        assert!(why.ends_with("replay stopped"), "{why}");
+    }
+
+    #[test]
+    fn old_intents_without_job_identity_are_not_collected() {
+        let (storage, mut store) = store(PASS, 0);
+        craft_dispatch(
+            &mut store,
+            Event::Intent(Intent {
+                call: 1,
+                machine: "fixture".into(),
+                command: hex::encode("exit 0"),
+                approval: Some(approval()),
+                job: None,
+            }),
+        );
+        let reopened = reopen(&storage.files(), PASS).unwrap();
+        assert_eq!(state(&reopened, 1), crate::dispatch::CallState::Unresolved);
+        assert!(
+            block_on(reopened.collectable("fixture"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     fn disposition(continuation: crate::dispatch::Continuation, calls: &[u64]) -> Disposition {
         Disposition {
             machine: "fixture".into(),
@@ -2445,6 +2719,7 @@ mod tests {
     fn dispatch_replay_errors_name_the_record_and_stop() {
         let intent = |call, command: &str, approval| {
             Event::Intent(Intent {
+                job: None,
                 call,
                 machine: "fixture".into(),
                 command: command.into(),
@@ -2503,6 +2778,7 @@ mod tests {
         craft_dispatch(
             &mut store,
             Event::Intent(Intent {
+                job: None,
                 call: 1,
                 machine: "private machine name".into(),
                 command: hex::encode("private command"),
@@ -2522,6 +2798,7 @@ mod tests {
         craft_dispatch(
             &mut store,
             Event::Intent(Intent {
+                job: None,
                 call: 2,
                 machine: "fixture".into(),
                 command: "ff00".into(),

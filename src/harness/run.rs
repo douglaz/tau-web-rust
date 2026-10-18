@@ -2,7 +2,8 @@
 
 use super::{AppendRefusal, Entry, Journal, PinSource};
 use crate::credential::{RelayKey, SshClientKey};
-use crate::dispatch::{Approval, ChannelDecision, ChannelEvent, ChannelFold, DispatchRefusal};
+use crate::dispatch::{Approval, DispatchRefusal};
+use crate::jobs::{self, Evidence, Record};
 use futures_util::{SinkExt, StreamExt};
 use pharos::{Observable, ObserveConfig};
 use russh::keys::ssh_key::private::{Ed25519Keypair, KeypairData};
@@ -40,6 +41,7 @@ pub struct Done {
     pub exit_status: u32,
     pub terminal: u64,
     pub host_key: String,
+    pub evidence: jobs::Report,
 }
 
 /// Why an attempt ended without the command being sent, or without its result.
@@ -63,9 +65,13 @@ pub enum Refusal {
     /// The journal refused the append, so no `exec` was sent (`STA-3`).
     Journal(String),
     Disposition(DispatchRefusal),
+    LaunchTooLong {
+        bytes: usize,
+    },
     Unresolved {
         call: u64,
         why: String,
+        evidence: Option<Box<jobs::Report>>,
     },
     /// Anything else: the transport, the protocol, authentication.
     Failed(String),
@@ -74,6 +80,12 @@ pub enum Refusal {
 impl Refusal {
     pub fn to_json(&self) -> Value {
         match self {
+            Refusal::LaunchTooLong { bytes } => json!({
+                "refused": "launch-too-long",
+                "why": "command is too long to launch; shorten the command",
+                "bytes": bytes,
+                "limit": jobs::MAX_LAUNCH_BYTES,
+            }),
             Refusal::NoPin => json!({ "refused": "no-pin" }),
             Refusal::NoCredentials => json!({ "refused": "no-credentials" }),
             Refusal::Relay { reason, close_code } => {
@@ -86,9 +98,11 @@ impl Refusal {
             Refusal::Disposition(record) => {
                 json!({ "refused": "disposition", "disposition": record.disposition, "continuation": record.continuation })
             }
-            Refusal::Unresolved { call, why } => {
-                json!({ "unresolved": true, "call": call, "why": why })
-            }
+            Refusal::Unresolved {
+                call,
+                why,
+                evidence,
+            } => jobs::unresolved(*call, why, evidence.as_deref()),
             Refusal::Failed(why) => json!({ "refused": "failed", "why": why }),
         }
     }
@@ -110,6 +124,7 @@ pub fn report(outcome: &Result<Done, Refusal>) -> Value {
             "stderr": String::from_utf8_lossy(&done.stderr),
             "exit_status": done.exit_status,
             "host_key": done.host_key,
+            "job_record": done.evidence,
         }),
         Err(refusal) => refusal.to_json(),
     }
@@ -168,6 +183,215 @@ pub async fn run_command(
         .check(&target.machine)
         .await
         .map_err(append_refusal)?;
+    let bytes = jobs::launch_size(&target.machine, command);
+    if !jobs::launch_fits(bytes) {
+        return Err(Refusal::LaunchTooLong { bytes });
+    }
+    let (ssh, pinned, host_key) = connect(
+        pins,
+        credentials,
+        target,
+        #[cfg(feature = "tracer")]
+        tamper_auth,
+    )
+    .await?;
+    let mut channel = ssh
+        .channel_open_session()
+        .await
+        .map_err(|e| Refusal::Failed(format!("session channel: {e}")))?;
+
+    // ARC-8, STA-4: the record is appended immediately before the bytes leave, and a failed
+    // append means they do not (STA-3).
+    let entry = Entry {
+        machine: target.machine.clone(),
+        command: command.to_vec(),
+    };
+    let approval = Approval::HarnessPin {
+        machine: target.machine.clone(),
+        fingerprint: pinned,
+    };
+    let seq = journal
+        .append(&entry, &approval)
+        .await
+        .map_err(append_refusal)?;
+    let intent = journal
+        .intent(seq)
+        .await
+        .ok_or_else(|| Refusal::Unresolved {
+            call: seq,
+            why: "intent read-back missing".into(),
+            evidence: None,
+        })?;
+    let job = intent.job.as_deref().expect("new intent has job identity");
+    let sent = jobs::launch(job, &entry.machine, &entry.command).into_bytes();
+    let result = exec_record(&mut channel, &sent).await;
+    let _ = ssh
+        .disconnect(russh::Disconnect::ByApplication, "", "en")
+        .await;
+    // CNF-30: the journal determines the wrapper's exact transmitted bytes.
+    let recorded = journal.read(seq).await;
+    let replayed = journal.intent(seq).await;
+    let recorded = match (recorded, replayed) {
+        (Some(recorded), Some(replayed))
+            if replayed.job.as_deref().is_some_and(|id| {
+                jobs::launch(id, &recorded.machine, &recorded.command).as_bytes() == sent
+            }) && recorded.machine == target.machine =>
+        {
+            recorded
+        }
+        _ => {
+            return Err(Refusal::Unresolved {
+                call: seq,
+                why: "transcript does not reconcile with command bytes".into(),
+                evidence: result.as_ref().ok().map(|record| {
+                    Box::new(jobs::uncommitted(
+                        &Evidence {
+                            call: seq,
+                            job: job.into(),
+                            record: record.clone(),
+                        },
+                        &entry.machine,
+                        &hex::encode(&entry.command),
+                    ))
+                }),
+            });
+        }
+    };
+    let record = result.map_err(|why| Refusal::Unresolved {
+        call: seq,
+        why,
+        evidence: None,
+    })?;
+    let received = Evidence {
+        call: seq,
+        job: job.into(),
+        record,
+    };
+    let evidence = journal
+        .job_evidence(&received)
+        .await
+        .map_err(|why| Refusal::Unresolved {
+            call: seq,
+            why: format!("job evidence append: {why}"),
+            evidence: Some(Box::new(jobs::uncommitted(
+                &received,
+                &entry.machine,
+                &hex::encode(&entry.command),
+            ))),
+        })?;
+    if evidence.state != jobs::State::Finished {
+        return Err(Refusal::Unresolved {
+            call: seq,
+            why: format!("job record: {:?}", evidence.state),
+            evidence: Some(Box::new(evidence)),
+        });
+    }
+    Ok(Done {
+        seq,
+        sent,
+        recorded,
+        stdout: evidence.stdout.as_bytes().to_vec(),
+        stderr: evidence.stderr.as_bytes().to_vec(),
+        exit_status: evidence.exit_status.expect("finished record"),
+        terminal: evidence.number.expect("committed evidence"),
+        host_key,
+        evidence,
+    })
+}
+
+/// Collecting is a read. It neither consults command dispositions nor appends an intent.
+/// Only this operation waits for outstanding jobs; a fresh command never collects first.
+pub async fn collect_jobs(
+    pins: &impl PinSource,
+    journal: &mut impl Journal,
+    credentials: &impl Credentials,
+    target: &Target,
+    #[cfg(feature = "tracer")] tamper_auth: bool,
+) -> Result<Vec<Value>, Refusal> {
+    let calls = journal
+        .collectable(&target.machine)
+        .await
+        .map_err(Refusal::Journal)?;
+    let (ssh, _, _) = connect(
+        pins,
+        credentials,
+        target,
+        #[cfg(feature = "tracer")]
+        tamper_auth,
+    )
+    .await?;
+    let mut reports = Vec::new();
+    for intent in calls {
+        let job = intent.job.expect("collectable has job identity");
+        if ssh.is_closed() {
+            reports.push(
+                json!({"call":intent.call,"job":job,"not_read":true,"why":"connection lost"}),
+            );
+            continue;
+        }
+        let result = match ssh.channel_open_session().await {
+            Ok(mut channel) => exec_record(&mut channel, jobs::collect(&job).as_bytes()).await,
+            Err(e) => Err(format!("session channel: {e}")),
+        };
+        let record = match result {
+            Ok(record) => record,
+            Err(why) => {
+                reports.push(json!({"call":intent.call,"job":job,"failed":true,"why":why}));
+                continue;
+            }
+        };
+        let received = Evidence {
+            call: intent.call,
+            job,
+            record,
+        };
+        match journal.job_evidence(&received).await {
+            Ok(report) => reports.push(serde_json::to_value(report).expect("report serialization")),
+            Err(why) => reports.push(json!({
+                "call":intent.call,"job":received.job,"failed":true,
+                "why":format!("job evidence append: {why}"),
+                "job_record":jobs::uncommitted(&received, &intent.machine, &intent.command)
+            })),
+        }
+    }
+    let _ = ssh
+        .disconnect(russh::Disconnect::ByApplication, "", "en")
+        .await;
+    Ok(reports)
+}
+
+/// The SSH exit status belongs to the wrapper, never to the command. Only a complete,
+/// valid record delivered on a normally ended read can establish the command's outcome.
+async fn exec_record(
+    channel: &mut russh::Channel<client::Msg>,
+    bytes: &[u8],
+) -> Result<Record, String> {
+    channel
+        .exec(true, bytes)
+        .await
+        .map_err(|e| format!("exec: {e}"))?;
+    let mut delivered = jobs::ReadDelivery::default();
+    while let Some(message) = channel.wait().await {
+        match message {
+            ChannelMsg::Data { data } => delivered.stdout.extend_from_slice(&data),
+            ChannelMsg::ExtendedData { data, .. } => delivered.extended_data(&data),
+            ChannelMsg::ExitStatus { exit_status } => delivered.status = Some(exit_status),
+            ChannelMsg::Close => {
+                delivered.closed = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    delivered.record()
+}
+
+async fn connect(
+    pins: &impl PinSource,
+    credentials: &impl Credentials,
+    target: &Target,
+    #[cfg(feature = "tracer")] tamper_auth: bool,
+) -> Result<(client::Handle<PinCheck>, String, String), Refusal> {
     // CHN-R4: with no pin there is nothing to check a key against, so nothing is contacted.
     let pinned = pins.pin(&target.machine).ok_or(Refusal::NoPin)?.0;
     let (Some(ssh_key), Some(relay_key)) = (credentials.ssh_key(), credentials.relay_key()) else {
@@ -273,95 +497,7 @@ pub async fn run_command(
     if !auth.success() {
         return Err(Refusal::Failed(format!("authentication refused: {auth:?}")));
     }
-    let mut channel = ssh
-        .channel_open_session()
-        .await
-        .map_err(|e| Refusal::Failed(format!("session channel: {e}")))?;
-
-    // ARC-8, STA-4: the record is appended immediately before the bytes leave, and a failed
-    // append means they do not (STA-3).
-    let entry = Entry {
-        machine: target.machine.clone(),
-        command: command.to_vec(),
-    };
-    let approval = Approval::HarnessPin {
-        machine: target.machine.clone(),
-        fingerprint: pinned,
-    };
-    let seq = journal
-        .append(&entry, &approval)
-        .await
-        .map_err(append_refusal)?;
-    if let Err(error) = channel.exec(true, entry.command.clone()).await {
-        return Err(Refusal::Unresolved {
-            call: seq,
-            why: format!("exec: {error}"),
-        });
-    }
-    let sent = entry.command;
-
-    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
-    let mut fold = ChannelFold::new(seq);
-    loop {
-        let event = match channel.wait().await {
-            Some(ChannelMsg::Data { data }) => {
-                stdout.extend_from_slice(&data);
-                None
-            }
-            Some(ChannelMsg::ExtendedData { data, .. }) => {
-                stderr.extend_from_slice(&data);
-                None
-            }
-            Some(ChannelMsg::ExitStatus { exit_status }) => {
-                Some(ChannelEvent::ExitStatus(exit_status))
-            }
-            Some(ChannelMsg::ExitSignal { .. }) => Some(ChannelEvent::ExitSignal),
-            Some(ChannelMsg::Close) => Some(ChannelEvent::Close),
-            None => Some(ChannelEvent::StreamEnd),
-            _ => None,
-        };
-        if let Some(event) = event {
-            if let Some(record) = fold.receive(event) {
-                fold.appended(journal.terminal(&record).await);
-            }
-            if matches!(event, ChannelEvent::Close | ChannelEvent::StreamEnd) {
-                break;
-            }
-        }
-    }
-    let _ = ssh
-        .disconnect(russh::Disconnect::ByApplication, "", "en")
-        .await;
-
-    // CNF-30: read back even an unresolved call; a mismatch asserts no external outcome.
-    let recorded = journal.read(seq).await;
-    let recorded = match recorded {
-        Some(recorded) if recorded.command == sent && recorded.machine == target.machine => {
-            recorded
-        }
-        _ => {
-            return Err(Refusal::Unresolved {
-                call: seq,
-                why: "transcript does not reconcile with command bytes".into(),
-            });
-        }
-    };
-    match fold.conclude() {
-        ChannelDecision::Finished {
-            exit_status,
-            terminal,
-        } => Ok(Done {
-            seq,
-            sent,
-            recorded,
-            stdout,
-            stderr,
-            exit_status,
-            terminal,
-            host_key,
-        }),
-        ChannelDecision::Unresolved(why) => Err(Refusal::Unresolved { call: seq, why }),
-    }
+    Ok((ssh, pinned, host_key))
 }
 
 /// The next frame, which the handshake requires to be a JSON text frame.

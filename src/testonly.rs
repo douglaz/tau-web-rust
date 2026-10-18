@@ -126,6 +126,7 @@ pub async fn run(
     command: &[u8],
     request: &serde_json::Value,
     journal: &mut (impl Journal + FailAppend),
+    collect: bool,
 ) -> Result<serde_json::Value, String> {
     use serde_json::json;
     let selector = &request["test_relay_key"];
@@ -151,23 +152,40 @@ pub async fn run(
     journal
         .fail_next_append(request["fail_append"] == json!(true))
         .await;
-    let outcome = crate::harness::run_command(
-        &TestPins,
-        journal,
-        &TestCredentials {
-            ssh: SshClientKey(SSH_CLIENT_SEED),
-            relay,
-        },
-        target,
-        command,
-        request["tamper_auth"] == json!(true),
-    )
-    .await;
+    let credentials = TestCredentials {
+        ssh: SshClientKey(SSH_CLIENT_SEED),
+        relay,
+    };
+    let outcome = if collect {
+        match crate::harness::collect_jobs(
+            &TestPins,
+            journal,
+            &credentials,
+            target,
+            request["tamper_auth"] == json!(true),
+        )
+        .await
+        {
+            Ok(records) => json!({"collected": records}),
+            Err(refusal) => refusal.to_json(),
+        }
+    } else {
+        let result = crate::harness::run_command(
+            &TestPins,
+            journal,
+            &credentials,
+            target,
+            command,
+            request["tamper_auth"] == json!(true),
+        )
+        .await;
+        crate::harness::report(&result)
+    };
     journal.fail_next_append(false).await;
     let appended = journal.commands().await;
     Ok(json!({
         "pin_source": PIN_SOURCE_MARKER,
-        "outcome": crate::harness::report(&outcome),
+        "outcome": outcome,
         "journal_entries": appended[before.min(appended.len())..]
             .iter()
             .map(|(_, e)| hex::encode(&e.command))
