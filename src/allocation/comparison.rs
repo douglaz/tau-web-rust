@@ -9,7 +9,7 @@
 use super::*;
 use crate::seed::Seed;
 use serde_json::Value;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 /// The file, under the pinned tree.
 const FILE: &str = "spec/docs/design/allocation-witnesses-v2.json";
@@ -515,6 +515,7 @@ fn compare(bytes: &[u8]) -> Result<Record, String> {
     let mut sequences = HashSet::new();
     // Per declaration of a paired trace: its side, the other side's name, and its differences.
     let mut pairs = BTreeMap::new();
+    let mut controlled = BTreeSet::new();
     let labelled = witnesses
         .iter()
         .enumerate()
@@ -585,6 +586,9 @@ fn compare(bytes: &[u8]) -> Result<Record, String> {
                 continue;
             }
         };
+        if admitted && !differences.is_empty() {
+            controlled.extend(GUARDS.into_iter().find(|g| trace.assumptions[*g] == false));
+        }
         if let Some(pair) = &trace.pair {
             for name in &trace.declarations {
                 pairs.insert(
@@ -632,8 +636,11 @@ fn compare(bytes: &[u8]) -> Result<Record, String> {
             )),
         }
     }
-    if !pairs.values().any(|(side, ..)| *side == Side::Admitted) {
-        failures.push("no admitted side: no negative control".into());
+    // Each guard has its own pair: an admitted side run without that guard alone, which differs.
+    for guard in GUARDS.into_iter().filter(|g| !controlled.contains(g)) {
+        failures.push(format!(
+            "no admitted side without {guard} differs: no negative control"
+        ));
     }
     if !failures.is_empty() {
         let shown = failures.iter().take(12).cloned().collect::<Vec<_>>();
@@ -862,7 +869,39 @@ mod breaks {
         let witnesses = file["witnesses"].as_array_mut().unwrap();
         witnesses.retain(|w| w["pair"]["side"] != "admitted");
         let e = failure(&file);
-        assert!(e.contains("no admitted side: no negative control"), "{e}");
+        for guard in GUARDS {
+            assert!(
+                e.contains(&format!("no admitted side without {guard}")),
+                "{e}"
+            );
+        }
+    }
+
+    /// Each guard needs its own pair: dropping the ceremony gate's pair, or running its admitted
+    /// side without the other guard instead, leaves `backupRecorded` with no negative control.
+    #[test]
+    fn a_guard_without_its_own_pair() {
+        let mut file = pinned();
+        file["witnesses"].as_array_mut().unwrap().retain(|w| {
+            w["pair"]["with"]
+                .as_str()
+                .is_none_or(|n| !n.contains("backup_missing"))
+        });
+        let e = failure(&file);
+        assert!(e.contains("no admitted side without backupRecorded"), "{e}");
+        assert!(!e.contains("without restoredAllocatesNone"), "{e}");
+
+        let mut file = pinned();
+        let admitted = file["witnesses"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|w| w["declarations"][0] == "TauWeb.Allocation.backup_missing_admitted")
+            .unwrap();
+        admitted["assumptions"]["backupRecorded"] = true.into();
+        admitted["assumptions"]["restoredAllocatesNone"] = false.into();
+        let e = failure(&file);
+        assert!(e.contains("no admitted side without backupRecorded"), "{e}");
     }
 
     #[test]

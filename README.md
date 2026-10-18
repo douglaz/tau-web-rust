@@ -664,15 +664,17 @@ file is a red test.
   append applies nothing.
 - **Both pairs.** The guards are exactly `restoredAllocatesNone` and `backupRecorded`.
   Unpaired traces and refused sides run with both true and must match every step. Each admitted
-  side runs with exactly one false and must differ somewhere. The production core has neither
-  switch. Both the `backup_missing` and `stale_sheet` pairs are recorded as negative controls.
+  side runs with exactly one false and must differ somewhere, and each guard needs its own such
+  side. The production core has neither switch. Both the `backup_missing` and `stale_sheet` pairs
+  are recorded as negative controls.
 - **Anything unknown fails**: an event kind, provenance, family, status, outcome, assumption or
   member. Every failure names its trace — a witness by its declarations, an enumerated trace as
   `enumeration[i]` — and its step, with the expected and actual values.
 - **Its own negative controls.** Unit tests build `CNF-3`'s three breaks in memory from the
   pinned file — an outcome flipped; empty bytes and an absent file; an unknown event kind and an
   unknown outcome — plus a truncated enumeration, an unknown member, a pair without its admitted
-  side, no admitted sides, an unknown completion, a flipped `recorded` outcome, and an enumerated
+  side, no admitted sides, a guard without its own pair (dropped, or its admitted side run
+  without the other guard), an unknown completion, a flipped `recorded` outcome, and an enumerated
   trace starting elsewhere than the initial journal, both the empty
   trace and one with steps, and each must fail naming the trace.
 
