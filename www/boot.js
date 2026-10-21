@@ -1,11 +1,9 @@
-// The page: it starts the harness worker (STA-1), which holds every key, pin and record, and shows
-// whether it came up, the store's one state, and the persistent-storage request's outcome. It
-// defines no global. A passphrase goes to the worker once, as UTF-8 bytes in one create or unlock
-// message, and its fields are cleared at once; nothing is submitted anywhere (STG-10).
-const $ = (id) => document.getElementById(id);
+// The page sends passphrase and re-entry bytes once and clears fields immediately. The only
+// mnemonic display is the dedicated seed-backup ceremony; lock removes its words and inputs.
+const $ = (id) => document.getElementById(`tau-${id}`);
 const status = $('status');
 const show = (state, text) => {
-  status.dataset.state = state;
+  status.dataset.state = state === 'ready' ? 'harness-ready' : state;
   status.textContent = text;
 };
 
@@ -17,6 +15,8 @@ const texts = {
   locked: 'The local store is locked.',
   unlocked: 'The local store is unlocked.',
 };
+const clearWords = () => $('seed-backup-words-slot').replaceChildren();
+let redisplay = false;
 const render = (store) => {
   const { state } = store;
   $('store').dataset.state = state;
@@ -28,6 +28,26 @@ const render = (store) => {
   $('passphrase').autocomplete = state === 'none' ? 'new-password' : 'current-password';
   $('unlock').hidden = state !== 'locked';
   $('lock').hidden = state !== 'unlocked';
+  const stage = store.seed_backup_stage;
+  const active = state === 'unlocked' && stage !== 'inactive';
+  clearWords();
+  $('seed-backup').hidden = !active;
+  $('seed-backup-answer').hidden = stage !== 'showing_words';
+  $('seed-backup-entry').hidden = stage !== 'answering';
+  $('redisplay').hidden = state !== 'unlocked' || active;
+  const completion = store.seed_backup_completion;
+  if (state === 'unlocked' && completion) {
+    $('store-state').textContent += completion === 'full_reentry'
+      ? ' Seed-backup record: all twelve words re-entered.'
+      : ' Seed-backup record: re-entry check skipped.';
+  }
+  $('seed-backup-state').textContent = active
+    ? ['Seed-backup ceremony.', store.seed_backup_owed
+      ? 'New machines, relay passes and handoffs are refused until the seed backup is recorded.'
+      : stage !== 'append_failed' && 'Re-display: record a new full re-entry or skip.',
+    'Dispatch is stopped.', store.error].filter(Boolean).join(' ')
+    : '';
+  if (state === 'locked' && redisplay) $('store-state').textContent += ' Enter the local passphrase again to show the seed backup.';
 };
 
 let worker;
@@ -35,12 +55,33 @@ const start = () => {
   show('starting', 'Starting the harness…');
   render({ state: 'starting' });
   worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
+  const current = worker;
   worker.onmessage = ({ data }) => {
-    if (data.ready) show('ready', `Harness ready (spec ${data.ready}).`);
-    else if (data.store) render(data.store);
-    else show('failed', `Harness failed: ${data.error}`);
+    if (worker !== current) return;
+    if (data.harness_ready) show('ready', `Harness ready (spec ${data.harness_ready}).`);
+    else if (data.store) {
+      const { store_state: state, store_error: error, store_reason: reason, ...rest } = data.store;
+      render({ state, error, reason, ...rest });
+    }
+    else if (Object.keys(data).length === 1 && typeof data.seed_backup_display === 'string') {
+      clearWords();
+      const list = document.createElement('ol');
+      list.id = 'tau-seed-backup-words';
+      for (const word of data.seed_backup_display.split(' ')) {
+        const item = document.createElement('li');
+        item.textContent = word;
+        list.append(item);
+      }
+      $('seed-backup-words-slot').append(list);
+    }
+    else show('failed', `Harness failed: ${data.harness_error}`);
   };
-  worker.onerror = (event) => show('failed', `Harness failed: ${event.message ?? 'the worker did not load'}`);
+  worker.onerror = (event) => {
+    if (worker !== current) return;
+    clearWords();
+    $('seed-backup-input').value = '';
+    show('failed', `Harness failed: ${event.message ?? 'the worker did not load'}`);
+  };
 };
 
 // STA-23: explicit lock, page hide and a back/forward-cache restore each end the harness worker,
@@ -49,6 +90,9 @@ const start = () => {
 // too (SEC-5 row 18: the passphrase is in the input UI briefly).
 const lock = () => {
   worker.terminate();
+  clearWords();
+  $('seed-backup-input').value = '';
+  redisplay = false;
   $('passphrase').value = '';
   $('confirm').value = '';
   start();
@@ -74,10 +118,31 @@ const send = (kind) => {
     return;
   }
   render({ state: 'working' });
-  worker.postMessage({ [kind]: bytes }, [bytes.buffer]);
+  const operation = kind === 'unlock' && redisplay ? 'seed_backup_redisplay' : kind;
+  redisplay = false;
+  worker.postMessage({ [operation]: bytes }, [bytes.buffer]);
 };
 $('create').addEventListener('click', () => send('create'));
 $('unlock').addEventListener('click', () => send('unlock'));
+
+$('redisplay').addEventListener('click', () => {
+  lock();
+  redisplay = true;
+});
+$('seed-backup-answer').addEventListener('click', () => {
+  clearWords();
+  worker.postMessage({ seed_backup_answer: true });
+});
+$('seed-backup-check').addEventListener('click', () => {
+  const field = $('seed-backup-input');
+  const bytes = new TextEncoder().encode(field.value);
+  field.value = '';
+  worker.postMessage({ seed_backup_reentry: bytes }, [bytes.buffer]);
+});
+$('seed-backup-skip').addEventListener('click', () => {
+  $('seed-backup-input').value = '';
+  worker.postMessage({ seed_backup_skip: true });
+});
 
 // STA-23: "The browser MUST request persistent storage and visibly report a refusal." Asked once
 // per load, unless already granted.

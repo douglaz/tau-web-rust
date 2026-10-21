@@ -466,14 +466,33 @@ impl<S: Storage> Store<S> {
         Ok(identity)
     }
 
-    /// Journals the stated ceremony completion for this store's seed (`STA-23`, `STA-3`).
-    /// Display and checking of the ceremony are the caller's duty.
+    /// Journals the stated seed-backup ceremony completion for this store's seed (`STA-23`, `STA-3`).
+    /// The seed-backup ceremony state machine calls this after checking or explicit skip.
     pub async fn seed_backup(&mut self, completion: allocation::Completion) -> Result<(), String> {
         self.record(allocation::Event::SeedBackup {
             seed: self.allocation().seed().into(),
             completion,
         })
         .await
+    }
+
+    /// Imports all twelve re-entered words and compares the current seed identifier.
+    /// The owned input is zeroized on every return, including malformed UTF-8.
+    pub async fn seed_backup_reentry(&mut self, words: Zeroizing<Vec<u8>>) -> Result<(), String> {
+        let text = std::str::from_utf8(&words).map_err(|_| "The entry is not UTF-8.")?;
+        let entered = Seed::import(text).map_err(|e| match e {
+            crate::seed::ImportError::WordCount(_) => "Enter exactly twelve words.".into(),
+            crate::seed::ImportError::UnknownWord { position } => {
+                format!("The word at position {position} is not on the English word list.")
+            }
+            crate::seed::ImportError::Checksum => {
+                "The words do not pass the checksum check.".into()
+            }
+        })?;
+        if entered.id() != self.allocation().seed() {
+            return Err("The entry does not match this seed.".into());
+        }
+        self.seed_backup(allocation::Completion::FullReentry).await
     }
 
     /// Journals an adapter's observation of an identity: created, failed or destroyed. One the
@@ -817,11 +836,23 @@ pub enum State<S> {
     Refused(String),
 }
 
+/// Only Display permits words to leave the worker. AppendFailed requires a reload.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum BackupStage {
+    Inactive,
+    #[serde(rename = "showing_words")]
+    Display,
+    Answering,
+    AppendFailed,
+}
+
 /// The store's state machine, which the worker's exports drive.
 pub struct Local<S, K> {
     storage: S,
     kdf: K,
     state: State<S>,
+    seed_backup: BackupStage,
 }
 
 impl<S: Storage + Clone, K: Kdf> Local<S, K> {
@@ -830,6 +861,7 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
             storage,
             kdf,
             state: State::Unopened,
+            seed_backup: BackupStage::Inactive,
         }
     }
 
@@ -851,7 +883,12 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
             return self.report(Some("a store is created only where there is none"));
         }
         match create(self.storage.clone(), &self.kdf, passphrase).await {
-            Ok(store) => self.state = State::Unlocked(Box::new(store)),
+            Ok(store) => {
+                if store.allocation().seed_backup_owed() {
+                    self.seed_backup = BackupStage::Display;
+                }
+                self.state = State::Unlocked(Box::new(store));
+            }
             Err(Failure::Input(why)) => return self.report(Some(&why)),
             Err(Failure::Refused(why)) => self.state = State::Refused(why),
         }
@@ -864,10 +901,103 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
             return self.report(Some("only a locked store is unlocked"));
         }
         self.state = match unlock(self.storage.clone(), &self.kdf, passphrase).await {
-            Ok(store) => State::Unlocked(Box::new(store)),
+            Ok(store) => {
+                if store.allocation().seed_backup_owed() {
+                    self.seed_backup = BackupStage::Display;
+                }
+                State::Unlocked(Box::new(store))
+            }
             Err(why) => State::Refused(why),
         };
         self.report(None)
+    }
+
+    /// Re-display uses a fresh, locked worker: the passphrase really unwraps the envelope.
+    pub async fn seed_backup_redisplay(&mut self, passphrase: LocalPassphrase) -> Value {
+        if !matches!(self.state, State::Locked) {
+            return self.report(Some("Re-display requires a fresh locked worker."));
+        }
+        self.unlock(passphrase).await;
+        if matches!(self.state, State::Unlocked(_)) {
+            self.seed_backup = BackupStage::Display;
+        }
+        self.report(None)
+    }
+
+    /// The sole display shape; never part of a store report or inspection.
+    pub fn seed_backup_display(&self) -> Value {
+        if self.seed_backup == BackupStage::Display
+            && let State::Unlocked(store) = &self.state
+            && let Some(seed) = store.seed()
+            && seed.id() == store.allocation().seed()
+        {
+            return json!({"seed_backup_display": &*seed.phrase()});
+        }
+        Value::Null
+    }
+
+    pub fn seed_backup_answer(&mut self) -> Value {
+        if self.seed_backup == BackupStage::Display {
+            self.seed_backup = BackupStage::Answering;
+        }
+        self.report(None)
+    }
+
+    /// Refused before contact while the seed-backup ceremony is active, including re-display.
+    pub fn dispatch_refusal(&self) -> Option<&'static str> {
+        if !matches!(self.state, State::Unlocked(_)) {
+            Some("locked")
+        } else if self.seed_backup != BackupStage::Inactive {
+            Some("seed_backup")
+        } else {
+            None
+        }
+    }
+
+    pub async fn seed_backup_complete(&mut self, words: Option<Zeroizing<Vec<u8>>>) -> Value {
+        if self.seed_backup != BackupStage::Answering {
+            return self.report(Some("Show and hide the twelve words before answering."));
+        }
+        let Some(store) = self.store() else {
+            return self.report(Some("The store is locked."));
+        };
+        let result = match words {
+            Some(words) => store.seed_backup_reentry(words).await,
+            None => store.seed_backup(allocation::Completion::Skipped).await,
+        };
+        match result {
+            Ok(()) => {
+                self.seed_backup = BackupStage::Inactive;
+                self.report(None)
+            }
+            Err(error) => {
+                let failed = self.store().is_some_and(|store| store.failed.is_some());
+                self.seed_backup = if failed {
+                    BackupStage::AppendFailed
+                } else {
+                    BackupStage::Display
+                };
+                if failed {
+                    let message = match self.store().unwrap().allocation().seed_backup() {
+                        None if self.store().unwrap().allocation().seed_backup_owed() => {
+                            "The completion was not recorded. The seed-backup ceremony is still owed. Reload and unlock to try again."
+                        }
+                        None => {
+                            "The completion was not recorded. No earlier seed-backup completion is recorded. Reload and unlock to try again."
+                        }
+                        Some(allocation::Completion::FullReentry) => {
+                            "The completion was not recorded. The earlier record stands: all twelve words re-entered. Reload and unlock to try again."
+                        }
+                        Some(allocation::Completion::Skipped) => {
+                            "The completion was not recorded. The earlier record stands: re-entry check skipped. Reload and unlock to try again."
+                        }
+                    };
+                    self.report(Some(message))
+                } else {
+                    self.report(Some(&error))
+                }
+            }
+        }
     }
 
     /// The unlocked store, if any.
@@ -885,7 +1015,12 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
             State::Unopened => json!({ "state": "unopened" }),
             State::NoStore => json!({ "state": "none" }),
             State::Locked => json!({ "state": "locked" }),
-            State::Unlocked(_) => json!({ "state": "unlocked" }),
+            State::Unlocked(store) => json!({
+                "state": "unlocked",
+                "seed_backup_owed": store.allocation().seed_backup_owed(),
+                "seed_backup_completion": store.allocation().seed_backup(),
+                "seed_backup_stage": self.seed_backup,
+            }),
             State::Refused(why) => json!({ "state": "refused", "reason": why }),
         };
         if let Some(error) = error {
@@ -1763,7 +1898,8 @@ mod tests {
             assert_eq!(*reopened.allocation(), before, "op {at}: nothing replayed");
             for family in Family::ALL {
                 assert!(
-                    block_on(store.allocate(family)).is_err(),
+                    block_on(store.allocate(family)).unwrap_err()
+                        == allocation::Refusal::BackupMissing.to_string(),
                     "op {at}: {family:?}"
                 );
                 assert!(
@@ -1771,6 +1907,392 @@ mod tests {
                         .unwrap_err()
                         .contains("seed-backup ceremony"),
                     "op {at}: reopened {family:?}"
+                );
+            }
+        }
+    }
+
+    fn backup_local(storage: MemoryStorage) -> Local<MemoryStorage, &'static Counting> {
+        let mut local = Local::new(storage, kdf());
+        block_on(local.open());
+        local
+    }
+
+    fn assert_backup_missing(store: &mut Store<MemoryStorage>) {
+        assert!(store.allocation().seed_backup_owed());
+        for family in Family::ALL {
+            assert_eq!(
+                block_on(store.allocate(family)).unwrap_err(),
+                allocation::Refusal::BackupMissing.to_string()
+            );
+        }
+    }
+
+    fn assert_inspection_has_no_mnemonic(inspected: &str, phrase: &str) {
+        assert!(!inspected.contains(phrase));
+        let words: Vec<_> = phrase.split(' ').collect();
+        fn check(value: &Value, words: &[&str]) {
+            match value {
+                Value::Array(items) => {
+                    for pair in items.windows(2) {
+                        assert!(!words.windows(2).any(|w| pair == [json!(w[0]), json!(w[1])]));
+                    }
+                    for item in items {
+                        check(item, words);
+                    }
+                }
+                Value::Object(fields) => {
+                    for value in fields.values() {
+                        check(value, words);
+                    }
+                }
+                _ => {}
+            }
+        }
+        check(&serde_json::from_str::<Value>(inspected).unwrap(), &words);
+    }
+
+    #[test]
+    fn seed_backup_fixed_text_and_inspection_accept_collision_controls_in_every_stage() {
+        let controls: Vec<_> = include_str!("../tests/vectors/seed-backup-collisions.txt")
+            .lines()
+            .collect();
+        for (i, phrase) in controls.iter().enumerate() {
+            let (_, created) = store(PASS, 0);
+            let storage = MemoryStorage::with_files(BTreeMap::from([(
+                ENVELOPE.into(),
+                created.storage().files()[ENVELOPE].clone(),
+            )]));
+            let mut seeded =
+                Store::new(storage.clone(), DataKey(created.key.0), created.id.clone());
+            block_on(seeded.commit(&Event::Seed {
+                mnemonic: phrase.to_string(),
+            }))
+            .unwrap();
+            let mut local = backup_local(storage.clone());
+            block_on(local.unlock(pass(PASS)));
+            assert_inspection_has_no_mnemonic(&local.inspect().to_string(), phrase);
+            local.seed_backup_answer();
+            assert_inspection_has_no_mnemonic(&local.inspect().to_string(), phrase);
+            let report = block_on(local.seed_backup_complete(Some(Zeroizing::new(
+                controls[(i + 1) % controls.len()].as_bytes().to_vec(),
+            ))));
+            assert_eq!(report["error"], "The entry does not match this seed.");
+            assert_eq!(local.seed_backup_display()["seed_backup_display"], *phrase);
+            assert_inspection_has_no_mnemonic(&local.inspect().to_string(), phrase);
+            local.seed_backup_answer();
+            storage.fault(Fault::Fail(3));
+            block_on(local.seed_backup_complete(None));
+            assert_eq!(local.inspect()["seed_backup_stage"], "append_failed");
+            assert_inspection_has_no_mnemonic(&local.inspect().to_string(), phrase);
+            let mut local = backup_local(MemoryStorage::with_files(storage.files()));
+            block_on(local.unlock(pass(PASS)));
+            local.seed_backup_answer();
+            block_on(local.seed_backup_complete(Some(Zeroizing::new(phrase.as_bytes().to_vec()))));
+            assert_eq!(local.inspect()["seed_backup_stage"], "inactive");
+            assert_inspection_has_no_mnemonic(&local.inspect().to_string(), phrase);
+        }
+    }
+
+    #[test]
+    fn seed_backup_owed_after_create_reopen_and_creation_finishing_unlock() {
+        let storage = MemoryStorage::default();
+        let mut local = backup_local(storage.clone());
+        block_on(local.create(pass(PASS)));
+        assert_eq!(local.dispatch_refusal(), Some("seed_backup"));
+        assert_eq!(local.inspect()["seed_backup_owed"], true);
+        let display = local.seed_backup_display();
+        assert!(Seed::import(display["seed_backup_display"].as_str().unwrap()).is_ok());
+        let mut files = storage.files();
+        let mut reopened = backup_local(MemoryStorage::with_files(files.clone()));
+        block_on(reopened.unlock(pass(PASS)));
+        assert_eq!(reopened.inspect()["seed_backup_owed"], true);
+        files.remove("0");
+        let mut interrupted = backup_local(MemoryStorage::with_files(files));
+        block_on(interrupted.unlock(pass(PASS)));
+        assert_eq!(interrupted.inspect()["seed_backup_owed"], true);
+        assert!(!interrupted.seed_backup_display().is_null());
+    }
+
+    #[test]
+    fn seed_backup_full_reentry_and_skip_are_distinct_durable_completions() {
+        for completion in [
+            allocation::Completion::FullReentry,
+            allocation::Completion::Skipped,
+        ] {
+            let storage = MemoryStorage::default();
+            let mut local = backup_local(storage.clone());
+            block_on(local.create(pass(PASS)));
+            let phrase = local.store().unwrap().seed().unwrap().phrase();
+            for stage in 0..3 {
+                if stage == 1 {
+                    local.seed_backup_answer();
+                }
+                if stage == 2 {
+                    let words = (completion == allocation::Completion::FullReentry).then(|| {
+                        Zeroizing::new(
+                            format!(" \t{}\r\n", phrase.replace(' ', "  \n")).into_bytes(),
+                        )
+                    });
+                    block_on(local.seed_backup_complete(words));
+                }
+                let inspected = local.inspect().to_string();
+                assert_inspection_has_no_mnemonic(&inspected, &phrase);
+                if stage == 1 {
+                    assert!(local.seed_backup_display().is_null());
+                }
+            }
+            assert_eq!(local.dispatch_refusal(), None);
+            assert_eq!(
+                local.store().unwrap().allocation().seed_backup(),
+                Some(completion)
+            );
+            assert!(!local.store().unwrap().allocation().restored_from_import());
+            for family in Family::ALL {
+                assert_eq!(
+                    block_on(local.store().unwrap().allocate(family))
+                        .unwrap()
+                        .index,
+                    0
+                );
+            }
+            let mut reopened = backup_local(MemoryStorage::with_files(storage.files()));
+            block_on(reopened.unlock(pass(PASS)));
+            assert_eq!(reopened.inspect()["seed_backup_owed"], false);
+            assert!(reopened.seed_backup_display().is_null());
+            assert_eq!(
+                reopened.store().unwrap().allocation().seed_backup(),
+                Some(completion)
+            );
+        }
+    }
+
+    #[test]
+    fn seed_backup_mismatch_returns_to_display_without_record_or_allocation() {
+        let storage = MemoryStorage::default();
+        let mut local = backup_local(storage.clone());
+        block_on(local.create(pass(PASS)));
+        let original = storage.files();
+        let phrase = local.store().unwrap().seed().unwrap().phrase();
+        let different = include_str!("../tests/vectors/seed-backup-collisions.txt")
+            .lines()
+            .find(|words| {
+                Seed::import(words).unwrap().id() != local.store().unwrap().allocation().seed()
+            })
+            .unwrap();
+        let inputs = [
+            (different.to_string(), "The entry does not match this seed."),
+            (
+                phrase.split(' ').take(11).collect::<Vec<_>>().join(" "),
+                "Enter exactly twelve words.",
+            ),
+            (
+                format!("{} abandon", *phrase),
+                "Enter exactly twelve words.",
+            ),
+            (
+                "abandon ".repeat(12),
+                "The words do not pass the checksum check.",
+            ),
+            (
+                phrase
+                    .split(' ')
+                    .enumerate()
+                    .map(|(i, w)| if i == 2 { "unknownword" } else { w })
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                "The word at position 3 is not on the English word list.",
+            ),
+            (
+                "unknownword ".repeat(12),
+                "The word at position 1 is not on the English word list.",
+            ),
+            (
+                String::from_utf8_lossy(&[255]).into_owned(),
+                "Enter exactly twelve words.",
+            ),
+        ];
+        for (input, expected) in inputs {
+            local.seed_backup_answer();
+            let report =
+                block_on(local.seed_backup_complete(Some(Zeroizing::new(input.into_bytes()))));
+            assert!(report["error"].is_string());
+            assert!(!local.seed_backup_display().is_null());
+            assert_eq!(storage.files(), original);
+            assert_backup_missing(local.store().unwrap());
+            assert_eq!(report["error"], expected);
+        }
+        local.seed_backup_answer();
+        let report = block_on(local.seed_backup_complete(Some(Zeroizing::new(vec![255]))));
+        assert_eq!(report["error"], "The entry is not UTF-8.");
+        assert!(!local.seed_backup_display().is_null());
+        assert_eq!(storage.files(), original);
+        assert_backup_missing(local.store().unwrap());
+    }
+
+    #[test]
+    fn seed_backup_failed_append_applies_nothing_for_both_completions_and_every_operation() {
+        for at in 1..=3 {
+            for full in [false, true] {
+                let storage = MemoryStorage::default();
+                let mut local = backup_local(storage.clone());
+                block_on(local.create(pass(PASS)));
+                let before = local.store().unwrap().allocation().clone();
+                let words = full.then(|| {
+                    Zeroizing::new(
+                        local
+                            .store()
+                            .unwrap()
+                            .seed()
+                            .unwrap()
+                            .phrase()
+                            .as_bytes()
+                            .to_vec(),
+                    )
+                });
+                local.seed_backup_answer();
+                storage.fault(Fault::Fail(at));
+                let report = block_on(local.seed_backup_complete(words));
+                assert!(report["error"].as_str().unwrap().contains("not recorded"));
+                assert!(report["error"].as_str().unwrap().contains("still owed"));
+                assert_eq!(local.store().unwrap().allocation(), &before);
+                assert_backup_missing(local.store().unwrap());
+                assert!(local.seed_backup_display().is_null());
+                assert_eq!(local.inspect()["seed_backup_stage"], "append_failed");
+                let phrase = local.store().unwrap().seed().unwrap().phrase();
+                assert_inspection_has_no_mnemonic(&local.inspect().to_string(), &phrase);
+                let mut reopened = backup_local(MemoryStorage::with_files(storage.files()));
+                block_on(reopened.unlock(pass(PASS)));
+                assert_backup_missing(reopened.store().unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn seed_backup_imported_store_with_or_without_completion_owes_no_new_display() {
+        for completion in [
+            None,
+            Some(allocation::Completion::FullReentry),
+            Some(allocation::Completion::Skipped),
+        ] {
+            let (storage, mut store) = store(PASS, 0);
+            if let Some(completion) = completion {
+                block_on(store.seed_backup(completion)).unwrap();
+            }
+            let export = store.allocation().export();
+            craft(&mut store, allocation::Event::Restore(export));
+            let mut local = backup_local(MemoryStorage::with_files(storage.files()));
+            block_on(local.unlock(pass(PASS)));
+            assert_eq!(local.inspect()["seed_backup_owed"], false);
+            assert_eq!(local.dispatch_refusal(), None);
+            assert!(local.seed_backup_display().is_null());
+            for family in Family::ALL {
+                assert_eq!(
+                    block_on(local.store().unwrap().allocate(family)).unwrap_err(),
+                    allocation::Refusal::Restored.to_string()
+                );
+            }
+            let copy = MemoryStorage::with_files(storage.files());
+            let mut redisplay = backup_local(copy.clone());
+            block_on(redisplay.seed_backup_redisplay(pass(PASS)));
+            redisplay.seed_backup_answer();
+            copy.fault(Fault::Fail(3));
+            let report = block_on(redisplay.seed_backup_complete(None));
+            assert_eq!(report["seed_backup_owed"], false);
+            assert!(!report["error"].as_str().unwrap().contains("still owed"));
+            assert_eq!(
+                redisplay.store().unwrap().allocation().seed_backup(),
+                completion
+            );
+        }
+    }
+
+    #[test]
+    fn seed_backup_redisplay_requires_unwrap_and_replaces_only_after_append() {
+        let (storage, mut store) = store(PASS, 0);
+        block_on(store.seed_backup(allocation::Completion::Skipped)).unwrap();
+        let before = storage.files();
+        let mut wrong = backup_local(MemoryStorage::with_files(before.clone()));
+        block_on(wrong.seed_backup_redisplay(pass("wrong passphrase")));
+        assert!(wrong.seed_backup_display().is_null());
+        assert!(wrong.store().is_none());
+        let mut unlocked = backup_local(storage.clone());
+        block_on(unlocked.unlock(pass(PASS)));
+        let refused = block_on(unlocked.seed_backup_redisplay(pass("wrong passphrase")));
+        assert!(refused["error"].is_string());
+        assert!(unlocked.seed_backup_display().is_null());
+        for full in [true, false] {
+            let mut local = backup_local(storage.clone());
+            block_on(local.seed_backup_redisplay(pass(PASS)));
+            assert!(!local.seed_backup_display().is_null());
+            assert_eq!(local.dispatch_refusal(), Some("seed_backup"));
+            let words = full.then(|| {
+                Zeroizing::new(
+                    local
+                        .store()
+                        .unwrap()
+                        .seed()
+                        .unwrap()
+                        .phrase()
+                        .as_bytes()
+                        .to_vec(),
+                )
+            });
+            local.seed_backup_answer();
+            block_on(local.seed_backup_complete(words));
+            let reopened = reopen(&storage.files(), PASS).unwrap();
+            assert_eq!(
+                reopened.allocation().seed_backup(),
+                Some(if full {
+                    allocation::Completion::FullReentry
+                } else {
+                    allocation::Completion::Skipped
+                })
+            );
+        }
+        for standing in [
+            allocation::Completion::Skipped,
+            allocation::Completion::FullReentry,
+        ] {
+            let (storage, mut store) = self::store(PASS, 0);
+            block_on(store.seed_backup(standing)).unwrap();
+            for at in 1..=3 {
+                let copy = MemoryStorage::with_files(storage.files());
+                let mut local = backup_local(copy.clone());
+                block_on(local.seed_backup_redisplay(pass(PASS)));
+                let phrase = local.store().unwrap().seed().unwrap().phrase();
+                let words = (standing == allocation::Completion::Skipped)
+                    .then(|| Zeroizing::new(phrase.as_bytes().to_vec()));
+                local.seed_backup_answer();
+                copy.fault(Fault::Fail(at));
+                let report = block_on(local.seed_backup_complete(words));
+                let error = report["error"].as_str().unwrap();
+                assert_eq!(
+                    error,
+                    match standing {
+                        allocation::Completion::FullReentry =>
+                            "The completion was not recorded. The earlier record stands: all twelve words re-entered. Reload and unlock to try again.",
+                        allocation::Completion::Skipped =>
+                            "The completion was not recorded. The earlier record stands: re-entry check skipped. Reload and unlock to try again.",
+                    }
+                );
+                assert!(!error.contains("still owed"));
+                assert_eq!(report["seed_backup_owed"], false);
+                assert_eq!(
+                    local.store().unwrap().allocation().seed_backup(),
+                    Some(standing),
+                    "op {at}: standing {standing:?}"
+                );
+                assert_inspection_has_no_mnemonic(&local.inspect().to_string(), &phrase);
+                for family in Family::ALL {
+                    assert!(local.store().unwrap().allocation().issue(family).is_ok());
+                }
+                assert_eq!(
+                    reopen(&copy.files(), PASS)
+                        .unwrap()
+                        .allocation()
+                        .seed_backup(),
+                    Some(standing)
                 );
             }
         }

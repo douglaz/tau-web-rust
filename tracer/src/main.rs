@@ -24,6 +24,7 @@ mod machine;
 #[cfg(test)]
 mod matrix;
 mod reader;
+mod seed_cases;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -82,15 +83,15 @@ const STORE: &str = "tau-web-store/";
 
 /// One case's verdict: the assertions that failed, empty when it passed.
 struct Case {
-    name: &'static str,
+    name: String,
     failures: Vec<String>,
 }
 
 impl Case {
-    fn new(name: &'static str) -> Case {
+    fn new(name: &str) -> Case {
         println!("\n== {name}");
         Case {
-            name,
+            name: name.into(),
             failures: Vec::new(),
         }
     }
@@ -181,7 +182,7 @@ async fn run(served: &Path, tracer: &Path) -> Result<(), String> {
     let failed: Vec<_> = cases
         .iter()
         .filter(|c| !c.failures.is_empty())
-        .map(|c| c.name)
+        .map(|c| c.name.as_str())
         .collect();
     if let Err(e) = outcome {
         Err(format!(
@@ -307,9 +308,9 @@ const HOOK: &str = r#"(() => {
 /// The page's view: the harness status, the store's one state and its text, the controls it
 /// offers, the persistent-storage report, and the visibility.
 const VIEW: &str = "(() => {
-    const $ = (id) => document.getElementById(id);
+    const $ = (id) => document.getElementById('tau-'+id);
     return {
-        status: $('status').dataset.state ?? '',
+        status: ($('status').dataset.state ?? '').replace('harness-', ''),
         store: $('store').dataset.state ?? '',
         text: $('store-state').textContent,
         create: !$('create').hidden,
@@ -493,9 +494,16 @@ impl Run<'_> {
             if let [worker] = self.live_workers(tab).as_slice()
                 && Some(worker) != old
             {
-                self.browser
+                if let Err(error) = self
+                    .browser
                     .call(Some(&worker.session), "Runtime.enable", json!({}))
-                    .await?;
+                    .await
+                {
+                    if error.contains("Session with given id not found") {
+                        continue;
+                    }
+                    return Err(error);
+                }
                 self.settled(tab, in_use).await?;
                 return Ok(worker.clone());
             }
@@ -547,7 +555,7 @@ impl Run<'_> {
                 &tab.session,
                 &format!(
                     "(() => {{
-                        const $ = (id) => document.getElementById(id);
+                        const $ = (id) => document.getElementById('tau-'+id);
                         $('passphrase').value = {passphrase};
                         $('confirm').value = {passphrase};
                         $('{kind}').click();
@@ -725,6 +733,44 @@ fn errors_since(browser: &cdp::Browser, from: usize, sessions: &[&str]) -> Vec<S
         .collect()
 }
 
+/// Keep the whole event payload, including property names, URLs, stacks and log arguments.
+fn console_params(event: &Value) -> Option<&Value> {
+    matches!(
+        event["method"].as_str(),
+        Some("Runtime.consoleAPICalled" | "Log.entryAdded" | "Runtime.exceptionThrown")
+    )
+    .then_some(&event["params"])
+}
+
+#[test]
+fn console_custody_searches_entire_payloads_including_property_names_urls_and_stacks() {
+    let secret = "a confidential test phrase";
+    let needles = reader::encodings("secret", secret.as_bytes());
+    for method in [
+        "Runtime.consoleAPICalled",
+        "Log.entryAdded",
+        "Runtime.exceptionThrown",
+    ] {
+        for params in [
+            json!({"args":[{"preview":{"properties":[{"name":secret,"value":"1"}]}}]}),
+            json!({"url":secret}),
+            json!({"stackTrace":{"description":secret}}),
+            json!({"entry":{"args":[secret]}}),
+        ] {
+            assert!(
+                !reader::found(
+                    &needles,
+                    console_params(&json!({"method":method,"params":params}))
+                        .unwrap()
+                        .to_string()
+                        .as_bytes()
+                )
+                .is_empty()
+            );
+        }
+    }
+}
+
 async fn run_cases(
     run: &Run<'_>,
     served_origin: &str,
@@ -757,7 +803,7 @@ async fn run_cases(
     // The served build loads, and its harness worker runs a request on what it has stored.
     let mut case = Case::new("the served build loads, and holds no pin, key or request hook");
     let from = browser.event_count();
-    let (served_tab, served_worker) = run.open(served_origin, false).await?;
+    let (mut served_tab, mut served_worker) = run.open(served_origin, false).await?;
     tokio::time::sleep(Duration::from_millis(500)).await;
     let errors = errors_since(
         browser,
@@ -812,6 +858,16 @@ async fn run_cases(
     );
     let report = run.harness_run(&served_worker, args("fixture")).await?;
     let observed = take(seen);
+    case.check(
+        "owed seed-backup ceremony refuses before contact or append",
+        report == json!({"outcome":{"refused":"seed_backup"}})
+            && observed.relay_accepted == 0
+            && observed.ssh_connections == 0
+            && run.inspect(&served_worker).await?["records"] == json!([0]),
+    );
+    seed_cases::skip(run, &served_tab).await?;
+    let report = run.harness_run(&served_worker, args("fixture")).await?;
+    let observed = take(seen);
     show(&observed);
     case.check(
         "called in its worker on the machine the tracer build pins, the served harness refused for the missing pin (CHN-R4)",
@@ -822,8 +878,8 @@ async fn run_cases(
         observed.relay_accepted == 0 && observed.ssh_connections == 0,
     );
     case.check(
-        "nothing was appended: the store holds the seed record alone",
-        run.inspect(&served_worker).await?["records"] == json!([0]),
+        "nothing was appended: the store holds only the seed and seed-backup records",
+        run.inspect(&served_worker).await?["records"] == json!([0, 1]),
     );
     let report = run.harness_collect(&served_worker, args("fixture")).await?;
     let observed = take(seen);
@@ -832,7 +888,7 @@ async fn run_cases(
         report == json!({"outcome":{"refused":"no-pin"}})
             && observed.relay_accepted == 0
             && observed.ssh_connections == 0
-            && run.inspect(&served_worker).await?["records"] == json!([0]),
+            && run.inspect(&served_worker).await?["records"] == json!([0, 1]),
     );
     cases.push(case);
 
@@ -846,7 +902,7 @@ async fn run_cases(
         view["store"] == "none"
             && view["create"] == true
             && browser
-                .evaluate(&tab.session, "document.getElementById('create-help').textContent")
+                .evaluate(&tab.session, "document.getElementById('tau-create-help').textContent")
                 .await?
                 .as_str()
                 .is_some_and(|t| t.contains("at least 16 characters") && t.contains("password manager")),
@@ -879,12 +935,12 @@ async fn run_cases(
     case.check(
         "the worker's replayed state is record 0 alone",
         run.inspect(&worker).await?
-            == json!({ "state": "unlocked", "locked": false, "records": [0], "commands": [], "calls": [], "terminals": [], "dispositions": [], "standing": {}, "jobs": [] }),
+            == json!({ "state": "unlocked", "seed_backup_owed": true, "seed_backup_completion": null, "seed_backup_stage": "showing_words", "locked": false, "records": [0], "commands": [], "calls": [], "terminals": [], "dispositions": [], "standing": {}, "jobs": [] }),
     );
     let host = reader::build(
         HOST_PASSPHRASE,
         &[
-            json!({ "seed": { "mnemonic": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about" } }),
+            json!({ "seed": { "mnemonic": include_str!("../../tests/vectors/seed-backup-collisions.txt").lines().next().expect("control mnemonic") } }),
             json!({ "command": { "machine": "fixture", "command": hex::encode("built on the host") } }),
         ],
     );
@@ -913,6 +969,36 @@ async fn run_cases(
     );
     cases.push(case);
 
+    // Keep the independent-reader and write-free unlock checks above before any completion.
+    seed_cases::skip(run, &tab).await?;
+    let completed = store_files(&run.dump(&tab).await?);
+    if std::env::var_os("TAU_TRACER_HOLD_CASE").is_none() {
+        seed_cases::run(run, &mut tab, &mut worker, PASSPHRASE, true, &args, cases).await?;
+        seed_cases::run(
+            run,
+            &mut served_tab,
+            &mut served_worker,
+            SERVED_PASSPHRASE,
+            false,
+            &args,
+            cases,
+        )
+        .await?;
+        if std::env::var_os("TAU_TRACER_SEED_CASE").is_some() {
+            return Ok(());
+        }
+        browser
+            .call(
+                None,
+                "Target.activateTarget",
+                json!({"targetId":tab.target}),
+            )
+            .await?;
+        worker = run.worker(&tab, None, false).await?;
+        run.put(&tab, &completed).await?;
+        worker = run.reload(&tab, &worker).await?;
+        run.submit(&tab, "unlock", PASSPHRASE).await?;
+    }
     // A focused fixture run for reproducible unresolved-command mutation checks.
     if std::env::var_os("TAU_TRACER_HOLD_CASE").is_some() {
         hold_cases::run(run, &tab, worker, &args, cases).await?;
@@ -1144,7 +1230,7 @@ async fn run_cases(
         &journal
             .records
             .iter()
-            .find(|(n, _)| *n == 1)
+            .find(|(n, _)| *n == 2)
             .ok_or("missing intent 1")?
             .1,
     )
@@ -1207,17 +1293,17 @@ async fn run_cases(
     );
     let replayed = run.inspect(&worker).await?;
     case.check(
-        "the store's replayed state holds it as record 1",
-        replayed["records"] == json!([0, 1, 2])
+        "the store's replayed state holds it as record 2",
+        replayed["records"] == json!([0, 1, 2, 3])
             && replayed["commands"]
-                == json!([{ "number": 1, "machine": "fixture", "command": hex::encode(COMMAND) }])
-            && outcome["seq"] == 1
-            && outcome["terminal"] == 2
+                == json!([{ "number": 2, "machine": "fixture", "command": hex::encode(COMMAND) }])
+            && outcome["seq"] == 2
+            && outcome["terminal"] == 3
             && replayed["calls"][0]["approval"]["harness_pin"]["machine"] == "fixture"
             && replayed["calls"][0]["approval"]["harness_pin"]["fingerprint"] == pinned.as_str()
             && replayed["calls"][0]["state"] == "finished"
             && replayed["terminals"]
-                == json!([{ "number": 2, "call": 1, "exit_status": EXIT_STATUS }]),
+                == json!([{ "number": 3, "call": 2, "exit_status": EXIT_STATUS }]),
     );
     case.check(
         "the output and exit status came back",
@@ -1291,7 +1377,7 @@ async fn run_cases(
     );
     case.check(
         "the replayed state has no record for it",
-        after_failure == before_failure && after_failure["records"] == json!([0, 1, 2]),
+        after_failure == before_failure && after_failure["records"] == json!([0, 1, 2, 3]),
     );
     worker = run.reload(&tab, &worker).await?;
     run.submit(&tab, "unlock", PASSPHRASE).await?;
@@ -1557,7 +1643,7 @@ async fn run_cases(
         reader::build(
             PASSPHRASE,
             &[
-                json!({ "seed": { "mnemonic": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about" } }),
+                json!({ "seed": { "mnemonic": include_str!("../../tests/vectors/seed-backup-collisions.txt").lines().next().expect("control mnemonic") } }),
                 json!({ "command": { "machine": "fixture", "command": hex::encode(COMMAND) } }),
             ],
         )["1"]
@@ -1666,7 +1752,7 @@ async fn run_cases(
             .evaluate(
                 &tab.session,
                 "(() => {
-                    const $ = (id) => document.getElementById(id);
+                    const $ = (id) => document.getElementById('tau-'+id);
                     $('passphrase').value = 'typed, never submitted';
                     $('confirm').value = 'typed, never submitted';
                     $('lock').click();
@@ -1986,14 +2072,26 @@ async fn run_cases(
     run.collect(&tab).await?;
     run.collect(&served_tab).await?;
     let all_messages = run.messages.borrow().clone();
-    let mut console = Vec::new();
-    for e in browser.events.lock().expect("events lock").iter() {
-        if let Some("Runtime.consoleAPICalled" | "Log.entryAdded" | "Runtime.exceptionThrown") =
-            e["method"].as_str()
-        {
-            console.push(e["params"].to_string());
-        }
-    }
+    let console: Vec<String> = browser
+        .events
+        .lock()
+        .expect("events lock")
+        .iter()
+        .filter_map(console_params)
+        .map(Value::to_string)
+        .collect();
+    let displayed: std::collections::BTreeSet<String> = all_messages
+        .iter()
+        .filter_map(|m| {
+            m.pointer("/from/seed_backup_display")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
+    let displayed_mnemonics: Vec<_> = displayed
+        .iter()
+        .flat_map(|p| reader::mnemonic_needles(p))
+        .collect();
     let requests: Vec<Vec<u8>> = requests
         .iter()
         .flat_map(|r| r.lock().expect("requests lock").clone())
@@ -2016,6 +2114,13 @@ async fn run_cases(
         let dumped = run.dump(page).await?;
         let opened = reader::read(&store_files(&dumped), passphrase)?;
         let mut needles = reader::needles(passphrase, &opened)?;
+        // Include seeds from earlier interrupted/replaced fixture stores, not only the final one.
+        for phrase in &displayed {
+            needles.extend(reader::seed_needles(phrase)?);
+        }
+        needles.sort();
+        needles.dedup();
+
         if test_keys {
             needles.extend(
                 checks::needles()
@@ -2039,6 +2144,20 @@ async fn run_cases(
         case.check(
             &format!("no OPFS file holds one: {in_files:?}"),
             in_files.is_empty() && !dumped.is_empty(),
+        );
+        let record_leaks: Vec<_> = opened
+            .records
+            .iter()
+            .skip(1)
+            .flat_map(|(n, bytes)| {
+                reader::record_findings(&needles, bytes, &opened.seed_id().expect("reader seed"))
+                    .into_iter()
+                    .map(move |what| format!("record {n}: {what}"))
+            })
+            .collect();
+        case.check(
+            &format!("non-seed decrypted records carry no forbidden plaintext: {record_leaks:?}"),
+            record_leaks.is_empty(),
         );
         let other = browser.evaluate(&page.session, OTHER_STORAGE).await?;
         println!("   other storage: {other}");
@@ -2176,7 +2295,7 @@ async fn run_cases(
             for (i, (control, expected)) in controls.iter().enumerate() {
                 let reported = planted
                     .get(i)
-                    .map(|m| findings(m, &needles, &passphrases).1)
+                    .map(|m| findings(m, &needles, &passphrases, &displayed_mnemonics).1)
                     .unwrap_or_default();
                 println!("   {control}: reported {reported:?}");
                 case.check(
@@ -2185,10 +2304,126 @@ async fn run_cases(
                 );
             }
         }
+        // The same guarded serializer and check handle control mnemonics and the final seed.
+        // No session input exists yet (twr-ggw.11, twr-ggw.14).
+        for mnemonic in std::iter::once(opened.mnemonic()?).chain(
+            include_str!("../../tests/vectors/seed-backup-collisions.txt")
+                .lines()
+                .map(str::to_string),
+        ) {
+            let planted = browser
+                .evaluate(
+                    &page.session,
+                    &format!(
+                        r#"(() => {{
+                const log=window.__tracerMessages, plain=log.plain;
+                const phrase={}, words=phrase.split(' '), start=log.length;
+                log.push({{from:plain({{other:phrase}})}}, {{from:plain({{other:words}})}},
+                    {{from:plain({{seed_backup_reentry:new TextEncoder().encode(phrase)}})}},
+                    {{from:plain({{other:new TextEncoder().encode(phrase)}})}});
+                return log.splice(start);
+            }})()"#,
+                        json!(mnemonic)
+                    ),
+                )
+                .await?;
+            for (index, message) in planted
+                .as_array()
+                .ok_or("seed custody controls missing")?
+                .iter()
+                .enumerate()
+            {
+                let expected = match index {
+                    0 => "text: the mnemonic, raw",
+                    1 => "text: the mnemonic word array",
+                    _ => "binary: the mnemonic, raw",
+                };
+                case.check(
+                    &format!("seed custody negative control {index}: {expected}"),
+                    findings(message, &needles, &passphrases, &displayed_mnemonics)
+                        .1
+                        .iter()
+                        .any(|s| s == expected),
+                );
+            }
+        }
+        for (name, bytes, expected) in [
+            (
+                "passphrase in re-entry shape",
+                passphrase.as_bytes().to_vec(),
+                "binary: the passphrase, raw",
+            ),
+            (
+                "data key hex in re-entry shape",
+                hex::encode(opened.data_key).into_bytes(),
+                "binary: the data key, hex",
+            ),
+            (
+                "earlier store seed id hex",
+                reader::seed_id(
+                    displayed
+                        .iter()
+                        .find(|p| **p != opened.mnemonic().unwrap())
+                        .ok_or("no earlier seed")?,
+                )?
+                .into_bytes(),
+                "binary: the seed identifier, raw",
+            ),
+        ] {
+            let kind = if name.contains("earlier") {
+                "other"
+            } else {
+                "seed_backup_reentry"
+            };
+            let planted = browser
+                .evaluate(
+                    &page.session,
+                    &format!(
+                        r#"(() => {{
+                const log=window.__tracerMessages, plain=log.plain, start=log.length;
+                log.push({{to:plain({{[{}]:Uint8Array.from(atob({}),c=>c.charCodeAt(0))}})}});
+                return log.splice(start)[0];
+            }})()"#,
+                        json!(kind),
+                        json!(STANDARD.encode(bytes))
+                    ),
+                )
+                .await?;
+            case.check(
+                &format!("negative control: {name} is reported"),
+                findings(&planted, &needles, &passphrases, &displayed_mnemonics)
+                    .1
+                    .iter()
+                    .any(|s| s == expected),
+            );
+        }
+        for (name, secret) in [
+            ("mnemonic", opened.mnemonic()?),
+            ("passphrase", passphrase.to_string()),
+        ] {
+            let start = browser.events.lock().expect("events lock").len();
+            browser
+                .evaluate(
+                    &page.session,
+                    &format!("console.log({{[{}]:1}})", json!(secret)),
+                )
+                .await?;
+            let events = browser.events.lock().expect("events lock");
+            let reported = events[start..]
+                .iter()
+                .filter_map(console_params)
+                .any(|p| !reader::found(&needles, p.to_string().as_bytes()).is_empty());
+            case.check(
+                &format!(
+                    "negative control: console object property name holding {name} is reported"
+                ),
+                reported,
+            );
+        }
         let mut carrying = Vec::new();
         let mut leaking = Vec::new();
         for message in &all_messages {
-            match findings(message, &needles, &passphrases) {
+            match findings(message, &needles, &passphrases, &displayed_mnemonics) {
                 (Some(carried), _) => carrying.push(carried),
                 (None, found) if !found.is_empty() => {
                     leaking.push(format!("{message}: {found:?}"));
@@ -2197,18 +2432,22 @@ async fn run_cases(
             }
         }
         case.check(
-            &format!("the passphrase reaches the worker only as the one create or unlock message: {} such messages", carrying.len()),
+            &format!("the passphrase reaches the worker only in create, unlock or re-display messages: {} such messages", carrying.len()),
             carrying.iter().any(|p| p == passphrase) && leaking.is_empty(),
         );
         if !leaking.is_empty() {
             println!("   messages carrying a secret: {leaking:?}");
         }
         case.check(
-            "no message from the worker carries one, in its text or in a binary payload",
+            "outside the exact seed-backup display, no worker message carries secret plaintext",
             all_messages
                 .iter()
                 .filter(|m| m.get("from").is_some())
-                .all(|m| findings(m, &needles, &passphrases).1.is_empty()),
+                .all(|m| {
+                    findings(m, &needles, &passphrases, &displayed_mnemonics)
+                        .1
+                        .is_empty()
+                }),
         );
         case.check(
             &format!(
@@ -2294,12 +2533,13 @@ fn findings(
     message: &Value,
     needles: &[(String, Vec<u8>)],
     passphrases: &[&str],
+    displayed_mnemonics: &[(String, Vec<u8>)],
 ) -> (Option<String>, Vec<String>) {
     let mut payloads = Vec::new();
     let mut opaque = Vec::new();
     let rest = binaries(message, &mut payloads, &mut opaque);
     if let [bytes] = payloads.as_slice()
-        && ["create", "unlock"]
+        && ["create", "unlock", "seed_backup_redisplay"]
             .iter()
             .any(|kind| rest == json!({ "to": { *kind: null } }))
         && let Some(carried) = passphrases
@@ -2308,6 +2548,33 @@ fn findings(
     {
         return (Some(carried.to_string()), Vec::new());
     }
+    let display = message.as_object().is_some_and(|o| o.len() == 1)
+        && message
+            .get("from")
+            .and_then(Value::as_object)
+            .is_some_and(|o| {
+                o.len() == 1
+                    && o.get("seed_backup_display")
+                        .and_then(Value::as_str)
+                        .is_some_and(|phrase| {
+                            displayed_mnemonics.iter().any(|(what, bytes)| {
+                                what == "the mnemonic, raw" && bytes == phrase.as_bytes()
+                            })
+                        })
+            });
+    let reentry = matches!(payloads.as_slice(), [bytes] if std::str::from_utf8(bytes).is_ok())
+        && rest == json!({"to":{"seed_backup_reentry":null}});
+    let filtered;
+    let needles = if display || reentry {
+        filtered = needles
+            .iter()
+            .filter(|n| !(n.0.starts_with("the mnemonic") && displayed_mnemonics.contains(n)))
+            .cloned()
+            .collect::<Vec<_>>();
+        &filtered
+    } else {
+        needles
+    };
     let has = |bytes: &[u8], p: &str| bytes.windows(p.len()).any(|w| w == p.as_bytes());
     let text = rest.to_string();
     let mut found: Vec<String> = reader::found(needles, text.as_bytes())
@@ -2335,6 +2602,63 @@ fn findings(
         );
     }
     (None, found)
+}
+
+#[test]
+fn seed_backup_exceptions_exempt_only_displayed_mnemonics() {
+    let controls: Vec<_> = include_str!("../../tests/vectors/seed-backup-collisions.txt")
+        .lines()
+        .collect();
+    let displayed = reader::mnemonic_needles(controls[0]);
+    let mut needles = reader::seed_needles(controls[0]).unwrap();
+    needles.extend(reader::seed_needles(controls[1]).unwrap());
+    needles.extend(reader::encodings("the data key", &[42; 32]));
+    needles.extend(reader::encodings("the passphrase", PASSPHRASE.as_bytes()));
+    let binary =
+        |text: &str| json!({"to":{"seed_backup_reentry":{"__tracerBinary":STANDARD.encode(text)}}});
+    for message in [
+        json!({"from":{"seed_backup_display":controls[0]}}),
+        binary(controls[0]),
+    ] {
+        assert!(
+            findings(&message, &needles, &[PASSPHRASE], &displayed)
+                .1
+                .is_empty()
+        );
+    }
+    for (message, expected) in [
+        (binary(PASSPHRASE), "binary: the passphrase, raw"),
+        (binary(&hex::encode([42; 32])), "binary: the data key, hex"),
+        (
+            binary(&reader::seed_id(controls[1]).unwrap()),
+            "binary: the seed identifier, raw",
+        ),
+        (binary(controls[1]), "binary: the mnemonic, raw"),
+    ] {
+        assert!(
+            findings(&message, &needles, &[PASSPHRASE], &displayed)
+                .1
+                .iter()
+                .any(|f| f == expected)
+        );
+    }
+    // Even if another forbidden secret equals the allowed display, it remains a finding.
+    let mut overlap = needles.clone();
+    overlap.push((
+        "the passphrase, raw".into(),
+        controls[0].as_bytes().to_vec(),
+    ));
+    assert!(
+        findings(
+            &json!({"from":{"seed_backup_display":controls[0]}}),
+            &overlap,
+            &[],
+            &displayed
+        )
+        .1
+        .iter()
+        .any(|f| f == "text: the passphrase, raw")
+    );
 }
 
 /// What a lock of any kind must leave: the old worker gone and one new one, the page offering

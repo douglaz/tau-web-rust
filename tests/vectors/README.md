@@ -40,3 +40,13 @@
 
 The specification's own v1 known answers, `spec/docs/design/credential-vectors-v1.json`, are
 not copied here: the tests read them from `spec/` at the pin.
+
+`seed-backup-collisions.txt` contains four public seed-backup test mnemonics. Each fixes its
+first eleven listed words (121 bits), appends seven zero bits to form 128-bit entropy, and
+uses the first four SHA-256 checksum bits to select its twelfth word. The host imports each
+with `Seed::import` and checks the required words against the vendored list. These fixtures
+exercise fixed text such as `icon`, `state`, `call` and `machine`, and the adjacent phrases
+`all twelve`, `match this`, `this seed` and `try again`, without relying on random word draws.
+The fourth also holds `approve never` and `improve never`: concatenated list-item text carries
+`proven` across those word boundaries. The language check omits only the displayed word list
+and still reports a planted hidden reserved claim elsewhere in the page.

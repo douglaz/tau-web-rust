@@ -40,6 +40,34 @@ impl Opened {
             .ok_or_else(|| "record 0 is not the seed".to_string())
     }
 
+    pub fn seed_id(&self) -> Result<String, String> {
+        seed_id(&self.mnemonic()?)
+    }
+
+    /// Read the encrypted completion independently; require this reader's own seed identifier.
+    pub fn seed_backups(&self) -> Result<Vec<String>, String> {
+        let id = self.seed_id()?;
+        let mut completions = Vec::new();
+        for (_, bytes) in &self.records {
+            let event: Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+            if let Some(record) = event.pointer("/allocation/seed_backup") {
+                if record["seed"] != id {
+                    return Err("completion names another seed".into());
+                }
+                if record.as_object().is_none_or(|o| o.len() != 2) {
+                    return Err("completion has extra fields".into());
+                }
+                completions.push(
+                    record["completion"]
+                        .as_str()
+                        .ok_or("completion is not text")?
+                        .to_string(),
+                );
+            }
+        }
+        Ok(completions)
+    }
+
     /// Every recorded command, `(number, machine, command bytes)`.
     #[cfg(test)]
     pub fn commands(&self) -> Vec<(u64, String, Vec<u8>)> {
@@ -191,7 +219,20 @@ fn check_event(number: u64, event: &Value) -> Result<(), String> {
                 return Err("disposition has no call identities".into());
             }
         }
-        "allocation" => {} // Outside this reader's interpretation.
+        "allocation" => {
+            if let Some(record) = body.get("seed_backup")
+                && (record.as_object().is_none_or(|o| o.len() != 2)
+                    || record["seed"].as_str().is_none_or(|id| {
+                        id.len() != 64
+                            || !id
+                                .bytes()
+                                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+                    })
+                    || ![json!("full_reentry"), json!("skipped")].contains(&record["completion"]))
+            {
+                return Err("invalid seed-backup record".into());
+            }
+        }
         _ => return Err(format!("unknown event kind {kind}")),
     }
     Ok(())
@@ -411,6 +452,15 @@ pub fn encodings(what: &str, bytes: &[u8]) -> Vec<(String, Vec<u8>)> {
     out
 }
 
+pub fn seed_id(mnemonic: &str) -> Result<String, String> {
+    let seed = bip39::Mnemonic::parse_normalized(mnemonic)
+        .map_err(|e| e.to_string())?
+        .to_seed_normalized("");
+    let mut bytes = b"tau-web seed id v1\0".to_vec();
+    bytes.extend_from_slice(&seed);
+    Ok(hex::encode(digest(&SHA256, &bytes)))
+}
+
 /// The seed's forbidden plaintext, from its mnemonic: the mnemonic, the entropy, the 64-byte
 /// seed and the seed identifier, and roles 0–4's private and public keys at indices 0 and 1
 /// (credential format v1: `m/707285'/1'/role'/index'`, every step hardened; roles 0 and 4 are
@@ -468,20 +518,105 @@ pub fn needles(passphrase: &str, opened: &Opened) -> Result<Vec<(String, Vec<u8>
         ("the wrapping key".to_string(), opened.wrapping_key.to_vec()),
         ("the data key".to_string(), opened.data_key.to_vec()),
     ];
-    secrets.extend(seed_secrets(&opened.mnemonic()?)?);
-    Ok(secrets
-        .iter()
-        .flat_map(|(what, bytes)| encodings(what, bytes))
-        .collect())
+    let mut needles: Vec<_> = secrets
+        .drain(..)
+        .flat_map(|(what, bytes)| encodings(&what, &bytes))
+        .collect();
+    needles.extend(seed_needles(&opened.mnemonic()?)?);
+    Ok(needles)
 }
 
-/// Which needles occur in `bytes`.
+/// Phrase encodings and structural array detection, independent of public JSON field names.
+pub fn mnemonic_needles(mnemonic: &str) -> Vec<(String, Vec<u8>)> {
+    let mut needles = encodings("the mnemonic", mnemonic.as_bytes());
+    needles.push((
+        "the mnemonic word array".into(),
+        serde_json::to_vec(&mnemonic.split_ascii_whitespace().collect::<Vec<_>>()).expect("words"),
+    ));
+    needles
+}
+
+pub fn seed_needles(mnemonic: &str) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let mut needles: Vec<_> = seed_secrets(mnemonic)?
+        .into_iter()
+        .filter(|(what, _)| what != "the mnemonic")
+        .flat_map(|(what, bytes)| encodings(&what, &bytes))
+        .collect();
+    needles.extend(mnemonic_needles(mnemonic));
+    Ok(needles)
+}
+
+// Only consecutive string elements of an actual array can be consecutive mnemonic words.
+// An object value followed by a field name is never such a pair.
+fn word_array(value: &Value, words: &[Value]) -> bool {
+    match value {
+        Value::Array(items) => {
+            items
+                .windows(2)
+                .any(|pair| words.windows(2).any(|w| w == pair))
+                || items.iter().any(|v| word_array(v, words))
+        }
+        Value::Object(fields) => fields.values().any(|v| word_array(v, words)),
+        _ => false,
+    }
+}
+
+/// Which needles occur in `bytes`, including consecutive mnemonic elements in parsed arrays.
 pub fn found<'a>(needles: &'a [(String, Vec<u8>)], bytes: &[u8]) -> Vec<&'a str> {
+    let parsed = serde_json::from_slice::<Value>(bytes).ok();
+    let text = std::str::from_utf8(bytes).ok();
     needles
         .iter()
-        .filter(|(_, needle)| bytes.windows(needle.len()).any(|w| w == needle.as_slice()))
+        .filter(|(what, needle)| {
+            if what == "the mnemonic word array" {
+                let words: Vec<Value> = serde_json::from_slice(needle).expect("mnemonic array");
+                parsed.as_ref().is_some_and(|v| word_array(v, &words))
+            } else if let (Some(text), Ok(needle)) = (text, std::str::from_utf8(needle)) {
+                text.contains(needle)
+            } else {
+                bytes.windows(needle.len()).any(|w| w == needle.as_slice())
+            }
+        })
         .map(|(what, _)| what.as_str())
         .collect()
+}
+
+/// Allocation records carry their own seed association inside encryption. Search all other
+/// fields with every needle, including seed identifiers outside those exact positions.
+pub fn record_findings<'a>(
+    needles: &'a [(String, Vec<u8>)],
+    bytes: &[u8],
+    seed_id: &str,
+) -> Vec<&'a str> {
+    let mut event: Value = serde_json::from_slice(bytes).expect("reader checked JSON");
+    for path in [
+        "/allocation/seed_backup/seed",
+        "/allocation/reserve/seed",
+        "/allocation/created/seed",
+        "/allocation/failed/seed",
+        "/allocation/destroyed/seed",
+        "/allocation/restore/seed",
+        "/allocation/replace/seed",
+    ] {
+        if let Some(value) = event.pointer_mut(path)
+            && value == seed_id
+        {
+            *value = Value::Null;
+        }
+    }
+    if let Some(entries) = event
+        .pointer_mut("/allocation/restore/entries")
+        .and_then(Value::as_array_mut)
+    {
+        for entry in entries {
+            if let Some(value) = entry.pointer_mut("/identity/seed")
+                && value == seed_id
+            {
+                *value = Value::Null;
+            }
+        }
+    }
+    found(needles, event.to_string().as_bytes())
 }
 
 /// `CNF-82` and `CNF-15`'s host half, against the harness's store on its in-memory storage.
@@ -497,6 +632,112 @@ mod tests {
         Entry {
             machine: "fixture".into(),
             command: format!("echo {n}").into_bytes(),
+        }
+    }
+
+    #[test]
+    fn collision_controls_allow_public_fields_and_find_mnemonic_arrays_in_records() {
+        for mnemonic in include_str!("../../tests/vectors/seed-backup-collisions.txt").lines() {
+            let id = seed_id(mnemonic).unwrap();
+            let events = vec![
+                json!({"seed":{"mnemonic":mnemonic}}),
+                json!({"intent":{"call":1,"machine":"other","command":"00",
+                    "approval":{"harness_pin":{"machine":"other","fingerprint":"SHA256:test-pin"}},
+                    "job":"00".repeat(24)}}),
+                json!({"job_observation":{"call":1,"job":"00".repeat(24),"record":{"kind":"missing"}}}),
+                json!({"terminal":{"call":1,"exit_status":0}}),
+                json!({"allocation":{"seed_backup":{"seed":id,"completion":"skipped"}}}),
+                json!({"allocation":{"reserve":{"seed":id,"derivation_version":1,"family":"machines","index":0}}}),
+            ];
+            let files = build(PASS, &events);
+            let replayed = block_on(unlock(
+                MemoryStorage::with_files(files.clone()),
+                &Pbkdf2,
+                tau_web::credential::LocalPassphrase::new(PASS.as_bytes().to_vec()),
+            ))
+            .unwrap();
+            assert_eq!(
+                replayed
+                    .allocation()
+                    .issue(tau_web::allocation::Family::Machines)
+                    .unwrap()
+                    .index,
+                1
+            );
+            let opened = read(&files, PASS).unwrap();
+            let needles = needles(PASS, &opened).unwrap();
+            for (number, bytes) in opened.records.iter().skip(1) {
+                assert!(
+                    record_findings(&needles, bytes, &id).is_empty(),
+                    "record {number}"
+                );
+            }
+            let mut id_leak = events[4].clone();
+            id_leak["other"] = json!(id);
+            assert!(
+                record_findings(&needles, id_leak.to_string().as_bytes(), &id)
+                    .contains(&"the seed identifier, raw")
+            );
+            let mut leak = events[1].clone();
+            leak["intent"]["words"] = json!(mnemonic.split(' ').collect::<Vec<_>>());
+            let mut leaked_events = events.clone();
+            leaked_events[1] = leak;
+            let leaked = read(&build(PASS, &leaked_events), PASS).unwrap();
+            assert!(
+                record_findings(&needles, &leaked.records[1].1, &id)
+                    .contains(&"the mnemonic word array")
+            );
+            for shape in [
+                json!({"call":"machine","other":"family"}),
+                json!({"match":"this","try":"again"}),
+            ] {
+                assert!(record_findings(&needles, shape.to_string().as_bytes(), &id).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn allocation_seed_associations_are_exempt_only_at_the_event_fields() {
+        for mnemonic in include_str!("../../tests/vectors/seed-backup-collisions.txt").lines() {
+            let id = seed_id(mnemonic).unwrap();
+            let identity = json!({"seed":id,"derivation_version":1,"family":"machines","index":0});
+            let export = json!({"seed":id,"derivation_version":1,
+                "next_unused":{"machines":2,"passes":0,"handoffs":0},
+                "entries":[{"identity":identity,"status":"created"},
+                           {"identity":identity,"status":"failed"}],
+                "restored_from_import":false,"seed_backup":"skipped"});
+            let events = vec![
+                json!({"allocation":{"seed_backup":{"seed":id,"completion":"skipped"}}}),
+                json!({"allocation":{"reserve":identity}}),
+                json!({"allocation":{"created":identity}}),
+                json!({"allocation":{"failed":identity}}),
+                json!({"allocation":{"destroyed":identity}}),
+                json!({"allocation":{"restore":export}}),
+                json!({"allocation":{"replace":{"seed":id}}}),
+            ];
+            let mut records = vec![json!({"seed":{"mnemonic":mnemonic}})];
+            records.extend(events.clone());
+            let opened = read(&build(PASS, &records), PASS).unwrap();
+            let needles = needles(PASS, &opened).unwrap();
+            for ((_, bytes), event) in opened.records.iter().skip(1).zip(events) {
+                assert!(record_findings(&needles, bytes, &id).is_empty(), "{event}");
+                let mut leak = event.clone();
+                leak["allocation"]["other"] = json!(id);
+                assert!(
+                    record_findings(&needles, leak.to_string().as_bytes(), &id)
+                        .contains(&"the seed identifier, raw"),
+                    "{leak}"
+                );
+            }
+            for path in ["/seed", "/identity/seed", "/allocation/other/seed"] {
+                let mut leak = json!({"seed":null,"identity":{"seed":null},"allocation":{"other":{"seed":null}}});
+                *leak.pointer_mut(path).unwrap() = json!(id);
+                assert!(
+                    record_findings(&needles, leak.to_string().as_bytes(), &id)
+                        .contains(&"the seed identifier, raw"),
+                    "{path}"
+                );
+            }
         }
     }
 

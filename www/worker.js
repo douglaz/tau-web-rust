@@ -1,15 +1,12 @@
-// The harness worker (STA-1): it loads the wasm module, takes the store's writer lock and opens
-// the store. Keys, pins and the journal live in the module. The page sends one message per
-// create or unlock, the passphrase's UTF-8 bytes, which the module zero-fills; the module's
-// `run_command` is called in this worker's own context, and only the tracer does so, over the
-// DevTools protocol.
-import init, { spec_commit, open, create, unlock } from './pkg/tau_web.js';
+// The harness worker alone holds the seed and keys. Only the dedicated seed-backup display
+// carries words to the page; re-entry and passphrase buffers are zero-filled by the module.
+import init, { spec_commit, open, create, unlock, seed_backup_display, seed_backup_answer, seed_backup_reentry, seed_backup_skip, seed_backup_redisplay } from './pkg/tau_web.js';
 
 try {
   await init();
-  postMessage({ ready: spec_commit() });
+  postMessage({ harness_ready: spec_commit() });
 } catch (error) {
-  postMessage({ error: String(error) });
+  postMessage({ harness_error: String(error) });
   throw error;
 }
 
@@ -22,11 +19,25 @@ const held = (options) =>
       return lock && new Promise(() => {});
     }));
 if (!(await held({ ifAvailable: true }))) {
-  postMessage({ store: { state: 'in-use' } });
+  postMessage({ store: { store_state: 'in-use' } });
   await held({});
 }
-onmessage = async ({ data }) => {
-  const report = data.create ? create(data.create) : unlock(data.unlock);
-  postMessage({ store: JSON.parse(await report) });
+const reportStore = (report) => {
+  const { state, error, reason, ...rest } = JSON.parse(report);
+  postMessage({ store: { store_state: state, ...(error ? { store_error: error } : {}),
+    ...(reason ? { store_reason: reason } : {}), ...rest } });
 };
-postMessage({ store: JSON.parse(await open()) });
+onmessage = async ({ data }) => {
+  let report;
+  if (data.create) report = await create(data.create);
+  else if (data.unlock) report = await unlock(data.unlock);
+  else if (data.seed_backup_redisplay) report = await seed_backup_redisplay(data.seed_backup_redisplay);
+  else if (data.seed_backup_reentry) report = await seed_backup_reentry(data.seed_backup_reentry);
+  else if (data.seed_backup_answer === true) report = await seed_backup_answer();
+  else if (data.seed_backup_skip === true) report = await seed_backup_skip();
+  else return;
+  reportStore(report);
+  const display = JSON.parse(await seed_backup_display());
+  if (display) postMessage(display);
+};
+reportStore(await open());
