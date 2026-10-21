@@ -25,6 +25,7 @@ mod machine;
 mod matrix;
 mod reader;
 mod seed_cases;
+mod typed_cases;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -935,7 +936,7 @@ async fn run_cases(
     case.check(
         "the worker's replayed state is record 0 alone",
         run.inspect(&worker).await?
-            == json!({ "state": "unlocked", "seed_backup_owed": true, "seed_backup_completion": null, "seed_backup_stage": "showing_words", "locked": false, "records": [0], "commands": [], "calls": [], "terminals": [], "dispositions": [], "standing": {}, "jobs": [] }),
+            == json!({ "state": "unlocked", "seed_backup_owed": true, "seed_backup_completion": null, "seed_backup_stage": "showing_words", "locked": false, "records": [0], "commands": [], "calls": [], "terminals": [], "dispositions": [], "standing": {}, "jobs": [], "typed_calls": [], "observations": [], "current_installations": {} }),
     );
     let host = reader::build(
         HOST_PASSPHRASE,
@@ -2067,6 +2068,7 @@ async fn run_cases(
         .await?;
     cases.push(case);
 
+    worker = typed_cases::run(run, &tab, worker, &args, cases).await?;
     job_cases::run(run, &tab, worker, &args, cases).await?;
     // twr-ggw.5 AC4, AC5: no plaintext secret in any storage, message, request or log, in both builds.
     run.collect(&tab).await?;

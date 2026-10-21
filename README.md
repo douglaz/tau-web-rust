@@ -111,7 +111,7 @@ There are two builds of the same page, both release builds:
 ### Dispatch
 
 `src/dispatch.rs` is the shared, synchronous core, written from the pinned Markdown requirements.
-A call is unresolved after its approved intent, finished after its exit status's terminal record,
+A box-plane call is unresolved after its approved intent, finished after its exit status's terminal record,
 disposed with outcome unknown after an accepted disposition, or cancelled when a new-format
 intent has no approval decision. These states are derived from committed records in journal
 order (`STA-3`, `STA-8`); the core takes no time input and no timer clears anything. Replay
@@ -138,8 +138,10 @@ writes nothing and shows why, any settling record, and the resource's unresolved
 Destructive reinstall and abandonment refuse commands to that machine, before contact and
 again atomically at the intent append. Continuing as if done and as if not done restrict
 nothing, explicit reissues included, subject to any unnamed unresolved command's hold; their
-recorded assumption is shown, never turned into an outcome. Here only replacement ends a
-destructive restriction: no operation dispatching its continuation exists yet. Later terminal
+recorded assumption is returned as an assumption with outcome `unknown`. A destructive
+restriction ends only when its continuation's typed intent commits: the vendor reinstall, or
+the abandonment flow's destroy. A failed append leaves it standing. The new intent's own barrier
+then governs. Later terminal
 evidence is recorded and shown without reopening the call or removing its disposition
 (`STA-24`).
 
@@ -150,7 +152,10 @@ does a terminal naming no call, a cancelled call or an already finished call, or
 identity is not its record number or whose command is not lowercase hex.
 `store_state` shows calls and their job identities, approval decisions and states, terminals,
 job-record evidence and findings, all disposition reports and the disposition standing per
-machine, without key material. No operator screen, page message or disposition export exists. The browser disposition case uses a store built by
+machine, plus `typed_calls`, `observations` and `current_installations`, without key material.
+Disposition records include both `machine` and `resource`: `machine` retains the command-era
+shape, while `resource` names the entry or inference resource used by the typed derivation.
+No operator screen, page message or disposition export exists. The browser disposition case uses a store built by
 the independent reader, with no added request switch.
 
 `run_command` reports completion as `{"done":true,"seq":1,"call":1,"terminal":2,...}`,
@@ -168,12 +173,134 @@ launch is refused before contact or intent with
 (the composed `bytes` vary with the command and machine). It allocates no call and leaves the
 store able to admit the next command.
 
-Typed cloud-plane operations and their barriers belong to twr-ggw.8; continuation dispatch to
-twr-ggw.40, twr-ggw.45 and twr-i6k.3; sessions and approved
-entries to twr-ggw.10, twr-ggw.11 and twr-ggw.22; inference records to twr-ggw.17. Disposition
-screens, snapshots, compaction and transcript retention are outside this change. `STA-24`'s
-untyped-vendor-scope hold is stage 2. This change demonstrates the box-plane disposition rule of
-`STA-24`.
+Typed operations share that derivation with commands. The fixture adapter offers `create`,
+`reset`, `reinstall`, `destroy` and status `read`. Its retry safety is
+`reconcile-before-retry`: mutation responses never confirm an effect. Its **fixture contract**
+is a status observation reporting that operation's effect observed; an ended system or a boot
+change establishes no success. This is fixture evidence, not an LNVPS reconciliation contract.
+The fixture vendor and its receive log compile only in host tests, never in the served build.
+
+A typed request carries its target, operation, session, requester and structured facts
+(arguments, cost bound and bundle commit), with an approval on exactly those values and the
+resolved resource. No approval, changed facts or an unmapped target refuses without a record.
+`Store::operation` repeats admission under the writer, commits, applies, then returns the
+journaled approved intent for the adapter to send. Status reads have their own pre-send intent,
+with state `no_effect`; observations are separately committed before they settle anything.
+They carry the call snapshot taken before the read, so a delayed response cannot settle a
+later reissue. Failed appends apply nothing; a landed move reporting failure applies on reopen.
+
+The resource is an **implementation reading** until twr-ggw.10 introduces approved entries:
+an entry is named as a command names its machine. The harness supplies its associations from
+allocation indices and vendor machine ids to entries; naming a known entry directly resolves
+there too. Requests supply no association and no resource. The fixture supplies this knowledge
+again on reopen; journaling it belongs to twr-ggw.10. Existing intents retain their recorded
+resource independently of those associations. Inference has a distinct resource type, so no
+entry name can collide with it; this core admits it, while twr-ggw.17 owns its journal.
+
+Every unresolved machine call bars cloud-plane mutations on that entry, whatever its call id,
+session or requester, including the operator flow. A second index for the same entry changes
+nothing. Another entry is independent. Only an unresolved reset, reinstall or destroy adds a
+box-plane stop; a create can remain unresolved beside a command. Commands retain their existing
+hold. `run_command` checks both before contact and at append; a typed barrier answers
+`{"refused":"barrier","calls":[<recorded typed intents>]}` and makes no connection. Pinned SSH
+attempts and job collection remain reads, with no intent and no disposition check.
+
+Within the disposed calls' reach, destructive reinstall permits the vendor reinstall only;
+abandonment permits only the harness flow's destroy, never a session's destroy. Both stop every
+box-plane command regardless of its requester or the disposed operation. Continuing choices
+restrict nothing, including an explicit reissue. Reads and inference neither restrict nor end
+a choice, nor does an operation on another entry. A replacement reports `replaces`, `dropped`
+and an optional `assumption` containing the recorded continuing choice and outcome `unknown`.
+Dropped calls stay disposed under the old record and cannot be named again. Refused replayed
+records retain their reports. Later observations remain beside disposed calls and change
+neither their outcome nor the standing choice. Each vendor reinstall intent advances the
+entry's derived installation ordinal; display and its bound belong to twr-i6k.8.
+
+Host fixture tests cover record-before-send at every storage kill boundary, lost creates across
+all existing requester routes and aliases, facts approval, durable observations, failed and
+landed appends, the 20 operation/continuation cases, naming and replay, replacement drops, late
+evidence and continuation boundaries. In every matrix row collection names exactly the
+collectable commands; command rows append collected job evidence and retain the disposition
+and command verdict. The pinned SSH attempt has no host form; its evidence is the browser
+cases. Browser cases use the independent writer to show an
+unresolved reset refusing without relay or SSH contact, confirmation permitting a command, and
+all four continuations preserving the real pinned attempt and collection with no intent.
+
+**The dispatch companion comparison** follows ADR-0032's comparison rule. It reads
+`spec/docs/design/dispatch-witnesses-v6.json` at run time, never compiled in. Its partition is an
+**implementation reading**: rescue content first, then reboot content in start or steps, then
+stage1. Empty reboot results and installation entries alone never route a trace; pairs stay
+whole. The header requires schema 6, namespace `TauWeb.Dispatch`, 3 events over 8 distinct
+alphabet events, and all 470 traces filtered to distinct request call ids, exactly once and
+starting at `bound.start`. A truncated enumeration fails.
+
+It runs stage1 only: 31 witnesses and 286 enumerated traces. The dedicated bucket, 54/184,
+belongs to twr-i6k.3; reboot, 12/0, belongs to twr-i6k.11. Together they cover 97/470. Each start
+is built as durable production records and replayed, including the invalid historical
+disposition. Every outcome and projection member is compared at every step. Oldest-first
+members stay lists; resource/entry members are keyed sets. Unmoved members must stay empty.
+Inference and dispositions on its resource run in the core without store records. Replay
+actually reopens the store. Command requests use the existing intent and job-evidence path,
+with target, session and requester provenance recorded by the production append. The file's
+approval facts map bijectively to the recorded pin admission's fingerprint, and its approval
+session maps to the recorded command session. No typed operation approval is attached to a
+command. Current `run_command` records its named target with no session; older command records
+retain their shape.
+The driver retains only identity mappings beside that production
+store and never projects its own request cache.
+
+Production assumptions are `resourceKey: entry`, `reach: disposed`, `lapse: continuation` and
+all boolean guards true. Every unpaired trace and refused side matches, and each admitted side
+changes exactly its named guard and differs somewhere. All twelve stage1 pairs are required.
+Unknown vocabulary or members fail with the trace and step. Permanent negative controls include
+an outcome flip, empty/absent file, unknown event/outcome, truncated enumeration, unknown
+member, missing pair side, a second disabled guard and wrong routing counts.
+
+The core and fixture tests were written from the Markdown before the witness JSON was read.
+Projection setup exposed two omissions before the first comparison: known entries must resolve
+when named directly (`STA-24`), and named entries start at installation zero (`STG-20`). Both
+were corrected from those requirements. The comparison then raised no behavioral disagreement.
+Its successful record is printed by
+`cargo test --locked dispatch::comparison -- --nocapture`; the implementation revision is the
+commit the test ran at:
+
+```text
+dispatch companion comparison: passed
+  rule: ADR-0032, How the implementation is compared; ticket partition is an implementation reading
+  file: spec/docs/design/dispatch-witnesses-v6.json
+  schema 6, module dispatch, namespace TauWeb.Dispatch, bound: 3 events over an alphabet of 8, distinct request call ids
+  stage1: 31 witnesses / 286 enumerated traces (twr-ggw.8)
+  dedicated: 54 witnesses / 184 enumerated traces (twr-i6k.3)
+  reboot: 12 witnesses / 0 enumerated traces (twr-i6k.11)
+  total: 97 witnesses / 470 enumerated traces
+  compared: start, every outcome and projection member at every stage1 step; keyed sets compared by key
+  commandHold: 4 named / 28 enumerated refusals
+  pair: TauWeb.Dispatch.boot_id_change_not_success_refused refused matched; TauWeb.Dispatch.boot_id_change_not_success_admitted admitted differed at step 2
+  pair: TauWeb.Dispatch.destructive_choice_stops_commands refused matched; TauWeb.Dispatch.command_preempts_reinstall_without_guard admitted differed at step 3
+  pair: TauWeb.Dispatch.disposition_names_own_unresolved_calls refused matched; TauWeb.Dispatch.disposition_ends_call_elsewhere_without_guard admitted differed at step 3
+  pair: TauWeb.Dispatch.disposition_one_continuation_refused refused matched; TauWeb.Dispatch.disposition_unrestricted_admitted admitted differed at step 2
+  pair: TauWeb.Dispatch.read_and_inference_never_restricted refused matched; TauWeb.Dispatch.read_and_inference_restricted_without_guard admitted differed at step 5
+  pair: TauWeb.Dispatch.read_does_not_lift_abandonment refused matched; TauWeb.Dispatch.read_lifts_abandonment_without_guard admitted differed at step 3
+  pair: TauWeb.Dispatch.replacement_in_force refused matched; TauWeb.Dispatch.replaced_continuation_dispatched_without_guard admitted differed at step 5
+  pair: TauWeb.Dispatch.resolution_append_failed_refused refused matched; TauWeb.Dispatch.resolution_append_failed_admitted admitted differed at step 2
+  pair: TauWeb.Dispatch.same_action_new_call_id_refused refused matched; TauWeb.Dispatch.same_action_new_call_id_admitted admitted differed at step 2
+  pair: TauWeb.Dispatch.second_command_held refused matched; TauWeb.Dispatch.second_command_without_hold admitted differed at step 2
+  pair: TauWeb.Dispatch.second_index_same_entry_refused refused matched; TauWeb.Dispatch.second_index_same_entry_admitted admitted differed at step 3
+  pair: TauWeb.Dispatch.session_destroy_under_abandonment_refused refused matched; TauWeb.Dispatch.session_destroy_lifts_abandonment_without_guard admitted differed at step 3
+  spec commit: d029ebd9f632696bb027a22559d774d165685947
+  implementation revision: the commit the test ran at
+```
+
+This comparison is evidence about harness knowledge alone; the storage and browser fault tests
+carry ordering and contact evidence. Approved entries, journaled indices and associations wait
+for twr-ggw.10, binding for twr-ggw.11, and actual session tools/routes for twr-ggw.14. The
+per-tool create case waits there; no extra route is invented here. Creating/paying and learning
+the vendor id are twr-ggw.21's; inference records twr-ggw.17's; the abandonment flow and its
+authorization twr-ggw.31's; LNVPS fixture and criterion 23's LNVPS half twr-ggw.32's; stop and
+renewal-off twr-ggw.40's; LNVPS reinstall twr-ggw.45's; operator rendering twr-ggw.66's and
+refused request results twr-ggw.67's. Rescue rules and remaining reboot traces belong to
+twr-i6k.3 and twr-i6k.11. Snapshots, compaction, retention and stage 2's untyped-scope hold remain
+outside this work.
 
 ### Job records and collection
 
@@ -475,8 +602,26 @@ the host tests run.
     `{"intent":{"call":1,"machine":"fixture","command":"<lowercase hex>","approval":{"harness_pin":{"machine":"fixture","fingerprint":"SHA256:…"}},"job":"<48 lowercase hex digits>"}}`.
     The call identity is the intent's record number, unique and never reused. The approval
     decision identifies the harness's admission using that machine's pin; it is not the
-    operator's approval of the command's contents. A new-format intent with `approval:null`
+    operator's approval of the command's contents. Optional `provenance` contains `target`,
+    `session` (text or null) and `requester` (`session`, `operator` or `harness_flow`), separately
+    from that admission. The production append records the provenance the command carried;
+    `run_command` supplies its directly named entry, no session, and requester `session`.
+    No command carries typed operation facts or an `OperationApproval`. A new-format intent with `approval:null`
     (or an absent approval member) means never dispatched. No path in this build writes one.
+  - a typed intent under `operation_intent`: `call` (its record number), `resource`
+    (`{"entry":"fixture"}`), `target` (`{"entry":"fixture"}`, `{"allocation_index":0}` or
+    `{"vendor_machine":"id"}`), `operation`, `session`, `requester` (`session`, `operator` or
+    `harness_flow`), `facts` and `approved`. Facts contain `arguments` (a map of text values),
+    `cost_bound` (an unsigned integer) and `bundle_commit`. Approval repeats the resource,
+    target, operation, session, requester and facts exactly. Operations here are `create`, `reset`,
+    `reinstall`, `destroy` and `read`; the writer refuses `exec` and `inference` as policy, and
+    replay and the independent reader reject such typed records and intents naming the inference
+    resource or target, naming the record.
+    No command text is accepted for a typed act.
+  - `{"operation_observation":{"resource":{"entry":"fixture"},"operation":"reset","reports":"confirmed","calls":[1]}}`.
+    `reports` is `confirmed`, `ended` or `unknown`; `calls` is the snapshot at read time.
+    Only the fixture's confirming observation settles an unresolved matching mutation.
+    Disposed calls retain their unknown outcome; the observation is still journaled and shown.
   - a legacy terminal record, still read and used by host dispatch tests:
     `{"terminal":{"call":1,"exit_status":7}}`. It carries no output; the command report carries
     output. New command completion uses the job terminal below.
@@ -509,7 +654,8 @@ the host tests run.
     encrypted record, where credential format v1 puts it.
 
   The independent reader in the tracer crate decrypts every record and reads the seed, legacy
-  command, intent, terminal, job terminal, job observation, disposition and seed-backup shapes.
+  command, intent, typed intent, typed observation, terminal, job terminal, job observation,
+  disposition and seed-backup shapes.
   It checks a completion against the seed identifier it derives independently, and inspects reservations.
 - **`staging`**, the one staging name, which is never a record name or the envelope's.
 
@@ -918,7 +1064,7 @@ browser holds:
 In headless Chromium 154 a new tab hides the one before it, which then restarts its worker, as
 page hide must. The cases account for it.
 
-The full run has 85 cases.
+The full run has 90 cases.
 
 The cases:
 
@@ -947,6 +1093,8 @@ The cases:
 | reload, explicit lock, page hide and a killed worker (twr-ggw.5 AC3, `CNF-82`) | one case each. The old worker target is gone and one new harness worker exists. The page offers Unlock alone. A request is refused with no TCP connection at the relay. After an unlock, the replayed state lists every command recorded before. Explicit lock, page hide and the killed worker also catch a running command: once the sshd has its `exec`, the lock comes, and the sshd sees its connection end; explicit lock and page hide also check that the relay fixture sees the client's WebSocket end. After the unlock the command reads unresolved in the replayed state and the sshd receives no second `exec`. Before the Lock button is pressed, text is typed into both passphrase fields and never submitted; both are empty once it is pressed |
 | close without exit status (twr-ggw.7, `STA-8`) | the sshd closes without an exit status; replay preserves the unresolved call. A second command answers held, reads its finished record and records no intent or launch |
 | dispositions (twr-ggw.7, `STA-24`) | the independent reader builds a destructive disposition: the request is refused before contact, with no relay connection, SSH connection or append. Replacing it with a continuing disposition admits the command and journals its terminal record |
+| typed reset bars commands before contact until durable confirmation (twr-ggw.8, `STA-24`) | an independently written unresolved reset refuses a command, names its intent and makes no relay or SSH contact or append; a confirming observation permits the command |
+| typed running-system disposition: pinned attempt and collection stay permitted, four cases (twr-ggw.8, `CNF-110`) | one disposed reset per continuation: commands through `run_command` obey the choice before and after collection; a bare pinned attempt reaches the relay and sshd, collects no jobs and appends no intent; the typed call stays disposed with unknown outcome and the choice stays in force |
 | one writer (twr-ggw.5, `STA-1`, `STA-7`) | a second tab opens, which hides the first and restarts its worker, so either tab's worker may win the lock. The holder is the tab that offers Unlock while the other says it is waiting; the roles follow from that. The holder unlocks. The other says it is waiting for the store and offers neither Create nor Unlock; its worker has not read the store, runs nothing and appends nothing. Once the holder's tab closes, the other offers Unlock and unlocks the same store |
 | persistent storage (twr-ggw.5 AC6, `STA-23`) | with the `persistent-storage` permission denied, then granted, through `Browser.setPermission`: `navigator.storage.persisted()` reads false, then true, and the page shows the refusal, then "Persistent storage is granted." (`persisted()` already reads true, so that load makes no request), each with the statement that this is a request, not a guarantee |
 | job drop (`CNF-40`) | lock drops a several-second command after launch; `collect_jobs` waits until its observed end, reads the finished record, records no intent and launches nothing |
@@ -1127,19 +1275,19 @@ rest of `CNF-88` has no code here yet.
 | `spec-checks` | `spec/bundle/cors-probe.sh` | `CNF-4` |
 | | `spec/prototypes/spec-checks/check-install-disks.py`, and `--baseline`, which must fail | evidence for `CNF-85` |
 | `build` (the job is `CNF-1`) | `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings` | `CNF-2`, at that strictness |
-| | `cargo test --locked` | runs `build.rs`, so the gates above run here, and the `[session]` fixtures (`CNF-88`'s build fixtures); the relay matrix, `CNF-87`'s fixture half; the seed's tests, `CNF-83`'s derivation tests and `CNF-13`'s tests; the local store's, `CNF-82`'s and `CNF-15`'s host half (below); dispatch and journal recovery for `CNF-29`'s box-plane case, including the unresolved-command hold before contact and at append, identical bytes and reads, no writes on refusal, replay, every holding call and other-machine independence, `CNF-30`, `CNF-39` and `STA-24` dispositions; job classification, channel deliveries, unresolved evidence, append failures, replay and all four dispositions, plus real-shell signals, high exit codes, missing and unreadable record files, NUL-corrupted scalars, exact scalar forms, the reader and replay exit ceiling, incomplete unreadable entries, owned-child cleanup, recycled PIDs, stale fixture groups, exact sentinel matching, drop, duplicate-id, boot, output and cross-store identity tests for `CNF-40`'s dropped command not re-run, waiting on its job record, `CNF-54`–`CNF-56` and `CNF-110`'s collection case; and allocation's, `CNF-72`'s tests and the companion comparison against the allocation witness file (ADR-0032), with `CNF-3`'s three breaks as its unit tests |
+| | `cargo test --locked` | runs `build.rs`, so the gates above run here, and the `[session]` fixtures (`CNF-88`'s build fixtures); the relay matrix, `CNF-87`'s fixture half; the seed's tests, `CNF-83`'s derivation tests and `CNF-13`'s tests; the local store's, `CNF-82`'s and `CNF-15`'s host half (below); dispatch and journal recovery for `CNF-29`'s box-plane case, including the unresolved-command hold before contact and at append, identical bytes and reads, no writes on refusal, replay, every holding call and other-machine independence, `CNF-30`, `CNF-39` and `STA-24` dispositions; job classification, channel deliveries, unresolved evidence, append failures, replay and all four dispositions, plus real-shell signals, high exit codes, missing and unreadable record files, NUL-corrupted scalars, exact scalar forms, the reader and replay exit ceiling, incomplete unreadable entries, owned-child cleanup, recycled PIDs, stale fixture groups, exact sentinel matching, drop, duplicate-id, boot, output and cross-store identity tests for `CNF-40`'s dropped command not re-run, waiting on its job record, `CNF-54`–`CNF-56` and `CNF-110`'s collection case; and allocation's, `CNF-72`'s tests and the companion comparison against the allocation witness file (ADR-0032), with `CNF-3`'s three breaks as its unit tests; typed fixture operations through the adapter's send path at every append kill boundary and a suspended record/send boundary, the resource barrier across both planes, all requester provenances through production command admission/append, disposition reach/end/replacement, exact collectable calls and committed job evidence in the 20-row matrix, unsupported typed-record replay refusals, and the dispatch companion's production-path stage1 comparison and complete vocabulary negative controls |
 | `web` (the job is `CNF-1` for the browser build) | `cargo clippy -D warnings` on wasm32, the served and the tracer build | `CNF-2`, on the new target |
 | | `scripts/check-adr-0024.sh` | spec ADR-0024's build check |
 | | `scripts/build-web.sh served`, then `tracer check-absence dist/served` | the served build (`ARC-32`) carries no test key, pin source or test switch |
 | | `tracer check-csp dist/served` | `ARC-33`'s policy, exactly |
-| | `scripts/tracer.sh`, in headless Chrome | `CNF-30`, `CNF-21`, `CNF-23`'s no-pin case and `ARC-33`, as above, the relay refusals of `CNF-87` a correct client meets, and the local store's `CNF-82` and `CNF-15` in the browser; seed-backup display, hiding, full re-entry/skip, interruptions, re-display and custody in both builds (`CNF-44`, `CNF-82`), and integrated allocation refusals, completions and failed OPFS appends (`CNF-72`); `CNF-40`'s dropped command not re-run, waiting on its job record, `CNF-54`–`CNF-56`, `STA-20a` and `CNF-110`'s box-plane collection case; unresolved-command hold, concurrent admission and shared results, stopped waits with the writer free, unreachable answers and destructive replacement |
+| | `scripts/tracer.sh`, in headless Chrome | `CNF-30`, `CNF-21`, `CNF-23`'s no-pin case and `ARC-33`, as above, the relay refusals of `CNF-87` a correct client meets, and the local store's `CNF-82` and `CNF-15` in the browser; seed-backup display, hiding, full re-entry/skip, interruptions, re-display and custody in both builds (`CNF-44`, `CNF-82`), and integrated allocation refusals, completions and failed OPFS appends (`CNF-72`); `CNF-40`'s dropped command not re-run, waiting on its job record, `CNF-54`–`CNF-56`, `STA-20a` and `CNF-110`'s box-plane collection case; unresolved-command hold, concurrent admission and shared results, stopped waits with the writer free, unreachable answers and destructive replacement; typed reset confirmation and every continuation on the real pinned connection; these browser cases supply the pinned SSH attempt evidence, which has no host form |
 
 Every job checks out the submodule; `spec-checks` takes the full history, which
 `check-install-disks.py --baseline` reads to reconstruct the pre-fix brief. `web` installs
 Rust 1.97.1 with the wasm32 target, clang and llvm-ar, and the wasm-bindgen CLI at the pinned
 version and checksum, with no manual step; the browser is the runner's Chrome.
 
-`CNF-3` in its general form — "The test suite fails when a test is deliberately broken" — was
+`CNF-3`'s general requirement that deliberately breaking a test makes the suite fail was
 verified by hand on 2026-09-21, against a temporary pin filling the inference slugs: the one
 test was broken deliberately, `cargo test` went red naming it, the restored test went green.
 The three further breaks `CNF-3` names are the companion comparison's (ADR-0032). They were made
@@ -1163,6 +1311,29 @@ unmodified copy first; then:
 Restored, the copy byte-identical to the pinned file, it went green, and the path edit was
 undone, the test file byte-identical to its saved copy. The same three breaks stay as the
 comparator's unit tests.
+The dispatch breaks were made by hand on 2026-10-21 against schema 6, with only the comparison
+path temporarily changed to a scratch copy outside `spec/`. The unmodified copy first passed.
+Each edited trace was checked to remain in stage1:
+
+- **Expected outcome flipped**, `TauWeb.Dispatch.second_command_held`, step 1: red,
+  `outcome: expected {"dispatch":"refused"}, actual {"dispatch":"dispatched"}`.
+- **File removed**, then empty: red with the exact scratch path and `No such file or directory
+  (os error 2)`, then `not a JSON document: EOF while parsing a value at line 1 column 0`.
+- **Unknown event kind**, then outcome, on that same trace's step 1: red,
+  ``unknown variant `unrecognised_event`, expected one of `request`, `read`, `dispose`, `replay` ``,
+  then `unknown outcome dispatch: "unrecognised_outcome"`.
+
+The restored copy compared byte-identically with the pinned file and passed; the path edit was
+undone, the comparison source compared byte-identically with its saved copy, and the pinned-file
+run passed. The same breaks remain permanent unit tests. Separate production mutations removed
+the typed barrier, applied a failed observation append, ended a continuation restriction
+before its intent committed, sent to the fixture before append, and removed the shared rule's
+destructive command stop. Respectively the lost-create test and comparison, the failed-read
+barrier test, the continuation-boundary test, the adapter kill-boundary test, and both the
+comparison and requester matrix failed. Removing the replay refusal of an inference resource
+or target also failed the extended unsupported-record test. Restoring the exact source bytes
+made each green.
+
 The tracer was broken the same way on 2026-10-12: case 1 was made to expect exit status 8 where
 the fixture command exits with 7. `scripts/tracer.sh` (the `web` job's command, run
 locally, not on GitHub) exited 1, naming case 1 and the assertion "the output and exit status

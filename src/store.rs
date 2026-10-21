@@ -161,7 +161,7 @@ struct RecordJson {
 /// What a record carries, encrypted: a seed, dispatch record or allocation event.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
-enum Event {
+pub(crate) enum Event {
     /// The operator seed's mnemonic, so a seed-backup ceremony can show the words.
     Seed {
         mnemonic: String,
@@ -172,6 +172,8 @@ enum Event {
         command: String,
     },
     Intent(Intent),
+    OperationIntent(crate::dispatch::OperationIntent),
+    OperationObservation(crate::dispatch::Observation),
     Terminal(Terminal),
     JobTerminal(crate::jobs::Evidence),
     JobObservation(crate::jobs::Evidence),
@@ -317,6 +319,12 @@ pub struct Store<S> {
     dispatch: Dispatch,
     /// Set by a failed append, whose move may have landed: no append follows in this worker.
     failed: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum OperationError {
+    Policy(crate::dispatch::RequestRefusal),
+    Storage(String),
 }
 
 /// Creates a store where there is none: the envelope first, then the seed record. A worker killed
@@ -523,6 +531,80 @@ impl<S: Storage> Store<S> {
         &self.dispatch
     }
 
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub(crate) fn dispatch_mut(&mut self) -> &mut Dispatch {
+        &mut self.dispatch
+    }
+
+    /// Historical invalid dispositions cannot be produced by the live writer, which
+    /// refuses them without a record. Fixtures commit them to exercise replay's reports.
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub(crate) async fn dispatch_fixture_record(&mut self, event: Event) -> Result<(), String> {
+        let Event::Disposition(disposition) = &event else {
+            return Err("only historical dispositions need this fixture writer".into());
+        };
+        if !matches!(
+            self.dispatch.check_disposition(self.next, disposition),
+            DispositionReport::Refused { .. }
+        ) {
+            return Err("a valid disposition must use the production writer".into());
+        }
+        let number = self.commit(&event).await?;
+        self.dispatch.disposition(number, disposition.clone());
+        Ok(())
+    }
+
+    pub fn associate(&mut self, association: crate::dispatch::Association) -> Result<(), String> {
+        self.dispatch.associate(association)
+    }
+
+    pub fn check_operation(
+        &self,
+        request: &crate::dispatch::Request,
+    ) -> Result<(), crate::dispatch::RequestRefusal> {
+        self.dispatch.check_request(request).map(|_| ())
+    }
+
+    /// Typed adapters check before contact and again under the writer at append. The return
+    /// is read back from committed state; an adapter sends these facts, never rebuilt arguments.
+    pub async fn operation(
+        &mut self,
+        request: &crate::dispatch::Request,
+    ) -> Result<crate::dispatch::OperationIntent, OperationError> {
+        use crate::dispatch::Operation;
+        if !request.operation.mutation() && request.operation != Operation::Read {
+            return Err(OperationError::Policy(
+                crate::dispatch::RequestRefusal::UnsupportedOperation {
+                    operation: request.operation,
+                },
+            ));
+        }
+        let intent = self
+            .dispatch
+            .prepare(self.next, request)
+            .map_err(OperationError::Policy)?;
+        let number = self
+            .commit(&Event::OperationIntent(intent.clone()))
+            .await
+            .map_err(OperationError::Storage)?;
+        self.dispatch
+            .operation_intent(number, intent)
+            .expect("a prepared intent applies");
+        Ok(self.dispatch.typed_calls[&number].intent.clone())
+    }
+
+    pub async fn operation_observation(
+        &mut self,
+        observation: crate::dispatch::Observation,
+    ) -> Result<Vec<u64>, String> {
+        let mut next = self.dispatch.clone();
+        let settled = next.observe(self.next, observation.clone())?;
+        self.commit(&Event::OperationObservation(observation))
+            .await?;
+        self.dispatch = next;
+        Ok(settled)
+    }
+
     /// The operator's act: refusal writes nothing; acceptance commits before apply (`STA-3`).
     pub async fn dispose(&mut self, disposition: Disposition) -> Result<DispositionReport, String> {
         let report = self.dispatch.check_disposition(self.next, &disposition);
@@ -540,6 +622,7 @@ impl<S: Storage> Store<S> {
         self.commands.push((
             number,
             Entry {
+                provenance: intent.provenance.clone(),
                 machine: intent.machine,
                 command: hex::decode(intent.command).expect("core checked hex"),
             },
@@ -603,6 +686,7 @@ impl<S: Storage> Store<S> {
                             command: command.clone(),
                             approval: Some(Approval::LegacyCommand),
                             job: None,
+                            provenance: None,
                         },
                     )
                     .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
@@ -610,6 +694,31 @@ impl<S: Storage> Store<S> {
                 (_, Event::Intent(intent)) => self
                     .apply_intent(number, intent.clone())
                     .map_err(|e| format!("record {number}: {e}; replay stopped"))?,
+                (_, Event::OperationIntent(intent)) => {
+                    if !intent.operation.mutation()
+                        && intent.operation != crate::dispatch::Operation::Read
+                    {
+                        return Err(format!(
+                            "record {number}: operation_intent cannot record {:?}; replay stopped",
+                            intent.operation
+                        ));
+                    }
+                    if intent.resource == crate::dispatch::Resource::Inference
+                        || intent.target == crate::dispatch::Target::Inference
+                    {
+                        return Err(format!(
+                            "record {number}: operation_intent cannot name inference; replay stopped"
+                        ));
+                    }
+                    self.dispatch
+                        .operation_intent(number, intent.clone())
+                        .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
+                }
+                (_, Event::OperationObservation(observation)) => {
+                    self.dispatch
+                        .observe(number, observation.clone())
+                        .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
+                }
                 (_, Event::Terminal(terminal)) => self
                     .dispatch
                     .terminal(number, terminal.clone())
@@ -767,6 +876,7 @@ impl<S: Storage> Journal for Store<S> {
             command: hex::encode(&entry.command),
             approval: Some(approval.clone()),
             job: Some(hex::encode(random::<24>().map_err(AppendRefusal::Storage)?)),
+            provenance: entry.provenance.clone(),
         };
         let number = self
             .commit(&Event::Intent(intent.clone()))
@@ -1047,6 +1157,14 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
                 .expect("standing dispositions serialize");
             report["jobs"] =
                 serde_json::to_value(&store.dispatch.jobs).expect("job evidence serializes");
+            report["typed_calls"] =
+                serde_json::to_value(store.dispatch.typed_calls.values().collect::<Vec<_>>())
+                    .expect("typed calls serialize");
+            report["observations"] =
+                serde_json::to_value(&store.dispatch.observations).expect("observations serialize");
+            report["current_installations"] =
+                serde_json::to_value(&store.dispatch.current_installations)
+                    .expect("installations serialize");
             report["commands"] = store
                 .commands()
                 .iter()
@@ -1263,13 +1381,72 @@ mod tests {
 
     fn command(n: u8) -> Entry {
         Entry {
+            provenance: None,
             machine: "fixture".into(),
             command: format!("echo {n}; printf '\\xff'").into_bytes(),
         }
     }
 
+    #[test]
+    fn replay_refuses_typed_exec_and_inference_naming_the_record() {
+        use crate::dispatch::*;
+        for (operation, resource, target) in [
+            (
+                Operation::Exec,
+                Resource::Entry("fixture".into()),
+                Target::Entry("fixture".into()),
+            ),
+            (Operation::Inference, Resource::Inference, Target::Inference),
+            (
+                Operation::Create,
+                Resource::Inference,
+                Target::Entry("fixture".into()),
+            ),
+            (
+                Operation::Create,
+                Resource::Entry("fixture".into()),
+                Target::Inference,
+            ),
+            (Operation::Read, Resource::Inference, Target::Inference),
+        ] {
+            let (storage, mut store) = store(PASS, 0);
+            let facts = Facts {
+                arguments: BTreeMap::new(),
+                cost_bound: 0,
+                bundle_commit: crate::SPEC_COMMIT.into(),
+            };
+            let intent = OperationIntent {
+                call: 1,
+                resource: resource.clone(),
+                target: target.clone(),
+                operation,
+                session: "fixture-session".into(),
+                requester: Requester::Session,
+                facts: facts.clone(),
+                approved: OperationApproval {
+                    resource,
+                    target,
+                    operation,
+                    session: "fixture-session".into(),
+                    requester: Requester::Session,
+                    facts,
+                },
+            };
+            // Craft an authenticated record that no production writer emits.
+            block_on(store.commit(&Event::OperationIntent(intent))).unwrap();
+            let why = reopen(&storage.files(), PASS)
+                .err()
+                .expect("unsupported typed record");
+            assert!(
+                why.contains("record 1") && why.contains("operation_intent"),
+                "{why}"
+            );
+        }
+    }
+
     fn independent_command(n: u8) -> Entry {
         Entry {
+            provenance: None,
             machine: format!("fixture-{n}"),
             ..command(n)
         }
@@ -1307,6 +1484,7 @@ mod tests {
                 command: hex::encode(command(n).command),
                 approval: Some(approval()),
                 job: Some(hex::encode([n; 24])),
+                provenance: None,
             };
             let number = block_on(store.commit(&Event::Intent(intent.clone()))).unwrap();
             assert_eq!(number, u64::from(n));
@@ -2959,6 +3137,7 @@ mod tests {
                 command: hex::encode("exit 0"),
                 approval: Some(approval()),
                 job: None,
+                provenance: None,
             }),
         );
         let reopened = reopen(&storage.files(), PASS).unwrap();
@@ -3044,6 +3223,7 @@ mod tests {
             command(2),
             command(1),
             Entry {
+                provenance: None,
                 machine: "fixture".into(),
                 command: b"cat /etc/os-release".to_vec(),
             },
@@ -3071,6 +3251,7 @@ mod tests {
             "criterion 9: unresolved-command hold survives replay"
         );
         let other = Entry {
+            provenance: None,
             machine: "other".into(),
             command: b"true".to_vec(),
         };
@@ -3139,6 +3320,7 @@ mod tests {
                 assert_eq!(storage.files(), before);
             }
             let entry = Entry {
+                provenance: None,
                 machine: "other".into(),
                 command: command(1).command,
             };
@@ -3241,7 +3423,12 @@ mod tests {
             replacement,
             DispositionReport::Accepted {
                 number: 4,
-                replaces: Some(first)
+                replaces: Some(first),
+                dropped: vec![],
+                assumption: Some(crate::dispatch::Assumption {
+                    continuation: AsIfNotDone,
+                    outcome: crate::dispatch::Unknown::Unknown
+                }),
             }
         );
         assert!(
@@ -3261,7 +3448,9 @@ mod tests {
             last,
             DispositionReport::Accepted {
                 number: 8,
-                replaces: Some(current)
+                replaces: Some(current),
+                dropped: vec![],
+                assumption: None,
             }
         );
         for s in [&mut store, &mut reopen(&storage.files(), PASS).unwrap()] {
@@ -3295,6 +3484,7 @@ mod tests {
                 continuation.destructive()
             );
             let entry = Entry {
+                provenance: None,
                 machine: "other".into(),
                 command: vec![1],
             };
@@ -3459,6 +3649,7 @@ mod tests {
         let intent = |call, command: &str, approval| {
             Event::Intent(Intent {
                 job: None,
+                provenance: None,
                 call,
                 machine: "fixture".into(),
                 command: command.into(),
@@ -3518,6 +3709,7 @@ mod tests {
             &mut store,
             Event::Intent(Intent {
                 job: None,
+                provenance: None,
                 call: 1,
                 machine: "private machine name".into(),
                 command: hex::encode("private command"),
@@ -3538,6 +3730,7 @@ mod tests {
             &mut store,
             Event::Intent(Intent {
                 job: None,
+                provenance: None,
                 call: 2,
                 machine: "fixture".into(),
                 command: "ff00".into(),

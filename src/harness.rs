@@ -74,6 +74,7 @@ pub trait PinSource {
 pub struct Entry {
     pub machine: String,
     pub command: Vec<u8>,
+    pub provenance: Option<crate::dispatch::CommandProvenance>,
 }
 
 /// A policy refusal does not trip the store's failed-append latch.
