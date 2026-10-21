@@ -42,9 +42,10 @@ const render = (store) => {
       : ' Seed-backup record: re-entry check skipped.';
   }
   $('seed-backup-state').textContent = active
-    ? `Seed-backup ceremony. ${store.seed_backup_owed
+    ? ['Seed-backup ceremony.', store.seed_backup_owed
       ? 'New machines, relay passes and handoffs are refused until the seed backup is recorded.'
-      : 'Re-display: record a new full re-entry or skip.'} Dispatch is stopped. ${store.error ?? ''}`
+      : stage !== 'append_failed' && 'Re-display: record a new full re-entry or skip.',
+    'Dispatch is stopped.', store.error].filter(Boolean).join(' ')
     : '';
   if (state === 'locked' && redisplay) $('store-state').textContent += ' Enter the local passphrase again to show the seed backup.';
 };
@@ -76,7 +77,10 @@ const start = () => {
     else show('failed', `Harness failed: ${data.harness_error}`);
   };
   worker.onerror = (event) => {
-    if (worker === current) show('failed', `Harness failed: ${event.message ?? 'the worker did not load'}`);
+    if (worker !== current) return;
+    clearWords();
+    $('seed-backup-input').value = '';
+    show('failed', `Harness failed: ${event.message ?? 'the worker did not load'}`);
   };
 };
 
