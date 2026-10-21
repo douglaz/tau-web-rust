@@ -66,6 +66,7 @@ pub enum Refusal {
     /// The journal refused the append, so no `exec` was sent (`STA-3`).
     Journal(String),
     Disposition(DestructiveDisposition),
+    Barrier(Vec<crate::dispatch::OperationIntent>),
     Held(Value),
     LaunchTooLong {
         bytes: usize,
@@ -83,6 +84,7 @@ impl Refusal {
     pub fn to_json(&self) -> Value {
         match self {
             Refusal::Held(answer) => answer.clone(),
+            Refusal::Barrier(calls) => json!({"refused":"barrier","calls":calls}),
             Refusal::LaunchTooLong { bytes } => json!({
                 "refused": "launch-too-long",
                 "why": "command is too long to launch; shorten the command",
@@ -137,6 +139,7 @@ fn append_refusal(refusal: AppendRefusal) -> Refusal {
     match refusal {
         AppendRefusal::Storage(why) => Refusal::Journal(why),
         AppendRefusal::Policy(DispatchRefusal::Disposition(record)) => Refusal::Disposition(record),
+        AppendRefusal::Policy(DispatchRefusal::TypedBarrier { calls }) => Refusal::Barrier(calls),
         AppendRefusal::Policy(DispatchRefusal::Held(_)) => {
             unreachable!("hold collects before reporting")
         }
@@ -217,6 +220,11 @@ pub async fn run_command(
     // ARC-8, STA-4: the record is appended immediately before the bytes leave, and a failed
     // append means they do not (STA-3).
     let entry = Entry {
+        provenance: Some(crate::dispatch::CommandProvenance {
+            target: crate::dispatch::Target::Entry(target.machine.clone()),
+            session: None,
+            requester: crate::dispatch::Requester::Session,
+        }),
         machine: target.machine.clone(),
         command: command.to_vec(),
     };

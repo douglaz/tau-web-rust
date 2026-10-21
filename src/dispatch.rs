@@ -1,9 +1,19 @@
-//! Journal-derived box-plane calls and operator dispositions (`STA-4`, `STA-8`, `STA-24`).
+//! Journal-derived calls across both planes and operator dispositions (`STA-4`, `STA-8`, `STA-24`).
 //! No clock, transport or storage enters this core. `STA-20`'s unresolved-command hold
 //! and destructive dispositions are both derived from committed records.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+
+mod typed;
+pub use typed::*;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod comparison;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod fixture;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod typed_tests;
 
 /// The identity of what admitted a command, not approval of its contents.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,6 +38,9 @@ pub struct Intent {
     pub approval: Option<Approval>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job: Option<String>,
+    /// Request provenance, separate from the scope admission above (`ARC-4`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<CommandProvenance>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +81,8 @@ pub enum CallState {
     Finished { terminal: u64, exit_status: u32 },
     Disposed { disposition: u64, outcome: Unknown },
     Cancelled,
+    NoEffect,
+    Confirmed { observation: u64 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -103,6 +118,7 @@ pub struct DispositionIssue {
 #[serde(tag = "kind", content = "record", rename_all = "snake_case")]
 pub enum SettlingRecord {
     Terminal(TerminalRecord),
+    Observation(ObservationRecord),
     Disposition {
         number: u64,
         disposition: Disposition,
@@ -115,6 +131,8 @@ pub enum DispositionReport {
     Accepted {
         number: u64,
         replaces: Option<u64>,
+        dropped: Vec<u64>,
+        assumption: Option<Assumption>,
     },
     Refused {
         issues: Vec<DispositionIssue>,
@@ -128,6 +146,7 @@ pub struct DispositionRecord {
     #[serde(flatten)]
     pub disposition: Disposition,
     pub report: DispositionReport,
+    pub resource: Resource,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -147,47 +166,61 @@ pub struct CommandHold {
 pub enum DispatchRefusal {
     Held(CommandHold),
     Disposition(DestructiveDisposition),
+    TypedBarrier { calls: Vec<OperationIntent> },
 }
 
 /// All projections come from committed records applied in journal order.
 #[derive(Clone, Debug, Default)]
 pub struct Dispatch {
+    pub intent_order: Vec<u64>,
     pub calls: BTreeMap<u64, Call>,
     pub terminals: Vec<TerminalRecord>,
     pub dispositions: Vec<DispositionRecord>,
     pub standing: BTreeMap<String, DispositionRecord>,
     pub jobs: Vec<crate::jobs::Report>,
+    pub typed_calls: BTreeMap<u64, OperationCall>,
+    pub observations: Vec<ObservationRecord>,
+    pub associations: Vec<Association>,
+    pub current_installations: BTreeMap<String, u64>,
+    pub inference_standing: Option<DispositionRecord>,
 }
 
 impl Dispatch {
     pub fn check_command(&self, machine: &str) -> Result<(), DispatchRefusal> {
-        let disposition = self.standing.get(machine).and_then(|record| {
-            record
-                .disposition
-                .continuation
-                .destructive()
-                .then_some(DestructiveDisposition {
-                    disposition: record.number,
-                    continuation: record.disposition.continuation,
-                })
-        });
-        let calls: Vec<_> = self
-            .calls
-            .values()
-            .filter(|call| call.intent.machine == machine && call.state == CallState::Unresolved)
-            .map(|call| call.intent.clone())
-            .collect();
-        if !calls.is_empty() {
-            return Err(DispatchRefusal::Held(CommandHold { calls, disposition }));
+        let resource = Resource::Entry(machine.into());
+        match self.check_operation(&resource, Operation::Exec, Requester::Session) {
+            Ok(()) => Ok(()),
+            Err(RequestRefusal::Barrier { calls }) => {
+                let running: Vec<_> = calls
+                    .iter()
+                    .filter_map(|id| self.typed_calls.get(id).map(|c| c.intent.clone()))
+                    .collect();
+                if !running.is_empty() {
+                    return Err(DispatchRefusal::TypedBarrier { calls: running });
+                }
+                let calls = calls
+                    .iter()
+                    .map(|id| self.calls[id].intent.clone())
+                    .collect();
+                let disposition = self.standing.get(machine).and_then(|record| {
+                    record.disposition.continuation.destructive().then_some(
+                        DestructiveDisposition {
+                            disposition: record.number,
+                            continuation: record.disposition.continuation,
+                        },
+                    )
+                });
+                Err(DispatchRefusal::Held(CommandHold { calls, disposition }))
+            }
+            Err(RequestRefusal::Continuation { in_force }) => {
+                Err(DispatchRefusal::Disposition(in_force))
+            }
+            Err(_) => unreachable!("operation admission checks only barriers and continuations"),
         }
-        if let Some(disposition) = disposition {
-            return Err(DispatchRefusal::Disposition(disposition));
-        }
-        Ok(())
     }
 
     pub fn intent(&mut self, number: u64, intent: Intent) -> Result<(), String> {
-        if intent.call != number || self.calls.contains_key(&number) {
+        if intent.call != number || self.call_state(number).is_some() {
             return Err("intent identity is not its unique record number".into());
         }
         let bytes = hex::decode(&intent.command).map_err(|_| "intent command is not hex")?;
@@ -209,22 +242,27 @@ impl Dispatch {
             CallState::Cancelled
         };
         self.calls.insert(number, Call { intent, state });
+        self.intent_order.push(number);
+        self.current_installations
+            .entry(self.calls[&number].intent.machine.clone())
+            .or_default();
         Ok(())
     }
 
     pub fn terminal(&mut self, number: u64, terminal: Terminal) -> Result<(), String> {
-        let call = self
-            .calls
-            .get_mut(&terminal.call)
-            .ok_or("terminal names no call")?;
-        if matches!(
-            call.state,
-            CallState::Cancelled | CallState::Finished { .. }
-        ) {
+        match self.call_operation(terminal.call) {
+            None => return Err("terminal names no call".into()),
+            Some(Operation::Exec) => {}
+            Some(_) => return Err("terminal names no box-plane call".into()),
+        }
+        let state = self
+            .call_state_mut(terminal.call)
+            .expect("recorded command");
+        if matches!(state, CallState::Cancelled | CallState::Finished { .. }) {
             return Err("terminal names a cancelled or already finished call".into());
         }
-        if matches!(call.state, CallState::Unresolved) {
-            call.state = CallState::Finished {
+        if matches!(state, CallState::Unresolved) {
+            *state = CallState::Finished {
                 terminal: number,
                 exit_status: terminal.exit_status,
             };
@@ -296,7 +334,20 @@ impl Dispatch {
 
     /// The same test is used before recording and during replay (`STA-24`).
     pub fn check_disposition(&self, number: u64, disposition: &Disposition) -> DispositionReport {
-        let standing = self.standing.get(&disposition.machine);
+        self.check_resource_disposition(
+            number,
+            &Resource::Entry(disposition.machine.clone()),
+            disposition,
+        )
+    }
+
+    pub fn check_resource_disposition(
+        &self,
+        number: u64,
+        resource: &Resource,
+        disposition: &Disposition,
+    ) -> DispositionReport {
+        let standing = self.standing_for(resource);
         let mut issues = Vec::new();
         if disposition.calls.is_empty() {
             issues.push(DispositionIssue {
@@ -307,17 +358,18 @@ impl Dispatch {
             });
         }
         for id in &disposition.calls {
-            let call = self.calls.get(id);
-            let eligible = call.is_some_and(|call| {
-                call.intent.machine == disposition.machine
-                    && (matches!(call.state, CallState::Unresolved)
-                        || matches!(call.state, CallState::Disposed { disposition: old, .. }
-                            if standing.is_some_and(|record| record.number == old)))
+            let call = self.call_state(*id);
+            let eligible = call.is_some_and(|state| {
+                self.call_resource(*id).as_ref() == Some(resource)
+                    && (matches!(state, CallState::Unresolved)
+                        || matches!(state, CallState::Disposed { disposition: old, .. }
+                            if standing.is_some_and(|record| record.number == *old)))
             });
             if !eligible {
-                let settled_by = call.and_then(|call| match call.state {
-                    CallState::Finished { terminal, .. } => Some(terminal),
-                    CallState::Disposed { disposition, .. } => Some(disposition),
+                let settled_by = call.and_then(|state| match state {
+                    CallState::Finished { terminal, .. } => Some(*terminal),
+                    CallState::Confirmed { observation } => Some(*observation),
+                    CallState::Disposed { disposition, .. } => Some(*disposition),
                     _ => None,
                 });
                 let settling_record = settled_by.and_then(|number| {
@@ -326,6 +378,13 @@ impl Dispatch {
                         .find(|record| record.number == number)
                         .cloned()
                         .map(SettlingRecord::Terminal)
+                        .or_else(|| {
+                            self.observations
+                                .iter()
+                                .find(|r| r.number == number)
+                                .cloned()
+                                .map(SettlingRecord::Observation)
+                        })
                         .or_else(|| {
                             self.dispositions
                                 .iter()
@@ -338,7 +397,7 @@ impl Dispatch {
                 });
                 let why = match call {
                     None => "call does not exist",
-                    Some(call) if call.intent.machine != disposition.machine => {
+                    Some(_) if self.call_resource(*id).as_ref() != Some(resource) => {
                         "call names another machine"
                     }
                     Some(_) => {
@@ -357,39 +416,64 @@ impl Dispatch {
             DispositionReport::Accepted {
                 number,
                 replaces: standing.map(|record| record.number),
+                dropped: standing
+                    .map(|record| {
+                        record
+                            .disposition
+                            .calls
+                            .iter()
+                            .filter(|id| !disposition.calls.contains(id))
+                            .copied()
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                assumption: (!disposition.continuation.destructive()).then_some(Assumption {
+                    continuation: disposition.continuation,
+                    outcome: Unknown::Unknown,
+                }),
             }
         } else {
             DispositionReport::Refused {
                 issues,
-                unresolved: self
-                    .calls
-                    .iter()
-                    .filter_map(|(id, call)| {
-                        (call.intent.machine == disposition.machine
-                            && matches!(call.state, CallState::Unresolved))
-                        .then_some(*id)
-                    })
-                    .collect(),
+                unresolved: self.unresolved(resource),
             }
         }
     }
 
     pub fn disposition(&mut self, number: u64, disposition: Disposition) -> DispositionReport {
-        let report = self.check_disposition(number, &disposition);
+        self.resource_disposition(
+            number,
+            Resource::Entry(disposition.machine.clone()),
+            disposition,
+        )
+    }
+
+    pub fn resource_disposition(
+        &mut self,
+        number: u64,
+        resource: Resource,
+        disposition: Disposition,
+    ) -> DispositionReport {
+        let report = self.check_resource_disposition(number, &resource, &disposition);
         let record = DispositionRecord {
             number,
             disposition,
             report: report.clone(),
+            resource: resource.clone(),
         };
         if matches!(report, DispositionReport::Accepted { .. }) {
             for id in &record.disposition.calls {
-                self.calls.get_mut(id).expect("checked call").state = CallState::Disposed {
+                *self.call_state_mut(*id).expect("checked call") = CallState::Disposed {
                     disposition: number,
                     outcome: Unknown::Unknown,
                 };
             }
-            self.standing
-                .insert(record.disposition.machine.clone(), record.clone());
+            match resource {
+                Resource::Entry(entry) => {
+                    self.standing.insert(entry, record.clone());
+                }
+                Resource::Inference => self.inference_standing = Some(record.clone()),
+            }
         }
         self.dispositions.push(record);
         report
@@ -407,6 +491,7 @@ mod tests {
             command: hex::encode("true"),
             approval,
             job: None,
+            provenance: None,
         }
     }
 

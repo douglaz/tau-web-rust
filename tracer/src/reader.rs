@@ -110,6 +110,20 @@ fn check_event(number: u64, event: &Value) -> Result<(), String> {
             text("machine")?;
             hex::decode(text("command")?).map_err(|_| "command is not hex")?;
             if kind == "intent" {
+                if let Some(provenance) = body.get("provenance") {
+                    exact(provenance, &["target", "session", "requester"])?;
+                    target(&provenance["target"])?;
+                    if !(provenance["session"].is_null()
+                        || provenance["session"].as_str().is_some())
+                        || !["session", "operator", "harness_flow"]
+                            .contains(&provenance["requester"].as_str().unwrap_or(""))
+                    {
+                        return Err("invalid command provenance".into());
+                    }
+                }
+                if body.get("request").is_some() {
+                    return Err("unknown command request member".into());
+                }
                 if let Some(job) = body.get("job")
                     && !job.as_str().is_some_and(|id| {
                         id.len() == 48
@@ -144,6 +158,66 @@ fn check_event(number: u64, event: &Value) -> Result<(), String> {
                     .is_none()
             {
                 return Err("terminal has no call identity or exit status".into());
+            }
+        }
+        "operation_intent" => {
+            exact(
+                body,
+                &[
+                    "call",
+                    "resource",
+                    "target",
+                    "operation",
+                    "session",
+                    "requester",
+                    "facts",
+                    "approved",
+                ],
+            )?;
+            if body["call"].as_u64() != Some(number) {
+                return Err("typed identity differs from record number".into());
+            }
+            resource(&body["resource"])?;
+            target(&body["target"])?;
+            if body["resource"] == "inference" || body["target"] == "inference" {
+                return Err("typed operation_intent cannot name inference".into());
+            }
+            if !["create", "reset", "reinstall", "destroy", "read"].contains(&text("operation")?)
+                || !["session", "operator", "harness_flow"].contains(&text("requester")?)
+            {
+                return Err("unknown typed operation or requester".into());
+            }
+            text("session")?;
+            facts(&body["facts"])?;
+            exact(
+                &body["approved"],
+                &["resource", "target", "operation", "session", "facts"],
+            )?;
+            for key in ["resource", "target", "operation", "session", "facts"] {
+                if body[key] != body["approved"][key] {
+                    return Err("typed intent differs from its approval".into());
+                }
+            }
+        }
+        "operation_observation" => {
+            exact(body, &["resource", "operation", "reports", "calls"])?;
+            resource(&body["resource"])?;
+            if ![
+                "create",
+                "reset",
+                "reinstall",
+                "destroy",
+                "read",
+                "exec",
+                "inference",
+            ]
+            .contains(&text("operation")?)
+                || !["confirmed", "ended", "unknown"].contains(&text("reports")?)
+                || !body["calls"]
+                    .as_array()
+                    .is_some_and(|calls| calls.iter().all(|call| call.as_u64().is_some()))
+            {
+                return Err("invalid typed observation".into());
             }
         }
         "job_terminal" | "job_observation" => {
@@ -234,6 +308,55 @@ fn check_event(number: u64, event: &Value) -> Result<(), String> {
             }
         }
         _ => return Err(format!("unknown event kind {kind}")),
+    }
+    Ok(())
+}
+
+fn exact(value: &Value, fields: &[&str]) -> Result<(), String> {
+    let object = value.as_object().ok_or("record body is not an object")?;
+    if object.len() != fields.len() || fields.iter().any(|k| !object.contains_key(*k)) {
+        return Err("unknown or missing typed member".into());
+    }
+    Ok(())
+}
+
+fn resource(value: &Value) -> Result<(), String> {
+    if value == "inference" {
+        return Ok(());
+    }
+    exact(value, &["entry"])?;
+    if value["entry"].as_str().is_none() {
+        return Err("resource entry is not text".into());
+    }
+    Ok(())
+}
+
+fn target(value: &Value) -> Result<(), String> {
+    if value == "inference" {
+        return Ok(());
+    }
+    let object = value.as_object().ok_or("typed target is not an object")?;
+    if object.len() == 1
+        && (value["entry"].is_string()
+            || value["vendor_machine"].is_string()
+            || value["allocation_index"]
+                .as_u64()
+                .is_some_and(|n| n <= u64::from(u32::MAX)))
+    {
+        return Ok(());
+    }
+    Err("unknown typed target".into())
+}
+
+fn facts(value: &Value) -> Result<(), String> {
+    exact(value, &["arguments", "cost_bound", "bundle_commit"])?;
+    if value["arguments"]
+        .as_object()
+        .is_none_or(|a| a.values().any(|v| !v.is_string()))
+        || value["cost_bound"].as_u64().is_none()
+        || !value["bundle_commit"].is_string()
+    {
+        return Err("invalid typed facts".into());
     }
     Ok(())
 }
@@ -628,8 +751,159 @@ mod tests {
 
     const PASS: &str = "correct horse battery staple";
 
+    #[test]
+    fn typed_records_are_read_independently_and_replayed_by_the_store() {
+        let mnemonic = bip39::Mnemonic::from_entropy(&[7; 16]).unwrap().to_string();
+        for operation in ["create", "reset", "reinstall", "destroy", "read"] {
+            let intent = super::super::typed_cases::intent(1, operation);
+            let observation = json!({"operation_observation":{"resource":{"entry":"fixture"},
+                "operation":operation,"reports":"confirmed","calls":[1]}});
+            let files = build(
+                PASS,
+                &[
+                    json!({"seed":{"mnemonic":mnemonic}}),
+                    intent.clone(),
+                    observation.clone(),
+                ],
+            );
+            let opened = read(&files, PASS).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&opened.records[1].1).unwrap(),
+                intent
+            );
+            assert_eq!(
+                serde_json::from_slice::<Value>(&opened.records[2].1).unwrap(),
+                observation
+            );
+            let replayed = block_on(unlock(
+                MemoryStorage::with_files(files),
+                &Pbkdf2,
+                tau_web::credential::LocalPassphrase::new(PASS.as_bytes().to_vec()),
+            ))
+            .unwrap();
+            assert_eq!(
+                replayed.dispatch().typed_calls[&1].state,
+                if operation == "read" {
+                    tau_web::dispatch::CallState::NoEffect
+                } else {
+                    tau_web::dispatch::CallState::Confirmed { observation: 2 }
+                }
+            );
+            let mut bad = intent.clone();
+            bad["operation_intent"]["facts"]["cost_bound"] = json!(99);
+            assert!(check_event(1, &bad).is_err());
+            let mut bad = observation;
+            bad["operation_observation"]["extra"] = json!(true);
+            assert!(check_event(2, &bad).is_err());
+        }
+    }
+
+    #[test]
+    fn production_command_provenance_keeps_the_job_evidence_path() {
+        let storage = MemoryStorage::default();
+        let pass = || tau_web::credential::LocalPassphrase::new(PASS.as_bytes().to_vec());
+        let mut store = block_on(create(storage.clone(), &Pbkdf2, pass())).unwrap();
+        let entry = Entry {
+            machine: "fixture".into(),
+            command: b"true".to_vec(),
+            provenance: Some(tau_web::dispatch::CommandProvenance {
+                target: tau_web::dispatch::Target::AllocationIndex(7),
+                session: Some("later-session".into()),
+                requester: tau_web::dispatch::Requester::Operator,
+            }),
+        };
+        let admission = tau_web::dispatch::Approval::HarnessPin {
+            machine: "fixture".into(),
+            fingerprint: "SHA256:fixture".into(),
+        };
+        assert_eq!(block_on(store.check("fixture")), Ok(()));
+        let call = block_on(store.append(&entry, &admission)).unwrap();
+        let opened = read(&storage.files(), PASS).unwrap();
+        let intent: Value = serde_json::from_slice(&opened.records[1].1).unwrap();
+        assert_eq!(
+            intent["intent"]["provenance"],
+            json!({"target":{"allocation_index":7},
+            "session":"later-session","requester":"operator"})
+        );
+        assert_eq!(
+            intent["intent"]["approval"]["harness_pin"]["fingerprint"],
+            "SHA256:fixture"
+        );
+        assert!(intent["intent"].get("request").is_none());
+        let job = store.dispatch().calls[&call].intent.job.clone().unwrap();
+        drop(store);
+        let mut store = block_on(unlock(
+            MemoryStorage::with_files(storage.files()),
+            &Pbkdf2,
+            pass(),
+        ))
+        .unwrap();
+        assert_eq!(
+            store.dispatch().calls[&call].intent.provenance,
+            entry.provenance
+        );
+        let evidence = tau_web::jobs::Evidence {
+            call: 1,
+            job,
+            record: tau_web::jobs::Record::Present {
+                machine: hex::encode("fixture"),
+                command: hex::encode("true"),
+                boot: "fixture-boot".into(),
+                current_boot: "fixture-boot".into(),
+                pid: 7,
+                alive: false,
+                exit_status: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        };
+        block_on(store.job_evidence(&evidence)).unwrap();
+        let opened = read(&store.storage().files(), PASS).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&opened.records[2].1).unwrap()["job_terminal"]["call"],
+            1
+        );
+    }
+
+    #[test]
+    fn independent_reader_refuses_typed_exec_and_inference_naming_the_record() {
+        let mnemonic = bip39::Mnemonic::from_entropy(&[7; 16]).unwrap().to_string();
+        for (operation, inference_resource, inference_target) in [
+            ("exec", false, false),
+            ("inference", true, true),
+            ("create", true, false),
+            ("create", false, true),
+            ("read", true, true),
+        ] {
+            let mut event = super::super::typed_cases::intent(1, operation);
+            if inference_resource {
+                for pointer in [
+                    "/operation_intent/resource",
+                    "/operation_intent/approved/resource",
+                ] {
+                    *event.pointer_mut(pointer).unwrap() = json!("inference");
+                }
+            }
+            if inference_target {
+                for pointer in [
+                    "/operation_intent/target",
+                    "/operation_intent/approved/target",
+                ] {
+                    *event.pointer_mut(pointer).unwrap() = json!("inference");
+                }
+            }
+            let files = build(PASS, &[json!({"seed":{"mnemonic":mnemonic}}), event]);
+            let why = read(&files, PASS).err().expect("unsupported typed record");
+            assert!(
+                why.contains("record 1") && why.contains("typed operation"),
+                "{why}"
+            );
+        }
+    }
+
     fn command(n: u8) -> Entry {
         Entry {
+            provenance: None,
             machine: "fixture".into(),
             command: format!("echo {n}").into_bytes(),
         }
@@ -875,6 +1149,7 @@ mod tests {
                 (
                     2,
                     Entry {
+                        provenance: None,
                         machine: "other".into(),
                         command: vec![0xff, 0]
                     }

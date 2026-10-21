@@ -982,6 +982,7 @@ mod tests {
             let call = store
                 .append(
                     &Entry {
+                        provenance: None,
                         machine: "fixture".into(),
                         command: command.as_bytes().to_vec(),
                     },
