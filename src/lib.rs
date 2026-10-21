@@ -86,6 +86,27 @@ mod worker {
         local().lock().await.inspect().to_string()
     }
 
+    /// Hold the real store writer until the tracer releases its promise.
+    #[cfg(feature = "tracer")]
+    #[wasm_bindgen]
+    pub async fn test_writer(
+        release: js_sys::Promise,
+        acquired: js_sys::Function,
+    ) -> Result<(), wasm_bindgen::JsValue> {
+        let local = local();
+        let _writer = local.lock().await;
+        acquired.call0(&wasm_bindgen::JsValue::NULL)?;
+        wasm_bindgen_futures::JsFuture::from(release).await?;
+        Ok(())
+    }
+
+    /// Count completed held-request reads without acquiring the writer.
+    #[cfg(feature = "tracer")]
+    #[wasm_bindgen]
+    pub fn test_completed_reads() -> u32 {
+        crate::testonly::completed_reads()
+    }
+
     /// The passphrase as the secret type; the JavaScript array it came in is zero-filled.
     fn take(passphrase: &Uint8Array) -> LocalPassphrase {
         let secret = LocalPassphrase::new(passphrase.to_vec());
@@ -94,7 +115,7 @@ mod worker {
     }
 
     /// The store's journal, which holds the store only inside an append or a read, so a command
-    /// in flight never holds it.
+    /// awaiting its record never holds it.
     struct StoreJournal(Rc<Mutex<Harness>>);
 
     impl Journal for StoreJournal {
@@ -153,6 +174,23 @@ mod worker {
                 None => Err("the store is locked".into()),
             }
         }
+
+        async fn job_evidence_unless_stopped(
+            &mut self,
+            evidence: &crate::jobs::Evidence,
+            stop: &crate::harness::Stop,
+        ) -> Option<Result<crate::jobs::Report, String>> {
+            crate::harness::write::unless_stopped(
+                self.0.lock(),
+                stop.notified(),
+                || stop.stopped(),
+                async |mut local| match local.store() {
+                    Some(store) => store.job_evidence(evidence).await,
+                    None => Err("the store is locked".into()),
+                },
+            )
+            .await
+        }
     }
 
     /// Runs one command: `request` is JSON naming the machine, the relay's URL, the destination,
@@ -168,7 +206,14 @@ mod worker {
         request_operation(request, false).await
     }
 
-    /// Read a machine's outstanding job records, waiting for its running commands.
+    /// Stop the current unresolved-command waits on this machine. Settles nothing.
+    #[wasm_bindgen]
+    pub fn stop_waits(machine: String) -> usize {
+        crate::harness::stop_waits(&machine)
+    }
+
+    /// Read a machine's outstanding job records, waiting for its running commands. A call whose
+    /// own dispatch still awaits its record is reported not read, and is not read separately.
     #[wasm_bindgen]
     pub async fn collect_jobs(request: String) -> Result<String, wasm_bindgen::JsValue> {
         request_operation(request, true).await

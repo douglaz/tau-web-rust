@@ -1,9 +1,10 @@
 //! The tracer's test-only parts (twr-ggw.2, twr-ggw.3, twr-ggw.5): the test keys, the host-key
 //! pin source, and the test switches the browser test sets on a request (`fail_append`,
-//! `tamper_auth`, `test_relay_key`). The harness worker's `run_command` runs on these and on the
-//! local store's journal in the tracer build; the served build runs it on nothing stored. Compiled
-//! only with the `tracer` feature; `tracer check-absence` reads the served directory for every one
-//! of them, through the marker, switch names and key encodings below.
+//! `tamper_auth`, `test_relay_key`, `test_no_credentials`). The harness worker's `run_command`
+//! runs on these and on the local store's journal in the tracer build; the served build runs it
+//! on nothing stored. Compiled only with the `tracer` feature; `tracer check-absence` reads the
+//! served directory for every one of them, through the marker, switch names and key encodings
+//! below. The tracer-only writer and completed-read exports coordinate evidence-append checks.
 //!
 //! The keys are test keys, not derived from a seed: derivation exists (`crate::seed`), and
 //! twr-ggw.11 binds its keys in their place. They are built as the credential types a derived key
@@ -64,12 +65,18 @@ pub const SSH_USER: &str = "tracer";
 /// Marks the pin source in a build; `tracer check-absence` refuses a served build holding it.
 pub const PIN_SOURCE_MARKER: &str = "tau-web test-only host-key pin source";
 
-/// The host-key pins, by machine: `fixture` is the fixture sshd's pinned host key; any other
-/// machine, `unpinned` in the tracer, has none.
-pub const PINS: &[(&str, &str)] = &[(
-    "fixture",
-    "SHA256:YHPidfDWj7ccV6cBUvdYdmAkCov2RZ7vQ+qVed7PWLY",
-)];
+/// `fixture` and `fixture-other` use the fixture sshd's pinned host key.
+/// Every other machine, `unpinned` in the tracer, has none.
+pub const PINS: &[(&str, &str)] = &[
+    (
+        "fixture-other",
+        "SHA256:YHPidfDWj7ccV6cBUvdYdmAkCov2RZ7vQ+qVed7PWLY",
+    ),
+    (
+        "fixture",
+        "SHA256:YHPidfDWj7ccV6cBUvdYdmAkCov2RZ7vQ+qVed7PWLY",
+    ),
+];
 
 /// The pin source the tracer runs with: `PINS`, read-only.
 pub struct TestPins;
@@ -100,16 +107,17 @@ pub trait FailAppend {
 struct TestCredentials {
     ssh: SshClientKey,
     relay: RelayKey,
+    unavailable: bool,
 }
 
 #[cfg(target_arch = "wasm32")]
 impl crate::harness::Credentials for TestCredentials {
     fn ssh_key(&self) -> Option<&SshClientKey> {
-        Some(&self.ssh)
+        (!self.unavailable).then_some(&self.ssh)
     }
 
     fn relay_key(&self) -> Option<&RelayKey> {
-        Some(&self.relay)
+        (!self.unavailable).then_some(&self.relay)
     }
 }
 
@@ -117,9 +125,10 @@ impl crate::harness::Credentials for TestCredentials {
 /// `test_relay_key` names the test relay key the AUTH is signed with, one of `RELAY_KEYS`, and
 /// any other value, or none, or a key that does not derive its recorded public half, fails the
 /// request before any contact; `fail_append` makes the store's append fail at its move, a real
-/// OPFS call; `tamper_auth` sends a wrongly signed AUTH. The key is chosen by name only: no key
-/// material comes from the request. The report adds the commands this request appended and the
-/// pin source's view afterwards, for the tracer to check.
+/// OPFS call; `tamper_auth` sends a wrongly signed AUTH; `test_no_credentials` supplies no keys.
+/// The key is chosen by name only: no key material comes from the request. The report adds
+/// the commands this request appended and the pin source's view afterwards, for the tracer
+/// to check.
 #[cfg(target_arch = "wasm32")]
 pub async fn run(
     target: &crate::harness::Target,
@@ -155,6 +164,7 @@ pub async fn run(
     let credentials = TestCredentials {
         ssh: SshClientKey(SSH_CLIENT_SEED),
         relay,
+        unavailable: request["test_no_credentials"] == json!(true),
     };
     let outcome = if collect {
         match crate::harness::collect_jobs(
@@ -186,10 +196,24 @@ pub async fn run(
     Ok(json!({
         "pin_source": PIN_SOURCE_MARKER,
         "outcome": outcome,
-        "journal_entries": appended[before.min(appended.len())..]
-            .iter()
+        "journal_entries": appended[before.min(appended.len())..].iter()
             .map(|(_, e)| hex::encode(&e.command))
             .collect::<Vec<_>>(),
         "pinned_after": TestPins.pin(&target.machine).map(|pin| pin.0),
     }))
+}
+
+#[cfg(target_arch = "wasm32")]
+std::thread_local! {
+    static COMPLETED_READS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn completed_read() {
+    COMPLETED_READS.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn completed_reads() -> u32 {
+    COMPLETED_READS.with(std::cell::Cell::get)
 }

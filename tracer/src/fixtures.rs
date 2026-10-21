@@ -84,6 +84,8 @@ pub struct Sshd {
     pub port: u16,
     /// Present `HOST_KEY_OTHER` instead of the pinned key, for the wrong-key case.
     pub present_other: Arc<AtomicBool>,
+    /// Disconnect the next job-record read after its exec arrives.
+    pub disconnect_read: Arc<AtomicBool>,
     /// Connections accepted and connections ended, over the whole run: never reset, so a
     /// connection from an earlier case that ends late is still counted against its own accept.
     pub accepted: Arc<AtomicU32>,
@@ -122,6 +124,8 @@ pub async fn sshd(seen: Observed) -> Sshd {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("sshd bind");
     let port = listener.local_addr().expect("sshd address").port();
     let present_other = Arc::new(AtomicBool::new(false));
+    let disconnect_read = Arc::new(AtomicBool::new(false));
+    let read_disconnect = disconnect_read.clone();
     let (accepted, ended) = (Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0)));
     let (other, accepts, ends) = (present_other.clone(), accepted.clone(), ended.clone());
     let machine = Arc::new(crate::machine::Machine::new());
@@ -151,6 +155,7 @@ pub async fn sshd(seen: Observed) -> Sshd {
                 machine: fixture.clone(),
                 execs: Arc::default(),
                 tasks: exec_tasks.clone(),
+                disconnect_read: read_disconnect.clone(),
             };
             let ends = ends.clone();
             tokio::spawn(async move {
@@ -164,6 +169,7 @@ pub async fn sshd(seen: Observed) -> Sshd {
     Sshd {
         port,
         present_other,
+        disconnect_read,
         accepted,
         ended,
         machine,
@@ -174,6 +180,7 @@ pub async fn sshd(seen: Observed) -> Sshd {
 
 struct SshSession {
     seen: Observed,
+    disconnect_read: Arc<AtomicBool>,
     machine: Arc<crate::machine::Machine>,
     execs: Arc<Mutex<Vec<crate::machine::ExecGroup>>>,
     tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
@@ -278,6 +285,16 @@ impl server::Handler for SshSession {
     ) -> Result<(), Self::Error> {
         observe(&self.seen, |s| s.ssh_exec.push(data.to_vec()));
         session.channel_success(channel)?;
+        if data.starts_with(b"# tau-web job read ")
+            && self.disconnect_read.swap(false, Ordering::SeqCst)
+        {
+            session.disconnect(
+                russh::Disconnect::ByApplication,
+                "fixture collection disconnect",
+                "en",
+            )?;
+            return Ok(());
+        }
         let mapped = self.machine.map(data);
         let mut child = tokio::process::Command::new("sh")
             .args(["-c", &mapped])
@@ -323,6 +340,10 @@ impl server::Handler for SshSession {
                 let _ = handle.data(channel, out).await;
                 let _ = handle.extended_data(channel, 1, err).await;
                 let _ = handle.exit_status_request(channel, status).await;
+            }
+            if close_without_status {
+                // Keep this dispatch awaiting its record while concurrent requests reach admission.
+                tokio::time::sleep(Duration::from_millis(500)).await;
             }
             let _ = handle.eof(channel).await;
             let _ = handle.close(channel).await;
@@ -493,6 +514,11 @@ impl Pace {
             dials.push_back(now);
         }
         allowed
+    }
+
+    /// Let a concurrency fixture admit simultaneous dials; return the prior spacing.
+    pub fn set_spacing(&mut self, spacing: Duration) -> Duration {
+        std::mem::replace(&mut self.limits.min_spacing, spacing)
     }
 
     /// Puts `host` at its window cap now, as though `window_cap` dials had just been made: the

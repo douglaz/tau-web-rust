@@ -51,7 +51,11 @@ mod tests {
     #[test]
     fn the_pin_source_pins_the_fixture_host_key() {
         let pins = tau_web::testonly::PINS;
-        assert_eq!(pins, &[("fixture", fingerprint(&HOST_KEY_PINNED).as_str())]);
+        let pin = fingerprint(&HOST_KEY_PINNED);
+        assert_eq!(
+            pins,
+            &[("fixture-other", pin.as_str()), ("fixture", pin.as_str())]
+        );
         assert_ne!(fingerprint(&HOST_KEY_PINNED), fingerprint(&HOST_KEY_OTHER));
     }
 
