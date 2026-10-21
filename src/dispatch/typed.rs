@@ -66,6 +66,7 @@ pub struct OperationApproval {
     pub target: Target,
     pub operation: Operation,
     pub session: String,
+    pub requester: Requester,
     pub facts: Facts,
 }
 
@@ -266,6 +267,7 @@ impl Dispatch {
             target: request.target.clone(),
             operation: request.operation,
             session: request.session.clone(),
+            requester: request.requester,
             facts: request.facts.clone(),
         };
         if request.approved.as_ref() != Some(&expected)
@@ -352,6 +354,7 @@ impl Dispatch {
                 target: intent.target.clone(),
                 operation: intent.operation,
                 session: intent.session.clone(),
+                requester: intent.requester,
                 facts: intent.facts.clone(),
             })
             || (intent.operation == Operation::Inference)

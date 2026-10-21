@@ -4,7 +4,7 @@ use super::*;
 pub(super) fn intent(call: u64, operation: &str) -> Value {
     let facts =
         json!({"arguments":{"size":"small"},"cost_bound":12,"bundle_commit":tau_web::SPEC_COMMIT});
-    let approved = json!({"resource":{"entry":"fixture"},"target":{"entry":"fixture"},"operation":operation,"session":"fixture-session","facts":facts});
+    let approved = json!({"resource":{"entry":"fixture"},"target":{"entry":"fixture"},"operation":operation,"session":"fixture-session","requester":"session","facts":facts});
     json!({"operation_intent":{"call":call,"resource":{"entry":"fixture"},"target":{"entry":"fixture"},"operation":operation,"session":"fixture-session","requester":"session","facts":facts,"approved":approved}})
 }
 

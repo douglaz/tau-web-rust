@@ -191,9 +191,23 @@ fn check_event(number: u64, event: &Value) -> Result<(), String> {
             facts(&body["facts"])?;
             exact(
                 &body["approved"],
-                &["resource", "target", "operation", "session", "facts"],
+                &[
+                    "resource",
+                    "target",
+                    "operation",
+                    "session",
+                    "requester",
+                    "facts",
+                ],
             )?;
-            for key in ["resource", "target", "operation", "session", "facts"] {
+            for key in [
+                "resource",
+                "target",
+                "operation",
+                "session",
+                "requester",
+                "facts",
+            ] {
                 if body[key] != body["approved"][key] {
                     return Err("typed intent differs from its approval".into());
                 }

@@ -613,7 +613,7 @@ the host tests run.
     `{"vendor_machine":"id"}`), `operation`, `session`, `requester` (`session`, `operator` or
     `harness_flow`), `facts` and `approved`. Facts contain `arguments` (a map of text values),
     `cost_bound` (an unsigned integer) and `bundle_commit`. Approval repeats the resource,
-    target, operation, session and facts exactly. Operations here are `create`, `reset`,
+    target, operation, session, requester and facts exactly. Operations here are `create`, `reset`,
     `reinstall`, `destroy` and `read`; the writer refuses `exec` and `inference` as policy, and
     replay and the independent reader reject such typed records and intents naming the inference
     resource or target, naming the record.

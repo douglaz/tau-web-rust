@@ -1428,6 +1428,7 @@ mod tests {
                     target,
                     operation,
                     session: "fixture-session".into(),
+                    requester: Requester::Session,
                     facts,
                 },
             };

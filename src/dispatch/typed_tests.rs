@@ -75,6 +75,7 @@ pub(super) fn request(operation: Operation) -> Request {
         target: target.clone(),
         operation,
         session: "session-1".into(),
+        requester: Requester::Session,
         facts: facts.clone(),
     };
     Request {
@@ -93,6 +94,7 @@ fn approve(request: &mut Request, resource: Resource) {
         target: request.target.clone(),
         operation: request.operation,
         session: request.session.clone(),
+        requester: request.requester,
         facts: request.facts.clone(),
     });
 }
@@ -562,6 +564,7 @@ fn continuation_reach_permissions_and_durable_end() {
         ] {
             let mut r = request(operation);
             r.requester = Requester::HarnessFlow;
+            approve(&mut r, Resource::Entry("fixture".into()));
             assert_eq!(
                 initial.check_operation(&r),
                 if operation == permitted {
@@ -589,6 +592,7 @@ fn continuation_reach_permissions_and_durable_end() {
         assert!(initial.dispatch().check_command("other").is_ok());
         let mut r = request(permitted);
         r.requester = Requester::HarnessFlow;
+        approve(&mut r, Resource::Entry("fixture".into()));
         let mut failing = reopen(&MemoryStorage::with_files(saved.clone()));
         let storage = failing.storage().clone();
         storage.fault(Fault::Fail(3));
@@ -703,6 +707,7 @@ fn partial_disposition_keeps_abandonment_flow_barred_until_every_call_is_dispose
     block_on(store.dispose(choice(&[create], Continuation::Abandonment))).unwrap();
     let mut destroy = request(Operation::Destroy);
     destroy.requester = Requester::HarnessFlow;
+    approve(&mut destroy, Resource::Entry("fixture".into()));
     assert_eq!(
         store.check_operation(&destroy),
         Err(RequestRefusal::Barrier { calls: vec![exec] })
@@ -727,6 +732,38 @@ fn partial_disposition_keeps_abandonment_flow_barred_until_every_call_is_dispose
             })
         );
     }
+}
+
+#[test]
+fn a_session_approval_cannot_stand_for_the_abandonment_flow() {
+    let (_, mut store) = fresh();
+    let mut vendor = fixture::Vendor::default();
+    let create = block_on(vendor.run(&mut store, &request(Operation::Create))).unwrap();
+    block_on(store.dispose(choice(&[create], Continuation::Abandonment))).unwrap();
+    let before = store.storage().files();
+    let mut relabelled = request(Operation::Destroy);
+    relabelled.requester = Requester::HarnessFlow;
+    assert_eq!(
+        store.check_operation(&relabelled),
+        Err(RequestRefusal::Facts)
+    );
+    assert_eq!(
+        block_on(store.operation(&relabelled)),
+        Err(OperationError::Policy(RequestRefusal::Facts))
+    );
+    assert_eq!(store.storage().files(), before);
+    assert!(store.dispatch().standing.contains_key("fixture"));
+    approve(&mut relabelled, Resource::Entry("fixture".into()));
+    assert_eq!(store.check_operation(&relabelled), Ok(()));
+    // Replay holds the recorded intent to the same approval.
+    let mut replayed = store.dispatch().clone();
+    let mut intent = replayed.prepare(99, &relabelled).unwrap();
+    intent.approved.requester = Requester::Session;
+    assert_eq!(
+        replayed.operation_intent(99, intent),
+        Err("intent differs from its approval".into())
+    );
+    assert!(replayed.standing.contains_key("fixture"));
 }
 
 #[test]

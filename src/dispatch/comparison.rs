@@ -579,6 +579,7 @@ impl Driver {
                 target,
                 operation,
                 session: format!("session-{}", a.session),
+                requester: Requester::Session,
                 facts: facts(a.facts),
             }),
         })
