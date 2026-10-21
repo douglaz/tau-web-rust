@@ -2,8 +2,8 @@
 //! it compiles in from that pinned tree (ADR-0031, gated in `build.rs`), and the harness worker's
 //! wasm module: one recorded command over a pinned SSH connection through the relay
 //! (`harness`), the encrypted local store it records to (`store`), the operator seed and its
-//! child keys (`seed`), the allocation of their indices (`allocation`), and the credential types
-//! with their `SEC-5` rows (`credential`).
+//! child keys (`seed`), the dedicated seed-backup ceremony, allocation indices for those keys
+//! (`allocation`), and the credential types with their `SEC-5` rows (`credential`).
 //! `testonly` is the tracer's, and only the `tracer` feature compiles it.
 
 pub mod allocation;
@@ -77,6 +77,78 @@ mod worker {
     pub async fn unlock(passphrase: Uint8Array) -> String {
         let passphrase = take(&passphrase);
         local().lock().await.unlock(passphrase).await.to_string()
+    }
+
+    /// The only mnemonic output: the dedicated seed-backup display message, or null.
+    #[wasm_bindgen]
+    pub async fn seed_backup_display() -> String {
+        local().lock().await.seed_backup_display().to_string()
+    }
+
+    #[wasm_bindgen]
+    pub async fn seed_backup_answer() -> String {
+        local().lock().await.seed_backup_answer().to_string()
+    }
+
+    #[wasm_bindgen]
+    pub async fn seed_backup_reentry(words: Uint8Array) -> String {
+        let secret = zeroize::Zeroizing::new(words.to_vec());
+        words.fill(0, 0, words.length());
+        local()
+            .lock()
+            .await
+            .seed_backup_complete(Some(secret))
+            .await
+            .to_string()
+    }
+
+    #[wasm_bindgen]
+    pub async fn seed_backup_skip() -> String {
+        local()
+            .lock()
+            .await
+            .seed_backup_complete(None)
+            .await
+            .to_string()
+    }
+
+    /// Called only on a fresh locked worker, after the page terminated the previous one.
+    #[wasm_bindgen]
+    pub async fn seed_backup_redisplay(passphrase: Uint8Array) -> String {
+        let passphrase = take(&passphrase);
+        local()
+            .lock()
+            .await
+            .seed_backup_redisplay(passphrase)
+            .await
+            .to_string()
+    }
+
+    /// Exercise the real store allocator without adding a served consumer.
+    #[cfg(feature = "tracer")]
+    #[wasm_bindgen]
+    pub async fn test_allocate(family: String) -> String {
+        let family = match serde_json::from_value::<crate::allocation::Family>(family.into()) {
+            Ok(family) => family,
+            Err(_) => return serde_json::json!({"refused":"unknown family"}).to_string(),
+        };
+        let local = local();
+        let mut local = local.lock().await;
+        match local.store() {
+            Some(store) => match store.allocate(family).await {
+                Ok(identity) => serde_json::json!({"identity":identity}).to_string(),
+                Err(reason) => serde_json::json!({"refused":reason}).to_string(),
+            },
+            None => serde_json::json!({"refused":"locked"}).to_string(),
+        }
+    }
+
+    #[cfg(feature = "tracer")]
+    #[wasm_bindgen]
+    pub async fn test_seed_backup_fail_append() {
+        if let Some(store) = local().lock().await.store() {
+            store.storage().fail_next_move.set(true);
+        }
     }
 
     /// The replayed calls, terminal evidence and dispositions, with the store's lock state and
@@ -239,8 +311,8 @@ mod worker {
         };
         let command = text("command");
         let local = local();
-        if local.lock().await.store().is_none() {
-            return Ok(serde_json::json!({ "outcome": { "refused": "locked" } }).to_string());
+        if let Some(reason) = local.lock().await.dispatch_refusal() {
+            return Ok(serde_json::json!({ "outcome": { "refused": reason } }).to_string());
         }
         let mut journal = StoreJournal(local);
         #[cfg(feature = "tracer")]

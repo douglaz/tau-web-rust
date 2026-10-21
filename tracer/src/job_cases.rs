@@ -78,7 +78,7 @@ pub(super) async fn drop_command(
         return Err("command ended before the drop".into());
     }
     run.browser
-        .evaluate(&tab.session, "document.getElementById('lock').click()")
+        .evaluate(&tab.session, "document.getElementById('tau-lock').click()")
         .await?;
     let new = run.worker(tab, Some(&worker), false).await?;
     if !run.sshd.all_ended().await {

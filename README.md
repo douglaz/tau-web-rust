@@ -53,15 +53,15 @@ because spec `STA-1` says "A single **harness worker** MUST be the only writer o
 What it does so far is the tracer bullet of twr-ggw.2, one command over a pinned SSH connection
 through the relay, recorded in the encrypted local store of twr-ggw.5 (below). The module exports
 `run_command` and `collect_jobs`, the same entry points in both builds below. The page defines no global and holds
-no reference to the worker's instance of the module. It sends the worker one kind of message, a
-passphrase to create or unlock the store, and no request; today only the tracer calls
+no reference to the worker's instance of the module. It sends passphrase and seed-backup
+messages to the worker, with no dispatch request; today only the tracer calls
 `run_command` there (below). Another same-origin script could still load its own copy of the
 module and call it; that copy has no unlocked store, so it refuses every request before any
-contact. While the store is not unlocked, every request is refused before any contact. The pins,
+contact. While locked or running the seed-backup ceremony, every request is refused before contact. The pins,
 keys and journal never come from the request: the journal is the store's, in both builds. The
 tracer build runs on test pins and keys. The served build runs on the pins and keys it has
 stored, which are none until the seed-derived keys are bound to sessions (twr-ggw.11), so it
-refuses every machine at the pin lookup, before any contact and any append. The connection path
+after the seed-backup ceremony refuses every machine at the pin lookup, before contact or append. The connection path
 below is still whole in the served wasm, which is what the absence check below reads.
 `src/harness/run.rs` does it in this order:
 
@@ -81,11 +81,11 @@ below is still whole in the served wasm, which is what the absence check below r
   nothing. Recomposition from the journal's read-back must equal the transmitted wrapper bytes
   (`ARC-8`, `STA-3`, `STA-4`, `CNF-30`).
 
-The page in `www/` holds no key, pin or record:
+The page in `www/` holds no key or pin; it briefly displays mnemonic words only in the seed-backup ceremony:
 
 - `index.html` carries `ARC-33`'s policy in a `<meta>` element, before any script;
 - `boot.js` starts the harness worker, shows whether it came up and the store's one state, sends
-  a passphrase once per create or unlock, locks, and reports the persistent-storage request
+  passphrase and re-entry buffers once, displays the seed-backup ceremony, locks, and reports the persistent-storage request
   (below);
 - `worker.js` loads the module, takes the store's writer lock, and opens the store.
 
@@ -371,7 +371,8 @@ children's PID and start time and end them only while that identity still matche
   design. The three local-store types also zeroize their bytes on drop.
 
 The local store generates the seed in the worker and keeps its mnemonic in its first record
-(below). No `wasm_bindgen` export takes or returns a mnemonic, a seed or a key. Allocation
+(below). Only seed-backup exports display and accept mnemonic words; no export returns a seed
+or child key. Allocation
 (twr-ggw.6, below) issues the indices the keys derive at; binding the keys to sessions
 (twr-ggw.11) comes next.
 
@@ -381,6 +382,64 @@ its `README.md`): BIP-32's test vectors 1, 3, 4 and 5, RFC 8032's Ed25519 vector
 public keys and the BIP-39 reference vectors. And a second implementation, the `bip39` and
 `bip32` crates, agrees with it on 18 entropies, every role and indices up to 2^31−1. Those two
 crates, `bs58` and `syn` are host-only dev-dependencies.
+
+### The seed-backup ceremony
+
+`STA-23` and ADR-0047 require a record for each generated seed. Create, a creation-finishing
+unlock and every later unlock with no completion show all twelve numbered words. The page
+says new machines, relay passes and handoffs are refused until the record exists (`STA-22b`).
+Imported seeds owe no new seed-backup ceremony and still cannot allocate.
+
+The operator explicitly hides the words before answering. The word container is removed from
+the document, then the operator re-enters all twelve words or explicitly skips the check.
+`Store::seed_backup_reentry` imports the zeroizing input and compares its seed identifier;
+any mismatch, word-count, list or checksum error returns to display without recording anything.
+The textarea disables completion, spelling and capitalization hints and clears immediately on
+submit and every lock. Re-entry refusals use fixed plain text, naming an unlisted word only by
+its position.
+
+A completion appends `seed_backup` with this seed's identifier and `full_reentry` or `skipped`
+before applying it. The page always states which completion is recorded (`SEC-2`). A failed
+append changes no completion; the page explains that it was not recorded and requires reload
+and unlock. For a generated seed with no earlier record it says the seed-backup ceremony is
+still owed; on re-display over an earlier record it names the completion that still stands.
+An imported seed with no earlier record remains exempt. Inspection exposes `seed_backup_owed`,
+`seed_backup_stage` and `seed_backup_completion`, with no words. Every dispatch request and collection refuses before
+contact while the seed-backup ceremony runs. Allocation's independent gate still checks the
+durable completion in all three families.
+
+Re-display terminates the worker through the ordinary lock, ending its connections and held
+waits. The local passphrase must unwrap a fresh worker's store before the same seed-backup
+ceremony shows words. It journals another completion; a failed append preserves the previous
+record. Nothing stopped resumes: a cut-off call stays unresolved and a held request records no
+intent. Tab close, page hide, worker death, pagehide, bfcache restore and explicit lock remove
+words and input; an incomplete generated seed still owes its seed-backup ceremony at unlock.
+
+The custody exceptions are exactly worker-to-page `{seed_backup_display: "<twelve words>"}`
+and page-to-worker `{seed_backup_reentry: <UTF-8 Uint8Array>}`. Re-entry uses a transferred
+buffer, zero-filled by the module, and a zeroizing Rust buffer. Passphrases have separate exact
+create, unlock and `seed_backup_redisplay` shapes. The two seed-backup exceptions exempt only
+the mnemonic needles of seeds displayed during the run; passphrases, keys and seed identifiers
+remain findings in those messages. No other message, log, fixture request or storage may
+contain the joined mnemonic, entropy, seed or keys. The tracer searches these secrets in raw,
+hex, HEX, base64 and base64url forms, including all seed secrets from earlier fixture stores.
+It searches whole console event payloads, including property names, URLs, stacks and arguments.
+Decrypted non-seed records are checked too; only a record's canonical allocation seed association
+is allowed at its specified field. Consecutive mnemonic string elements are detected inside
+parsed JSON arrays, so object values cannot collide with the next field name. There are no
+single-word token searches and no field-name exceptions in the literal search.
+
+Hiding checks compare the complete document and every field value at the same stage under
+different seeds. Attribute order is canonicalized without removing content or attribute values.
+Four valid collision-control mnemonics include the fixed texts' listed words and adjacent
+phrases. They exercise host refusals and inspection, the independent reader, and browser
+display, answering, mismatch, full re-entry and lock in both builds. Planting twelve hidden
+word elements changes the document and is reported; phrase, array and binary leaks still fire.
+
+The Replace flow and a second store seed belong to twr-ggw.29; the core already clears the
+record for a fresh seed and gates its allocations, while store replay refuses Replace today.
+Sheet import belongs to twr-ggw.27. Session workers do not exist until twr-ggw.11 and twr-ggw.14;
+the seed-backup ceremony stops the dispatch waits and connections that do exist.
 
 ### The local store
 
@@ -450,7 +509,8 @@ the host tests run.
     encrypted record, where credential format v1 puts it.
 
   The independent reader in the tracer crate decrypts every record and reads the seed, legacy
-  command, intent, terminal, job terminal, job observation and disposition shapes; it does not interpret allocation records.
+  command, intent, terminal, job terminal, job observation, disposition and seed-backup shapes.
+  It checks a completion against the seed identifier it derives independently, and inspects reservations.
 - **`staging`**, the one staging name, which is never a record name or the envelope's.
 
 **The commit boundary.**
@@ -505,7 +565,7 @@ the host tests run.
 
 **Unlock and lock.**
 
-- **The passphrase.** The page sends its UTF-8 bytes once, in one create or unlock message, and
+- **The passphrase.** The page sends its UTF-8 bytes once, in one create, unlock or seed re-display message, and
   clears both fields at once.
   - The module copies the bytes into its secret type and zero-fills the array they came in.
   - It also zero-fills the copy it hands WebCrypto's `importKey` and the buffer `deriveBits`
@@ -555,8 +615,8 @@ backup and recovery remain necessary." Nothing on the page promises the store ca
 - **Clearing buffers is best effort** (`STA-23`). It does not reach the strings the page's
   fields held, copies the allocator left behind, or the `CryptoKey` that `importKey` makes.
 - **The interrupted-creation window** above.
-- **No seed-backup ceremony exists yet,** so the mnemonic is displayed nowhere. It lives only
-  in the encrypted seed record.
+- **The seed-backup ceremony** above is the only mnemonic display; every other record and
+  inspection excludes its words.
 - **The data key's bound.** Credential format v1 says "Never perform 2^32 encryptions under one
   data key". Record 0 is the first encryption under it, so an append whose record number is
   2^32−1 or above is refused before it encrypts: nothing is written and nothing applied.
@@ -617,11 +677,11 @@ identifier.
 - **The metadata.** The seed identifier, the derivation version (1), the next unused index of
   each family — machines, passes, handoffs — and the allocated entries, oldest first. Each entry
   is an identity (seed identifier, derivation version, family, index) with a status: `reserved`,
-  `created`, `failed` or `destroyed`. Beside them, the current seed's ceremony record,
+  `created`, `failed` or `destroyed`. Beside them, the current seed's seed-backup ceremony record,
   `full_reentry`, `skipped` or none, and whether the seed was imported with no Replace since.
 - **Families.** Roles 0–2 share the machine index; role 3 takes a pass index and role 4 a handoff
   index (`STA-22`; credential format v1's role table). Each family has its own counter.
-- **The ceremony gate.** Every family under a generated seed refuses allocation until that seed
+- **The seed-backup gate.** Every family under a generated seed refuses allocation until that seed
   has its journaled `STA-23` completion. Both full re-entry and explicit skip admit allocation;
   neither is a verified-backup claim.
 - **Allocate** issues the family's next unused index as a reserved entry. Indices are monotonic
@@ -634,12 +694,12 @@ identifier.
   `destroyed` for one never created — is refused and changes nothing.
 - **Export** is the whole metadata. The sheet's export time and journal sequence are twr-ggw.27's.
 - **Restore** is an event that takes an export. The listed identities come back, and every
-  allocation, in every family, is refused until a Replace, with or without a ceremony record:
+  allocation, in every family, is refused until a Replace, with or without a seed-backup ceremony record:
   `STA-22b` says "every imported seed may restore listed identities but MUST NOT allocate new ones".
-  Restore copies the exported ceremony record. An
+  Restore copies the exported seed-backup ceremony record. An
   export recording a derivation version other than 1 is refused (`STA-22a`).
 - **Replace** is an event that takes a freshly generated seed's identifier. The restriction
-  clears, and the ceremony record clears too. Generating the fresh seed is never gated, but
+  clears, and the seed-backup ceremony record clears too. Generating the fresh seed is never gated, but
   its allocations wait for its own record. Each family starts at 0 under it, and the old
   entries are retained under the old seed's identifier (`STA-22b`: "old records are retained
   until migration is complete"). A Replace to the current seed, or to one an entry already names,
@@ -653,10 +713,9 @@ carry", above).
   only then returns the identity. A failed append returns no identity and moves no counter. A
   move that landed but reported failure is replayed after the restart, so its index stays
   consumed and is never issued again.
-- **Ceremony completions.** `Store::seed_backup` journals the stated completion for its own seed,
+- **Seed-backup completions.** `Store::seed_backup` journals the stated completion for its own seed,
   append before apply. Replay takes it through the core; another seed's completion refuses the
-  store. A failed append leaves no completion. The ceremony that supplies it is twr-ggw.58's
-  and is not built yet.
+  store. A failed append leaves no completion. The dedicated seed-backup ceremony supplies it after full re-entry or explicit skip.
 - **Observations** are journaled the same way, so tombstones survive a restart. One the core
   cannot apply is refused and never journaled.
 - **Replay** rebuilds the core from record 0's seed identifier and applies each allocation record
@@ -677,18 +736,18 @@ sheet itself and `CNF-84`'s import refusals are twr-ggw.27's. This ticket shows 
 on the core — the seed's mnemonic imported with `Seed::import`, the core's own export restored,
 the same keys re-derived, allocation refused in all three families until a Replace — and through
 a restore record crafted with the data key and replayed. Neither is evidence that a store can be
-created from an imported seed today. No `wasm_bindgen` export, UI or page message reaches
-allocation, since nothing calls it yet.
+created from an imported seed today. The tracer-only `test_allocate` export reaches
+`Store::allocate`; the served build has no allocation consumer.
 
 **The tests** (`cargo test`). On the core: each family's own counter; a recorded identity never
 reserved again or revived; tombstones never reissued; exhaustion, started at 2^31−1; an unknown
-derivation version; every import above; the ceremony gate in each family for both completions; wrong-seed
+derivation version; every import above; the seed-backup ceremony gate in each family for both completions; wrong-seed
 completion refusal; and Restore copying and Replace clearing the record. On `MemoryStorage` stores: roles 0–4 derive
 the same keys at an allocated identity after a reopen, and different keys at another index
 (`CNF-72`); an observation that does not apply journals nothing; each crafted record listed under
 Replay refuses the store at unlock; the reservation's move commits before the identity returns; a
 failed append, a move that lands then fails, and a worker killed after the commit; failed and
-destroyed indices never reissued across a reopen; the journaled restore; and ceremony persistence and failed appends across a reopen.
+destroyed indices never reissued across a reopen; the journaled restore; and seed-backup ceremony persistence and failed appends across a reopen.
 
 **The companion comparison** (spec ADR-0032, "How the implementation is compared").
 `src/allocation/comparison.rs`, a host test, reads `spec/docs/design/allocation-witnesses-v2.json`
@@ -706,7 +765,7 @@ file is a red test.
   `export_sheet` keeps the core's export, and `restore` passes the latest one, or with none
   restores nothing. After each step it compares the outcome (`allocation`, and `identity` when
   admitted), `recorded` for `seed_backup`, and the `journal` projection with what the core says
-  and holds. A ceremony event takes its completion and nested append outcome; a non-durable
+  and holds. A seed-backup event takes its completion and nested append outcome; a non-durable
   append applies nothing.
 - **Both pairs.** The guards are exactly `restoredAllocatesNone` and `backupRecorded`.
   Unpaired traces and refused sides run with both true and must match every step. Each admitted
@@ -806,8 +865,8 @@ For the local store, the tracer works the page as an operator would and inspects
 browser holds:
 
 - **The page.** It types each passphrase into the page's fields and presses the page's buttons.
-  A store is created in each build before its cases, so the existing cases run on the tracer
-  build's store.
+  Stores created through the page complete seed backup through the page. The seed-record
+  reader and write-free unlock checks run before completion.
 - **The messages.** It records every message between each page and its harness workers, from
   before the first, with a script it installs over the DevTools protocol before the page's own
   (`Page.addScriptToEvaluateOnNewDocument`). The product carries no hook. At any depth and
@@ -859,15 +918,22 @@ browser holds:
 In headless Chromium 154 a new tab hides the one before it, which then restarts its worker, as
 page hide must. The cases account for it.
 
-The full run has 31 cases.
+The full run has 85 cases.
 
 The cases:
 
 | Case | What the fixtures show |
 |---|---|
-| the served build loads | its worker comes up and nothing errs, and the page has no `tauWeb` global and no global holding the worker. With no store, the page offers Create alone, and a request is refused before any contact. A store is created; then, called in its worker on the machine the tracer build pins, it refuses for the missing pin, the relay accepts no connection and the sshd sees none, and nothing is appended |
+| the served build loads | its worker comes up and nothing errs, and the page has no `tauWeb` global and no global holding the worker. With no store, the page offers Create alone, and a request is refused before any contact. A store is created and refuses dispatch for seed backup without contact or append; after explicit skip, called in its worker on the machine the tracer build pins, it refuses for the missing pin, the relay accepts no connection and the sshd sees none, and nothing is appended |
 | create and unlock (twr-ggw.5, `CNF-82`) | the page offers Create, stating the 16-character minimum and a password manager, and refuses 15 characters. The independent reader reads the store the browser created, from the passphrase alone: record 0, the seed. A store the reader built, put into OPFS, unlocks in the browser and replays its command, and the unlock writes nothing: WebCrypto's PBKDF2 agrees with the host's |
-| 1. recorded, then sent (`CNF-30`, `ARC-8`) | exactly one relay connection; the sshd received exactly the wrapper recomposed from the journal entry, and its job record holds exactly the journal command; the replayed state holds approved intent 1 and job terminal 2 (exit status 7), and the output and exit status came back. With the append made to fail, the sshd received no `exec`, read only once that SSH connection has ended at the sshd |
+| seed-backup create and mismatch, each build | twelve numbered words match the independent reader; dispatch contacts neither fixture; answering leaves the same complete document and field values as an independent seed; another valid mnemonic restores display without an append; tracer allocation refuses in all families |
+| seed-backup collision controls, four per build | fixed-text words and adjacent phrases cause no false finding; seed-independent answering, lock, re-display and wrong-passphrase documents agree; twelve planted hidden word elements and a hidden reserved claim alongside displayed words are reported; cross-word language collisions cause no finding; mismatch and durable full re-entry work |
+| seed-backup full re-entry and explicit skip, each build | independent decryption reads the distinct completion for its own seed identifier; the page names it; restart retains it without display; tracer reservations start at zero in every family, then one after restart |
+| seed-backup failed OPFS move at create, both completions | real move failure leaves no in-memory or replayed completion and every family refuses with the gate's reason; page says not recorded and still owed at create, and requests reload and unlock; host re-display failure checks name the earlier completion that still stands |
+| seed-backup creation-finishing unlock, each build | an envelope with no record gains record 0 and displays exactly its mnemonic |
+| seed-backup interruption, twelve cases per build | display and answering each meet explicit lock, visibility hidden, pagehide, bfcache restore, close and renderer crash; words and input disappear and next unlock still owes the same record |
+| seed-backup re-display, each build | fresh passphrase is required; wrong passphrase shows no word; answering removes words; tracer relay and SSH connections end before display, held waits end, no stopped request resumes and the cut-off call stays unresolved |
+| 1. recorded, then sent (`CNF-30`, `ARC-8`) | exactly one relay connection; the sshd received exactly the wrapper recomposed from the journal entry, and its job record holds exactly the journal command; the replayed state holds approved intent 2 and job terminal 3 (exit status 7), and the output and exit status came back. With the append made to fail, the sshd received no `exec`, read only once that SSH connection has ended at the sshd |
 | a failed append is not applied (twr-ggw.5 AC2, `STA-3`) | that failed append failed at its `move()`, a real OPFS call; the replayed state has no record for it, and none appears after a reload and an unlock |
 | 2. a wrong host key halts (`CNF-21`, `SEC-11`) | no authentication attempt, no `exec`, no journal entry, and exactly one connection |
 | 3. no pin, no contact (`CNF-23`'s no-pin case, `CHN-R4`) | no TCP connection accepted at the relay, none at the sshd, no dial, and nothing pinned afterwards |
@@ -899,7 +965,7 @@ The cases:
 | legacy and unreadable commands (`STA-20`) | after replay, identical bytes and reads name every holding call; each has no job identity and reports why only a disposition can release it, with no contact or writes |
 | held unreachable machine (`STA-20`) | no pin, no credentials, relay refusal, host-key halt, authentication failure, unreachable SSH destination and a connection lost during a record read each answer held at once with why nothing was read, without retry or intent |
 | destructive replacement with unnamed command (`STA-24`) | a continuing disposition releases A, B runs, replacement of A is destructive. A held request collects B only and names the standing restriction; collection of disposed A remains permitted and never removes that restriction |
-| no plaintext (twr-ggw.5 AC4 and AC5, `CNF-15`, `STG-10`), in each build | from the passphrase the tracer typed, the independent reader learns the wrapping key, the data key and the seed. None of these appears, raw, hex, HEX, base64 or base64url (whole, or inside a longer value at any byte alignment), in any OPFS file: the passphrase, the wrapping and data keys, the mnemonic, the entropy, the 64-byte seed, the seed identifier, and roles 0–4's private and public keys at indices 0 and 1, plus the test keys in the tracer build. Local storage, session storage, IndexedDB and Cache Storage hold nothing, and no service worker is registered. A passphrase reaches the worker only as the one create or unlock message, and no message from the worker carries any of the items, in its text or in a binary payload's bytes; any other passphrase occurrence, text or binary, is a finding. In the tracer build's case, the sixteen negative controls listed under "The messages" run first, through the same guarded serializer and the same check, and each must be reported for its own reason. The fields were empty after every submit. The HTTPS fixtures' requests and the console hold none |
+| no plaintext (twr-ggw.5 AC4 and AC5, `CNF-15`, `STG-10`), in each build | from the passphrase the tracer typed, the independent reader learns the wrapping key, the data key and the seed. None of these appears, raw, hex, HEX, base64 or base64url (whole, or inside a longer value at any byte alignment), in any OPFS file: the passphrase, the wrapping and data keys, the mnemonic, the entropy, the 64-byte seed, the seed identifier, and roles 0–4's private and public keys at indices 0 and 1, plus the test keys in the tracer build. Local storage, session storage, IndexedDB and Cache Storage hold nothing, and no service worker is registered. Passphrase bytes appear only in exact create, unlock or re-display messages. Only the displayed seeds' mnemonic needles are exempt in the exact directed display and re-entry messages described above; other secrets remain findings in those shapes. Non-seed decrypted records are checked, retaining only canonical allocation seed associations. In the tracer build's case, the sixteen negative controls listed under "The messages" run first, through the same guarded serializer and the same check, and each must be reported for its own reason. Four seed message controls run for the final seed and each collision-control mnemonic in each build: phrase, array, wrong-direction re-entry and binary. Further controls report a passphrase and a data key in the re-entry shape, an earlier store's seed identifier, and mnemonic and passphrase console property names. Fields are empty after every submit. The HTTPS fixtures' requests and the console hold none |
 
 In cases 6–8 the relay fixture also accepted exactly one connection, dialed nothing, and its log
 shows no frame from the client after the refusal but the close; the sshd saw no connection.
@@ -1066,7 +1132,7 @@ rest of `CNF-88` has no code here yet.
 | | `scripts/check-adr-0024.sh` | spec ADR-0024's build check |
 | | `scripts/build-web.sh served`, then `tracer check-absence dist/served` | the served build (`ARC-32`) carries no test key, pin source or test switch |
 | | `tracer check-csp dist/served` | `ARC-33`'s policy, exactly |
-| | `scripts/tracer.sh`, in headless Chrome | `CNF-30`, `CNF-21`, `CNF-23`'s no-pin case and `ARC-33`, as above, the relay refusals of `CNF-87` a correct client meets, and the local store's `CNF-82` and `CNF-15` in the browser; `CNF-40`'s dropped command not re-run, waiting on its job record, `CNF-54`–`CNF-56`, `STA-20a` and `CNF-110`'s box-plane collection case; unresolved-command hold, concurrent admission and shared results, stopped waits with the writer free, unreachable answers and destructive replacement |
+| | `scripts/tracer.sh`, in headless Chrome | `CNF-30`, `CNF-21`, `CNF-23`'s no-pin case and `ARC-33`, as above, the relay refusals of `CNF-87` a correct client meets, and the local store's `CNF-82` and `CNF-15` in the browser; seed-backup display, hiding, full re-entry/skip, interruptions, re-display and custody in both builds (`CNF-44`, `CNF-82`), and integrated allocation refusals, completions and failed OPFS appends (`CNF-72`); `CNF-40`'s dropped command not re-run, waiting on its job record, `CNF-54`–`CNF-56`, `STA-20a` and `CNF-110`'s box-plane collection case; unresolved-command hold, concurrent admission and shared results, stopped waits with the writer free, unreachable answers and destructive replacement |
 
 Every job checks out the submodule; `spec-checks` takes the full history, which
 `check-install-disks.py --baseline` reads to reconstruct the pre-fix brief. `web` installs
@@ -1113,3 +1179,8 @@ retain the read as `not_journaled` and leave the call unresolved and its machine
 The tracer-only `test_writer` and `test_completed_reads` exports coordinate the writer and
 observe completed reads. The `test_no_credentials` switch exercises a held request's unavailable
 credentials. The served-build absence check covers all three.
+
+For focused seed-backup checks, set `TAU_TRACER_SEED_CASE` to `create`, `mismatch`,
+`failed-append` or `all`. These selectors are test-only; unset both tracer selectors for the
+full gate. `test_allocate` and `test_seed_backup_fail_append` exist only under `tracer` and
+are included in `check-absence`.

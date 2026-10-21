@@ -5,8 +5,8 @@
 //!
 //! Built on every target. The local store (`src/store.rs`) generates the seed and keeps its
 //! mnemonic in its first record; allocation (`src/allocation.rs`) issues the indices the child keys
-//! derive at, and binding (twr-ggw.11) wires the keys in. No `wasm_bindgen` export returns or
-//! accepts a mnemonic, a seed or a child key.
+//! derive at, and binding (twr-ggw.11) wires the keys in. Only the dedicated seed-backup
+//! ceremony displays or accepts mnemonic words; no export returns a seed or child key.
 //!
 //! Derivation refuses rather than aliases: an unknown version, a role outside 0–4, an index above
 //! 2^31−1 and an invalid BIP-32 step are each an error, and no step ever moves on to another index
@@ -158,8 +158,7 @@ impl Seed {
     }
 
     /// The mnemonic, the words joined by single spaces: what the local store's seed record
-    /// carries (`src/store.rs`), so a seed-backup ceremony can show the words. Nothing displays
-    /// it yet (`STA-23`'s dedicated seed-backup ceremony is twr-ggw.58's).
+    /// carries (`src/store.rs`), and the dedicated seed-backup ceremony alone displays (`STA-23`).
     pub(crate) fn phrase(&self) -> zeroize::Zeroizing<String> {
         zeroize::Zeroizing::new(self.words.join(" "))
     }
@@ -904,6 +903,32 @@ mod tests {
             Seed::import(&["abandon"; 12].join(" ")).err(),
             Some(ImportError::Checksum)
         );
+    }
+
+    #[test]
+    fn seed_backup_collision_controls_are_listed_and_import_with_the_required_adjacencies() {
+        let controls = include_str!("../tests/vectors/seed-backup-collisions.txt");
+        for phrase in controls.lines() {
+            assert_eq!(phrase.split(' ').count(), 12);
+            assert!(Seed::import(phrase).is_ok());
+        }
+        for word in "icon all twelve enter entry match this seed again try unlock call machine other family index job kind record object type name number key error reason state ready".split(' ') {
+            assert!(ENGLISH.lines().any(|listed| listed == word), "{word}");
+            assert!(controls.split_ascii_whitespace().any(|w| w == word), "{word}");
+        }
+        assert_eq!(controls.lines().count(), 4);
+        let fourth: Vec<_> = controls.lines().nth(3).unwrap().split(' ').collect();
+        for word in ["approve", "improve"] {
+            assert!(fourth.windows(2).any(|pair| pair[0] == word
+                && pair[1].starts_with('n')
+                && ENGLISH.lines().any(|listed| listed == pair[1])));
+        }
+        let first = controls.lines().next().unwrap();
+        let mut rest = first;
+        for pair in ["all twelve", "match this", "this seed", "try again"] {
+            let at = rest.find(pair).unwrap();
+            rest = &rest[at + pair.find(' ').unwrap()..];
+        }
     }
 
     #[test]

@@ -83,6 +83,8 @@ pub fn needles() -> Vec<(String, Vec<u8>)> {
         "test_relay_key",
         "test_no_credentials",
         "test_writer",
+        "test_allocate",
+        "test_seed_backup_fail_append",
         "test_completed_reads",
     ] {
         needles.push((format!("test switch: {switch}"), switch.as_bytes().to_vec()));

@@ -220,6 +220,11 @@ impl Metadata {
         self.restored_from_import
     }
 
+    /// A generated seed owes its own seed-backup ceremony until its durable record.
+    pub fn seed_backup_owed(&self) -> bool {
+        !self.restored_from_import && self.seed_backup.is_none()
+    }
+
     pub fn seed_backup(&self) -> Option<Completion> {
         self.seed_backup
     }
@@ -393,6 +398,7 @@ pub(crate) mod tests {
             let mut core = Metadata::new("other".into());
             core.apply(&Event::Restore(export)).unwrap();
             assert_eq!(core.seed_backup(), completion);
+            assert!(!core.seed_backup_owed());
             for family in Family::ALL {
                 assert_eq!(reserve(&mut core, family), Err(Refusal::Restored));
             }
@@ -428,6 +434,7 @@ pub(crate) mod tests {
             })
             .unwrap();
             assert_eq!(core.seed_backup(), None);
+            assert!(core.seed_backup_owed());
             for family in Family::ALL {
                 assert_eq!(reserve(&mut core, family), Err(Refusal::BackupMissing));
             }

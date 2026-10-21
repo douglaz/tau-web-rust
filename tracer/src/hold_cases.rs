@@ -58,7 +58,7 @@ pub(super) async fn run(
 ) -> Result<Worker, String> {
     let saved = store_files(&run.dump(tab).await?);
     // Independent fixtures start from the same seed, without older collectable disposed calls.
-    let original = reader::build(PASSPHRASE, &events(&saved)?[..1]);
+    let original = reader::build(PASSPHRASE, &events(&saved)?[..2]);
     worker = restore(run, tab, worker, &original).await?;
     let selected = |name: &str| {
         std::env::var("TAU_TRACER_HOLD_CASE").map_or(true, |s| {
