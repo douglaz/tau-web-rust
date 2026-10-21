@@ -212,7 +212,8 @@ mod worker {
         crate::harness::stop_waits(&machine)
     }
 
-    /// Read a machine's outstanding job records, waiting for its running commands.
+    /// Read a machine's outstanding job records, waiting for its running commands. A call whose
+    /// own dispatch still awaits its record is reported not read, and is not read separately.
     #[wasm_bindgen]
     pub async fn collect_jobs(request: String) -> Result<String, wasm_bindgen::JsValue> {
         request_operation(request, true).await
