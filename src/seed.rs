@@ -99,6 +99,14 @@ pub struct Seed {
     bytes: [u8; 64],
 }
 
+// `STA-23`: on lock "the worker clears its keys and credential buffers", and "Clearing buffers is
+// best effort in a browser". The words are pointers into the list and are not cleared.
+impl Drop for Seed {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.bytes);
+    }
+}
+
 impl Seed {
     /// A new seed from 16 bytes of the CSPRNG: the browser's on wasm32, the OS's on the host. A
     /// CSPRNG failure is an error, never a fallback.
@@ -929,6 +937,15 @@ mod tests {
             let at = rest.find(pair).unwrap();
             rest = &rest[at + pair.find(' ').unwrap()..];
         }
+    }
+
+    #[test]
+    fn dropping_a_seed_clears_its_bytes() {
+        let mut seed = std::mem::ManuallyDrop::new(Seed::generate().unwrap());
+        assert_ne!(seed.bytes, [0; 64]);
+        // SAFETY: run once; afterwards only the plain bytes, still a valid [u8; 64], are read.
+        unsafe { std::mem::ManuallyDrop::drop(&mut seed) };
+        assert_eq!(seed.bytes, [0; 64]);
     }
 
     #[test]
