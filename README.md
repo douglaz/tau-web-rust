@@ -166,7 +166,9 @@ store able to admit the next command.
 Typed cloud-plane operations and their barriers belong to twr-ggw.8; continuation dispatch to
 twr-ggw.40, twr-ggw.45 and twr-i6k.3; sessions and approved
 entries to twr-ggw.10, twr-ggw.11 and twr-ggw.22; inference records to twr-ggw.17. Disposition
-screens, snapshots, compaction and transcript retention are outside this change. `STA-24`'s untyped-vendor-scope hold is stage 2. This change demonstrates the box-plane disposition rule of `STA-24`.
+screens, snapshots, compaction and transcript retention are outside this change. `STA-24`'s
+untyped-vendor-scope hold is stage 2. This change demonstrates the box-plane disposition rule of
+`STA-24`.
 
 ### Job records and collection
 
@@ -258,9 +260,10 @@ lies. **A mismatched record still settles the call** with its recorded exit code
 finding. The evidence and finding survive reload and unlock.
 
 Collection ends no restriction: a standing disposition stays standing and its call stays
-disposed, with the later evidence shown beside it (`STA-24`). Today a fresh `run_command` admits and runs another command, including an explicit reissue
-of the same bytes, without collecting or waiting on the unresolved call. This falls short of
-`STA-20`'s unresolved-command hold, which twr-ggw.69 builds.
+disposed, with the later evidence shown beside it (`STA-24`). Today a fresh `run_command` admits
+and runs another command, including an explicit reissue of the same bytes, without collecting or
+waiting on the unresolved call. This falls short of `STA-20`'s unresolved-command hold, which
+twr-ggw.69 builds.
 Sessions will call collection at re-entry in their own tickets. Rescue records and planned-reset
 handoff, service lifecycle and standard-input harness jobs are outside this change.
 
@@ -1010,7 +1013,7 @@ rest of `CNF-88` has no code here yet.
 | `spec-checks` | `spec/bundle/cors-probe.sh` | `CNF-4` |
 | | `spec/prototypes/spec-checks/check-install-disks.py`, and `--baseline`, which must fail | evidence for `CNF-85` |
 | `build` (the job is `CNF-1`) | `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings` | `CNF-2`, at that strictness |
-| | `cargo test --locked` | runs `build.rs`, so the gates above run here, and the `[session]` fixtures (`CNF-88`'s build fixtures); the relay matrix, `CNF-87`'s fixture half; the seed's tests, `CNF-83`'s derivation tests and `CNF-13`'s tests; the local store's, `CNF-82`'s and `CNF-15`'s host half (below); dispatch and journal recovery for `CNF-29`'s box-plane case, `CNF-30`, `CNF-39` and `STA-24` dispositions; job classification, channel deliveries, unresolved evidence, append failures, replay and all four dispositions, plus real-shell signals, high exit codes, missing and unreadable record files, NUL-corrupted scalars, exact scalar forms, the reader and replay exit ceiling, incomplete unreadable entries, owned-child cleanup, recycled PIDs, stale fixture groups, exact sentinel matching, drop, duplicate-id, boot, output and cross-store identity tests for `CNF-40`'s dropped command not re-run, waiting on its job record, `CNF-54`–`CNF-56` and `CNF-110`'s collection case; and allocation's, `CNF-72`'s tests and the companion comparison against the allocation witness file (ADR-0032), with `CNF-3`'s three breaks as its unit tests |
+| | `cargo test --locked` | runs `build.rs`, so the gates above run here, and the `[session]` fixtures (`CNF-88`'s build fixtures); the relay matrix, `CNF-87`'s fixture half; the seed's tests, `CNF-83`'s derivation tests and `CNF-13`'s tests; the local store's, `CNF-82`'s and `CNF-15`'s host half (below); dispatch and journal recovery for `CNF-29`'s box-plane case but its refusal of a second command (twr-ggw.69), `CNF-30`, `CNF-39` and `STA-24` dispositions; job classification, channel deliveries, unresolved evidence, append failures, replay and all four dispositions, plus real-shell signals, high exit codes, missing and unreadable record files, NUL-corrupted scalars, exact scalar forms, the reader and replay exit ceiling, incomplete unreadable entries, owned-child cleanup, recycled PIDs, stale fixture groups, exact sentinel matching, drop, duplicate-id, boot, output and cross-store identity tests for `CNF-40`'s dropped command not re-run, waiting on its job record, `CNF-54`–`CNF-56` and `CNF-110`'s collection case; and allocation's, `CNF-72`'s tests and the companion comparison against the allocation witness file (ADR-0032), with `CNF-3`'s three breaks as its unit tests |
 | `web` (the job is `CNF-1` for the browser build) | `cargo clippy -D warnings` on wasm32, the served and the tracer build | `CNF-2`, on the new target |
 | | `scripts/check-adr-0024.sh` | spec ADR-0024's build check |
 | | `scripts/build-web.sh served`, then `tracer check-absence dist/served` | the served build (`ARC-32`) carries no test key, pin source or test switch |
