@@ -5,7 +5,7 @@ browser and provisions real infrastructure on its operator's behalf. Rust, compi
 WebAssembly, following the configuration the specification records.
 
 **The specification lives in [`douglaz/tau-web-spec`](https://github.com/douglaz/tau-web-spec)
-and is vendored here at `spec/`, pinned to an exact commit, today `8869ade`** (spec ADR-0031).
+and is vendored here at `spec/`, pinned to an exact commit, today `d029ebd`** (spec ADR-0031).
 The build refuses to run if the checked-out tree does not match the pin, and every release
 records the spec commit it was built from. What the build compiles in from the pin:
 
@@ -27,10 +27,12 @@ Start reading at [`spec/00-overview.md`](./spec/00-overview.md). What to build f
 [`spec/07-conformance.md`](./spec/07-conformance.md), and its "Before declaring stage 1
 complete" paragraph.
 
-At the pin `8869ade`, stage 1 is `STG-21`'s scenario, which the "Stage 1: required" row states as
-"One live LNVPS machine on catalogue plain Arch with no tenant", created through a typed
-adapter and paid by a Lightning invoice from the operator's own wallet. Hermes is installed
-with its own installer.
+At the pin `d029ebd`, stage 1 is `STG-21`'s scenario: one live LNVPS machine on
+catalogue plain Arch with no tenant, created through a typed adapter and paid by a Lightning
+invoice from the operator's own wallet. Hermes is installed with its own installer.
+Items 53 and 55 leave their `delivery_reboot` cases to the dedicated row. Item 95
+cases (e) and (f) run on M alone at stage 1; their A/B output-release assertions, and
+case (e)'s copied-key assertions, belong to stage 2.
 LNVPS accepts no buyer boot configuration, so attest cannot run there (`STG-21`);
 first contact uses `CHN-R7`'s published-key route. The table's attest row does not gate
 LNVPS stage 1.
@@ -120,9 +122,10 @@ record and a real unlock; no path in this build produces that record.
 Today the harness admits a machine for which it holds a host-key pin. The decision's identity
 will become the bound session's binding in twr-ggw.11 without changing the intent's shape.
 The resource here is an implementation reading: the machine name checked against the pin
-source, until approved machine entries exist in twr-ggw.10. There is no barrier between
-box-plane commands, including explicit reissues of the same bytes while another call is
-unresolved (`STA-24`'s box-plane carve-out).
+source, until approved machine entries exist in twr-ggw.10. Today a second command,
+including an explicit reissue of the same bytes, is admitted and run on a machine with an
+unresolved call, with no collection first. This falls short of `STA-20`'s unresolved-command
+hold, which twr-ggw.69 builds.
 
 A disposition must name at least one call, each unresolved on its own resource or disposed by
 the disposition currently standing there. A subset leaves unnamed calls unresolved. One
@@ -163,8 +166,7 @@ store able to admit the next command.
 Typed cloud-plane operations and their barriers belong to twr-ggw.8; continuation dispatch to
 twr-ggw.40, twr-ggw.45 and twr-i6k.3; sessions and approved
 entries to twr-ggw.10, twr-ggw.11 and twr-ggw.22; inference records to twr-ggw.17. Disposition
-screens, snapshots, compaction and transcript retention are outside this change. The untyped
-vendor hold is stage 2. This change demonstrates the box-plane disposition rule of `STA-24`.
+screens, snapshots, compaction and transcript retention are outside this change. `STA-24`'s untyped-vendor-scope hold is stage 2. This change demonstrates the box-plane disposition rule of `STA-24`.
 
 ### Job records and collection
 
@@ -256,8 +258,9 @@ lies. **A mismatched record still settles the call** with its recorded exit code
 finding. The evidence and finding survive reload and unlock.
 
 Collection ends no restriction: a standing disposition stays standing and its call stays
-disposed, with the later evidence shown beside it (`STA-24`). A fresh `run_command` neither
-collects first nor waits on another job; the existing box-plane carve-out still applies.
+disposed, with the later evidence shown beside it (`STA-24`). Today a fresh `run_command` admits and runs another command, including an explicit reissue
+of the same bytes, without collecting or waiting on the unresolved call. This falls short of
+`STA-20`'s unresolved-command hold, which twr-ggw.69 builds.
 Sessions will call collection at re-entry in their own tickets. Rescue records and planned-reset
 handoff, service lifecycle and standard-input harness jobs are outside this change.
 
@@ -691,7 +694,7 @@ allocation companion comparison: passed
   compared: 8 witnesses and 4681 enumerated traces, every step
   pair: TauWeb.Allocation.backup_missing_refused matched; TauWeb.Allocation.backup_missing_admitted differed at step 2
   pair: TauWeb.Allocation.stale_sheet_refused matched; TauWeb.Allocation.stale_sheet_admitted differed at step 8
-  spec commit: 8869aded2c1708d0c25cae7b6bf07eeb30c75e5f
+  spec commit: d029ebd9f632696bb027a22559d774d165685947
 ```
 
 A pass is evidence about harness knowledge alone: never about external state, about whether an
@@ -837,7 +840,7 @@ The cases:
 | dispositions (twr-ggw.7, `STA-24`) | the independent reader builds a destructive disposition: the request is refused before contact, with no relay connection, SSH connection or append. Replacing it with a continuing disposition admits the command and journals its terminal record |
 | one writer (twr-ggw.5, `STA-1`, `STA-7`) | a second tab opens, which hides the first and restarts its worker, so either tab's worker may win the lock. The holder is the tab that offers Unlock while the other says it is waiting; the roles follow from that. The holder unlocks. The other says it is waiting for the store and offers neither Create nor Unlock; its worker has not read the store, runs nothing and appends nothing. Once the holder's tab closes, the other offers Unlock and unlocks the same store |
 | persistent storage (twr-ggw.5 AC6, `STA-23`) | with the `persistent-storage` permission denied, then granted, through `Browser.setPermission`: `navigator.storage.persisted()` reads false, then true, and the page shows the refusal, then "Persistent storage is granted." (`persisted()` already reads true, so that load makes no request), each with the statement that this is a request, not a guarantee |
-| job drop (`CNF-40`) | lock drops a several-second command after the fixture sees its launch; collection waits until its observed end, reads the record, launches nothing and never resends the command |
+| job drop (`CNF-40`'s dropped command not re-run, waiting on its job record) | lock drops a several-second command after the fixture sees its launch; collection waits until its observed end, reads the record, launches nothing and never resends the command |
 | completed drop (`CNF-54`) | the job finishes while disconnected; collection immediately reads both streams and a nonzero exit from its persistent files |
 | reboot (`CNF-55`) | the persistent finished record still settles; a running old-boot command reads ended without a terminal; a removed record reads missing and stays unresolved; neither is waited on |
 | background stdout (`STA-20a`) | `sleep 30 & echo hi` returns promptly with output and exit 0; the fixture saw the command launch and end |
@@ -897,7 +900,7 @@ to that file's values.
 build ships. A dedicated worker takes its policy from its own response, not from the page. The
 tracer's HTTPS server sends the page's policy as a header on `worker.js`, so the worker runs under
 it in the tracer, and case 4 shows it enforced there. A static host that sends no header leaves
-the worker with no policy of its own. At `8869ade`, `ARC-32` requires that host header and
+the worker with no policy of its own. At `d029ebd`, `ARC-32` requires that host header and
 `ARC-33` requires every worker to check policy before loading dependencies or receiving
 credentials. This repository ships no host configuration or worker self-check yet; twr-ggw.54
 owns them and `CNF-111`'s integrated evidence.
@@ -1007,12 +1010,12 @@ rest of `CNF-88` has no code here yet.
 | `spec-checks` | `spec/bundle/cors-probe.sh` | `CNF-4` |
 | | `spec/prototypes/spec-checks/check-install-disks.py`, and `--baseline`, which must fail | evidence for `CNF-85` |
 | `build` (the job is `CNF-1`) | `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings` | `CNF-2`, at that strictness |
-| | `cargo test --locked` | runs `build.rs`, so the gates above run here, and the `[session]` fixtures (`CNF-88`'s build fixtures); the relay matrix, `CNF-87`'s fixture half; the seed's tests, `CNF-83`'s derivation tests and `CNF-13`'s tests; the local store's, `CNF-82`'s and `CNF-15`'s host half (below); dispatch and journal recovery for `CNF-29`'s box-plane case, `CNF-30`, `CNF-39` and `STA-24` dispositions; job classification, channel deliveries, unresolved evidence, append failures, replay and all four dispositions, plus real-shell signals, high exit codes, missing and unreadable record files, NUL-corrupted scalars, exact scalar forms, the reader and replay exit ceiling, incomplete unreadable entries, owned-child cleanup, recycled PIDs, stale fixture groups, exact sentinel matching, drop, duplicate-id, boot, output and cross-store identity tests for `CNF-40`, `CNF-54`–`CNF-56` and `CNF-110`'s collection case; and allocation's, `CNF-72`'s tests and the companion comparison against the allocation witness file (ADR-0032), with `CNF-3`'s three breaks as its unit tests |
+| | `cargo test --locked` | runs `build.rs`, so the gates above run here, and the `[session]` fixtures (`CNF-88`'s build fixtures); the relay matrix, `CNF-87`'s fixture half; the seed's tests, `CNF-83`'s derivation tests and `CNF-13`'s tests; the local store's, `CNF-82`'s and `CNF-15`'s host half (below); dispatch and journal recovery for `CNF-29`'s box-plane case, `CNF-30`, `CNF-39` and `STA-24` dispositions; job classification, channel deliveries, unresolved evidence, append failures, replay and all four dispositions, plus real-shell signals, high exit codes, missing and unreadable record files, NUL-corrupted scalars, exact scalar forms, the reader and replay exit ceiling, incomplete unreadable entries, owned-child cleanup, recycled PIDs, stale fixture groups, exact sentinel matching, drop, duplicate-id, boot, output and cross-store identity tests for `CNF-40`'s dropped command not re-run, waiting on its job record, `CNF-54`–`CNF-56` and `CNF-110`'s collection case; and allocation's, `CNF-72`'s tests and the companion comparison against the allocation witness file (ADR-0032), with `CNF-3`'s three breaks as its unit tests |
 | `web` (the job is `CNF-1` for the browser build) | `cargo clippy -D warnings` on wasm32, the served and the tracer build | `CNF-2`, on the new target |
 | | `scripts/check-adr-0024.sh` | spec ADR-0024's build check |
 | | `scripts/build-web.sh served`, then `tracer check-absence dist/served` | the served build (`ARC-32`) carries no test key, pin source or test switch |
 | | `tracer check-csp dist/served` | `ARC-33`'s policy, exactly |
-| | `scripts/tracer.sh`, in headless Chrome | `CNF-30`, `CNF-21`, `CNF-23`'s no-pin case and `ARC-33`, as above, the relay refusals of `CNF-87` a correct client meets, and the local store's `CNF-82` and `CNF-15` in the browser; `CNF-40`, `CNF-54`–`CNF-56`, `STA-20a` and `CNF-110`'s box-plane collection case |
+| | `scripts/tracer.sh`, in headless Chrome | `CNF-30`, `CNF-21`, `CNF-23`'s no-pin case and `ARC-33`, as above, the relay refusals of `CNF-87` a correct client meets, and the local store's `CNF-82` and `CNF-15` in the browser; `CNF-40`'s dropped command not re-run, waiting on its job record, `CNF-54`–`CNF-56`, `STA-20a` and `CNF-110`'s box-plane collection case |
 
 Every job checks out the submodule; `spec-checks` takes the full history, which
 `check-install-disks.py --baseline` reads to reconstruct the pre-fix brief. `web` installs
