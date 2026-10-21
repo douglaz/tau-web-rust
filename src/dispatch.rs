@@ -1,6 +1,6 @@
 //! Journal-derived box-plane calls and operator dispositions (`STA-4`, `STA-8`, `STA-24`).
-//! No clock, transport or storage enters this core. Today admission does not check for an
-//! unresolved command; `STA-20`'s unresolved-command hold is pending twr-ggw.69.
+//! No clock, transport or storage enters this core. `STA-20`'s unresolved-command hold
+//! and destructive dispositions are both derived from committed records.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -131,9 +131,22 @@ pub struct DispositionRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct DispatchRefusal {
+pub struct DestructiveDisposition {
     pub disposition: u64,
     pub continuation: Continuation,
+}
+
+/// The calls that hold this machine, including unreadable legacy calls.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct CommandHold {
+    pub calls: Vec<Intent>,
+    pub disposition: Option<DestructiveDisposition>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DispatchRefusal {
+    Held(CommandHold),
+    Disposition(DestructiveDisposition),
 }
 
 /// All projections come from committed records applied in journal order.
@@ -148,13 +161,27 @@ pub struct Dispatch {
 
 impl Dispatch {
     pub fn check_command(&self, machine: &str) -> Result<(), DispatchRefusal> {
-        if let Some(record) = self.standing.get(machine)
-            && record.disposition.continuation.destructive()
-        {
-            return Err(DispatchRefusal {
-                disposition: record.number,
-                continuation: record.disposition.continuation,
-            });
+        let disposition = self.standing.get(machine).and_then(|record| {
+            record
+                .disposition
+                .continuation
+                .destructive()
+                .then_some(DestructiveDisposition {
+                    disposition: record.number,
+                    continuation: record.disposition.continuation,
+                })
+        });
+        let calls: Vec<_> = self
+            .calls
+            .values()
+            .filter(|call| call.intent.machine == machine && call.state == CallState::Unresolved)
+            .map(|call| call.intent.clone())
+            .collect();
+        if !calls.is_empty() {
+            return Err(DispatchRefusal::Held(CommandHold { calls, disposition }));
+        }
+        if let Some(disposition) = disposition {
+            return Err(DispatchRefusal::Disposition(disposition));
         }
         Ok(())
     }
@@ -366,5 +393,79 @@ impl Dispatch {
         }
         self.dispositions.push(record);
         report
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn intent(call: u64, approval: Option<Approval>) -> Intent {
+        Intent {
+            call,
+            machine: "fixture".into(),
+            command: hex::encode("true"),
+            approval,
+            job: None,
+        }
+    }
+
+    #[test]
+    fn unresolved_command_hold_includes_every_legacy_and_unreadable_call_only_on_its_machine() {
+        let mut dispatch = Dispatch::default();
+        dispatch
+            .intent(1, intent(1, Some(Approval::LegacyCommand)))
+            .unwrap();
+        dispatch
+            .intent(
+                2,
+                intent(
+                    2,
+                    Some(Approval::HarnessPin {
+                        machine: "fixture".into(),
+                        fingerprint: "SHA256:fixture".into(),
+                    }),
+                ),
+            )
+            .unwrap();
+        dispatch.intent(3, intent(3, None)).unwrap();
+        let Err(DispatchRefusal::Held(hold)) = dispatch.check_command("fixture") else {
+            panic!("criteria 1, 3: legacy and unreadable unresolved commands hold their machine")
+        };
+        assert_eq!(
+            hold.calls.iter().map(|c| c.call).collect::<Vec<_>>(),
+            [1, 2],
+            "criterion 7: names every holding call, excludes cancelled calls"
+        );
+        assert!(
+            dispatch.check_command("other").is_ok(),
+            "criterion 4: other machine unaffected while this machine is held"
+        );
+        dispatch
+            .terminal(
+                4,
+                Terminal {
+                    call: 1,
+                    exit_status: 0,
+                },
+            )
+            .unwrap();
+        assert!(
+            dispatch.check_command("fixture").is_err(),
+            "criterion 3: a finished call releases only its own hold"
+        );
+        dispatch
+            .terminal(
+                5,
+                Terminal {
+                    call: 2,
+                    exit_status: 7,
+                },
+            )
+            .unwrap();
+        assert!(
+            dispatch.check_command("fixture").is_ok(),
+            "criterion 3: finished and cancelled calls hold nothing"
+        );
     }
 }

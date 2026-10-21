@@ -11,7 +11,9 @@ async fn collect(run: &Run<'_>, worker: &Worker, args: Value) -> Result<Value, S
 }
 
 fn evidence(report: &Value, call: u64) -> Value {
-    report["outcome"]["collected"]
+    report["outcome"]
+        .get("collected")
+        .unwrap_or(&report["outcome"]["calls"])
         .as_array()
         .into_iter()
         .flatten()
@@ -20,7 +22,7 @@ fn evidence(report: &Value, call: u64) -> Value {
         .unwrap_or(Value::Null)
 }
 
-async fn wait_launch(
+pub(super) async fn wait_launch(
     run: &Run<'_>,
     worker: &Worker,
     previous: u64,
@@ -39,7 +41,7 @@ async fn wait_launch(
     Err("fixture saw no job launch".into())
 }
 
-async fn wait_end(run: &Run<'_>, id: &str) -> Result<(), String> {
+pub(super) async fn wait_end(run: &Run<'_>, id: &str) -> Result<(), String> {
     for _ in 0..1000 {
         if run
             .sshd
@@ -56,7 +58,7 @@ async fn wait_end(run: &Run<'_>, id: &str) -> Result<(), String> {
     Err(format!("fixture saw no job end: {id}"))
 }
 
-async fn drop_command(
+pub(super) async fn drop_command(
     run: &Run<'_>,
     tab: &Tab,
     worker: Worker,
@@ -86,7 +88,7 @@ async fn drop_command(
     Ok((new, call, id))
 }
 
-fn only_reads(seen: &Seen) -> bool {
+pub(super) fn only_reads(seen: &Seen) -> bool {
     !seen.ssh_exec.is_empty()
         && seen
             .ssh_exec
@@ -106,6 +108,7 @@ pub(super) async fn run(
     // hold a later collection open. Reboot keeps their records and proves their old boot ended.
     run.sshd.machine.reboot();
     collect(run, &worker, args("fixture")).await?;
+    worker = settle_unresolved(run, tab, worker).await?;
     take(run.seen);
 
     let mut case = Case::new("job drop waits without a second launch (CNF-40)");
@@ -125,14 +128,76 @@ pub(super) async fn run(
     let jobs_after = run.sshd.machine.observe();
     let e = evidence(&report, call);
     case.check(
-        "collection appends no intent",
-        run.inspect(&worker).await?["commands"] == commands_before,
+        "collect_jobs appends no intent and reports the holding call",
+        run.inspect(&worker).await?["commands"] == commands_before
+            && report["journal_entries"] == json!([])
+            && report["outcome"]["collected"].is_array()
+            && e["call"] == call,
     );
     case.check(
         "collection waited until the fixture saw the command end",
         jobs_after[&id].ended.is_some_and(|t| t >= start)
             && e["state"] == "finished"
             && e["stdout"] == "waited\n",
+    );
+    case.check(
+        "one launch, original command never re-executed, collection only read",
+        jobs_before.len() == jobs_after.len()
+            && run
+                .sshd
+                .machine
+                .launches()
+                .iter()
+                .filter(|(job, _)| job == &id)
+                .count()
+                == 1
+            && jobs_after
+                .values()
+                .filter(|j| j.command == command.as_bytes())
+                .count()
+                == 1
+            && only_reads(&observed)
+            && observed.relay_dials.len() == 1,
+    );
+    case.check(
+        "matching record is labelled advisory",
+        e["agreement"] == "advisory_match"
+            && !e.to_string().to_lowercase().contains("verif")
+            && !e.to_string().to_lowercase().contains("passed"),
+    );
+    cases.push(case);
+
+    let mut case = Case::new(
+        "held request on a dropped running command waits without a second launch (CNF-40)",
+    );
+    let command = "sleep 6; echo held-waited; exit 0";
+    let (new, call, id) = drop_command(run, tab, worker, args("fixture"), command).await?;
+    worker = new;
+    let jobs_before = run.sshd.machine.observe();
+    case.check(
+        "after lock the detached command is still alive",
+        machine::alive(jobs_before[&id].pid) && jobs_before[&id].ended.is_none(),
+    );
+    take(run.seen);
+    let commands_before = run.inspect(&worker).await?["commands"].clone();
+    let start = Instant::now();
+    fresh_pace(run.relay);
+    let report = run.harness_run(&worker, args("fixture")).await?;
+    let observed = take(run.seen);
+    let jobs_after = run.sshd.machine.observe();
+    let e = evidence(&report, call);
+    case.check(
+        "criteria 1, 5, 7, 9: held request names the call and release, never runs or appends intent",
+        run.inspect(&worker).await?["commands"] == commands_before
+            && report["outcome"]["held"] == true
+            && report["outcome"]["release"] == json!(["finished_record","disposition"])
+            && e["call"] == call,
+    );
+    case.check(
+        "criteria 5, 10: held collection waited until the fixture saw the command end",
+        jobs_after[&id].ended.is_some_and(|t| t >= start)
+            && e["state"] == "finished"
+            && e["stdout"] == "held-waited\n",
     );
     case.check(
         "one launch, original command never re-executed, collection only read",
@@ -209,9 +274,24 @@ pub(super) async fn run(
     .await?;
     worker = new;
     wait_end(run, &finished_id).await?;
+    let mut legacy_slots = Vec::new();
+    legacy_slots.push(
+        run.inspect(&worker).await?["records"]
+            .as_array()
+            .unwrap()
+            .len(),
+    );
+    worker = settle_unresolved(run, tab, worker).await?;
     let (new, running, running_id) =
         drop_command(run, tab, worker, args("fixture"), "sleep 30; echo too-late").await?;
     worker = new;
+    legacy_slots.push(
+        run.inspect(&worker).await?["records"]
+            .as_array()
+            .unwrap()
+            .len(),
+    );
+    worker = settle_unresolved(run, tab, worker).await?;
     let (new, missing, missing_id) = drop_command(
         run,
         tab,
@@ -221,6 +301,7 @@ pub(super) async fn run(
     )
     .await?;
     worker = new;
+    worker = restore_older_journal(run, tab, worker, &legacy_slots).await?;
     wait_end(run, &missing_id).await?;
     std::fs::remove_dir_all(run.sshd.machine.path(&missing_id, "")).map_err(|e| e.to_string())?;
     let old_boot =
@@ -263,6 +344,7 @@ pub(super) async fn run(
             && run.sshd.machine.observe().len() == count,
     );
     cases.push(case);
+    worker = settle_unresolved(run, tab, worker).await?;
 
     let mut case = Case::new("background stdout holder does not hold the command open (STA-20a)");
     fresh_pace(run.relay);
@@ -466,11 +548,17 @@ pub(super) async fn run(
     );
     cases.push(case);
 
+    worker = settle_unresolved(run, tab, worker).await?;
     let mut case = Case::new("collection continues past an invalid job record file");
     let (new, bad, bad_id) =
         drop_command(run, tab, worker, args("fixture"), "sleep 2; echo damaged").await?;
     worker = new;
     wait_end(run, &bad_id).await?;
+    let slot = run.inspect(&worker).await?["records"]
+        .as_array()
+        .unwrap()
+        .len();
+    worker = settle_unresolved(run, tab, worker).await?;
     let (new, good, good_id) = drop_command(
         run,
         tab,
@@ -480,6 +568,7 @@ pub(super) async fn run(
     )
     .await?;
     worker = new;
+    worker = restore_older_journal(run, tab, worker, &[slot]).await?;
     wait_end(run, &good_id).await?;
     let boot_path = run.sshd.machine.path(&bad_id, "boot");
     let boot = std::fs::read(&boot_path).map_err(|e| e.to_string())?;
@@ -513,5 +602,31 @@ pub(super) async fn run(
     std::fs::write(&boot_path, boot).map_err(|e| e.to_string())?;
     cases.push(case);
 
+    worker = settle_unresolved(run, tab, worker).await?;
+    super::hold_cases::run(run, tab, worker, args, cases).await
+}
+
+/// Replay fixture for an older journal with several unresolved commands on one machine.
+/// Replace temporary fixture dispositions by cancelled intents, preserving every call number.
+pub(super) async fn restore_older_journal(
+    run: &Run<'_>,
+    tab: &Tab,
+    worker: Worker,
+    slots: &[usize],
+) -> Result<Worker, String> {
+    let files = store_files(&run.dump(tab).await?);
+    let opened = reader::read(&files, PASSPHRASE)?;
+    let mut events: Vec<Value> = opened
+        .records
+        .iter()
+        .map(|(_, p)| serde_json::from_slice(p).map_err(|e| e.to_string()))
+        .collect::<Result<_, _>>()?;
+    for &slot in slots {
+        assert!(events[slot].get("disposition").is_some());
+        events[slot] = json!({"intent":{"call":slot,"machine":"fixture","command":hex::encode("true"),"approval":null}});
+    }
+    run.put(tab, &reader::build(PASSPHRASE, &events)).await?;
+    let worker = run.reload(tab, &worker).await?;
+    run.submit(tab, "unlock", PASSPHRASE).await?;
     Ok(worker)
 }

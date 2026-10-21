@@ -77,7 +77,14 @@ pub fn needles() -> Vec<(String, Vec<u8>)> {
         "pin source: its marker".into(),
         PIN_SOURCE_MARKER.as_bytes().to_vec(),
     ));
-    for switch in ["fail_append", "tamper_auth", "test_relay_key"] {
+    for switch in [
+        "fail_append",
+        "tamper_auth",
+        "test_relay_key",
+        "test_no_credentials",
+        "test_writer",
+        "test_completed_reads",
+    ] {
         needles.push((format!("test switch: {switch}"), switch.as_bytes().to_vec()));
     }
     needles

@@ -1,8 +1,9 @@
 //! The attempt itself, on the browser's WebSocket: wasm32 only.
 
+use super::wait;
 use super::{AppendRefusal, Entry, Journal, PinSource};
 use crate::credential::{RelayKey, SshClientKey};
-use crate::dispatch::{Approval, DispatchRefusal};
+use crate::dispatch::{Approval, CommandHold, DestructiveDisposition, DispatchRefusal};
 use crate::jobs::{self, Evidence, Record};
 use futures_util::{SinkExt, StreamExt};
 use pharos::{Observable, ObserveConfig};
@@ -64,7 +65,8 @@ pub enum Refusal {
     },
     /// The journal refused the append, so no `exec` was sent (`STA-3`).
     Journal(String),
-    Disposition(DispatchRefusal),
+    Disposition(DestructiveDisposition),
+    Held(Value),
     LaunchTooLong {
         bytes: usize,
     },
@@ -80,6 +82,7 @@ pub enum Refusal {
 impl Refusal {
     pub fn to_json(&self) -> Value {
         match self {
+            Refusal::Held(answer) => answer.clone(),
             Refusal::LaunchTooLong { bytes } => json!({
                 "refused": "launch-too-long",
                 "why": "command is too long to launch; shorten the command",
@@ -133,7 +136,10 @@ pub fn report(outcome: &Result<Done, Refusal>) -> Value {
 fn append_refusal(refusal: AppendRefusal) -> Refusal {
     match refusal {
         AppendRefusal::Storage(why) => Refusal::Journal(why),
-        AppendRefusal::Disposition(record) => Refusal::Disposition(record),
+        AppendRefusal::Policy(DispatchRefusal::Disposition(record)) => Refusal::Disposition(record),
+        AppendRefusal::Policy(DispatchRefusal::Held(_)) => {
+            unreachable!("hold collects before reporting")
+        }
     }
 }
 
@@ -179,10 +185,18 @@ pub async fn run_command(
     command: &[u8],
     #[cfg(feature = "tracer")] tamper_auth: bool,
 ) -> Result<Done, Refusal> {
-    journal
-        .check(&target.machine)
-        .await
-        .map_err(append_refusal)?;
+    if let Err(refusal) = journal.check(&target.machine).await {
+        return Err(admission_refusal(
+            pins,
+            journal,
+            credentials,
+            target,
+            refusal,
+            #[cfg(feature = "tracer")]
+            tamper_auth,
+        )
+        .await);
+    }
     let bytes = jobs::launch_size(&target.machine, command);
     if !jobs::launch_fits(bytes) {
         return Err(Refusal::LaunchTooLong { bytes });
@@ -210,97 +224,268 @@ pub async fn run_command(
         machine: target.machine.clone(),
         fingerprint: pinned,
     };
-    let seq = journal
-        .append(&entry, &approval)
-        .await
-        .map_err(append_refusal)?;
-    let intent = journal
-        .intent(seq)
-        .await
-        .ok_or_else(|| Refusal::Unresolved {
+    let seq = match journal.append(&entry, &approval).await {
+        Ok(seq) => seq,
+        Err(refusal) => {
+            // No exec for this request, even when it already opened a channel.
+            drop(channel);
+            drop(ssh);
+            return Err(admission_refusal(
+                pins,
+                journal,
+                credentials,
+                target,
+                refusal,
+                #[cfg(feature = "tracer")]
+                tamper_auth,
+            )
+            .await);
+        }
+    };
+    // No await separates committed intent from registration in this single-threaded worker.
+    let own = wait::DispatchResult::new(seq);
+    let outcome = async {
+        let intent = journal
+            .intent(seq)
+            .await
+            .ok_or_else(|| Refusal::Unresolved {
+                call: seq,
+                why: "intent read-back missing".into(),
+                evidence: None,
+            })?;
+        let job = intent.job.as_deref().expect("new intent has job identity");
+        let sent = jobs::launch(job, &entry.machine, &entry.command).into_bytes();
+        let result = exec_record(&mut channel, &sent).await;
+        let _ = ssh
+            .disconnect(russh::Disconnect::ByApplication, "", "en")
+            .await;
+        // CNF-30: the journal determines the wrapper's exact transmitted bytes.
+        let recorded = journal.read(seq).await;
+        let replayed = journal.intent(seq).await;
+        let recorded = match (recorded, replayed) {
+            (Some(recorded), Some(replayed))
+                if replayed.job.as_deref().is_some_and(|id| {
+                    jobs::launch(id, &recorded.machine, &recorded.command).as_bytes() == sent
+                }) && recorded.machine == target.machine =>
+            {
+                recorded
+            }
+            _ => {
+                return Err(Refusal::Unresolved {
+                    call: seq,
+                    why: "transcript does not reconcile with command bytes".into(),
+                    evidence: result.as_ref().ok().map(|record| {
+                        Box::new(jobs::uncommitted(
+                            &Evidence {
+                                call: seq,
+                                job: job.into(),
+                                record: record.clone(),
+                            },
+                            &entry.machine,
+                            &hex::encode(&entry.command),
+                        ))
+                    }),
+                });
+            }
+        };
+        let record = result.map_err(|why| Refusal::Unresolved {
             call: seq,
-            why: "intent read-back missing".into(),
+            why,
             evidence: None,
         })?;
-    let job = intent.job.as_deref().expect("new intent has job identity");
-    let sent = jobs::launch(job, &entry.machine, &entry.command).into_bytes();
-    let result = exec_record(&mut channel, &sent).await;
-    let _ = ssh
-        .disconnect(russh::Disconnect::ByApplication, "", "en")
-        .await;
-    // CNF-30: the journal determines the wrapper's exact transmitted bytes.
-    let recorded = journal.read(seq).await;
-    let replayed = journal.intent(seq).await;
-    let recorded = match (recorded, replayed) {
-        (Some(recorded), Some(replayed))
-            if replayed.job.as_deref().is_some_and(|id| {
-                jobs::launch(id, &recorded.machine, &recorded.command).as_bytes() == sent
-            }) && recorded.machine == target.machine =>
-        {
-            recorded
-        }
-        _ => {
-            return Err(Refusal::Unresolved {
-                call: seq,
-                why: "transcript does not reconcile with command bytes".into(),
-                evidence: result.as_ref().ok().map(|record| {
-                    Box::new(jobs::uncommitted(
-                        &Evidence {
-                            call: seq,
-                            job: job.into(),
-                            record: record.clone(),
-                        },
+        let received = Evidence {
+            call: seq,
+            job: job.into(),
+            record,
+        };
+        let evidence =
+            journal
+                .job_evidence(&received)
+                .await
+                .map_err(|why| Refusal::Unresolved {
+                    call: seq,
+                    why: format!("job evidence append: {why}"),
+                    evidence: Some(Box::new(jobs::uncommitted(
+                        &received,
                         &entry.machine,
                         &hex::encode(&entry.command),
-                    ))
-                }),
+                    ))),
+                })?;
+        if evidence.state != jobs::State::Finished {
+            return Err(Refusal::Unresolved {
+                call: seq,
+                why: format!("job record: {:?}", evidence.state),
+                evidence: Some(Box::new(evidence)),
             });
         }
-    };
-    let record = result.map_err(|why| Refusal::Unresolved {
-        call: seq,
-        why,
-        evidence: None,
-    })?;
-    let received = Evidence {
-        call: seq,
-        job: job.into(),
-        record,
-    };
-    let evidence = journal
-        .job_evidence(&received)
-        .await
-        .map_err(|why| Refusal::Unresolved {
-            call: seq,
-            why: format!("job evidence append: {why}"),
-            evidence: Some(Box::new(jobs::uncommitted(
-                &received,
-                &entry.machine,
-                &hex::encode(&entry.command),
-            ))),
-        })?;
-    if evidence.state != jobs::State::Finished {
-        return Err(Refusal::Unresolved {
-            call: seq,
-            why: format!("job record: {:?}", evidence.state),
-            evidence: Some(Box::new(evidence)),
-        });
+        Ok(Done {
+            seq,
+            sent,
+            recorded,
+            stdout: evidence.stdout.as_bytes().to_vec(),
+            stderr: evidence.stderr.as_bytes().to_vec(),
+            exit_status: evidence.exit_status.expect("finished record"),
+            terminal: evidence.number.expect("committed evidence"),
+            host_key,
+            evidence,
+        })
     }
-    Ok(Done {
-        seq,
-        sent,
-        recorded,
-        stdout: evidence.stdout.as_bytes().to_vec(),
-        stderr: evidence.stderr.as_bytes().to_vec(),
-        exit_status: evidence.exit_status.expect("finished record"),
-        terminal: evidence.number.expect("committed evidence"),
-        host_key,
-        evidence,
-    })
+    .await;
+    own.finish(report(&outcome));
+    outcome
+}
+
+/// Admission's hold collects only its snapshot of holding calls; it never resumes dispatch.
+async fn admission_refusal(
+    pins: &impl PinSource,
+    journal: &mut impl Journal,
+    credentials: &impl Credentials,
+    target: &Target,
+    refusal: AppendRefusal,
+    #[cfg(feature = "tracer")] tamper_auth: bool,
+) -> Refusal {
+    let AppendRefusal::Policy(DispatchRefusal::Held(hold)) = refusal else {
+        return append_refusal(refusal);
+    };
+    Refusal::Held(
+        held(
+            pins,
+            journal,
+            credentials,
+            target,
+            hold,
+            #[cfg(feature = "tracer")]
+            tamper_auth,
+        )
+        .await,
+    )
+}
+
+async fn held(
+    pins: &impl PinSource,
+    journal: &mut impl Journal,
+    credentials: &impl Credentials,
+    target: &Target,
+    hold: CommandHold,
+    #[cfg(feature = "tracer")] tamper_auth: bool,
+) -> Value {
+    let stop = wait::Stop::new(&target.machine);
+    let mut reports = Vec::new();
+    let mut connection = None;
+    let mut unreachable: Option<Value> = None;
+    let calls: Vec<_> = hold
+        .calls
+        .iter()
+        .map(|intent| (intent, wait::result(intent.call)))
+        .collect();
+    for (intent, own) in calls {
+        let not_read = |why: Value| json!({"call":intent.call,"not_read":true,"why":why});
+        let Some(job) = intent.job.as_deref() else {
+            reports.push(not_read(json!(
+                "no job identity; only a disposition can release this call"
+            )));
+            continue;
+        };
+        if stop.stopped() {
+            reports.push(not_read(json!("stopped before record was read")));
+            continue;
+        }
+        if let Some(own) = own {
+            let result = stop.until(own.get()).await;
+            reports.push(match result {
+                Some(result) => json!({"call":intent.call,"dispatch_result":result}),
+                None => not_read(json!("stopped while awaiting own dispatch's result")),
+            });
+            continue;
+        }
+        if let Some(why) = &unreachable {
+            reports.push(not_read(why.clone()));
+            continue;
+        }
+        if connection.is_none() {
+            match stop
+                .until(connect(
+                    pins,
+                    credentials,
+                    target,
+                    #[cfg(feature = "tracer")]
+                    tamper_auth,
+                ))
+                .await
+            {
+                Some(Ok((ssh, _, _))) => connection = Some(ssh),
+                Some(Err(why)) => {
+                    let reason = match why {
+                        Refusal::Failed(why) => json!({"connection":"unavailable","why":why}),
+                        other => other.to_json(),
+                    };
+                    let why = json!({"unreachable":reason});
+                    reports.push(not_read(why.clone()));
+                    unreachable = Some(why);
+                    continue;
+                }
+                None => {
+                    reports.push(not_read(json!("stopped before record was read")));
+                    continue;
+                }
+            }
+        }
+        let ssh = connection.as_ref().expect("connected for collection");
+        let read = async {
+            let mut channel = ssh
+                .channel_open_session()
+                .await
+                .map_err(|e| format!("session channel: {e}"))?;
+            exec_record(&mut channel, jobs::collect(job).as_bytes()).await
+        };
+        let record = match stop.until(read).await {
+            Some(Ok(record)) => record,
+            Some(Err(why)) => {
+                reports.push(not_read(json!(why)));
+                if ssh.is_closed() {
+                    unreachable = Some(json!("connection lost"));
+                }
+                continue;
+            }
+            None => {
+                reports.push(not_read(json!("stopped while reading record")));
+                continue;
+            }
+        };
+        let received = Evidence {
+            call: intent.call,
+            job: job.into(),
+            record,
+        };
+        #[cfg(feature = "tracer")]
+        crate::testonly::completed_read();
+        match journal.job_evidence_unless_stopped(&received, &stop).await {
+            Some(Ok(report)) => {
+                reports.push(serde_json::to_value(report).expect("report serialization"))
+            }
+            result => {
+                let why = match result {
+                    Some(Err(why)) => format!("job evidence append: {why}"),
+                    None => "wait stopped before journaling job evidence".into(),
+                    Some(Ok(_)) => unreachable!(),
+                };
+                reports.push(json!({"call":intent.call,"not_journaled":true,"why":why,
+                    "job_record":jobs::uncommitted(&received, &intent.machine, &intent.command)}));
+            }
+        }
+    }
+    let mut answer = json!({"held":true,"machine":target.machine,"calls":reports,
+        "release":["finished_record","disposition"]});
+    if let Some(disposition) = hold.disposition {
+        answer["disposition"] = json!(disposition.disposition);
+        answer["continuation"] = json!(disposition.continuation);
+        answer["dispatch_still_restricted"] = json!(true);
+    }
+    answer
 }
 
 /// Collecting is a read. It neither consults command dispositions nor appends an intent.
-/// Only this operation waits for outstanding jobs; a fresh command never collects first.
+/// Calls whose own dispatch awaits its record are reported as not read here.
 pub async fn collect_jobs(
     pins: &impl PinSource,
     journal: &mut impl Journal,
@@ -312,6 +497,23 @@ pub async fn collect_jobs(
         .collectable(&target.machine)
         .await
         .map_err(Refusal::Journal)?;
+    let mut reports = Vec::new();
+    let had_calls = !calls.is_empty();
+    let calls: Vec<_> = calls
+        .into_iter()
+        .filter(|intent| {
+            if wait::result(intent.call).is_some() {
+                reports.push(json!({"call":intent.call,"not_read":true,
+                "why":"own dispatch awaits its record"}));
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+    if had_calls && calls.is_empty() {
+        return Ok(reports);
+    }
     let (ssh, _, _) = connect(
         pins,
         credentials,
@@ -320,7 +522,6 @@ pub async fn collect_jobs(
         tamper_auth,
     )
     .await?;
-    let mut reports = Vec::new();
     for intent in calls {
         let job = intent.job.expect("collectable has job identity");
         if ssh.is_closed() {

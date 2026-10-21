@@ -17,6 +17,7 @@
 mod cdp;
 mod checks;
 mod fixtures;
+mod hold_cases;
 mod job_cases;
 mod keys;
 mod machine;
@@ -66,8 +67,8 @@ const COMMAND: &str =
 const STDOUT: &str = "tau-web tracer — recorded, then sent\n";
 const STDERR: &str = "to stderr\n";
 const EXIT_STATUS: u32 = 7;
-/// A finite command still in flight when the lock ends its connection.
-const HELD: &str = "sleep 15 # tau-web tracer: held in flight";
+/// A finite command running when the lock ends its connection.
+const LOCK_COMMAND: &str = "sleep 15 # tau-web tracer: running when the lock comes";
 
 /// The passphrases the tracer types. The tracer build's is not ASCII, so its UTF-8 bytes are what
 /// the worker counts and derives from.
@@ -912,6 +913,12 @@ async fn run_cases(
     );
     cases.push(case);
 
+    // A focused fixture run for reproducible unresolved-command mutation checks.
+    if std::env::var_os("TAU_TRACER_HOLD_CASE").is_some() {
+        hold_cases::run(run, &tab, worker, &args, cases).await?;
+        return Ok(());
+    }
+
     // Case 4 (AC6): the policy Chrome loaded is the served page's, and it is enforced.
     let mut case = Case::new("4. the page runs under ARC-33's policy (AC6)");
     let loaded = browser
@@ -1331,6 +1338,16 @@ async fn run_cases(
             && observed.ssh_exec.is_empty()
             && observed.relay_accepted == 0,
     );
+    fresh_pace(relay);
+    let commands = before["commands"].clone();
+    let held = run.harness_run(&worker, args("fixture")).await?;
+    let observed = take(seen);
+    case.check("criterion 10: a second command beside the unresolved close is held, reads only, records no intent",
+        held["outcome"]["held"] == true && held["outcome"]["calls"][0]["call"] == call
+        && held["outcome"]["calls"][0]["state"] == "finished"
+        && observed.relay_dials.len() == 1 && job_cases::only_reads(&observed)
+        && run.inspect(&worker).await?["commands"] == commands);
+    worker = settle_unresolved(run, &tab, worker).await?;
     cases.push(case);
 
     let mut case = Case::new(
@@ -1644,7 +1661,7 @@ async fn run_cases(
         Case::new("explicit lock requires unlock again, and ends its exec (twr-ggw.5 AC3, CNF-82)");
     // Text typed in both fields and never submitted goes with the lock (SEC-5 row 18).
     let mut left = Value::Null;
-    worker = held_then(run, &mut case, &tab, worker, &args, "Lock", async {
+    worker = lock_during_command(run, &mut case, &tab, worker, &args, "Lock", async {
         left = browser
             .evaluate(
                 &tab.session,
@@ -1666,6 +1683,7 @@ async fn run_cases(
     );
     cases.push(case);
 
+    worker = settle_unresolved(run, &tab, worker).await?;
     let mut case =
         Case::new("page hide requires unlock again, and ends its exec (twr-ggw.5 AC3, CNF-82)");
     browser
@@ -1675,7 +1693,7 @@ async fn run_cases(
         )
         .await?;
     // The browser's own visibilitychange: in headless Chromium a new tab hides this one.
-    worker = held_then(
+    worker = lock_during_command(
         run,
         &mut case,
         &tab,
@@ -1715,7 +1733,7 @@ async fn run_cases(
     );
     // A pagehide alone: the browser fires its own only as the page unloads (the reload case), so
     // the event is dispatched on the real window.
-    worker = held_then(run, &mut case, &tab, worker, &args, "pagehide", async {
+    worker = lock_during_command(run, &mut case, &tab, worker, &args, "pagehide", async {
         browser
             .evaluate(
                 &tab.session,
@@ -1727,17 +1745,18 @@ async fn run_cases(
     .await?;
     cases.push(case);
 
+    worker = settle_unresolved(run, &tab, worker).await?;
     let mut case = Case::new(
         "a killed worker surfaces an unresolved command and requires unlock (twr-ggw.7, CNF-39)",
     );
     take(seen);
     fresh_pace(relay);
-    let mut held = args("fixture");
-    held["command"] = HELD.into();
-    run.harness_start(&worker, held).await?;
-    let received = settle_for(seen, 20, |s| exec_command_is(s, HELD)).await;
+    let mut running = args("fixture");
+    running["command"] = LOCK_COMMAND.into();
+    run.harness_start(&worker, running).await?;
+    let received = settle_for(seen, 20, |s| exec_command_is(s, LOCK_COMMAND)).await;
     case.check(
-        "before Page.crash the sshd received the held exec",
+        "before Page.crash the sshd received the running exec",
         received,
     );
     let before = run.inspect(&worker).await?;
@@ -1788,12 +1807,12 @@ async fn run_cases(
     let observed = take(seen);
     let after = run.inspect(&worker).await?;
     case.check(
-        "after the crash, the held call is surfaced as unresolved without another exec",
+        "after the crash, the running call is surfaced as unresolved without another exec",
         after["calls"]
             .as_array()
             .and_then(|calls| calls.last())
             .is_some_and(|call| {
-                call["command"] == hex::encode(HELD) && call["state"] == "unresolved"
+                call["command"] == hex::encode(LOCK_COMMAND) && call["state"] == "unresolved"
             })
             && observed.ssh_exec.is_empty()
             && observed.relay_accepted == 0,
@@ -2373,10 +2392,38 @@ async fn relocked(
     Ok(())
 }
 
-/// Runs `HELD`, locks by `how` once the sshd has its `exec`, and checks the connection ended: the relay fixture sees the client's WebSocket close and the sshd its
-/// connection end; then `relocked`, and the held command, in the replayed state, is never sent
+/// Explicit continuing disposition between independent browser fixtures.
+async fn settle_unresolved(run: &Run<'_>, tab: &Tab, worker: Worker) -> Result<Worker, String> {
+    let state = run.inspect(&worker).await?;
+    let calls: Vec<_> = state["calls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|call| call["machine"] == "fixture" && call["state"] == "unresolved")
+        .map(|call| call["call"].clone())
+        .collect();
+    if calls.is_empty() {
+        return Ok(worker);
+    }
+    let files = store_files(&run.dump(tab).await?);
+    let opened = reader::read(&files, PASSPHRASE)?;
+    let mut events: Vec<Value> = opened
+        .records
+        .iter()
+        .map(|(_, p)| serde_json::from_slice(p).map_err(|e| e.to_string()))
+        .collect::<Result<_, _>>()?;
+    events.push(json!({"disposition":{"machine":"fixture","calls":calls,
+        "continuation":"as_if_not_done","uncertainty":"the command outcome is unknown"}}));
+    run.put(tab, &reader::build(PASSPHRASE, &events)).await?;
+    let worker = run.reload(tab, &worker).await?;
+    run.submit(tab, "unlock", PASSPHRASE).await?;
+    Ok(worker)
+}
+
+/// Runs `LOCK_COMMAND`, locks by `how` once the sshd has its `exec`, and checks the connection ended: the relay fixture sees the client's WebSocket close and the sshd its
+/// connection end; then `relocked`, and the running command, in the replayed state, is never sent
 /// again. The new worker.
-async fn held_then(
+async fn lock_during_command(
     run: &Run<'_>,
     case: &mut Case,
     tab: &Tab,
@@ -2385,14 +2432,15 @@ async fn held_then(
     how: &str,
     lock: impl std::future::Future<Output = Result<(), String>>,
 ) -> Result<Worker, String> {
+    let worker = settle_unresolved(run, tab, worker).await?;
     take(run.seen);
     fresh_pace(run.relay);
-    let mut held = args("fixture");
-    held["command"] = HELD.into();
-    run.harness_start(&worker, held.clone()).await?;
-    let received = settle_for(run.seen, 20, |s| exec_command_is(s, HELD)).await;
+    let mut running = args("fixture");
+    running["command"] = LOCK_COMMAND.into();
+    run.harness_start(&worker, running.clone()).await?;
+    let received = settle_for(run.seen, 20, |s| exec_command_is(s, LOCK_COMMAND)).await;
     case.check(
-        &format!("{how}: the sshd received the held command's exec"),
+        &format!("{how}: the sshd received the running command's exec"),
         received,
     );
     let before = run.inspect(&worker).await?;
@@ -2401,7 +2449,7 @@ async fn held_then(
         &format!("{how}: it was recorded before it was sent"),
         numbers
             .last()
-            .is_some_and(|c| c["command"] == hex::encode(HELD))
+            .is_some_and(|c| c["command"] == hex::encode(LOCK_COMMAND))
             && before["calls"]
                 .as_array()
                 .and_then(|calls| calls.last())
@@ -2436,7 +2484,7 @@ async fn held_then(
     let observed = take(run.seen);
     case.check(
         &format!(
-            "{how}: the held command is in the replayed state, and the sshd received no second exec"
+            "{how}: the running command is in the replayed state, and the sshd received no second exec"
         ),
         observed.ssh_exec.is_empty() && observed.relay_accepted == 0,
     );

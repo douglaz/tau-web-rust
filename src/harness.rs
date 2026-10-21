@@ -9,7 +9,15 @@
 #[cfg(target_arch = "wasm32")]
 mod run;
 #[cfg(target_arch = "wasm32")]
+mod wait;
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) mod write;
+#[cfg(target_arch = "wasm32")]
 pub use run::*;
+#[cfg(target_arch = "wasm32")]
+pub use wait::Stop;
+#[cfg(target_arch = "wasm32")]
+pub use wait::stop_waits;
 
 /// Where the session's durable record goes: the local store's journal (`crate::store`). Box-plane
 /// work is recorded per command before transmission (`ARC-8`), and a failed append means the
@@ -19,7 +27,8 @@ pub use run::*;
     reason = "used generically and only on one thread: the browser's worker, or a host test"
 )]
 pub trait Journal {
-    /// Check the standing disposition before any contact; repeated atomically at append.
+    /// Check the unresolved-command hold and disposition before contact; repeat atomically
+    /// at append.
     async fn check(&self, machine: &str) -> Result<(), AppendRefusal>;
     /// Commit an intent and its scope admission, returning its call identity only afterwards.
     async fn append(
@@ -38,6 +47,19 @@ pub trait Journal {
         &mut self,
         evidence: &crate::jobs::Evidence,
     ) -> Result<crate::jobs::Report, String>;
+    /// Stop before beginning an evidence append; an append already begun completes whole.
+    #[cfg(target_arch = "wasm32")]
+    async fn job_evidence_unless_stopped(
+        &mut self,
+        evidence: &crate::jobs::Evidence,
+        stop: &Stop,
+    ) -> Option<Result<crate::jobs::Report, String>> {
+        if stop.stopped() {
+            None
+        } else {
+            Some(self.job_evidence(evidence).await)
+        }
+    }
 }
 
 /// Where host-key pins come from. Read-only here: no path in this module stores a key it was
@@ -58,18 +80,14 @@ pub struct Entry {
 #[derive(Debug, PartialEq, Eq)]
 pub enum AppendRefusal {
     Storage(String),
-    Disposition(crate::dispatch::DispatchRefusal),
+    Policy(crate::dispatch::DispatchRefusal),
 }
 
 impl std::fmt::Display for AppendRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Storage(why) => f.write_str(why),
-            Self::Disposition(record) => write!(
-                f,
-                "disposition {}: {:?}",
-                record.disposition, record.continuation
-            ),
+            Self::Policy(record) => write!(f, "dispatch: {record:?}"),
         }
     }
 }

@@ -530,10 +530,14 @@ mod tests {
         ))
         .unwrap();
         for n in 1..=2 {
+            let mut entry = command(n);
+            if n == 2 {
+                entry.machine = "other".into();
+            }
             block_on(store.append(
-                &command(n),
+                &entry,
                 &tau_web::dispatch::Approval::HarnessPin {
-                    machine: "fixture".into(),
+                    machine: entry.machine.clone(),
                     fingerprint: "SHA256:test-pin".into(),
                 },
             ))
@@ -545,7 +549,7 @@ mod tests {
         }))
         .unwrap();
         block_on(store.dispose(tau_web::dispatch::Disposition {
-            machine: "fixture".into(),
+            machine: "other".into(),
             calls: vec![2],
             continuation: tau_web::dispatch::Continuation::AsIfNotDone,
             uncertainty: "the command outcome is unknown".into(),
@@ -561,7 +565,7 @@ mod tests {
             opened.commands(),
             [
                 (1, "fixture".to_string(), b"echo 1".to_vec()),
-                (2, "fixture".to_string(), b"echo 2".to_vec())
+                (2, "other".to_string(), b"echo 2".to_vec())
             ]
         );
         assert_eq!(
