@@ -1,5 +1,6 @@
 //! Journal-derived box-plane calls and operator dispositions (`STA-4`, `STA-8`, `STA-24`).
-//! No clock, transport or storage enters this core. Box-plane calls can be unresolved together.
+//! No clock, transport or storage enters this core. Today admission does not check for an
+//! unresolved command; `STA-20`'s unresolved-command hold is pending twr-ggw.69.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;

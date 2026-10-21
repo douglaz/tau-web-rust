@@ -2450,6 +2450,8 @@ mod tests {
         }
     }
 
+    // Pins today's admission, which falls short of STA-20's unresolved-command hold;
+    // twr-ggw.69 inverts this test.
     #[test]
     fn unresolved_calls_allow_another_command_and_an_explicit_reissue() {
         use crate::dispatch::CallState;
