@@ -167,6 +167,12 @@ impl Dispatch {
         if association.target == Target::Inference {
             return Err("inference cannot be associated with a machine entry".into());
         }
+        // `resolve` reads an entry target as that entry, so any other mapping would never apply.
+        if let Target::Entry(entry) = &association.target
+            && entry != &association.entry
+        {
+            return Err("an entry target names only its own entry".into());
+        }
         if let Some(old) = self
             .associations
             .iter()
@@ -296,7 +302,6 @@ impl Dispatch {
         }
         if let Some(record) = self.standing_for(resource) {
             let continuation = record.disposition.continuation;
-            let within_reach = operation.mutation() || operation == Operation::Exec;
             let permits = match continuation {
                 Continuation::DestructiveReinstall => operation == Operation::Reinstall,
                 Continuation::Abandonment => {
@@ -304,7 +309,7 @@ impl Dispatch {
                 }
                 Continuation::AsIfDone | Continuation::AsIfNotDone => true,
             };
-            if within_reach && !permits {
+            if !permits {
                 return Err(RequestRefusal::Continuation {
                     in_force: DestructiveDisposition {
                         disposition: record.number,

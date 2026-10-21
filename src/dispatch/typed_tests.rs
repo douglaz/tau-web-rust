@@ -262,6 +262,22 @@ fn lost_create_new_call_session_route_and_index_are_refused_after_replay() {
 }
 
 #[test]
+fn an_entry_target_associates_only_with_its_own_entry() {
+    let (_, mut store) = fresh();
+    assert_eq!(
+        store.associate(Association {
+            target: Target::Entry("stray".into()),
+            entry: "fixture".into(),
+        }),
+        Err("an entry target names only its own entry".into())
+    );
+    assert_eq!(
+        store.dispatch().resolve(&Target::Entry("stray".into())),
+        None
+    );
+}
+
+#[test]
 fn approved_facts_are_required_and_are_exactly_what_the_fixture_receives() {
     let (_, mut store) = fresh();
     let mut vendor = fixture::Vendor::default();
