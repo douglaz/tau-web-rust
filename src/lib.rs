@@ -390,9 +390,10 @@ mod worker {
         }
     }
 
-    /// The served build's sources: no pin or key is stored yet (twr-ggw.11). An unapproved
-    /// machine is refused at the journal check; an approved entry reaches the pin lookup and
-    /// is refused there, before any contact and any append (`CHN-R4`).
+    /// The served build's sources: no pin or key is stored yet (twr-ggw.11). A command to an
+    /// unapproved machine is refused at the journal check; a command to an approved entry, like
+    /// every collection, reaches the pin lookup and is refused there, before any contact and any
+    /// append (`CHN-R4`).
     #[cfg(not(feature = "tracer"))]
     struct NothingStored;
 

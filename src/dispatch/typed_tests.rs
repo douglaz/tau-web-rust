@@ -973,10 +973,12 @@ fn inspection_reports_typed_records_drops_assumptions_and_refused_replay() {
 
 #[test]
 fn journal_assignment_keeps_the_running_system_barrier_without_transient_associations() {
-    let (storage, mut store, _) = fresh();
-    let call = block_on(store.operation(&request(Operation::Reset)))
-        .unwrap()
-        .call;
+    let (storage, mut store, extra) = fresh();
+    // Dispatched through the transient extra index, which the reopen below does not supply.
+    let mut reset = request(Operation::Reset);
+    reset.target = Target::AllocationIndex(extra);
+    reset.approved.as_mut().unwrap().target = reset.target.clone();
+    let call = block_on(store.operation(&reset)).unwrap().call;
     let replayed = block_on(store::unlock(
         MemoryStorage::with_files(storage.files()),
         &FixedKdf,

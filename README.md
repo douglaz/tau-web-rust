@@ -63,8 +63,9 @@ seed-backup ceremony, every request is refused before contact. The pins,
 keys and journal never come from the request: the journal is the store's, in both builds. The
 tracer build runs on test pins and keys. The served build runs on the pins and keys it has
 stored, which are none until the seed-derived keys are bound to sessions (twr-ggw.11), so
-after the seed-backup ceremony it refuses an unapproved machine as `no-entry`,
-and an approved entry at the pin lookup, before contact or append. The connection path
+after the seed-backup ceremony it refuses a command to an unapproved machine as `no-entry`,
+and a command to an approved entry, like every collection, at the pin lookup, before contact
+or append. The connection path
 below is still whole in the served wasm, which is what the absence check below reads.
 `src/harness/run.rs` does it in this order:
 
@@ -218,7 +219,8 @@ approval is refused at the act and on replay, even with distinct entry names
 Entry names resolve directly, and both entries and their indices exist after reopen with no
 `associate` call. Approved entries start at installation 0. Requests supply no association and no resource.
 `Dispatch::associate` accepts only allocation-index and vendor-machine targets on an already
-approved entry, and refuses a target assigned elsewhere. Its **implementation reading** is
+approved entry, and refuses a target assigned elsewhere; `Store::associate` also refuses an
+allocation index the machine family has not reserved. Its **implementation reading** is
 in-memory harness knowledge: a vendor id learned at create, or a further index reserved for
 another create attempt. Both wait for twr-ggw.21 to journal them; until then the harness supplies
 only those associations again after reopen. They create neither entries nor installation ordinals.
@@ -1178,7 +1180,7 @@ The cases:
 | Case | What the fixtures show |
 |---|---|
 | the served build loads | its worker comes up and nothing errs, and the page has no `tauWeb` global and no global holding the worker. With no store, the page offers Create alone, and a request is refused before any contact. A store is created and refuses dispatch for seed backup without contact or append; after explicit skip an unapproved command refuses as no-entry; after approval through the card, called in its worker on the machine the tracer build pins, it refuses for the missing pin, the relay accepts no connection and the sshd sees none, and nothing is appended |
-| setup batch card and indices, each build | all entries and approved costs, totals and recurring statement precede the click; no approval/reservation before it; unapproved command refuses before contact; one approval records both indices and exactly the rendered offer |
+| setup batch card and indices, each build | all entries and approved costs, totals and recurring statement precede the click; no approval/reservation before it; unapproved command refuses before contact; one approval records both indices and exactly the offer the worker reported before the click (`setup_offer`) |
 | setup class questions, each build | no checked, selected, autofocus, focus or keyboard default before answering or after reload; Not sure is multi-tenant and No is single-purpose in the independent reader; maintained access with ad-hoc revision; second answer refuses |
 | setup non-operator inputs, each build | extra dispatch/collection members and malformed page messages change no journal or store state, supply no question or answer and seal nothing |
 | setup ceremony refusal, each build | locked and ceremony-active approval attempts append nothing |

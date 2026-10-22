@@ -616,7 +616,18 @@ impl<S: Storage> Store<S> {
         Ok(())
     }
 
+    /// An index is associated only once the allocation core holds it in the machine family
+    /// (`STA-22b`), so no create can name an index that was never reserved.
     pub fn associate(&mut self, association: crate::dispatch::Association) -> Result<(), String> {
+        if let crate::dispatch::Target::AllocationIndex(index) = &association.target
+            && !self
+                .allocation()
+                .entries()
+                .iter()
+                .any(|e| e.identity.family == Family::Machines && e.identity.index == *index)
+        {
+            return Err("allocation index not reserved".into());
+        }
         self.dispatch.associate(association)
     }
 

@@ -565,6 +565,13 @@ fn commands_require_an_approved_entry_and_matching_provenance_without_latching()
             })
             .is_err()
     );
+    assert_eq!(
+        store.associate(Association {
+            target: Target::AllocationIndex(extra.index + 1),
+            entry: "fixture".into()
+        }),
+        Err("allocation index not reserved".into())
+    );
     for target in [
         Target::AllocationIndex(extra.index),
         Target::VendorMachine("vendor-id".into()),
