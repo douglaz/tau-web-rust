@@ -19,6 +19,7 @@ const clearWords = () => $('seed-backup-words-slot').replaceChildren();
 let redisplay = false;
 const render = (store) => {
   const { state } = store;
+  renderSetup(store);
   $('store').dataset.state = state;
   $('store-state').textContent = state === 'refused'
     ? `The local store is refused: ${store.reason}. Reload the page to try again.`
@@ -48,6 +49,75 @@ const render = (store) => {
     'Dispatch is stopped.', store.error].filter(Boolean).join(' ')
     : '';
   if (state === 'locked' && redisplay) $('store-state').textContent += ' Enter the local passphrase again to show the seed backup.';
+};
+
+// Fixture wording until the signed bundle supplies it. No message supplies question text.
+const classQuestion = "Will this machine serve people you have never met, for example by renting out space on it or hosting other people's accounts?";
+const classHelp = "If you are not sure, the machine is treated as serving people you have never met: it never holds spendable keys and is always bound alone.";
+const answers = [['yes', 'Yes'], ['no', 'No, only me and people I know'], ['not_sure', 'Not sure']];
+const paragraph = (parent, text) => {
+  const p = document.createElement('p');
+  p.textContent = text;
+  parent.append(p);
+};
+const renderSetup = (store) => {
+  const slot = $('setup');
+  slot.replaceChildren();
+  slot.hidden = store.state !== 'unlocked' || store.seed_backup_stage !== 'inactive';
+  if (slot.hidden) return;
+  const approved = store.setup ?? [];
+  const entries = approved.length ? approved.map(m => m.entry) : store.setup_offer ?? [];
+  if (!entries.length) return;
+  paragraph(slot, approved.length ? 'Approved setup' : 'Approve the setup');
+  paragraph(slot, "Prices are fixture data, not a vendor's price.");
+  for (const entry of entries) {
+    paragraph(slot, `${entry.machine}: ${entry.vendor}; ${entry.product}; ${entry.region}; ${entry.cost.amount} ${entry.cost.unit} per ${entry.cost.period}.`);
+  }
+  const monthly = entries.reduce((sum, entry) => sum + BigInt(entry.cost.amount), 0n);
+  paragraph(slot, `Setup total: ${monthly} sat per month; ${monthly * 12n} sat per year.`);
+  paragraph(slot, 'Each machine will be bound alone in its own session.');
+  paragraph(slot, "Recurring means each machine is billed by its vendor every month from the moment it is created until it is destroyed or abandoned, whether or not setup finishes. tau-web never pays for a machine and cannot stop a vendor's billing; only you can.");
+  if (!approved.length) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.id = 'tau-setup-approve';
+    button.textContent = 'Approve setup';
+    button.addEventListener('click', () => {
+      button.disabled = true;
+      worker.postMessage({ setup_approve: true });
+    });
+    slot.append(button);
+    return;
+  }
+  for (const machine of approved) {
+    const section = document.createElement('section');
+    section.dataset.machine = machine.entry.machine;
+    paragraph(section, `${machine.entry.machine}: ${machine.family} index ${machine.index}.`);
+    if (machine.class === null) {
+      paragraph(section, `Machine class for ${machine.entry.machine}.`);
+      paragraph(section, classQuestion);
+      paragraph(section, classHelp);
+      const controls = document.createElement('div');
+      controls.dataset.classAnswers = '';
+      for (const [answer, label] of answers) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.dataset.answer = answer;
+        button.textContent = label;
+        button.addEventListener('click', () => {
+          for (const control of controls.children) control.disabled = true;
+          worker.postMessage({ setup_answer: { machine: machine.entry.machine, answer } });
+        });
+        controls.append(button);
+      }
+      section.append(controls);
+    } else {
+      paragraph(section, `Answer: ${machine.answer}; class: ${machine.class}.`);
+    }
+    const access = machine.access;
+    if (access) paragraph(section, `Access model: ${access.model}; profile ${access.profile}, revision ${access.revision}.`);
+    slot.append(section);
+  }
 };
 
 let worker;

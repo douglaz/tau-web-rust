@@ -92,3 +92,22 @@ impl std::fmt::Display for AppendRefusal {
         }
     }
 }
+
+/// Exact dispatch boundaries: setup and class input never enters through a tool request.
+pub fn valid_request(request: &serde_json::Value) -> bool {
+    let Some(fields) = request.as_object() else {
+        return false;
+    };
+    fields.iter().all(|(key, value)| match key.as_str() {
+        "machine" | "relay" | "host" | "user" => value.is_string(),
+        "command" => value.is_string(),
+        "port" => value
+            .as_u64()
+            .is_some_and(|n| n > 0 && n <= u64::from(u16::MAX)),
+        #[cfg(feature = "tracer")]
+        "test_relay_key" => value.is_string(),
+        #[cfg(feature = "tracer")]
+        "fail_append" | "tamper_auth" | "test_no_credentials" => value.is_boolean(),
+        _ => false,
+    })
+}

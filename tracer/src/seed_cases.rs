@@ -631,6 +631,7 @@ pub(super) async fn run(
         skip(run, tab).await?;
         let mut before = run.inspect(worker).await?;
         if tracer {
+            setup_cases::approve(run, tab, worker).await?;
             take(run.seen);
             fresh_pace(run.relay);
             let mut request = args("fixture");

@@ -53,19 +53,24 @@ because spec `STA-1` says "A single **harness worker** MUST be the only writer o
 What it does so far is the tracer bullet of twr-ggw.2, one command over a pinned SSH connection
 through the relay, recorded in the encrypted local store of twr-ggw.5 (below). The module exports
 `run_command` and `collect_jobs`, the same entry points in both builds below. The page defines no global and holds
-no reference to the worker's instance of the module. It sends passphrase and seed-backup
+no reference to the worker's instance of the module. It sends passphrase, seed-backup, setup-approval and per-entry class-answer
 messages to the worker, with no dispatch request; today only the tracer calls
 `run_command` there (below). Another same-origin script could still load its own copy of the
 module and call it; that copy has no unlocked store, so it refuses every request before any
-contact. While locked or running the seed-backup ceremony, every request is refused before contact. The pins,
+contact. For approval and class-answer acts, the harness cannot distinguish an operator's click
+from an identical message another same-origin script posts. While locked or running the
+seed-backup ceremony, every request is refused before contact. The pins,
 keys and journal never come from the request: the journal is the store's, in both builds. The
 tracer build runs on test pins and keys. The served build runs on the pins and keys it has
-stored, which are none until the seed-derived keys are bound to sessions (twr-ggw.11), so it
-after the seed-backup ceremony refuses every machine at the pin lookup, before contact or append. The connection path
+stored, which are none until the seed-derived keys are bound to sessions (twr-ggw.11), so
+after the seed-backup ceremony it refuses an unapproved machine as `no-entry`,
+and an approved entry at the pin lookup, before contact or append. The connection path
 below is still whole in the served wasm, which is what the absence check below reads.
 `src/harness/run.rs` does it in this order:
 
-- **Pin first.** It looks up the machine's host-key pin, and with none it contacts nothing.
+- **Entry first.** The journal check refuses a machine naming no approved entry before contact
+  or append, then checks unresolved calls and dispositions.
+- **Pin next.** It looks up the machine's host-key pin, and with none it contacts nothing.
   `CHN-R4` says "the harness MUST NOT do it through the relay".
 - **Relay handshake.** It opens the relay WebSocket and runs the handshake of
   [paid-tcp-relay](https://github.com/douglaz/paid-tcp-relay) at `844e834` (its `WIR-4`–`WIR-8`),
@@ -119,10 +124,9 @@ writes nothing, surfaces uncertain calls and never resumes or automatically reis
 (`STA-6`, `STA-7`). The cancellation branch is exercised only through an authenticated crafted
 record and a real unlock; no path in this build produces that record.
 
-Today the harness admits a machine for which it holds a host-key pin. The decision's identity
-will become the bound session's binding in twr-ggw.11 without changing the intent's shape.
-The resource here is an implementation reading: the machine name checked against the pin
-source, until approved machine entries exist in twr-ggw.10. `STA-20`'s unresolved-command
+The harness admits an approved machine entry for which it holds a host-key pin. The decision's
+identity will become the bound session's binding in twr-ggw.11 without changing the intent's shape.
+The resource is the journaled approved entry, with its approval-time machine allocation index. `STA-20`'s unresolved-command
 hold prevents every further box-plane command on that machine, reads and identical bytes
 included. The check runs before contact and atomically with intent append under the single
 writer. A held request records no intent and never runs afterwards: it collects the calls
@@ -152,10 +156,12 @@ does a terminal naming no call, a cancelled call or an already finished call, or
 identity is not its record number or whose command is not lowercase hex.
 `store_state` shows calls and their job identities, approval decisions and states, terminals,
 job-record evidence and findings, all disposition reports and the disposition standing per
-machine, plus `typed_calls`, `observations` and `current_installations`, without key material.
+machine, plus `typed_calls`, `observations`, `current_installations`, `setup` and `setup_offer`, without key material.
+`setup` lists each entry's facts and cost, allocation family/index, nullable answer and class, and access model/profile/revision.
+It contains no seed identifier; the page's store report carries the same setup projection.
 Disposition records include both `machine` and `resource`: `machine` retains the command-era
 shape, while `resource` names the entry or inference resource used by the typed derivation.
-No operator screen, page message or disposition export exists. The browser disposition case uses a store built by
+No disposition screen, disposition page message or disposition export exists. The browser disposition case uses a store built by
 the independent reader, with no added request switch.
 
 `run_command` reports completion as `{"done":true,"seq":1,"call":1,"terminal":2,...}`,
@@ -166,7 +172,19 @@ channel close without a complete record, lost connection or evidence append fail
 the unresolved response also includes `job_record`, with the same state, comparison, output
 and exit status as a finished response. Evidence whose append failed has `number:null`. The command's exit code is read from
 its job record and journaled before completion is reported; the SSH wrapper's own exit status
-never settles the command. Pre-intent refusals keep their existing shape; a disposition refusal
+never settles the command. An unapproved command refuses before the pin lookup as
+`{"refused":"no-entry","machine":"fixture"}`, with no intent and no failed-append latch.
+A mismatched command provenance target refuses at append as `{"refused":"provenance"}`.
+As an **implementation reading**, `crate::harness::valid_request` refuses `run_command` and
+`collect_jobs` JSON input that is not an object, has a member outside the build's fixed set,
+or has a member of the wrong type. After JSON parsing, it reports
+`{"outcome":{"refused":"request"}}` before other checks, with no contact or record.
+Text that is not JSON fails earlier as a JavaScript error (`request: …`). The fixed set is `machine`, `relay`, `host`,
+`user` and `command` (strings), and `port` (an unsigned integer from 1 through 65535).
+The tracer build also accepts `test_relay_key` (string), `fail_append`, `tamper_auth` and
+`test_no_credentials` (booleans). It validates supplied members without requiring them to be
+present; the worker uses empty text and port zero for absent values.
+Other pre-intent refusals keep their existing shape; a disposition refusal
 is `{"refused":"disposition","disposition":2,"continuation":"abandonment"}`. An oversized
 launch is refused before contact or intent with
 `{"refused":"launch-too-long","why":"command is too long to launch; shorten the command","bytes":156406,"limit":131071}`
@@ -183,19 +201,32 @@ The fixture vendor and its receive log compile only in host tests, never in the 
 A typed request carries its target, operation, session, requester and structured facts
 (arguments, cost bound and bundle commit), with an approval on exactly those values and the
 resolved resource. No approval, changed facts or an unmapped target refuses without a record.
+As an **implementation reading**, the typed request check in `src/dispatch/typed.rs` also
+refuses any `facts.arguments` key named `class`, `answer`, `access_model`, `setup`, `entries`,
+`question`, `goal` or `proposal`, or any argument value equal to `sealed`. It reports
+`RequestRefusal::Facts` with no record.
 `Store::operation` repeats admission under the writer, commits, applies, then returns the
 journaled approved intent for the adapter to send. Status reads have their own pre-send intent,
 with state `no_effect`; observations are separately committed before they settle anything.
 They carry the call snapshot taken before the read, so a delayed response cannot settle a
 later reissue. Failed appends apply nothing; a landed move reporting failure applies on reopen.
 
-The resource is an **implementation reading** until twr-ggw.10 introduces approved entries:
-an entry is named as a command names its machine. The harness supplies its associations from
-allocation indices and vendor machine ids to entries; naming a known entry directly resolves
-there too. Requests supply no association and no resource. The fixture supplies this knowledge
-again on reopen; journaling it belongs to twr-ggw.10. Existing intents retain their recorded
-resource independently of those associations. Inference has a distinct resource type, so no
-entry name can collide with it; this core admits it, while twr-ggw.17 owns its journal.
+The resource is an approved entry. Approval and its one allocation index replay from the journal.
+As an **implementation reading**, ARC-15's batch is the setup's one approval: a second setup
+approval is refused at the act and on replay, even with distinct entry names
+(`setup already approved or empty`). Adding a machine to the set later belongs to twr-ggw.22.
+Entry names resolve directly, and both entries and their indices exist after reopen with no
+`associate` call. Approved entries start at installation 0. Requests supply no association and no resource.
+`Dispatch::associate` accepts only allocation-index and vendor-machine targets on an already
+approved entry, and refuses a target assigned elsewhere. Its **implementation reading** is
+in-memory harness knowledge: a vendor id learned at create, or a further index reserved for
+another create attempt. Both wait for twr-ggw.21 to journal them; until then the harness supplies
+only those associations again after reopen. They create neither entries nor installation ordinals.
+The production command append resolves any provenance target against its command's approved entry
+before commit. Existing intents retain their recorded resource, holds and dispositions without
+requiring approval records; replay never treats those historical calls as a store refusal.
+Inference has a distinct resource type, so no entry name can collide with it; this core admits
+it, while twr-ggw.17 owns its journal.
 
 Every unresolved machine call bars cloud-plane mutations on that entry, whatever its call id,
 session or requester, including the operator flow. A second index for the same entry changes
@@ -236,8 +267,10 @@ starting at `bound.start`. A truncated enumeration fails.
 
 It runs stage1 only: 31 witnesses and 286 enumerated traces. The dedicated bucket, 54/184,
 belongs to twr-i6k.3; reboot, 12/0, belongs to twr-i6k.11. Together they cover 97/470. Each start
-is built as durable production records and replayed, including the invalid historical
-disposition. Every outcome and projection member is compared at every step. Oldest-first
+journals a seed-backup completion, one batch approval with one index per entry, its calls and
+dispositions, including the invalid historical disposition. Only the extra index and vendor-id
+associations remain supplied in memory, including after reopen, until twr-ggw.21 journals them.
+Every outcome and projection member is compared at every step. Oldest-first
 members stay lists; resource/entry members are keyed sets. Unmoved members must stay empty.
 Inference and dispositions on its resource run in the core without store records. Replay
 actually reopens the store. Command requests use the existing intent and job-evidence path,
@@ -246,8 +279,14 @@ approval facts map bijectively to the recorded pin admission's fingerprint, and 
 session maps to the recorded command session. No typed operation approval is attached to a
 command. Current `run_command` records its named target with no session; older command records
 retain their shape.
-The driver retains only identity mappings beside that production
-store and never projects its own request cache.
+The driver maps witness allocation indices bijectively from production returns: approve entry 2
+then entry 1, reserve the extra index with `Store::allocate`, then associate the vendor id. At this
+start the map is witness 2 ↔ production 0, 0 ↔ 1, 1 ↔ 2. It is fixed, injective, retained across
+reopen, and applied in target conversion both ways, beside the entry, vendor, session, fact and
+call mappings. Associations stay an oldest-first list under this ordering. Reopen supplies only
+the extra index and vendor id; it never reconstructs approved entries or their journaled indices.
+The driver retains only identity mappings beside that production store and never projects its
+own request cache.
 
 Production assumptions are `resourceKey: entry`, `reach: disposed`, `lapse: continuation` and
 all boolean guards true. Every unpaired trace and refused side matches, and each admitted side
@@ -292,8 +331,8 @@ dispatch companion comparison: passed
 ```
 
 This comparison is evidence about harness knowledge alone; the storage and browser fault tests
-carry ordering and contact evidence. Approved entries, journaled indices and associations wait
-for twr-ggw.10, binding for twr-ggw.11, and actual session tools/routes for twr-ggw.14. The
+carry ordering and contact evidence. Approved entries and their approval-time indices are
+journaled here. Binding waits for twr-ggw.11, and actual session tools/routes for twr-ggw.14. The
 per-tool create case waits there; no extra route is invented here. Creating/paying and learning
 the vendor id are twr-ggw.21's; inference records twr-ggw.17's; the abandonment flow and its
 authorization twr-ggw.31's; LNVPS fixture and criterion 23's LNVPS half twr-ggw.32's; stop and
@@ -595,7 +634,9 @@ the host tests run.
   `nonce` and `ciphertext` (the ciphertext followed by its tag), in that order, with no
   whitespace; binary fields are unpadded base64url. Any other bytes under a record name are
   refused.
-- **What the records carry.** Each record's plaintext is one event, compact JSON:
+- **What the records carry.** Each record's plaintext is one event, compact JSON. Command
+  examples also describe pre-ticket records; a new store now journals its seed, ceremony
+  completion and setup approval before its first intent:
   - record 0, the seed, generated in the worker: `{"seed":{"mnemonic":"…"}}`, the mnemonic's
     words;
   - an intent, immediately before one `exec`:
@@ -604,7 +645,8 @@ the host tests run.
     decision identifies the harness's admission using that machine's pin; it is not the
     operator's approval of the command's contents. Optional `provenance` contains `target`,
     `session` (text or null) and `requester` (`session`, `operator` or `harness_flow`), separately
-    from that admission. The production append records the provenance the command carried;
+    from that admission. The production append resolves its target to the command's approved entry
+    before commit, then records the provenance;
     `run_command` supplies its directly named entry, no session, and requester `session`.
     No command carries typed operation facts or an `OperationApproval`. A new-format intent with `approval:null`
     (or an absent approval member) means never dispatched. No path in this build writes one.
@@ -645,6 +687,21 @@ the host tests run.
     Its missing approval member proves nothing: it was written before transmission. It becomes
     an unresolved call with its record number and the admission marker `legacy_command`, never
     a cancelled call.
+  - a setup act: `{"setup":{"approval":{"entries":[{"entry":{"machine":"fixture","vendor":"Fixture vendor","product":"Fixture machine","region":"Fixture region","cost":{"amount":1000,"unit":"sat","period":"month"}},"identity":{"seed":"<seed identifier>","derivation_version":1,"family":"machines","index":0},"access":{"model":"maintained","profile":"ad-hoc","revision":3}}],"monthly_sat":1000,"annual_sat":12000}}}`.
+    Production approves both fixture entries in this one record (the single-entry example only
+    illustrates the shape). Every index is reserved through the allocation core on a clone;
+    the record commits before either projection is swapped in. No separate reservation precedes it.
+    A per-entry answer is `{"setup":{"class":{"machine":"fixture","answer":"not_sure","class":"multi_tenant"}}}`.
+    Answers are `yes`, `no`, `not_sure`; classes are `single_purpose`, `multi_tenant`.
+    Replay also reads `{"setup":{"access":{"machine":"fixture","access":{"model":"maintained","profile":"ad-hoc","revision":3}}}}`.
+    This last shape and an approval's explicit `access:null` support independent missing-fact
+    replay fixtures; the production approval always records maintained access.
+    The independent reader requires exact object members and enum values throughout these setup
+    shapes. Production always writes objects and refuses unknown members and enum values, but
+    its derived replay deserializers also accept positional arrays for setup struct bodies.
+    Repeated entries/answers, unapproved facts, inconsistent
+    classes/totals, invalid allocation order or gate, and sealed ad-hoc access refuse replay,
+    naming the record without quoting plaintext. None carries derived key material.
   - a later record, one allocation event appended before it is applied ("Allocation", below):
     `{"allocation":{"reserve":{"seed":"<seed identifier>","derivation_version":1,"family":"machines","index":0}}}`;
     `created`, `failed` and `destroyed` carry the same identity; `restore` carries an export,
@@ -655,7 +712,7 @@ the host tests run.
 
   The independent reader in the tracer crate decrypts every record and reads the seed, legacy
   command, intent, typed intent, typed observation, terminal, job terminal, job observation,
-  disposition and seed-backup shapes.
+  disposition, seed-backup and setup approval/class/access shapes, with exact setup members.
   It checks a completion against the seed identifier it derives independently, and inspects reservations.
 - **`staging`**, the one staging name, which is never a record name or the envelope's.
 
@@ -851,8 +908,8 @@ identifier.
   until migration is complete"). A Replace to the current seed, or to one an entry already names,
   is refused: it would issue a recorded identity again.
 
-**Journaled in the local store.** Each allocation event is a record of its own ("What the records
-carry", above).
+**Journaled in the local store.** A standalone allocation event is a record of its own ("What the records
+carry", above); setup approval carries its own machine reservations atomically.
 
 - **Append before apply** (`STA-3`). `Store::allocate` takes a family and no index. It asks the
   core what it would issue, appends the reservation, applies it once the append commits, and
@@ -883,7 +940,7 @@ on the core — the seed's mnemonic imported with `Seed::import`, the core's own
 the same keys re-derived, allocation refused in all three families until a Replace — and through
 a restore record crafted with the data key and replayed. Neither is evidence that a store can be
 created from an imported seed today. The tracer-only `test_allocate` export reaches
-`Store::allocate`; the served build has no allocation consumer.
+`Store::allocate`; setup approval is also a machine-family allocation consumer in the served build.
 
 **The tests** (`cargo test`). On the core: each family's own counter; a recorded identity never
 reserved again or revived; tombstones never reissued; exhaustion, started at 2^31−1; an unknown
@@ -948,6 +1005,56 @@ allocation companion comparison: passed
 A pass is evidence about harness knowledge alone: never about external state, about whether an
 effect ran before its append returned, or about concurrency (ADR-0032, "Evidence").
 
+### The setup's machine entries
+
+After unlock and completion of the seed-backup ceremony, one batch card shows both machine
+entries, vendor, product, region and recurring sat/month cost, plus monthly and annual totals.
+It states that each machine is bound alone in its own session, and explains billing from
+creation until destruction or abandonment, including unfinished setups. Only the operator can
+stop vendor billing; tau-web never pays for a machine. One button approves exactly that card.
+Approval and both allocation identities commit as one record before the act returns. The
+allocation core's own seed-backup and restored-seed checks apply to approval and answers.
+Answering checks issuance read-only and consumes no further index. Refusal journals nothing.
+Failed appends apply neither entries nor indices and latch the store. A landed move that
+reports failure replays as approved, with both indices consumed.
+
+The page then asks each machine's class with nothing preselected. The three explicit button
+acts are Yes, No, only me and people I know, and Not sure. Yes and Not sure journal
+`multi_tenant`; No journals `single_purpose`. No control is checked, selected, autofocused or
+an implicit form default, and no draft survives lock or reload. Each entry's access model is
+journaled as `maintained`, with profile `ad-hoc` and the revision read from compiled
+`TENANT_PROFILES` (3 at this pin). The two stricter request refusals are documented under
+Dispatch as implementation readings. Neither dispatch requests, typed requests nor unknown or
+malformed page messages can supply questions, answers or access models. Only the dedicated
+operator class-answer message supplies a shipped answer; no request, typed request or page
+message supplies question wording or an access model. The access type represents `sealed` so
+replay and boundary tests can reject it; no production act emits it. Replay and the independent
+reader retain the recorded unsigned profile revision that fits in `u32` for maintained ad-hoc
+access rather than comparing it to the compiled revision (ADR-0030). Inspection and the page
+show that recorded revision. Sealed access, another profile, missing or extra access members,
+and a revision above `4294967295` or of any other JSON type are refused.
+
+`src/dispatch/setup.rs` exports
+`Dispatch::check_binding(&self, entry: &str) -> Result<(), BindingRefusal>`.
+Its distinct refusals are `NoEntry`, `ClassMissing` and `AccessMissing`; both recorded facts
+admit the entry, also after reopen. This builds no binding act, session, create, payment or
+delivery declaration. Those wait for twr-ggw.11, twr-ggw.14, twr-ggw.21 and twr-ggw.15.
+
+**Implementation readings.** The compiled two-entry setup (`fixture`, `fixture-other`), its
+vendor/product/region labels and 1000/2000 sat per month prices are fixture data, not a vendor's
+price, until a real source exists. Approving in the served build consumes real machine-family
+indices in the operator's store; they are never reused. The question wording is also a
+compile-time fixture until twr-ggw.34 supplies the bundle's wording; no page message changes it.
+The approved-entry refusal precedes binding; binding will narrow it to the session's bound set
+in twr-ggw.11. Access is checked at binding as an implementation reading of ARC-44's installation
+boundary. One answer per entry is an implementation reading; tightening waits for twr-ggw.15.
+The one-approval-per-store reading and remaining in-memory associations are described under
+Dispatch above.
+
+The same-origin limit also applies to these acts: the harness cannot distinguish an operator's
+click from an identical message posted by another same-origin script. Page messages have exact
+members; unknown fields or values are refused or ignored with no journal entry.
+
 ### The tracer
 
 `scripts/tracer.sh` builds both directories, then runs `tracer/`. That is a host binary, never
@@ -1011,7 +1118,7 @@ For the local store, the tracer works the page as an operator would and inspects
 browser holds:
 
 - **The page.** It types each passphrase into the page's fields and presses the page's buttons.
-  Stores created through the page complete seed backup through the page. The seed-record
+  Stores created through the page complete seed backup and approve the fixture setup through the page before dispatch. The seed-record
   reader and write-free unlock checks run before completion.
 - **The messages.** It records every message between each page and its harness workers, from
   before the first, with a script it installs over the DevTools protocol before the page's own
@@ -1054,8 +1161,8 @@ browser holds:
 - **The replayed state.** It reads it in the worker's own context, through the module's
   `store_state`, which returns whether the store is locked, record numbers, calls and their
   states, job identities, terminal and job evidence, findings, disposition reports and standing
-  continuations, with command
-  bytes as hex and no key material.
+  continuations, approved setup entries and their facts/cost/index/class/access, with command
+  bytes as hex and no seed identifier or key material.
 - **The stores' contents.** It reads them with an independent reader, `tracer/src/reader.rs`.
   The reader is written from the format's text and never calls the harness's store code. It
   runs on `ring`'s PBKDF2, AES-256-GCM and SHA-256, and derives the seed's keys with the
@@ -1064,13 +1171,17 @@ browser holds:
 In headless Chromium 154 a new tab hides the one before it, which then restarts its worker, as
 page hide must. The cases account for it.
 
-The full run has 90 cases.
+The full run has 98 cases.
 
 The cases:
 
 | Case | What the fixtures show |
 |---|---|
-| the served build loads | its worker comes up and nothing errs, and the page has no `tauWeb` global and no global holding the worker. With no store, the page offers Create alone, and a request is refused before any contact. A store is created and refuses dispatch for seed backup without contact or append; after explicit skip, called in its worker on the machine the tracer build pins, it refuses for the missing pin, the relay accepts no connection and the sshd sees none, and nothing is appended |
+| the served build loads | its worker comes up and nothing errs, and the page has no `tauWeb` global and no global holding the worker. With no store, the page offers Create alone, and a request is refused before any contact. A store is created and refuses dispatch for seed backup without contact or append; after explicit skip an unapproved command refuses as no-entry; after approval through the card, called in its worker on the machine the tracer build pins, it refuses for the missing pin, the relay accepts no connection and the sshd sees none, and nothing is appended |
+| setup batch card and indices, each build | all entries and approved costs, totals and recurring statement precede the click; no approval/reservation before it; unapproved command refuses before contact; one approval records both indices and exactly the rendered offer |
+| setup class questions, each build | no checked, selected, autofocus, focus or keyboard default before answering or after reload; Not sure is multi-tenant and No is single-purpose in the independent reader; maintained access with ad-hoc revision; second answer refuses |
+| setup non-operator inputs, each build | extra dispatch/collection members and malformed page messages change no journal or store state, supply no question or answer and seal nothing |
+| setup ceremony refusal, each build | locked and ceremony-active approval attempts append nothing |
 | create and unlock (twr-ggw.5, `CNF-82`) | the page offers Create, stating the 16-character minimum and a password manager, and refuses 15 characters. The independent reader reads the store the browser created, from the passphrase alone: record 0, the seed. A store the reader built, put into OPFS, unlocks in the browser and replays its command, and the unlock writes nothing: WebCrypto's PBKDF2 agrees with the host's |
 | seed-backup create and mismatch, each build | twelve numbered words match the independent reader; dispatch contacts neither fixture; answering leaves the same complete document and field values as an independent seed; another valid mnemonic restores display without an append; tracer allocation refuses in all families |
 | seed-backup collision controls, four per build | fixed-text words and adjacent phrases cause no false finding; seed-independent answering, lock, re-display and wrong-passphrase documents agree; twelve planted hidden word elements and a hidden reserved claim alongside displayed words are reported; cross-word language collisions cause no finding; mismatch and durable full re-entry work |
@@ -1079,7 +1190,7 @@ The cases:
 | seed-backup creation-finishing unlock, each build | an envelope with no record gains record 0 and displays exactly its mnemonic |
 | seed-backup interruption, twelve cases per build | display and answering each meet explicit lock, visibility hidden, pagehide, bfcache restore, close and renderer crash; words and input disappear and next unlock still owes the same record |
 | seed-backup re-display, each build | fresh passphrase is required; wrong passphrase shows no word; answering removes words; tracer relay and SSH connections end before display, held waits end, no stopped request resumes and the cut-off call stays unresolved |
-| 1. recorded, then sent (`CNF-30`, `ARC-8`) | exactly one relay connection; the sshd received exactly the wrapper recomposed from the journal entry, and its job record holds exactly the journal command; the replayed state holds approved intent 2 and job terminal 3 (exit status 7), and the output and exit status came back. With the append made to fail, the sshd received no `exec`, read only once that SSH connection has ended at the sshd |
+| 1. recorded, then sent (`CNF-30`, `ARC-8`) | exactly one relay connection; the sshd received exactly the wrapper recomposed from the journal entry, and its job record holds exactly the journal command; the replayed state holds the command intent after the setup approval and its following job terminal (exit status 7), and the output and exit status came back. With the append made to fail, the sshd received no `exec`, read only once that SSH connection has ended at the sshd |
 | a failed append is not applied (twr-ggw.5 AC2, `STA-3`) | that failed append failed at its `move()`, a real OPFS call; the replayed state has no record for it, and none appears after a reload and an unlock |
 | 2. a wrong host key halts (`CNF-21`, `SEC-11`) | no authentication attempt, no `exec`, no journal entry, and exactly one connection |
 | 3. no pin, no contact (`CNF-23`'s no-pin case, `CHN-R4`) | no TCP connection accepted at the relay, none at the sshd, no dial, and nothing pinned afterwards |
@@ -1275,12 +1386,12 @@ rest of `CNF-88` has no code here yet.
 | `spec-checks` | `spec/bundle/cors-probe.sh` | `CNF-4` |
 | | `spec/prototypes/spec-checks/check-install-disks.py`, and `--baseline`, which must fail | evidence for `CNF-85` |
 | `build` (the job is `CNF-1`) | `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings` | `CNF-2`, at that strictness |
-| | `cargo test --locked` | runs `build.rs`, so the gates above run here, and the `[session]` fixtures (`CNF-88`'s build fixtures); the relay matrix, `CNF-87`'s fixture half; the seed's tests, `CNF-83`'s derivation tests and `CNF-13`'s tests; the local store's, `CNF-82`'s and `CNF-15`'s host half (below); dispatch and journal recovery for `CNF-29`'s box-plane case, including the unresolved-command hold before contact and at append, identical bytes and reads, no writes on refusal, replay, every holding call and other-machine independence, `CNF-30`, `CNF-39` and `STA-24` dispositions; job classification, channel deliveries, unresolved evidence, append failures, replay and all four dispositions, plus real-shell signals, high exit codes, missing and unreadable record files, NUL-corrupted scalars, exact scalar forms, the reader and replay exit ceiling, incomplete unreadable entries, owned-child cleanup, recycled PIDs, stale fixture groups, exact sentinel matching, drop, duplicate-id, boot, output and cross-store identity tests for `CNF-40`'s dropped command not re-run, waiting on its job record, `CNF-54`–`CNF-56` and `CNF-110`'s collection case; and allocation's, `CNF-72`'s tests and the companion comparison against the allocation witness file (ADR-0032), with `CNF-3`'s three breaks as its unit tests; typed fixture operations through the adapter's send path at every append kill boundary and a suspended record/send boundary, the resource barrier across both planes, all requester provenances through production command admission/append, disposition reach/end/replacement, exact collectable calls and committed job evidence in the 20-row matrix, unsupported typed-record replay refusals, and the dispatch companion's production-path stage1 comparison and complete vocabulary negative controls |
+| | `cargo test --locked` | runs `build.rs`, so the gates above run here, and the `[session]` fixtures (`CNF-88`'s build fixtures); the relay matrix, `CNF-87`'s fixture half; the seed's tests, `CNF-83`'s derivation tests and `CNF-13`'s tests; the local store's, `CNF-82`'s and `CNF-15`'s host half (below); dispatch and journal recovery for `CNF-29`'s box-plane case, including the unresolved-command hold before contact and at append, identical bytes and reads, no writes on refusal, replay, every holding call and other-machine independence, `CNF-30`, `CNF-39` and `STA-24` dispositions; job classification, channel deliveries, unresolved evidence, append failures, replay and all four dispositions, plus real-shell signals, high exit codes, missing and unreadable record files, NUL-corrupted scalars, exact scalar forms, the reader and replay exit ceiling, incomplete unreadable entries, owned-child cleanup, recycled PIDs, stale fixture groups, exact sentinel matching, drop, duplicate-id, boot, output and cross-store identity tests for `CNF-40`'s dropped command not re-run, waiting on its job record, `CNF-54`–`CNF-56` and `CNF-110`'s collection case; and allocation's, `CNF-72`'s tests and the companion comparison against the allocation witness file (ADR-0032), with `CNF-3`'s three breaks as its unit tests; atomic setup approval and indices, ceremony gates, unanswered classes, maintained access/profile, binding prerequisites, provenance resolution and replay; typed fixture operations through the adapter's send path at every append kill boundary and a suspended record/send boundary, the resource barrier across both planes, all requester provenances through production command admission/append, disposition reach/end/replacement, exact collectable calls and committed job evidence in the 20-row matrix, unsupported typed-record replay refusals, and the dispatch companion's production-path stage1 comparison and complete vocabulary negative controls |
 | `web` (the job is `CNF-1` for the browser build) | `cargo clippy -D warnings` on wasm32, the served and the tracer build | `CNF-2`, on the new target |
 | | `scripts/check-adr-0024.sh` | spec ADR-0024's build check |
 | | `scripts/build-web.sh served`, then `tracer check-absence dist/served` | the served build (`ARC-32`) carries no test key, pin source or test switch |
 | | `tracer check-csp dist/served` | `ARC-33`'s policy, exactly |
-| | `scripts/tracer.sh`, in headless Chrome | `CNF-30`, `CNF-21`, `CNF-23`'s no-pin case and `ARC-33`, as above, the relay refusals of `CNF-87` a correct client meets, and the local store's `CNF-82` and `CNF-15` in the browser; seed-backup display, hiding, full re-entry/skip, interruptions, re-display and custody in both builds (`CNF-44`, `CNF-82`), and integrated allocation refusals, completions and failed OPFS appends (`CNF-72`); `CNF-40`'s dropped command not re-run, waiting on its job record, `CNF-54`–`CNF-56`, `STA-20a` and `CNF-110`'s box-plane collection case; unresolved-command hold, concurrent admission and shared results, stopped waits with the writer free, unreachable answers and destructive replacement; typed reset confirmation and every continuation on the real pinned connection; these browser cases supply the pinned SSH attempt evidence, which has no host form |
+| | `scripts/tracer.sh`, in headless Chrome | `CNF-30`, `CNF-21`, `CNF-23`'s no-pin case and `ARC-33`, as above, the relay refusals of `CNF-87` a correct client meets, and the local store's `CNF-82` and `CNF-15` in the browser; seed-backup display, hiding, full re-entry/skip, interruptions, re-display and custody in both builds (`CNF-44`, `CNF-82`), and integrated allocation refusals, completions and failed OPFS appends (`CNF-72`); `CNF-40`'s dropped command not re-run, waiting on its job record, `CNF-54`–`CNF-56`, `STA-20a` and `CNF-110`'s box-plane collection case; unresolved-command hold, concurrent admission and shared results, stopped waits with the writer free, unreachable answers and destructive replacement; typed reset confirmation and every continuation on the real pinned connection; setup batch costs and indices, unanswered class controls, Not sure and No, maintained access and non-operator boundaries in both builds; these browser cases supply the pinned SSH attempt evidence, which has no host form |
 
 Every job checks out the submodule; `spec-checks` takes the full history, which
 `check-install-disks.py --baseline` reads to reconstruct the pre-fix brief. `web` installs
@@ -1355,3 +1466,7 @@ For focused seed-backup checks, set `TAU_TRACER_SEED_CASE` to `create`, `mismatc
 `failed-append` or `all`. These selectors are test-only; unset both tracer selectors for the
 full gate. `test_allocate` and `test_seed_backup_fail_append` exist only under `tracer` and
 are included in `check-absence`.
+
+For focused setup checks, set `TAU_TRACER_SETUP_CASE=all`. The `existing` value runs the existing
+dispatch/job cases without seed-display-dependent custody controls. The full gate leaves
+`TAU_TRACER_SETUP_CASE`, `TAU_TRACER_SEED_CASE` and `TAU_TRACER_HOLD_CASE` unset and runs all 98 cases.

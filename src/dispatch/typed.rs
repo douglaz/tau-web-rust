@@ -162,17 +162,18 @@ pub enum RequestRefusal {
 }
 
 impl Dispatch {
-    /// Associations are supplied by the harness, independently of each request. Their
-    /// persistence belongs to the approved-entry allocation work.
+    /// In-memory harness knowledge for an already approved entry: a vendor machine id learned
+    /// at create, or a further index reserved for another create attempt. twr-ggw.21 will
+    /// journal these; until then the harness supplies them again after reopen.
     pub fn associate(&mut self, association: Association) -> Result<(), String> {
-        if association.target == Target::Inference {
-            return Err("inference cannot be associated with a machine entry".into());
+        if !matches!(
+            association.target,
+            Target::AllocationIndex(_) | Target::VendorMachine(_)
+        ) {
+            return Err("only allocation indices and vendor ids can be associated".into());
         }
-        // `resolve` reads an entry target as that entry, so any other mapping would never apply.
-        if let Target::Entry(entry) = &association.target
-            && entry != &association.entry
-        {
-            return Err("an entry target names only its own entry".into());
+        if !self.approved_entries.contains_key(&association.entry) {
+            return Err("association names no approved entry".into());
         }
         if let Some(old) = self
             .associations
@@ -185,9 +186,6 @@ impl Dispatch {
                 Err("target already associated".into())
             };
         }
-        self.current_installations
-            .entry(association.entry.clone())
-            .or_default();
         self.associations.push(association);
         Ok(())
     }
@@ -196,9 +194,8 @@ impl Dispatch {
         if target == &Target::Inference {
             Some(Resource::Inference)
         } else if let Target::Entry(entry) = target {
-            self.associations
-                .iter()
-                .any(|a| &a.entry == entry)
+            self.approved_entries
+                .contains_key(entry)
                 .then(|| Resource::Entry(entry.clone()))
         } else {
             self.associations
@@ -262,6 +259,22 @@ impl Dispatch {
         let resource = self
             .resolve(&request.target)
             .ok_or(RequestRefusal::Unmapped)?;
+        if request.facts.arguments.iter().any(|(key, value)| {
+            [
+                "class",
+                "answer",
+                "access_model",
+                "setup",
+                "entries",
+                "question",
+                "goal",
+                "proposal",
+            ]
+            .contains(&key.as_str())
+                || value == "sealed"
+        }) {
+            return Err(RequestRefusal::Facts);
+        }
         let expected = OperationApproval {
             resource: resource.clone(),
             target: request.target.clone(),

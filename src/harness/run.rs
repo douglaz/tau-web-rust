@@ -50,6 +50,8 @@ pub struct Done {
 pub enum Refusal {
     /// No pin for the machine: refused before the relay is contacted (`CHN-R4`, `CNF-23`).
     NoPin,
+    NoEntry(String),
+    Provenance,
     /// No SSH client key or relay key to use: refused before the relay is contacted.
     NoCredentials,
     /// The relay refused the AUTH (`WIR-7`, paid-tcp-relay `844e834`) with this reason and close
@@ -91,6 +93,8 @@ impl Refusal {
                 "bytes": bytes,
                 "limit": jobs::MAX_LAUNCH_BYTES,
             }),
+            Refusal::NoEntry(machine) => json!({"refused":"no-entry","machine":machine}),
+            Refusal::Provenance => json!({"refused":"provenance"}),
             Refusal::NoPin => json!({ "refused": "no-pin" }),
             Refusal::NoCredentials => json!({ "refused": "no-credentials" }),
             Refusal::Relay { reason, close_code } => {
@@ -137,6 +141,8 @@ pub fn report(outcome: &Result<Done, Refusal>) -> Value {
 
 fn append_refusal(refusal: AppendRefusal) -> Refusal {
     match refusal {
+        AppendRefusal::Policy(DispatchRefusal::NoEntry { machine }) => Refusal::NoEntry(machine),
+        AppendRefusal::Policy(DispatchRefusal::Provenance) => Refusal::Provenance,
         AppendRefusal::Storage(why) => Refusal::Journal(why),
         AppendRefusal::Policy(DispatchRefusal::Disposition(record)) => Refusal::Disposition(record),
         AppendRefusal::Policy(DispatchRefusal::TypedBarrier { calls }) => Refusal::Barrier(calls),

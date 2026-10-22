@@ -25,6 +25,7 @@ mod machine;
 mod matrix;
 mod reader;
 mod seed_cases;
+mod setup_cases;
 mod typed_cases;
 
 use base64::Engine;
@@ -799,6 +800,13 @@ async fn run_cases(
             "test_relay_key": "with-pass",
         })
     };
+    let served_args = |machine: &str| {
+        let mut request = args(machine);
+        for key in ["fail_append", "tamper_auth", "test_relay_key"] {
+            request.as_object_mut().unwrap().remove(key);
+        }
+        request
+    };
     let locked = json!({ "outcome": { "refused": "locked" } });
 
     // The served build loads, and its harness worker runs a request on what it has stored.
@@ -840,13 +848,17 @@ async fn run_cases(
             && view["lock"] == false,
     );
     take(seen);
-    let report = run.harness_run(&served_worker, args("fixture")).await?;
+    let report = run
+        .harness_run(&served_worker, served_args("fixture"))
+        .await?;
     let observed = take(seen);
     case.check(
         "with no unlocked store, the served harness refuses before any contact (STA-23)",
         report == locked && observed.relay_accepted == 0 && observed.ssh_connections == 0,
     );
-    let report = run.harness_collect(&served_worker, args("fixture")).await?;
+    let report = run
+        .harness_collect(&served_worker, served_args("fixture"))
+        .await?;
     let observed = take(seen);
     case.check(
         "collection also refuses while locked before contact",
@@ -857,7 +869,9 @@ async fn run_cases(
         "a store is created in the served build, and the page offers Lock",
         view["store"] == "unlocked" && view["lock"] == true,
     );
-    let report = run.harness_run(&served_worker, args("fixture")).await?;
+    let report = run
+        .harness_run(&served_worker, served_args("fixture"))
+        .await?;
     let observed = take(seen);
     case.check(
         "owed seed-backup ceremony refuses before contact or append",
@@ -867,7 +881,22 @@ async fn run_cases(
             && run.inspect(&served_worker).await?["records"] == json!([0]),
     );
     seed_cases::skip(run, &served_tab).await?;
-    let report = run.harness_run(&served_worker, args("fixture")).await?;
+    let before_approval = run.inspect(&served_worker).await?;
+    let report = run
+        .harness_run(&served_worker, served_args("fixture"))
+        .await?;
+    let observed = take(seen);
+    case.check(
+        "served command before approval names no entry before contact or append",
+        report["outcome"] == json!({"refused":"no-entry","machine":"fixture"})
+            && observed.relay_accepted == 0
+            && observed.ssh_connections == 0
+            && run.inspect(&served_worker).await? == before_approval,
+    );
+    setup_cases::approve(run, &served_tab, &served_worker).await?;
+    let report = run
+        .harness_run(&served_worker, served_args("fixture"))
+        .await?;
     let observed = take(seen);
     show(&observed);
     case.check(
@@ -879,17 +908,19 @@ async fn run_cases(
         observed.relay_accepted == 0 && observed.ssh_connections == 0,
     );
     case.check(
-        "nothing was appended: the store holds only the seed and seed-backup records",
-        run.inspect(&served_worker).await?["records"] == json!([0, 1]),
+        "nothing was appended after the seed, completion and setup approval",
+        run.inspect(&served_worker).await?["records"] == json!([0, 1, 2]),
     );
-    let report = run.harness_collect(&served_worker, args("fixture")).await?;
+    let report = run
+        .harness_collect(&served_worker, served_args("fixture"))
+        .await?;
     let observed = take(seen);
     case.check(
         "served collection refuses the missing pin before contact or append",
         report == json!({"outcome":{"refused":"no-pin"}})
             && observed.relay_accepted == 0
             && observed.ssh_connections == 0
-            && run.inspect(&served_worker).await?["records"] == json!([0, 1]),
+            && run.inspect(&served_worker).await?["records"] == json!([0, 1, 2]),
     );
     cases.push(case);
 
@@ -936,7 +967,7 @@ async fn run_cases(
     case.check(
         "the worker's replayed state is record 0 alone",
         run.inspect(&worker).await?
-            == json!({ "state": "unlocked", "seed_backup_owed": true, "seed_backup_completion": null, "seed_backup_stage": "showing_words", "locked": false, "records": [0], "commands": [], "calls": [], "terminals": [], "dispositions": [], "standing": {}, "jobs": [], "typed_calls": [], "observations": [], "current_installations": {} }),
+            == json!({ "state": "unlocked", "seed_backup_owed": true, "seed_backup_completion": null, "seed_backup_stage": "showing_words", "locked": false, "records": [0], "commands": [], "calls": [], "terminals": [], "dispositions": [], "standing": {}, "jobs": [], "typed_calls": [], "observations": [], "current_installations": {}, "setup": [], "setup_offer": tau_web::dispatch::fixture_setup() }),
     );
     let host = reader::build(
         HOST_PASSPHRASE,
@@ -973,7 +1004,9 @@ async fn run_cases(
     // Keep the independent-reader and write-free unlock checks above before any completion.
     seed_cases::skip(run, &tab).await?;
     let completed = store_files(&run.dump(&tab).await?);
-    if std::env::var_os("TAU_TRACER_HOLD_CASE").is_none() {
+    if std::env::var_os("TAU_TRACER_HOLD_CASE").is_none()
+        && std::env::var_os("TAU_TRACER_SETUP_CASE").is_none()
+    {
         seed_cases::run(run, &mut tab, &mut worker, PASSPHRASE, true, &args, cases).await?;
         seed_cases::run(
             run,
@@ -981,7 +1014,7 @@ async fn run_cases(
             &mut served_worker,
             SERVED_PASSPHRASE,
             false,
-            &args,
+            &served_args,
             cases,
         )
         .await?;
@@ -1000,6 +1033,35 @@ async fn run_cases(
         worker = run.reload(&tab, &worker).await?;
         run.submit(&tab, "unlock", PASSPHRASE).await?;
     }
+    if std::env::var_os("TAU_TRACER_HOLD_CASE").is_none()
+        && std::env::var_os("TAU_TRACER_SEED_CASE").is_none()
+        && std::env::var("TAU_TRACER_SETUP_CASE").as_deref() != Ok("existing")
+    {
+        setup_cases::run(run, &mut tab, &mut worker, PASSPHRASE, true, &args, cases).await?;
+        setup_cases::run(
+            run,
+            &mut served_tab,
+            &mut served_worker,
+            SERVED_PASSPHRASE,
+            false,
+            &served_args,
+            cases,
+        )
+        .await?;
+        browser
+            .call(
+                None,
+                "Target.activateTarget",
+                json!({"targetId":tab.target}),
+            )
+            .await?;
+        worker = run.worker(&tab, None, false).await?;
+        if std::env::var_os("TAU_TRACER_SETUP_CASE").is_some() {
+            return Ok(());
+        }
+        run.submit(&tab, "unlock", PASSPHRASE).await?;
+    }
+    setup_cases::approve(run, &tab, &worker).await?;
     // A focused fixture run for reproducible unresolved-command mutation checks.
     if std::env::var_os("TAU_TRACER_HOLD_CASE").is_some() {
         hold_cases::run(run, &tab, worker, &args, cases).await?;
@@ -1095,6 +1157,17 @@ async fn run_cases(
 
     // Case 3 (AC3): no pin, no contact.
     let mut case = Case::new("3. a machine with no pin is refused before any contact (AC3)");
+    let prior_no_pin = store_files(&run.dump(&tab).await?);
+    let mnemonic = reader::read(&prior_no_pin, PASSPHRASE)?.mnemonic()?;
+    let mut no_pin_events = vec![json!({"seed":{"mnemonic":mnemonic}})];
+    no_pin_events.extend(reader::setup_events(
+        &mnemonic,
+        &["fixture", "fixture-other", "unpinned"],
+    ));
+    run.put(&tab, &reader::build(PASSPHRASE, &no_pin_events))
+        .await?;
+    worker = run.reload(&tab, &worker).await?;
+    run.submit(&tab, "unlock", PASSPHRASE).await?;
     take(seen);
     let report = run.harness_run(&worker, args("unpinned")).await?;
     let observed = take(seen);
@@ -1123,6 +1196,9 @@ async fn run_cases(
         "nothing was journaled",
         report["journal_entries"] == json!([]),
     );
+    run.put(&tab, &prior_no_pin).await?;
+    worker = run.reload(&tab, &worker).await?;
+    run.submit(&tab, "unlock", PASSPHRASE).await?;
     cases.push(case);
 
     let mut case = Case::new("oversized launch refuses before intent and contact (twr-ggw.71)");
@@ -1231,8 +1307,8 @@ async fn run_cases(
         &journal
             .records
             .iter()
-            .find(|(n, _)| *n == 2)
-            .ok_or("missing intent 1")?
+            .find(|(n, _)| *n == 3)
+            .ok_or("missing intent 3")?
             .1,
     )
     .map_err(|e| e.to_string())?;
@@ -1294,17 +1370,17 @@ async fn run_cases(
     );
     let replayed = run.inspect(&worker).await?;
     case.check(
-        "the store's replayed state holds it as record 2",
-        replayed["records"] == json!([0, 1, 2, 3])
+        "the store's replayed state holds it as record 3 after approval",
+        replayed["records"] == json!([0, 1, 2, 3, 4])
             && replayed["commands"]
-                == json!([{ "number": 2, "machine": "fixture", "command": hex::encode(COMMAND) }])
-            && outcome["seq"] == 2
-            && outcome["terminal"] == 3
+                == json!([{ "number": 3, "machine": "fixture", "command": hex::encode(COMMAND) }])
+            && outcome["seq"] == 3
+            && outcome["terminal"] == 4
             && replayed["calls"][0]["approval"]["harness_pin"]["machine"] == "fixture"
             && replayed["calls"][0]["approval"]["harness_pin"]["fingerprint"] == pinned.as_str()
             && replayed["calls"][0]["state"] == "finished"
             && replayed["terminals"]
-                == json!([{ "number": 3, "call": 2, "exit_status": EXIT_STATUS }]),
+                == json!([{ "number": 4, "call": 3, "exit_status": EXIT_STATUS }]),
     );
     case.check(
         "the output and exit status came back",
@@ -1378,7 +1454,7 @@ async fn run_cases(
     );
     case.check(
         "the replayed state has no record for it",
-        after_failure == before_failure && after_failure["records"] == json!([0, 1, 2, 3]),
+        after_failure == before_failure && after_failure["records"] == json!([0, 1, 2, 3, 4]),
     );
     worker = run.reload(&tab, &worker).await?;
     run.submit(&tab, "unlock", PASSPHRASE).await?;
@@ -2070,6 +2146,9 @@ async fn run_cases(
 
     worker = typed_cases::run(run, &tab, worker, &args, cases).await?;
     job_cases::run(run, &tab, worker, &args, cases).await?;
+    if std::env::var("TAU_TRACER_SETUP_CASE").as_deref() == Ok("existing") {
+        return Ok(());
+    }
     // twr-ggw.5 AC4, AC5: no plaintext secret in any storage, message, request or log, in both builds.
     run.collect(&tab).await?;
     run.collect(&served_tab).await?;

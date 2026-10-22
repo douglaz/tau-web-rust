@@ -979,6 +979,14 @@ mod tests {
             )
             .await
             .unwrap();
+            store
+                .seed_backup(tau_web::allocation::Completion::Skipped)
+                .await
+                .unwrap();
+            store
+                .approve_setup(tau_web::dispatch::fixture_setup())
+                .await
+                .unwrap();
             let call = store
                 .append(
                     &Entry {
@@ -993,7 +1001,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(call, 1);
+            assert_eq!(call, 3);
             let id = store.intent(call).await.unwrap().job.unwrap();
             let (child, _guard) =
                 start(&machine, &jobs::launch(&id, "fixture", command.as_bytes()));

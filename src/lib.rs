@@ -124,6 +124,21 @@ mod worker {
             .to_string()
     }
 
+    #[wasm_bindgen]
+    pub async fn setup_approve() -> String {
+        local().lock().await.setup_approve().await.to_string()
+    }
+
+    #[wasm_bindgen]
+    pub async fn setup_answer(request: String) -> String {
+        local()
+            .lock()
+            .await
+            .setup_answer(&request)
+            .await
+            .to_string()
+    }
+
     /// Exercise the real store allocator without adding a served consumer.
     #[cfg(feature = "tracer")]
     #[wasm_bindgen]
@@ -298,6 +313,9 @@ mod worker {
         use crate::harness::Target;
         let request: serde_json::Value = serde_json::from_str(&request)
             .map_err(|e| wasm_bindgen::JsValue::from_str(&format!("request: {e}")))?;
+        if !crate::harness::valid_request(&request) {
+            return Ok(serde_json::json!({"outcome":{"refused":"request"}}).to_string());
+        }
         let text = |name: &str| request[name].as_str().unwrap_or_default().to_string();
         let target = Target {
             machine: text("machine"),
@@ -372,8 +390,9 @@ mod worker {
         }
     }
 
-    /// The served build's sources: no pin or key is stored yet (twr-ggw.11), so every machine is
-    /// refused at the pin lookup, before any contact and any append (`CHN-R4`).
+    /// The served build's sources: no pin or key is stored yet (twr-ggw.11). An unapproved
+    /// machine is refused at the journal check; an approved entry reaches the pin lookup and
+    /// is refused there, before any contact and any append (`CHN-R4`).
     #[cfg(not(feature = "tracer"))]
     struct NothingStored;
 
