@@ -85,6 +85,7 @@ pub(super) async fn drop_command(
         return Err("dropped SSH connection remained".into());
     }
     run.submit(tab, "unlock", PASSPHRASE).await?;
+    binding_cases::prepare(run, tab, &new, PASSPHRASE).await?;
     Ok((new, call, id))
 }
 
@@ -104,6 +105,7 @@ pub(super) async fn run(
     cases: &mut Vec<Case>,
 ) -> Result<Worker, String> {
     run.submit(tab, "unlock", PASSPHRASE).await?;
+    binding_cases::prepare(run, tab, &worker, PASSPHRASE).await?;
     // Explicit-lock, visibility/pagehide and renderer-crash jobs from earlier cases cannot
     // hold a later collection open. Reboot keeps their records and proves their old boot ended.
     run.sshd.machine.reboot();
@@ -436,7 +438,7 @@ pub(super) async fn run(
     let after = run.inspect(&worker).await?;
     case.check(
         "finding and terminal survive reload and unlock",
-        after == before
+        after == binding_cases::replayed(&before)
             && after["jobs"]
                 .as_array()
                 .unwrap()
@@ -449,6 +451,7 @@ pub(super) async fn run(
     );
     cases.push(case);
 
+    binding_cases::prepare(run, tab, &worker, PASSPHRASE).await?;
     let mut case = Case::new("collection under each standing disposition preserves it (CNF-110)");
     for continuation in [
         "destructive_reinstall",
@@ -476,6 +479,7 @@ pub(super) async fn run(
         run.put(tab, &reader::build(PASSPHRASE, &events)).await?;
         worker = run.reload(tab, &worker).await?;
         run.submit(tab, "unlock", PASSPHRASE).await?;
+        binding_cases::prepare(run, tab, &worker, PASSPHRASE).await?;
         let before = run.inspect(&worker).await?;
         let destructive = matches!(continuation, "destructive_reinstall" | "abandonment");
         for phase in 0..2 {
@@ -513,6 +517,7 @@ pub(super) async fn run(
         run.put(tab, &original).await?;
         worker = run.reload(tab, &worker).await?;
         run.submit(tab, "unlock", PASSPHRASE).await?;
+        binding_cases::prepare(run, tab, &worker, PASSPHRASE).await?;
     }
     cases.push(case);
     let mut case = Case::new("live signal reports ended evidence without a terminal");
@@ -628,5 +633,6 @@ pub(super) async fn restore_older_journal(
     run.put(tab, &reader::build(PASSPHRASE, &events)).await?;
     let worker = run.reload(tab, &worker).await?;
     run.submit(tab, "unlock", PASSPHRASE).await?;
+    binding_cases::prepare(run, tab, &worker, PASSPHRASE).await?;
     Ok(worker)
 }

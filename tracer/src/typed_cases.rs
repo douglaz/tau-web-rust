@@ -17,6 +17,7 @@ async fn restore(
     run.put(tab, &reader::build(PASSPHRASE, events)).await?;
     let worker = run.reload(tab, &worker).await?;
     run.submit(tab, "unlock", PASSPHRASE).await?;
+    binding_cases::prepare(run, tab, &worker, PASSPHRASE).await?;
     Ok(worker)
 }
 

@@ -22,6 +22,7 @@ async fn restore(
     run.put(tab, files).await?;
     let worker = run.reload(tab, &worker).await?;
     run.submit(tab, "unlock", PASSPHRASE).await?;
+    binding_cases::prepare(run, tab, &worker, PASSPHRASE).await?;
     Ok(worker)
 }
 
@@ -389,6 +390,7 @@ pub(super) async fn run(
             // A storage error latches dispatch off until the worker reopens the journal.
             worker = run.reload(tab, &worker).await?;
             run.submit(tab, "unlock", PASSPHRASE).await?;
+            binding_cases::prepare(run, tab, &worker, PASSPHRASE).await?;
         }
         take(run.seen);
         fresh_pace(run.relay);

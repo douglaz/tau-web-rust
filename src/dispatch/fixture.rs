@@ -16,8 +16,12 @@ impl Vendor {
     pub async fn run<S: Storage>(
         &mut self,
         store: &mut Store<S>,
+        caller: Option<&str>,
         request: &Request,
     ) -> Result<u64, OperationError> {
+        store
+            .check_bound_operation(caller, request)
+            .map_err(OperationError::Policy)?;
         store
             .check_operation(request)
             .map_err(OperationError::Policy)?;
@@ -34,17 +38,21 @@ impl Vendor {
     pub async fn status<S: Storage>(
         &mut self,
         store: &mut Store<S>,
+        caller: Option<&str>,
         request: &Request,
         operation: Operation,
         reports: Reports,
     ) -> Result<Vec<u64>, OperationError> {
+        store
+            .check_bound_operation(caller, request)
+            .map_err(OperationError::Policy)?;
         let resource = store
             .dispatch()
             .check_request(request)
             .map_err(OperationError::Policy)?;
         assert_eq!(request.operation, Operation::Read);
         let observation = store.dispatch().observation(resource, operation, reports);
-        self.run(store, request).await?;
+        self.run(store, caller, request).await?;
         store
             .operation_observation(observation)
             .await

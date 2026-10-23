@@ -80,8 +80,8 @@ fn batch_indices_precede_any_create_and_match_the_card() {
     let request = crate::dispatch::typed_tests::request(Operation::Create);
     let before = store.storage.files();
     assert_eq!(
-        block_on(vendor.run(&mut store, &request)),
-        Err(OperationError::Policy(RequestRefusal::Unmapped))
+        block_on(vendor.run(&mut store, None, &request)),
+        Err(OperationError::Policy(RequestRefusal::BoundSet))
     );
     assert!(vendor.received.is_empty());
     assert_eq!(store.storage.files(), before);
@@ -118,7 +118,12 @@ fn batch_indices_precede_any_create_and_match_the_card() {
             .map(|a| a.identity.clone())
             .collect::<Vec<_>>()
     );
-    let call = block_on(vendor.run(&mut store, &request)).unwrap();
+    block_on(store.answer_class("fixture".into(), ClassAnswer::No)).unwrap();
+    let caller = block_on(store.bind("fixture")).unwrap();
+    let mut request = request;
+    request.session = caller.clone();
+    request.approved.as_mut().unwrap().session = caller.clone();
+    let call = block_on(vendor.run(&mut store, Some(&caller), &request)).unwrap();
     let records = events(&store);
     assert_eq!(
         records[2]["setup"]["approval"],
@@ -129,8 +134,8 @@ fn batch_indices_precede_any_create_and_match_the_card() {
             .iter()
             .all(|e| e.get("setup").is_none() && e.pointer("/allocation/reserve").is_none())
     );
-    assert_eq!(call, 3);
-    assert!(records[3].get("operation_intent").is_some());
+    assert_eq!(call, 5);
+    assert!(records[5].get("operation_intent").is_some());
     assert_eq!(store.allocation().next_unused().machines, 2);
 }
 

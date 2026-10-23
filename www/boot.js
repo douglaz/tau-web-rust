@@ -116,6 +116,19 @@ const renderSetup = (store) => {
     }
     const access = machine.access;
     if (access) paragraph(section, `Access model: ${access.model}; profile ${access.profile}, revision ${access.revision}.`);
+    const session = (store.sessions ?? []).find(s => s.bound_set.includes(machine.entry.machine));
+    if (session) paragraph(section, `Session ${session.identity}: bound set ${session.bound_set.join(', ')}.`);
+    else if (machine.class !== null && access) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.dataset.bind = machine.entry.machine;
+      button.textContent = `Bind ${machine.entry.machine}`;
+      button.addEventListener('click', () => {
+        button.disabled = true;
+        worker.postMessage({ bind: { machine: machine.entry.machine } });
+      });
+      section.append(button);
+    }
     slot.append(section);
   }
 };

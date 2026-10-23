@@ -34,6 +34,9 @@
 //! `MemoryStorage`; the browser's storage and KDF are `opfs` (wasm32 only).
 
 use crate::allocation::{self, Family, Identity, Metadata};
+use crate::binding::{
+    AdmissionRefusal, BoundMachine, ConnectionRefusal, Exposure, Reason, Session,
+};
 use crate::credential::{DataKey, LocalPassphrase, WrappingKey};
 use crate::dispatch::{Approval, Dispatch, Disposition, DispositionReport, Intent, Terminal};
 use crate::harness::{AppendRefusal, Entry, Journal};
@@ -45,6 +48,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::rc::Rc;
 use zeroize::{Zeroize, Zeroizing};
 
 #[cfg(target_arch = "wasm32")]
@@ -183,6 +187,8 @@ pub(crate) enum Event {
     /// effect (`STA-22b`), with its seed identifier and derivation version (`STA-22a`).
     Allocation(allocation::Event),
     Setup(crate::dispatch::SetupRecord),
+    Exposure(Exposure),
+    ConnectionRefusal(ConnectionRefusal),
 }
 
 impl Drop for Event {
@@ -319,6 +325,9 @@ pub struct Store<S> {
     allocation: Option<Metadata>,
     commands: Vec<(u64, Entry)>,
     dispatch: Dispatch,
+    sessions: Vec<Rc<Session>>,
+    exposure_ledger: Vec<Exposure>,
+    connection_refusals: Vec<ConnectionRefusal>,
     /// Set by a failed append, whose move may have landed: no append follows in this worker.
     failed: Option<String>,
 }
@@ -440,6 +449,9 @@ impl<S: Storage> Store<S> {
             allocation: None,
             commands: Vec::new(),
             dispatch: Dispatch::default(),
+            sessions: Vec::new(),
+            exposure_ledger: Vec::new(),
+            connection_refusals: Vec::new(),
             failed: None,
         }
     }
@@ -581,6 +593,171 @@ impl<S: Storage> Store<S> {
         self.commit(&Event::Setup(record)).await?;
         self.dispatch = dispatch;
         self.allocation = Some(allocation);
+        Ok(())
+    }
+
+    /// Binding allocates nothing. The key uses the approved entry's journaled identity.
+    pub async fn bind(&mut self, machine: &str) -> Result<String, String> {
+        self.dispatch
+            .check_binding(machine)
+            .map_err(|e| format!("{e:?}"))?;
+        if self
+            .sessions
+            .iter()
+            .any(|s| s.bound_set.iter().any(|m| m == machine))
+        {
+            return Err("already bound".into());
+        }
+        let identity = self.dispatch.approved_entries[machine]
+            .approved
+            .identity
+            .clone();
+        if identity.seed != self.allocation().seed()
+            || !self
+                .allocation()
+                .entries()
+                .iter()
+                .any(|e| e.identity == identity)
+        {
+            return Err("binding identity is not listed under the current seed".into());
+        }
+        let key = self
+            .seed()
+            .expect("seed first")
+            .ssh_client_key(identity.derivation_version, identity.index)
+            .map_err(|_| "client key derivation refused")?;
+        let session = format!("session-{}", self.next);
+        let exposure = Exposure {
+            session: session.clone(),
+            bound_set: vec![BoundMachine {
+                machine: machine.into(),
+                identity,
+            }],
+        };
+        self.commit(&Event::Exposure(exposure.clone())).await?;
+        self.exposure_ledger.push(exposure);
+        self.sessions
+            .push(Rc::new(Session::new(session.clone(), machine.into(), key)));
+        Ok(session)
+    }
+
+    pub fn sessions(&self) -> Vec<Value> {
+        self.sessions.iter().map(|s| s.inspect()).collect()
+    }
+
+    pub fn exposure_ledger(&self) -> &[Exposure] {
+        &self.exposure_ledger
+    }
+
+    pub fn connection_refusals(&self) -> &[ConnectionRefusal] {
+        &self.connection_refusals
+    }
+
+    /// Host-testable connection admission, before holds, pin lookup or contact.
+    pub async fn connection_session(
+        &mut self,
+        machine: &str,
+    ) -> Result<Rc<Session>, AdmissionRefusal> {
+        if !self.dispatch.approved_entries.contains_key(machine) {
+            return Err(AdmissionRefusal::NoEntry);
+        }
+        if let Some(session) = self
+            .sessions
+            .iter()
+            .find(|s| s.bound_set.iter().any(|m| m == machine))
+        {
+            return Ok(Rc::clone(session));
+        }
+        let refusal = ConnectionRefusal {
+            machine: machine.into(),
+            reason: Reason::Unbound,
+        };
+        self.commit(&Event::ConnectionRefusal(refusal.clone()))
+            .await
+            .map_err(AdmissionRefusal::Journal)?;
+        self.connection_refusals.push(refusal);
+        Err(AdmissionRefusal::Unbound)
+    }
+
+    /// The harness derives this per attempt; no session receives the relay key.
+    pub fn relay_key(&self) -> Option<crate::credential::RelayKey> {
+        let identity = &self
+            .allocation()
+            .entries()
+            .iter()
+            .find(|e| {
+                e.identity.family == Family::Passes
+                    && e.identity.seed == self.allocation().seed()
+                    && matches!(
+                        e.status,
+                        allocation::Status::Reserved | allocation::Status::Created
+                    )
+            })?
+            .identity;
+        self.seed()?
+            .relay_key(identity.derivation_version, identity.index)
+            .ok()
+    }
+
+    /// Adapter admission uses the harness's caller, before composing or comparing an approval.
+    pub fn check_bound_operation(
+        &self,
+        caller: Option<&str>,
+        request: &crate::dispatch::Request,
+    ) -> Result<(), crate::dispatch::RequestRefusal> {
+        use crate::dispatch::{RequestRefusal, Requester, Resource};
+        if request.requester != Requester::Session {
+            return if caller.is_none() {
+                Ok(())
+            } else {
+                Err(RequestRefusal::BoundSet)
+            };
+        }
+        let session = self
+            .sessions
+            .iter()
+            .find(|s| Some(s.identity.as_str()) == caller)
+            .ok_or(RequestRefusal::BoundSet)?;
+        if request.session != session.identity {
+            return Err(RequestRefusal::BoundSet);
+        }
+        let resource = self
+            .dispatch
+            .resolve(&request.target)
+            .ok_or(RequestRefusal::Unmapped)?;
+        match resource {
+            Resource::Entry(machine) if session.bound_set.contains(&machine) => Ok(()),
+            _ => Err(RequestRefusal::BoundSet),
+        }
+    }
+
+    fn replay_exposure(&mut self, number: u64, exposure: &Exposure) -> Result<(), String> {
+        if exposure.session != format!("session-{number}") || exposure.bound_set.len() != 1 {
+            return Err("invalid exposure ledger entry".into());
+        }
+        for bound in &exposure.bound_set {
+            let approved = self
+                .dispatch
+                .approved_entries
+                .get(&bound.machine)
+                .ok_or("exposure names no approved entry")?;
+            if bound.identity != approved.approved.identity {
+                return Err("exposure identity differs from approved entry".into());
+            }
+            if bound.identity.seed != self.allocation().seed()
+                || !self
+                    .allocation()
+                    .entries()
+                    .iter()
+                    .any(|e| e.identity == bound.identity)
+            {
+                return Err("exposure identity is not listed under the current seed".into());
+            }
+            self.dispatch
+                .check_binding(&bound.machine)
+                .map_err(|_| "exposure lacks binding prerequisites")?;
+        }
+        self.exposure_ledger.push(exposure.clone());
         Ok(())
     }
 
@@ -750,6 +927,22 @@ impl<S: Storage> Store<S> {
                     self.seed = Some(seed);
                 }
                 (FIRST, _) => return Err("the first record is not the seed; replay stopped".into()),
+                (_, Event::Exposure(exposure)) => {
+                    self.replay_exposure(number, exposure)
+                        .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
+                }
+                (_, Event::ConnectionRefusal(refusal)) => {
+                    if !self
+                        .dispatch
+                        .approved_entries
+                        .contains_key(&refusal.machine)
+                    {
+                        return Err(format!(
+                            "record {number}: refusal names no approved entry; replay stopped"
+                        ));
+                    }
+                    self.connection_refusals.push(refusal.clone());
+                }
                 (_, Event::Setup(record)) => {
                     self.dispatch
                         .apply_setup(self.allocation.as_mut().expect("seed first"), record)
@@ -882,9 +1075,35 @@ impl<S: Storage> Store<S> {
                 )
                 .map_err(|_| "authentication failed".to_string())?,
         );
-        // The parser's message would quote the plaintext, and the reason reaches the page.
-        serde_json::from_slice(&plaintext)
-            .map_err(|_| "its event is not one this version reads".to_string())
+        // Parser errors must never quote decrypted plaintext. Parse directly into Event so
+        // duplicate members are rejected and mnemonic buffers retain Event's zeroization.
+        let event: Event = serde_json::from_slice(&plaintext)
+            .map_err(|_| "its event is not one this version reads".to_string())?;
+        if matches!(event, Event::Exposure(_) | Event::ConnectionRefusal(_)) {
+            let value: Value = serde_json::from_slice(&plaintext)
+                .map_err(|_| "invalid binding record shape".to_string())?;
+            if let Some(exposure) = value.get("exposure") {
+                let objects = exposure.is_object()
+                    && exposure
+                        .get("bound_set")
+                        .and_then(Value::as_array)
+                        .is_some_and(|set| {
+                            set.iter().all(|b| {
+                                b.is_object() && b.get("identity").is_some_and(Value::is_object)
+                            })
+                        });
+                if !objects {
+                    return Err("invalid exposure ledger shape".into());
+                }
+            }
+            if value
+                .get("connection_refusal")
+                .is_some_and(|body| !body.is_object())
+            {
+                return Err("invalid connection refusal shape".into());
+            }
+        }
+        Ok(event)
     }
 
     /// Encrypts `event` as the record numbered `next` and commits it: written whole under the
@@ -1235,6 +1454,28 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
         self.report(result.as_ref().err().map(String::as_str))
     }
 
+    pub async fn bind(&mut self, request: &str) -> Value {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Bind {
+            machine: String,
+        }
+        if let Some(reason) = self.dispatch_refusal() {
+            return self.report(Some(reason));
+        }
+        let Ok(value) = serde_json::from_str::<Value>(request) else {
+            return self.report(Some("invalid binding"));
+        };
+        if !value.is_object() {
+            return self.report(Some("invalid binding"));
+        }
+        let Ok(bind) = serde_json::from_str::<Bind>(request) else {
+            return self.report(Some("invalid binding"));
+        };
+        let result = self.store().expect("unlocked").bind(&bind.machine).await;
+        self.report(result.as_ref().err().map(String::as_str))
+    }
+
     /// The unlocked store, if any.
     pub fn store(&mut self) -> Option<&mut Store<S>> {
         match &mut self.state {
@@ -1256,6 +1497,9 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
                 "seed_backup_completion": store.allocation().seed_backup(),
                 "seed_backup_stage": self.seed_backup,
                 "setup": store.dispatch.setup_view(),
+                "sessions": store.sessions(),
+                "exposure_ledger": store.exposure_ledger().iter().map(|e| json!({"session":e.session,"bound_set":e.bound_set.iter().map(|b| json!({"machine":b.machine,"family":b.identity.family,"index":b.identity.index})).collect::<Vec<_>>()})).collect::<Vec<_>>(),
+                "connection_refusals": store.connection_refusals(),
                 "setup_offer": if store.dispatch.approved_entries.is_empty() { serde_json::to_value(crate::dispatch::fixture_setup()).expect("fixture serializes") } else { Value::Null },
             }),
             State::Refused(why) => json!({ "state": "refused", "reason": why }),
@@ -4072,3 +4316,15 @@ mod tests {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod setup_tests;
+
+impl<S: Storage> crate::harness::BoundJournal for Store<S> {
+    async fn connection_session(&mut self, machine: &str) -> Result<Rc<Session>, AdmissionRefusal> {
+        Store::connection_session(self, machine).await
+    }
+    async fn relay_key(&self) -> Option<crate::credential::RelayKey> {
+        Store::relay_key(self)
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod binding_tests;

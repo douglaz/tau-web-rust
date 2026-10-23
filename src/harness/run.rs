@@ -1,8 +1,8 @@
 //! The attempt itself, on the browser's WebSocket: wasm32 only.
 
 use super::wait;
-use super::{AppendRefusal, Entry, Journal, PinSource};
-use crate::credential::{RelayKey, SshClientKey};
+use super::{AppendRefusal, BoundJournal, Entry, PinSource};
+use crate::binding::{AdmissionRefusal, Session};
 use crate::dispatch::{Approval, CommandHold, DestructiveDisposition, DispatchRefusal};
 use crate::jobs::{self, Evidence, Record};
 use futures_util::{SinkExt, StreamExt};
@@ -25,13 +25,6 @@ pub struct Target {
     pub user: String,
 }
 
-/// Where the credentials an attempt uses come from: the SSH client key and the relay key. They
-/// stay inside the module; nothing here returns them.
-pub trait Credentials {
-    fn ssh_key(&self) -> Option<&SshClientKey>;
-    fn relay_key(&self) -> Option<&RelayKey>;
-}
-
 /// What a completed command returns, including the journal read-back it was reconciled with.
 pub struct Done {
     pub seq: u64,
@@ -51,6 +44,7 @@ pub enum Refusal {
     /// No pin for the machine: refused before the relay is contacted (`CHN-R4`, `CNF-23`).
     NoPin,
     NoEntry(String),
+    Unbound(String),
     Provenance,
     /// No SSH client key or relay key to use: refused before the relay is contacted.
     NoCredentials,
@@ -93,6 +87,7 @@ impl Refusal {
                 "bytes": bytes,
                 "limit": jobs::MAX_LAUNCH_BYTES,
             }),
+            Refusal::Unbound(machine) => json!({"refused":"unbound","machine":machine}),
             Refusal::NoEntry(machine) => json!({"refused":"no-entry","machine":machine}),
             Refusal::Provenance => json!({"refused":"provenance"}),
             Refusal::NoPin => json!({ "refused": "no-pin" }),
@@ -188,17 +183,17 @@ impl client::Handler for PinCheck {
 /// way to send a wrongly signed AUTH; it exists only in the tracer build.
 pub async fn run_command(
     pins: &impl PinSource,
-    journal: &mut impl Journal,
-    credentials: &impl Credentials,
+    journal: &mut impl BoundJournal,
     target: &Target,
     command: &[u8],
     #[cfg(feature = "tracer")] tamper_auth: bool,
 ) -> Result<Done, Refusal> {
+    let session = resolve(journal, &target.machine).await?;
     if let Err(refusal) = journal.check(&target.machine).await {
         return Err(admission_refusal(
             pins,
             journal,
-            credentials,
+            &session,
             target,
             refusal,
             #[cfg(feature = "tracer")]
@@ -212,7 +207,8 @@ pub async fn run_command(
     }
     let (ssh, pinned, host_key) = connect(
         pins,
-        credentials,
+        journal,
+        &session,
         target,
         #[cfg(feature = "tracer")]
         tamper_auth,
@@ -228,7 +224,7 @@ pub async fn run_command(
     let entry = Entry {
         provenance: Some(crate::dispatch::CommandProvenance {
             target: crate::dispatch::Target::Entry(target.machine.clone()),
-            session: None,
+            session: Some(session.identity.clone()),
             requester: crate::dispatch::Requester::Session,
         }),
         machine: target.machine.clone(),
@@ -247,7 +243,7 @@ pub async fn run_command(
             return Err(admission_refusal(
                 pins,
                 journal,
-                credentials,
+                &session,
                 target,
                 refusal,
                 #[cfg(feature = "tracer")]
@@ -352,8 +348,8 @@ pub async fn run_command(
 /// Admission's hold collects only its snapshot of holding calls; it never resumes dispatch.
 async fn admission_refusal(
     pins: &impl PinSource,
-    journal: &mut impl Journal,
-    credentials: &impl Credentials,
+    journal: &mut impl BoundJournal,
+    session: &Session,
     target: &Target,
     refusal: AppendRefusal,
     #[cfg(feature = "tracer")] tamper_auth: bool,
@@ -365,7 +361,7 @@ async fn admission_refusal(
         held(
             pins,
             journal,
-            credentials,
+            session,
             target,
             hold,
             #[cfg(feature = "tracer")]
@@ -377,8 +373,8 @@ async fn admission_refusal(
 
 async fn held(
     pins: &impl PinSource,
-    journal: &mut impl Journal,
-    credentials: &impl Credentials,
+    journal: &mut impl BoundJournal,
+    session: &Session,
     target: &Target,
     hold: CommandHold,
     #[cfg(feature = "tracer")] tamper_auth: bool,
@@ -420,7 +416,8 @@ async fn held(
             match stop
                 .until(connect(
                     pins,
-                    credentials,
+                    journal,
+                    session,
                     target,
                     #[cfg(feature = "tracer")]
                     tamper_auth,
@@ -502,11 +499,11 @@ async fn held(
 /// Calls whose own dispatch awaits its record are reported as not read here.
 pub async fn collect_jobs(
     pins: &impl PinSource,
-    journal: &mut impl Journal,
-    credentials: &impl Credentials,
+    journal: &mut impl BoundJournal,
     target: &Target,
     #[cfg(feature = "tracer")] tamper_auth: bool,
 ) -> Result<Vec<Value>, Refusal> {
+    let session = resolve(journal, &target.machine).await?;
     let calls = journal
         .collectable(&target.machine)
         .await
@@ -530,7 +527,8 @@ pub async fn collect_jobs(
     }
     let (ssh, _, _) = connect(
         pins,
-        credentials,
+        journal,
+        &session,
         target,
         #[cfg(feature = "tracer")]
         tamper_auth,
@@ -603,13 +601,20 @@ async fn exec_record(
 
 async fn connect(
     pins: &impl PinSource,
-    credentials: &impl Credentials,
+    journal: &impl BoundJournal,
+    session: &Session,
     target: &Target,
     #[cfg(feature = "tracer")] tamper_auth: bool,
 ) -> Result<(client::Handle<PinCheck>, String, String), Refusal> {
     // CHN-R4: with no pin there is nothing to check a key against, so nothing is contacted.
     let pinned = pins.pin(&target.machine).ok_or(Refusal::NoPin)?.0;
-    let (Some(ssh_key), Some(relay_key)) = (credentials.ssh_key(), credentials.relay_key()) else {
+    if !journal.credentials_available() {
+        return Err(Refusal::NoCredentials);
+    }
+    let (Some(ssh_key), Some(relay_key)) = (
+        session.client_key(&target.machine),
+        journal.relay_key().await,
+    ) else {
         return Err(Refusal::NoCredentials);
     };
     // Role 0's child secret is an RFC 8032 Ed25519 seed (credential format v1).
@@ -724,4 +729,18 @@ async fn text_frame(ws: &mut WsStream) -> Result<Value, String> {
         Some(WsMessage::Binary(_)) => Err("a binary frame during the handshake".into()),
         None => Err("the relay closed the connection".into()),
     }
+}
+
+async fn resolve(
+    journal: &mut impl BoundJournal,
+    machine: &str,
+) -> Result<std::rc::Rc<Session>, Refusal> {
+    journal
+        .connection_session(machine)
+        .await
+        .map_err(|refusal| match refusal {
+            AdmissionRefusal::NoEntry => Refusal::NoEntry(machine.into()),
+            AdmissionRefusal::Unbound => Refusal::Unbound(machine.into()),
+            AdmissionRefusal::Journal(why) => Refusal::Journal(why),
+        })
 }

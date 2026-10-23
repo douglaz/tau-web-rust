@@ -60,6 +60,43 @@ fn reopen(storage: &MemoryStorage, extra_index: u32) -> Store<MemoryStorage> {
     store
 }
 
+fn bind_entries(store: &mut Store<MemoryStorage>) {
+    for machine in ["fixture", "other"] {
+        if store.dispatch().approved_entries[machine].class.is_none() {
+            block_on(store.answer_class(machine.into(), ClassAnswer::No)).unwrap();
+        }
+        block_on(store.bind(machine)).unwrap();
+    }
+}
+
+fn bound_fresh() -> (MemoryStorage, Store<MemoryStorage>, u32) {
+    let (storage, mut store, extra) = fresh();
+    bind_entries(&mut store);
+    (storage, store, extra)
+}
+
+fn bound_reopen(storage: &MemoryStorage, extra: u32) -> Store<MemoryStorage> {
+    let mut store = reopen(storage, extra);
+    bind_entries(&mut store);
+    store
+}
+
+fn bound_request(store: &Store<MemoryStorage>, operation: Operation, machine: &str) -> Request {
+    let caller = store
+        .sessions()
+        .into_iter()
+        .find(|s| s["bound_set"][0] == machine)
+        .expect("fixture has a live binding")["identity"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut request = request(operation);
+    request.target = Target::Entry(machine.into());
+    request.session = caller;
+    approve(&mut request, Resource::Entry(machine.into()));
+    request
+}
+
 pub(crate) fn request(operation: Operation) -> Request {
     let facts = Facts {
         arguments: BTreeMap::from([("size".into(), "small".into())]),
@@ -141,16 +178,17 @@ const CHOICES: [Continuation; 4] = [
 
 #[test]
 fn typed_record_before_send_survives_every_kill_boundary() {
-    let (storage, _, extra_index) = fresh();
+    let (storage, _, extra_index) = bound_fresh();
     let files = storage.files();
     for at in 1..=4 {
         let storage = MemoryStorage::with_files(files.clone());
-        let mut store = reopen(&storage, extra_index);
+        let mut store = bound_reopen(&storage, extra_index);
         // Reopen's storage is a new worker; fault the exact storage it owns.
         let active = store.storage().clone();
         active.fault(Fault::Die(at));
         let mut vendor = fixture::Vendor::default();
-        let result = block_on(vendor.run(&mut store, &request(Operation::Create)));
+        let request = bound_request(&store, Operation::Create, "fixture");
+        let result = block_on(vendor.run(&mut store, Some(&request.session), &request));
         if at != 4 {
             assert!(
                 matches!(result, Err(OperationError::Storage(_))),
@@ -159,16 +197,13 @@ fn typed_record_before_send_survives_every_kill_boundary() {
         }
         assert_eq!(result.is_ok(), at == 4);
         drop(store);
-        let replayed = reopen(&active, extra_index);
-        assert_eq!(replayed.records(), 0..if at == 4 { 5 } else { 4 });
+        let replayed = bound_reopen(&active, extra_index);
+        assert_eq!(replayed.records(), 0..if at == 4 { 13 } else { 12 });
         assert_eq!(replayed.dispatch().typed_calls.len(), usize::from(at == 4));
         if at == 4 {
-            let recorded = &replayed.dispatch().typed_calls[&4];
+            let recorded = &replayed.dispatch().typed_calls[&10];
             assert_eq!(recorded.state, CallState::Unresolved);
-            assert_eq!(
-                recorded.intent.approved,
-                request(Operation::Create).approved.unwrap()
-            );
+            assert_eq!(recorded.intent.approved, request.approved.unwrap());
             assert_eq!(
                 vendor.received.as_slice(),
                 std::slice::from_ref(&recorded.intent)
@@ -181,16 +216,16 @@ fn typed_record_before_send_survives_every_kill_boundary() {
         }
     }
     // Kill the actual request future at the record/send boundary after a successful append.
-    let (_, mut store, extra_index) = fresh();
+    let (_, mut store, extra_index) = bound_fresh();
     let active = store.storage().clone();
     let mut vendor = fixture::Vendor {
         pause_before_send: true,
         ..Default::default()
     };
-    let request = request(Operation::Create);
+    let request = bound_request(&store, Operation::Create, "fixture");
     {
         use std::future::Future;
-        let mut run = std::pin::pin!(vendor.run(&mut store, &request));
+        let mut run = std::pin::pin!(vendor.run(&mut store, Some(&request.session), &request));
         assert!(
             run.as_mut()
                 .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
@@ -198,13 +233,13 @@ fn typed_record_before_send_survives_every_kill_boundary() {
         );
     }
     drop(store);
-    let replayed = reopen(&active, extra_index);
+    let replayed = bound_reopen(&active, extra_index);
     assert_eq!(
-        replayed.dispatch().typed_calls[&4].state,
+        replayed.dispatch().typed_calls[&8].state,
         CallState::Unresolved
     );
     assert_eq!(
-        replayed.dispatch().typed_calls[&4].intent.approved,
+        replayed.dispatch().typed_calls[&8].intent.approved,
         request.approved.unwrap()
     );
     assert!(
@@ -215,15 +250,17 @@ fn typed_record_before_send_survives_every_kill_boundary() {
 
 #[test]
 fn lost_create_new_call_session_route_and_index_are_refused_after_replay() {
-    let (storage, mut store, extra_index) = fresh();
+    let (storage, mut store, extra_index) = bound_fresh();
     let mut vendor = fixture::Vendor::default();
     assert_eq!(fixture::Vendor::RETRY_SAFETY, "reconcile-before-retry");
-    let call = block_on(vendor.run(&mut store, &request(Operation::Create))).unwrap();
+    let active_request = bound_request(&store, Operation::Create, "fixture");
+    let call =
+        block_on(vendor.run(&mut store, Some(&active_request.session), &active_request)).unwrap();
     assert_eq!(
         vendor.received[0],
         store.dispatch().typed_calls[&call].intent
     );
-    for store in [&mut store, &mut reopen(&storage, extra_index)] {
+    for store in [&mut store, &mut bound_reopen(&storage, extra_index)] {
         assert_eq!(
             store.dispatch().typed_calls[&call].state,
             CallState::Unresolved
@@ -258,10 +295,10 @@ fn lost_create_new_call_session_route_and_index_are_refused_after_replay() {
             before,
             "every refusal journals nothing"
         );
-        let mut other = request(Operation::Create);
+        let mut other = bound_request(store, Operation::Create, "other");
         other.target = Target::Entry("other".into());
         approve(&mut other, Resource::Entry("other".into()));
-        assert!(block_on(vendor.run(store, &other)).is_ok());
+        assert!(block_on(vendor.run(store, Some(&other.session), &other)).is_ok());
     }
     // Every actual requester route above shares this check.
 }
@@ -284,28 +321,30 @@ fn an_entry_target_associates_only_with_its_own_entry() {
 
 #[test]
 fn approved_facts_are_required_and_are_exactly_what_the_fixture_receives() {
-    let (_, mut store, _) = fresh();
+    let (_, mut store, _) = bound_fresh();
     let mut vendor = fixture::Vendor::default();
     let before = store.storage().files();
-    let mut changed = request(Operation::Create);
+    let mut changed = bound_request(&store, Operation::Create, "fixture");
     changed.facts.cost_bound += 1;
     assert_eq!(
-        block_on(vendor.run(&mut store, &changed)),
+        block_on(vendor.run(&mut store, Some(&changed.session), &changed)),
         Err(OperationError::Policy(RequestRefusal::Facts))
     );
     changed.approved = None;
     assert_eq!(
-        block_on(vendor.run(&mut store, &changed)),
+        block_on(vendor.run(&mut store, Some(&changed.session), &changed)),
         Err(OperationError::Policy(RequestRefusal::Facts))
     );
     changed.target = Target::AllocationIndex(999);
     assert_eq!(
-        block_on(vendor.run(&mut store, &changed)),
+        block_on(vendor.run(&mut store, Some(&changed.session), &changed)),
         Err(OperationError::Policy(RequestRefusal::Unmapped))
     );
     assert_eq!(store.storage().files(), before);
     assert!(vendor.received.is_empty());
-    let call = block_on(vendor.run(&mut store, &request(Operation::Create))).unwrap();
+    let active_request = bound_request(&store, Operation::Create, "fixture");
+    let call =
+        block_on(vendor.run(&mut store, Some(&active_request.session), &active_request)).unwrap();
     assert_eq!(
         vendor.received[0],
         store.dispatch().typed_calls[&call].intent
@@ -316,13 +355,17 @@ fn approved_facts_are_required_and_are_exactly_what_the_fixture_receives() {
 #[test]
 fn status_reads_pass_and_failed_observation_append_keeps_barrier() {
     for operation in [Operation::Create, Operation::Reset, Operation::Reinstall] {
-        let (_, mut store, extra_index) = fresh();
+        let (_, mut store, extra_index) = bound_fresh();
         let mut vendor = fixture::Vendor::default();
-        let call = block_on(vendor.run(&mut store, &request(operation))).unwrap();
+        let active_request = bound_request(&store, operation, "fixture");
+        let call = block_on(vendor.run(&mut store, Some(&active_request.session), &active_request))
+            .unwrap();
         assert!(store.check_operation(&request(Operation::Read)).is_ok());
+        let read = bound_request(&store, Operation::Read, "fixture");
         block_on(vendor.status(
             &mut store,
-            &request(Operation::Read),
+            Some(&read.session),
+            &read,
             operation,
             Reports::Ended,
         ))
@@ -333,7 +376,8 @@ fn status_reads_pass_and_failed_observation_append_keeps_barrier() {
         );
         let snapshot = store.storage().files();
         for (fault, landed) in [(Fault::Fail(3), false), (Fault::LandThenFail(3), true)] {
-            let mut worker = reopen(&MemoryStorage::with_files(snapshot.clone()), extra_index);
+            let mut worker =
+                bound_reopen(&MemoryStorage::with_files(snapshot.clone()), extra_index);
             let storage = worker.storage().clone();
             let read = worker.dispatch().observation(
                 Resource::Entry("fixture".into()),
@@ -362,7 +406,7 @@ fn status_reads_pass_and_failed_observation_append_keeps_barrier() {
                 ))),
                 "failed-append latch"
             );
-            let replayed = reopen(&storage, extra_index);
+            let replayed = bound_reopen(&storage, extra_index);
             assert_eq!(
                 replayed.dispatch().typed_calls[&call].state == CallState::Unresolved,
                 !landed
@@ -409,14 +453,14 @@ fn disposition_matrix_reads_and_commands_in_core_store_and_replay() {
         Operation::Exec,
     ] {
         for continuation in CHOICES {
-            let (storage, mut store, extra_index) = fresh();
+            let (storage, mut store, extra_index) = bound_fresh();
             let call = if operation == Operation::Exec {
                 block_on(store.append(&command(), &pin())).unwrap()
             } else {
                 block_on(store.operation(&request(operation))).unwrap().call
             };
             block_on(store.dispose(choice(&[call], continuation))).unwrap();
-            for store in [&mut store, &mut reopen(&storage, extra_index)] {
+            for store in [&mut store, &mut bound_reopen(&storage, extra_index)] {
                 let standing = store.dispatch().standing["fixture"].clone();
                 command_refused(
                     store,
@@ -432,7 +476,7 @@ fn disposition_matrix_reads_and_commands_in_core_store_and_replay() {
                     Requester::Operator,
                     Requester::HarnessFlow,
                 ] {
-                    let mut worker = reopen(store.storage(), extra_index);
+                    let mut worker = bound_reopen(store.storage(), extra_index);
                     let mut entry = command();
                     entry.provenance = Some(CommandProvenance {
                         target: Target::AllocationIndex(0),
@@ -463,9 +507,11 @@ fn disposition_matrix_reads_and_commands_in_core_store_and_replay() {
                     }
                 }
                 let mut vendor = fixture::Vendor::default();
+                let read = bound_request(store, Operation::Read, "fixture");
                 block_on(vendor.status(
                     store,
-                    &request(Operation::Read),
+                    Some(&read.session),
+                    &read,
                     operation,
                     Reports::Unknown,
                 ))
@@ -522,7 +568,7 @@ fn disposition_matrix_reads_and_commands_in_core_store_and_replay() {
                 );
                 // The pinned SSH attempt is exercised by the browser cases.
                 if !continuation.destructive() {
-                    let mut command_worker = reopen(store.storage(), extra_index);
+                    let mut command_worker = bound_reopen(store.storage(), extra_index);
                     assert!(
                         block_on(command_worker.append(&command(), &pin())).is_ok(),
                         "continuing choice dispatches a new command"
@@ -649,9 +695,11 @@ fn continuation_reach_permissions_and_durable_end() {
 
 #[test]
 fn replacements_drop_calls_permanently_and_later_evidence_keeps_unknown_outcome() {
-    let (_, mut store, extra_index) = fresh();
+    let (_, mut store, extra_index) = bound_fresh();
     let mut vendor = fixture::Vendor::default();
-    let create = block_on(vendor.run(&mut store, &request(Operation::Create))).unwrap();
+    let active_request = bound_request(&store, Operation::Create, "fixture");
+    let create =
+        block_on(vendor.run(&mut store, Some(&active_request.session), &active_request)).unwrap();
     let exec = block_on(store.append(&command(), &pin())).unwrap();
     let first =
         block_on(store.dispose(choice(&[create, exec], Continuation::DestructiveReinstall)))
@@ -673,7 +721,7 @@ fn replacements_drop_calls_permanently_and_later_evidence_keeps_unknown_outcome(
             .unwrap()
             .is_empty()
     );
-    let mut replayed = reopen(store.storage(), extra_index);
+    let mut replayed = bound_reopen(store.storage(), extra_index);
     for store in [&mut store, &mut replayed] {
         let before = store.storage().files();
         let refusal = block_on(store.dispose(choice(&[create], Continuation::AsIfDone))).unwrap();
@@ -708,9 +756,11 @@ fn replacements_drop_calls_permanently_and_later_evidence_keeps_unknown_outcome(
 
 #[test]
 fn partial_disposition_keeps_abandonment_flow_barred_until_every_call_is_disposed() {
-    let (_, mut store, extra_index) = fresh();
+    let (_, mut store, extra_index) = bound_fresh();
     let mut vendor = fixture::Vendor::default();
-    let create = block_on(vendor.run(&mut store, &request(Operation::Create))).unwrap();
+    let active_request = bound_request(&store, Operation::Create, "fixture");
+    let create =
+        block_on(vendor.run(&mut store, Some(&active_request.session), &active_request)).unwrap();
     let exec = block_on(store.append(&command(), &pin())).unwrap();
     block_on(store.dispose(choice(&[create], Continuation::Abandonment))).unwrap();
     let mut destroy = request(Operation::Destroy);
@@ -731,7 +781,7 @@ fn partial_disposition_keeps_abandonment_flow_barred_until_every_call_is_dispose
         })
     );
     let intent = block_on(store.operation(&destroy)).unwrap();
-    for store in [&store, &reopen(store.storage(), extra_index)] {
+    for store in [&store, &bound_reopen(store.storage(), extra_index)] {
         assert!(!store.dispatch().standing.contains_key("fixture"));
         assert_eq!(
             store.check_operation(&request(Operation::Destroy)),
@@ -744,12 +794,14 @@ fn partial_disposition_keeps_abandonment_flow_barred_until_every_call_is_dispose
 
 #[test]
 fn a_session_approval_cannot_stand_for_the_abandonment_flow() {
-    let (_, mut store, _) = fresh();
+    let (_, mut store, _) = bound_fresh();
     let mut vendor = fixture::Vendor::default();
-    let create = block_on(vendor.run(&mut store, &request(Operation::Create))).unwrap();
+    let active_request = bound_request(&store, Operation::Create, "fixture");
+    let create =
+        block_on(vendor.run(&mut store, Some(&active_request.session), &active_request)).unwrap();
     block_on(store.dispose(choice(&[create], Continuation::Abandonment))).unwrap();
     let before = store.storage().files();
-    let mut relabelled = request(Operation::Destroy);
+    let mut relabelled = bound_request(&store, Operation::Destroy, "fixture");
     relabelled.requester = Requester::HarnessFlow;
     assert_eq!(
         store.check_operation(&relabelled),
@@ -886,22 +938,26 @@ fn typed_disposition_naming_refusals_and_invalid_replayed_replacements_are_repor
 
 #[test]
 fn later_confirming_fixture_evidence_is_journaled_without_removing_the_standing_choice() {
-    let (_, mut store, extra_index) = fresh();
+    let (_, mut store, extra_index) = bound_fresh();
     let mut vendor = fixture::Vendor::default();
-    let call = block_on(vendor.run(&mut store, &request(Operation::Reset))).unwrap();
+    let active_request = bound_request(&store, Operation::Reset, "fixture");
+    let call =
+        block_on(vendor.run(&mut store, Some(&active_request.session), &active_request)).unwrap();
     block_on(store.dispose(choice(&[call], Continuation::Abandonment))).unwrap();
     let standing = store.dispatch().standing["fixture"].clone();
+    let read = bound_request(&store, Operation::Read, "fixture");
     assert!(
         block_on(vendor.status(
             &mut store,
-            &request(Operation::Read),
+            Some(&read.session),
+            &read,
             Operation::Reset,
             Reports::Confirmed
         ))
         .unwrap()
         .is_empty()
     );
-    for store in [&store, &reopen(store.storage(), extra_index)] {
+    for store in [&store, &bound_reopen(store.storage(), extra_index)] {
         assert_eq!(store.dispatch().standing["fixture"], standing);
         assert_eq!(
             store.dispatch().observations[0].observation.reports,
