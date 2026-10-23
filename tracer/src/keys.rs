@@ -1,10 +1,7 @@
-//! The fixture sshd's host keys, which never enter a wasm build, and the public halves of the
-//! harness's test keys (`tau_web::testonly`), which the fixtures authorize and the absence check
-//! looks for.
+//! Fixture host keys and public-key encodings, never included in a wasm build.
 
 use russh::keys::ssh_key::private::{Ed25519Keypair, KeypairData};
 use russh::keys::{HashAlg, PrivateKey};
-use tau_web::testonly::SSH_CLIENT_SEED;
 
 /// The host key the pin source pins for the machine `fixture`.
 pub const HOST_KEY_PINNED: [u8; 32] = [
@@ -30,11 +27,6 @@ pub fn fingerprint(seed: &[u8; 32]) -> String {
         .to_string()
 }
 
-/// The test SSH client key's public half, raw.
-pub fn ssh_client_public() -> [u8; 32] {
-    Ed25519Keypair::from_seed(&SSH_CLIENT_SEED).public.0
-}
-
 /// A relay key's public half: the x-only key an AUTH's `pubkey` carries.
 pub fn relay_public(secret: &[u8; 32]) -> [u8; 32] {
     k256::schnorr::SigningKey::from_bytes(secret)
@@ -57,12 +49,5 @@ mod tests {
             &[("fixture-other", pin.as_str()), ("fixture", pin.as_str())]
         );
         assert_ne!(fingerprint(&HOST_KEY_PINNED), fingerprint(&HOST_KEY_OTHER));
-    }
-
-    #[test]
-    fn each_test_relay_key_derives_its_recorded_public_half() {
-        for (name, secret, public) in tau_web::testonly::RELAY_KEYS {
-            assert_eq!(relay_public(secret), *public, "{name}");
-        }
     }
 }

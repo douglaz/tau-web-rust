@@ -15,7 +15,7 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [features]
-# The tracer's test-only parts: the test keys, the host-key pin source and the test switches,
+# The tracer's test-only parts: the host-key pin source and the test switches,
 # one of which makes the local store's append fail. Never in the served build
 # (`scripts/build-web.sh served`).
 tracer = []

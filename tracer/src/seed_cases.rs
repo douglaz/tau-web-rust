@@ -622,7 +622,7 @@ pub(super) async fn run(
                 cases.push(case);
             }
         }
-        // No session input exists yet: session workers arrive with twr-ggw.11 and twr-ggw.14.
+        // Sessions end with the harness worker; goals, tools and session workers are twr-ggw.14's.
         let mut case = Case::new(if tracer {
             "seed-backup re-display ends dispatch connections and waits"
         } else {
@@ -632,6 +632,7 @@ pub(super) async fn run(
         let mut before = run.inspect(worker).await?;
         if tracer {
             setup_cases::approve(run, tab, worker).await?;
+            binding_cases::prepare(run, tab, worker, pass).await?;
             take(run.seen);
             fresh_pace(run.relay);
             let mut request = args("fixture");

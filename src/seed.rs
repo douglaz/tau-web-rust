@@ -5,7 +5,7 @@
 //!
 //! Built on every target. The local store (`src/store.rs`) generates the seed and keeps its
 //! mnemonic in its first record; allocation (`src/allocation.rs`) issues the indices the child keys
-//! derive at, and binding (twr-ggw.11) wires the keys in. Only the dedicated seed-backup
+//! derive at, and binding gives each live session its machine's client key. Only the dedicated seed-backup
 //! ceremony displays or accepts mnemonic words; no export returns a seed or child key.
 //!
 //! Derivation refuses rather than aliases: an unknown version, a role outside 0–4, an index above

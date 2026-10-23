@@ -105,9 +105,20 @@ pub fn valid_request(request: &serde_json::Value) -> bool {
             .as_u64()
             .is_some_and(|n| n > 0 && n <= u64::from(u16::MAX)),
         #[cfg(feature = "tracer")]
-        "test_relay_key" => value.is_string(),
-        #[cfg(feature = "tracer")]
         "fail_append" | "tamper_auth" | "test_no_credentials" => value.is_boolean(),
         _ => false,
     })
+}
+
+/// Live connection admission is above the dispatch core used by the formal comparison.
+#[allow(async_fn_in_trait, reason = "single worker")]
+pub trait BoundJournal: Journal {
+    async fn connection_session(
+        &mut self,
+        machine: &str,
+    ) -> Result<std::rc::Rc<crate::binding::Session>, crate::binding::AdmissionRefusal>;
+    async fn relay_key(&self) -> Option<crate::credential::RelayKey>;
+    fn credentials_available(&self) -> bool {
+        true
+    }
 }

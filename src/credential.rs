@@ -142,6 +142,17 @@ impl Drop for DataKey {
     }
 }
 
+impl Drop for SshClientKey {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
+impl Drop for RelayKey {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
+
 /// The Ed25519 public key of a 32-byte RFC 8032 seed, never an already-expanded scalar: the
 /// mapping of roles 0 and 4.
 pub(crate) fn ed25519_public(seed: &[u8; 32]) -> [u8; 32] {
@@ -171,8 +182,7 @@ impl PostHarnessCredential {
     }
 }
 
-// Derivation only hands out secrets in 1..n−1, and testonly checks its test relay keys before
-// building one, so the x-only key always exists.
+// Derivation only hands out secrets in 1..n−1, so the x-only key always exists.
 const VALID: &str = "a secp256k1 credential holds a secret in 1..n-1";
 
 impl AttestSenderKey {

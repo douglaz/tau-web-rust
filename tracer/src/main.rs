@@ -8,12 +8,13 @@
 //!
 //! ```text
 //! tracer run <served-dir> <tracer-dir>   the tracer; Chrome from $CHROME, which must be set
-//! tracer check-absence <dir>             AC5: no test key, pin source or test switch
+//! tracer check-absence <dir>             AC5: no fixture-derived key, pin source or test switch
 //! tracer check-csp <dir>                 AC6: the page's policy is exactly ARC-33's
 //! ```
 //!
 //! `scripts/tracer.sh` builds both directories and runs the first.
 
+mod binding_cases;
 mod cdp;
 mod checks;
 mod fixtures;
@@ -37,7 +38,7 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime};
-use tau_web::testonly::{PINS, RELAY_SECRET, SSH_CLIENT_SEED, SSH_USER};
+use tau_web::testonly::{PINS, SSH_USER};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -120,14 +121,8 @@ async fn run(served: &Path, tracer: &Path) -> Result<(), String> {
     let seen = Observed::default();
     let tls = fixtures::tls();
     let sshd = fixtures::sshd(seen.clone()).await;
-    // The test relay key's pass: the sshd's host, on any port, for an hour (PAS-6, paid-tcp-relay
-    // 844e834: a hand-recorded pass is never unbounded).
-    let pass = fixtures::Pass {
-        key: keys::relay_public(&RELAY_SECRET),
-        hosts: vec!["127.0.0.1".into()],
-        expires: SystemTime::now() + Duration::from_secs(3600),
-    };
-    let relay = fixtures::relay(seen.clone(), tls.acceptor.clone(), vec![pass], false).await;
+    let sshd_other = fixtures::sshd(seen.clone()).await;
+    let relay = fixtures::relay(seen.clone(), tls.acceptor.clone(), vec![], false).await;
     let (served_origin, served_requests) = fixtures::https(
         served.to_path_buf(),
         tls.acceptor.clone(),
@@ -156,6 +151,7 @@ async fn run(served: &Path, tracer: &Path) -> Result<(), String> {
         browser: &browser,
         seen: &seen,
         sshd: &sshd,
+        sshd_other: &sshd_other,
         relay: &relay,
         messages: RefCell::default(),
         uncleared: RefCell::default(),
@@ -172,6 +168,7 @@ async fn run(served: &Path, tracer: &Path) -> Result<(), String> {
     .await;
     browser.close().await;
     sshd.cleanup().await;
+    sshd_other.cleanup().await;
 
     // The summary names every case that ran, even when one stopped the run.
     println!("\n== summary");
@@ -376,6 +373,7 @@ struct Run<'a> {
     browser: &'a cdp::Browser,
     seen: &'a Observed,
     sshd: &'a fixtures::Sshd,
+    sshd_other: &'a fixtures::Sshd,
     relay: &'a fixtures::Relay,
     /// Every message between a page and its harness workers, gathered before each reload or
     /// close and at the end.
@@ -792,17 +790,16 @@ async fn run_cases(
             "machine": machine,
             "relay": relay.url,
             "host": "127.0.0.1",
-            "port": sshd.port,
+            "port": if machine == "fixture-other" { run.sshd_other.port } else { sshd.port },
             "user": SSH_USER,
             "command": COMMAND,
             "fail_append": false,
             "tamper_auth": false,
-            "test_relay_key": "with-pass",
         })
     };
     let served_args = |machine: &str| {
         let mut request = args(machine);
-        for key in ["fail_append", "tamper_auth", "test_relay_key"] {
+        for key in ["fail_append", "tamper_auth"] {
             request.as_object_mut().unwrap().remove(key);
         }
         request
@@ -810,7 +807,9 @@ async fn run_cases(
     let locked = json!({ "outcome": { "refused": "locked" } });
 
     // The served build loads, and its harness worker runs a request on what it has stored.
-    let mut case = Case::new("the served build loads, and holds no pin, key or request hook");
+    let mut case = Case::new(
+        "the served build loads, derives bound credentials and has no pin or request hook",
+    );
     let from = browser.event_count();
     let (mut served_tab, mut served_worker) = run.open(served_origin, false).await?;
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -894,6 +893,7 @@ async fn run_cases(
             && run.inspect(&served_worker).await? == before_approval,
     );
     setup_cases::approve(run, &served_tab, &served_worker).await?;
+    binding_cases::prepare(run, &served_tab, &served_worker, SERVED_PASSPHRASE).await?;
     let report = run
         .harness_run(&served_worker, served_args("fixture"))
         .await?;
@@ -908,8 +908,8 @@ async fn run_cases(
         observed.relay_accepted == 0 && observed.ssh_connections == 0,
     );
     case.check(
-        "nothing was appended after the seed, completion and setup approval",
-        run.inspect(&served_worker).await?["records"] == json!([0, 1, 2]),
+        "only the seed, completion, setup approval, two class answers and two exposure entries were appended",
+        run.inspect(&served_worker).await?["records"] == json!([0, 1, 2, 3, 4, 5, 6]),
     );
     let report = run
         .harness_collect(&served_worker, served_args("fixture"))
@@ -920,7 +920,7 @@ async fn run_cases(
         report == json!({"outcome":{"refused":"no-pin"}})
             && observed.relay_accepted == 0
             && observed.ssh_connections == 0
-            && run.inspect(&served_worker).await?["records"] == json!([0, 1, 2]),
+            && run.inspect(&served_worker).await?["records"] == json!([0, 1, 2, 3, 4, 5, 6]),
     );
     cases.push(case);
 
@@ -967,7 +967,7 @@ async fn run_cases(
     case.check(
         "the worker's replayed state is record 0 alone",
         run.inspect(&worker).await?
-            == json!({ "state": "unlocked", "seed_backup_owed": true, "seed_backup_completion": null, "seed_backup_stage": "showing_words", "locked": false, "records": [0], "commands": [], "calls": [], "terminals": [], "dispositions": [], "standing": {}, "jobs": [], "typed_calls": [], "observations": [], "current_installations": {}, "setup": [], "setup_offer": tau_web::dispatch::fixture_setup() }),
+            == json!({ "state": "unlocked", "seed_backup_owed": true, "seed_backup_completion": null, "seed_backup_stage": "showing_words", "locked": false, "records": [0], "commands": [], "calls": [], "terminals": [], "dispositions": [], "standing": {}, "jobs": [], "typed_calls": [], "observations": [], "current_installations": {}, "setup": [], "setup_offer": tau_web::dispatch::fixture_setup(), "sessions":[],"exposure_ledger":[],"connection_refusals":[] }),
     );
     let host = reader::build(
         HOST_PASSPHRASE,
@@ -1062,6 +1062,7 @@ async fn run_cases(
         run.submit(&tab, "unlock", PASSPHRASE).await?;
     }
     setup_cases::approve(run, &tab, &worker).await?;
+    binding_cases::prepare(run, &tab, &worker, PASSPHRASE).await?;
     // A focused fixture run for reproducible unresolved-command mutation checks.
     if std::env::var_os("TAU_TRACER_HOLD_CASE").is_some() {
         hold_cases::run(run, &tab, worker, &args, cases).await?;
@@ -1168,6 +1169,7 @@ async fn run_cases(
         .await?;
     worker = run.reload(&tab, &worker).await?;
     run.submit(&tab, "unlock", PASSPHRASE).await?;
+    binding_cases::prepare(run, &tab, &worker, PASSPHRASE).await?;
     take(seen);
     let report = run.harness_run(&worker, args("unpinned")).await?;
     let observed = take(seen);
@@ -1199,6 +1201,7 @@ async fn run_cases(
     run.put(&tab, &prior_no_pin).await?;
     worker = run.reload(&tab, &worker).await?;
     run.submit(&tab, "unlock", PASSPHRASE).await?;
+    binding_cases::prepare(run, &tab, &worker, PASSPHRASE).await?;
     cases.push(case);
 
     let mut case = Case::new("oversized launch refuses before intent and contact (twr-ggw.71)");
@@ -1260,6 +1263,7 @@ async fn run_cases(
     run.put(&tab, &original).await?;
     worker = run.reload(&tab, &worker).await?;
     run.submit(&tab, "unlock", PASSPHRASE).await?;
+    binding_cases::prepare(run, &tab, &worker, PASSPHRASE).await?;
     take(seen);
     cases.push(case);
 
@@ -1307,8 +1311,8 @@ async fn run_cases(
         &journal
             .records
             .iter()
-            .find(|(n, _)| *n == 3)
-            .ok_or("missing intent 3")?
+            .find(|(n, _)| *n == 12)
+            .ok_or("missing intent 12")?
             .1,
     )
     .map_err(|e| e.to_string())?;
@@ -1337,7 +1341,7 @@ async fn run_cases(
             && observed.relay_refusals.is_empty(),
     );
     case.check(
-        "the fixture sshd admitted the test client key",
+        "the fixture sshd admitted the derived machine client key",
         observed
             .ssh_auth
             .iter()
@@ -1370,17 +1374,17 @@ async fn run_cases(
     );
     let replayed = run.inspect(&worker).await?;
     case.check(
-        "the store's replayed state holds it as record 3 after approval",
-        replayed["records"] == json!([0, 1, 2, 3, 4])
+        "the store's replayed state holds it as record 12 after binding",
+        replayed["records"] == json!([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13])
             && replayed["commands"]
-                == json!([{ "number": 3, "machine": "fixture", "command": hex::encode(COMMAND) }])
-            && outcome["seq"] == 3
-            && outcome["terminal"] == 4
+                == json!([{ "number": 12, "machine": "fixture", "command": hex::encode(COMMAND) }])
+            && outcome["seq"] == 12
+            && outcome["terminal"] == 13
             && replayed["calls"][0]["approval"]["harness_pin"]["machine"] == "fixture"
             && replayed["calls"][0]["approval"]["harness_pin"]["fingerprint"] == pinned.as_str()
             && replayed["calls"][0]["state"] == "finished"
             && replayed["terminals"]
-                == json!([{ "number": 4, "call": 3, "exit_status": EXIT_STATUS }]),
+                == json!([{ "number": 13, "call": 12, "exit_status": EXIT_STATUS }]),
     );
     case.check(
         "the output and exit status came back",
@@ -1454,14 +1458,16 @@ async fn run_cases(
     );
     case.check(
         "the replayed state has no record for it",
-        after_failure == before_failure && after_failure["records"] == json!([0, 1, 2, 3, 4]),
+        after_failure == before_failure
+            && after_failure["records"] == json!([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]),
     );
     worker = run.reload(&tab, &worker).await?;
     run.submit(&tab, "unlock", PASSPHRASE).await?;
     case.check(
         "after a reload and an unlock, none appears",
-        run.inspect(&worker).await? == before_failure,
+        run.inspect(&worker).await? == binding_cases::replayed(&before_failure),
     );
+    binding_cases::prepare(run, &tab, &worker, PASSPHRASE).await?;
     cases.push(case);
 
     let mut case = Case::new("close without exit status stays unresolved (twr-ggw.7, STA-8)");
@@ -1497,10 +1503,11 @@ async fn run_cases(
     let observed = take(seen);
     case.check(
         "replay preserves the unresolved call and sends no second exec",
-        run.inspect(&worker).await? == before
+        run.inspect(&worker).await? == binding_cases::replayed(&before)
             && observed.ssh_exec.is_empty()
             && observed.relay_accepted == 0,
     );
+    binding_cases::prepare(run, &tab, &worker, PASSPHRASE).await?;
     fresh_pace(relay);
     let commands = before["commands"].clone();
     let held = run.harness_run(&worker, args("fixture")).await?;
@@ -1530,6 +1537,7 @@ async fn run_cases(
     run.put(&tab, &reader::build(PASSPHRASE, &events)).await?;
     worker = run.reload(&tab, &worker).await?;
     run.submit(&tab, "unlock", PASSPHRASE).await?;
+    binding_cases::prepare(run, &tab, &worker, PASSPHRASE).await?;
     take(seen);
     fresh_pace(relay);
     let before = run.inspect(&worker).await?;
@@ -1550,6 +1558,7 @@ async fn run_cases(
     run.put(&tab, &reader::build(PASSPHRASE, &events)).await?;
     worker = run.reload(&tab, &worker).await?;
     run.submit(&tab, "unlock", PASSPHRASE).await?;
+    binding_cases::prepare(run, &tab, &worker, PASSPHRASE).await?;
     fresh_pace(relay);
     let report = run.harness_run(&worker, args("fixture")).await?;
     let observed = take(seen);
@@ -1579,6 +1588,7 @@ async fn run_cases(
     run.put(&tab, &original).await?;
     worker = run.reload(&tab, &worker).await?;
     run.submit(&tab, "unlock", PASSPHRASE).await?;
+    binding_cases::prepare(run, &tab, &worker, PASSPHRASE).await?;
     take(seen);
     cases.push(case);
 
@@ -1645,23 +1655,39 @@ async fn run_cases(
     let closed = |s: &Seen| s.relay_log.iter().any(|(_, e)| *e == Event::Frame("close"));
 
     let mut case = Case::new("6. a relay key with no pass is refused for `pass` (twr-ggw.3)");
-    let mut unknown = args("fixture");
-    unknown["test_relay_key"] = "no-such-key".into();
-    let failed = run.harness_run(&worker, unknown).await;
+    let saved_pass_store = store_files(&run.dump(&tab).await?);
+    let mnemonic = reader::read(&saved_pass_store, PASSPHRASE)?.mnemonic()?;
+    let mut no_pass = vec![json!({"seed":{"mnemonic":mnemonic}})];
+    no_pass.extend(reader::setup_events(
+        &mnemonic,
+        &["fixture", "fixture-other"],
+    ));
+    run.put(&tab, &reader::build(PASSPHRASE, &no_pass)).await?;
+    worker = run.reload(&tab, &worker).await?;
+    run.submit(&tab, "unlock", PASSPHRASE).await?;
+    binding_cases::prepare_without_enrolment(run, &tab, &worker, PASSPHRASE).await?;
+    take(seen);
+    let failed = run.harness_run(&worker, args("fixture")).await?;
     let observed = take(seen);
-    println!("   an unrecognised test_relay_key: {failed:?}");
     case.check(
-        "an unrecognised test_relay_key fails the request, and the relay fixture accepted no connection",
-        failed.is_err_and(|e| e.contains("test_relay_key")) && observed.relay_accepted == 0,
+        "no journaled pass refuses no-credentials after the pin lookup without contact",
+        failed["outcome"] == json!({"refused":"no-credentials"})
+            && observed.relay_accepted == 0
+            && observed.ssh_connections == 0,
     );
-    let mut without = args("fixture");
-    without["test_relay_key"] = "without-pass".into();
+    run.put(&tab, &saved_pass_store).await?;
+    worker = run.reload(&tab, &worker).await?;
+    run.submit(&tab, "unlock", PASSPHRASE).await?;
+    binding_cases::prepare(run, &tab, &worker, PASSPHRASE).await?;
+    let enrolled_passes = std::mem::take(&mut *relay.passes.lock().expect("passes lock"));
+    let without = args("fixture");
     fresh_pace(relay);
     let report = run.harness_run(&worker, without).await?;
     settle(seen, closed).await;
     let observed = take(seen);
     show(&observed);
     refused(&mut case, &report, &observed, "pass", "127.0.0.1");
+    *relay.passes.lock().expect("passes lock") = enrolled_passes;
     cases.push(case);
 
     let mut case =
@@ -1799,8 +1825,9 @@ async fn run_cases(
     run.submit(&tab, "unlock", PASSPHRASE).await?;
     case.check(
         "the store put back unlocks",
-        run.inspect(&worker).await? == baseline_state,
+        run.inspect(&worker).await? == binding_cases::replayed(&baseline_state),
     );
+    binding_cases::prepare(run, &tab, &worker, PASSPHRASE).await?;
     cases.push(case);
 
     // twr-ggw.5 AC3: reload, explicit lock, page hide and a killed worker each require unlock again.
@@ -2146,6 +2173,16 @@ async fn run_cases(
 
     worker = typed_cases::run(run, &tab, worker, &args, cases).await?;
     job_cases::run(run, &tab, worker, &args, cases).await?;
+    binding_cases::run(run, &tab, PASSPHRASE, true, &args, cases).await?;
+    binding_cases::run(
+        run,
+        &served_tab,
+        SERVED_PASSPHRASE,
+        false,
+        &served_args,
+        cases,
+    )
+    .await?;
     if std::env::var("TAU_TRACER_SETUP_CASE").as_deref() == Ok("existing") {
         return Ok(());
     }
@@ -2199,16 +2236,15 @@ async fn run_cases(
         for phrase in &displayed {
             needles.extend(reader::seed_needles(phrase)?);
         }
+        if test_keys {
+            needles.extend(reader::encodings(
+                "SSH client key, private half",
+                &reader::role_key(&opened.mnemonic()?, 0, 0)?,
+            ));
+        }
         needles.sort();
         needles.dedup();
 
-        if test_keys {
-            needles.extend(
-                checks::needles()
-                    .into_iter()
-                    .filter(|(what, _)| what.contains("key")),
-            );
-        }
         println!(
             "   {} files in OPFS, {} needles",
             dumped.len(),
@@ -2254,7 +2290,7 @@ async fn run_cases(
             "fifteen chars!!",
         ];
         if test_keys {
-            // Negative controls: the test SSH client key, planted as binary in eleven shapes, a
+            // Negative controls: the current machine client key, planted as binary in eleven shapes, a
             // passphrase outside a create or unlock message, three objects the serializer
             // cannot read and one it throws on, through the same guarded serializer, the same
             // log and the same check. Each must be reported for its own reason.
@@ -2359,7 +2395,7 @@ async fn run_cases(
                             ].map(each));
                             return log.splice(start);
                         }})()",
-                        STANDARD.encode(SSH_CLIENT_SEED),
+                        STANDARD.encode(reader::role_key(&opened.mnemonic()?, 0, 0)?),
                         serde_json::to_string(passphrase).expect("a JSON string"),
                     ),
                 )
@@ -2386,7 +2422,7 @@ async fn run_cases(
             }
         }
         // The same guarded serializer and check handle control mnemonics and the final seed.
-        // No session input exists yet (twr-ggw.11, twr-ggw.14).
+        // Sessions end with the harness worker; goals, tools and session workers are twr-ggw.14's.
         for mnemonic in std::iter::once(opened.mnemonic()?).chain(
             include_str!("../../tests/vectors/seed-backup-collisions.txt")
                 .lines()
@@ -2792,8 +2828,14 @@ async fn relocked(
     println!("   replayed: {replayed}");
     case.check(
         "after unlock, the replayed state lists every command recorded before",
-        view["store"] == "unlocked" && replayed == *before,
+        view["store"] == "unlocked"
+            && replayed == {
+                let mut expected = before.clone();
+                expected["sessions"] = json!([]);
+                expected
+            },
     );
+    binding_cases::prepare(run, tab, worker, PASSPHRASE).await?;
     Ok(())
 }
 
@@ -2822,6 +2864,7 @@ async fn settle_unresolved(run: &Run<'_>, tab: &Tab, worker: Worker) -> Result<W
     run.put(tab, &reader::build(PASSPHRASE, &events)).await?;
     let worker = run.reload(tab, &worker).await?;
     run.submit(tab, "unlock", PASSPHRASE).await?;
+    binding_cases::prepare(run, tab, &worker, PASSPHRASE).await?;
     Ok(worker)
 }
 

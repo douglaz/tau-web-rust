@@ -1,14 +1,12 @@
 //! The served build's checks (twr-ggw.2, AC5 and AC6): nothing test-only in its bytes, and the
 //! page's Content-Security-Policy exactly `ARC-33`'s.
 
-use crate::keys::{relay_public, ssh_client_public};
+use crate::keys::relay_public;
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use tau_web::testonly::{
-    PIN_SOURCE_MARKER, PINS, RELAY_SECRET, RELAY_SECRET_WITHOUT_PASS, SSH_CLIENT_SEED,
-};
+use tau_web::testonly::{PIN_SOURCE_MARKER, PINS};
 
 /// The files the served build is: the page, its script, the worker script and the wasm
 /// (`ARC-32`). A check over a directory missing one of them would pass on nothing.
@@ -31,42 +29,54 @@ pub const ARC_33: &[(&str, &[&str])] = &[
     ("connect-src", &["https:", "wss:"]),
 ];
 
-/// What `check-absence` looks for: each test key's private and public half as raw bytes, hex and
+/// What `check-absence` looks for: each fixed fixture seed's derived private and public halves as raw bytes, hex and
 /// base64, the SSH client key in OpenSSH's encoding, the pins and the pin source's marker, and the
 /// test switches a request can set (`fail_append` among them, which makes the store's append
 /// fail).
 pub fn needles() -> Vec<(String, Vec<u8>)> {
     let mut needles = Vec::new();
-    for (key, private, public) in [
-        ("SSH client key", SSH_CLIENT_SEED, ssh_client_public()),
-        ("relay key", RELAY_SECRET, relay_public(&RELAY_SECRET)),
-        (
-            "relay key without a pass",
-            RELAY_SECRET_WITHOUT_PASS,
-            relay_public(&RELAY_SECRET_WITHOUT_PASS),
-        ),
-    ] {
-        for (half, bytes) in [("private", private), ("public", public)] {
-            for (encoding, encoded) in [
-                ("raw", bytes.to_vec()),
-                ("hex", hex::encode(bytes).into_bytes()),
-                ("HEX", hex::encode_upper(bytes).into_bytes()),
-                ("base64", STANDARD_NO_PAD.encode(bytes).into_bytes()),
-                ("base64url", URL_SAFE_NO_PAD.encode(bytes).into_bytes()),
-            ] {
-                needles.push((format!("{key}, {half} half, {encoding}"), encoded));
+    let phrases = std::iter::once("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about")
+        .chain(include_str!("../../tests/vectors/seed-backup-collisions.txt").lines());
+    for (fixture, mnemonic) in phrases.enumerate() {
+        for role in [0, 3] {
+            for index in [0, 1] {
+                let private =
+                    crate::reader::role_key(mnemonic, role, index).expect("fixture derivation");
+                let public = if role == 0 {
+                    crate::keys::ed25519(&private)
+                        .public_key()
+                        .key_data()
+                        .ed25519()
+                        .expect("Ed25519")
+                        .0
+                } else {
+                    relay_public(&private)
+                };
+                let key = format!("fixture {fixture} role {role} index {index}");
+                for (half, bytes) in [("private", private), ("public", public)] {
+                    for (encoding, encoded) in [
+                        ("raw", bytes.to_vec()),
+                        ("hex", hex::encode(bytes).into_bytes()),
+                        ("HEX", hex::encode_upper(bytes).into_bytes()),
+                        ("base64", STANDARD_NO_PAD.encode(bytes).into_bytes()),
+                        ("base64url", URL_SAFE_NO_PAD.encode(bytes).into_bytes()),
+                    ] {
+                        needles.push((format!("{key}, {half} half, {encoding}"), encoded));
+                    }
+                }
+                if role == 0 {
+                    let openssh = crate::keys::ed25519(&private)
+                        .public_key()
+                        .to_openssh()
+                        .expect("OpenSSH");
+                    needles.push((
+                        format!("{key}, public half, OpenSSH"),
+                        openssh.split(' ').nth(1).expect("blob").as_bytes().to_vec(),
+                    ));
+                }
             }
         }
     }
-    let openssh = crate::keys::ed25519(&SSH_CLIENT_SEED)
-        .public_key()
-        .to_openssh()
-        .expect("an OpenSSH public key");
-    let blob = openssh.split(' ').nth(1).expect("ssh-ed25519 <base64>");
-    needles.push((
-        "SSH client key, public half, OpenSSH".into(),
-        blob.as_bytes().to_vec(),
-    ));
     for (machine, pin) in PINS {
         needles.push((
             format!("pin source: the pin for {machine}"),
@@ -119,7 +129,7 @@ fn require_served_files(dir: &Path) -> Result<(), String> {
     }
 }
 
-/// AC5: the test keys, the pin source and the test switches are absent
+/// AC5: fixture-derived keys, the pin source and the test switches are absent
 /// from every file under `dir`. Each finding names the file and what was found.
 pub fn absence(dir: &Path) -> Result<(), String> {
     require_served_files(dir)?;
@@ -271,6 +281,27 @@ pub fn csp(dir: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn absence_detects_a_planted_derived_key() {
+        let dir = std::env::temp_dir().join(format!(
+            "tau-absence-{}-{}",
+            std::process::id(),
+            hex::encode(crate::fixtures::urandom::<8>())
+        ));
+        std::fs::create_dir_all(dir.join("pkg")).unwrap();
+        for file in super::SERVED_FILES {
+            std::fs::write(dir.join(file), b"").unwrap();
+        }
+        assert!(super::absence(&dir).is_ok());
+        let (name, key) = super::needles()
+            .into_iter()
+            .find(|(name, _)| name == "fixture 0 role 0 index 0, private half, raw")
+            .unwrap();
+        std::fs::write(dir.join("pkg/tau_web_bg.wasm"), key).unwrap();
+        assert!(super::absence(&dir).unwrap_err().contains(&name));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     use super::*;
 
     const ARC_33_POLICY: &str = "script-src 'self' 'wasm-unsafe-eval'; object-src 'none'; base-uri 'self'; connect-src https: wss:";

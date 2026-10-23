@@ -103,6 +103,38 @@ fn check_event(number: u64, event: &Value) -> Result<(), String> {
             .ok_or_else(|| format!("{kind}: {name} is not text"))
     };
     match kind.as_str() {
+        "exposure" => {
+            exact(body, &["session", "bound_set"])?;
+            if text("session")? != format!("session-{number}") {
+                return Err("exposure identity differs from record number".into());
+            }
+            let set = body["bound_set"]
+                .as_array()
+                .filter(|s| s.len() == 1)
+                .ok_or("invalid bound set")?;
+            for bound in set {
+                exact(bound, &["machine", "identity"])?;
+                if bound["machine"].as_str().is_none_or(str::is_empty) {
+                    return Err("invalid bound machine".into());
+                }
+                let id = &bound["identity"];
+                exact(id, &["seed", "derivation_version", "family", "index"])?;
+                if id["seed"].as_str().is_none_or(|s| {
+                    s.len() != 64 || hex::decode(s).is_err() || s != s.to_lowercase()
+                }) || id["derivation_version"] != 1
+                    || id["family"] != "machines"
+                    || !id["index"].as_u64().is_some_and(|i| i <= 0x7fff_ffff)
+                {
+                    return Err("invalid bound identity".into());
+                }
+            }
+        }
+        "connection_refusal" => {
+            exact(body, &["machine", "reason"])?;
+            if text("machine")?.is_empty() || text("reason")? != "unbound" {
+                return Err("invalid connection refusal".into());
+            }
+        }
         "seed" => {
             text("mnemonic")?;
         }
@@ -782,6 +814,21 @@ pub fn needles(passphrase: &str, opened: &Opened) -> Result<Vec<(String, Vec<u8>
     Ok(needles)
 }
 
+/// Independent BIP-32 derivation for fixture enrolment and each machine's authorized_keys.
+pub fn role_key(mnemonic: &str, role: u32, index: u32) -> Result<[u8; 32], String> {
+    use bip32::{ChildNumber, XPrv};
+    let seed = bip39::Mnemonic::parse_normalized(mnemonic)
+        .map_err(|e| e.to_string())?
+        .to_seed_normalized("");
+    let mut key = XPrv::new(seed).map_err(|e| e.to_string())?;
+    for component in [707_285, 1, role, index] {
+        key = key
+            .derive_child(ChildNumber::new(component, true).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(key.private_key().to_bytes().into())
+}
+
 /// Phrase encodings and structural array detection, independent of public JSON field names.
 pub fn mnemonic_needles(mnemonic: &str) -> Vec<(String, Vec<u8>)> {
     let mut needles = encodings("the mnemonic", mnemonic.as_bytes());
@@ -884,6 +931,18 @@ pub fn record_findings<'a>(
             }
         }
     }
+    if let Some(entries) = event
+        .pointer_mut("/exposure/bound_set")
+        .and_then(Value::as_array_mut)
+    {
+        for entry in entries {
+            if let Some(value) = entry.pointer_mut("/identity/seed")
+                && value == seed_id
+            {
+                *value = Value::Null;
+            }
+        }
+    }
     found(needles, event.to_string().as_bytes())
 }
 
@@ -893,6 +952,50 @@ mod tests {
     use super::*;
     use tau_web::harness::{Entry, Journal};
     use tau_web::store::{MemoryStorage, Pbkdf2, block_on, create, unlock};
+
+    #[test]
+    fn exposure_and_connection_refusal_shapes_are_exact_and_builder_readable() {
+        let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let mut events = vec![json!({"seed":{"mnemonic":mnemonic}})];
+        events.extend(setup_events(mnemonic, &["fixture"]));
+        let identity = events[2]["setup"]["approval"]["entries"][0]["identity"].clone();
+        events.push(
+            json!({"setup":{"class":{"machine":"fixture","answer":"no","class":"single_purpose"}}}),
+        );
+        let exposure = json!({"exposure":{"session":"session-4","bound_set":[{"machine":"fixture","identity":identity}]}});
+        let refusal = json!({"connection_refusal":{"machine":"fixture","reason":"unbound"}});
+        events.extend([exposure.clone(), refusal.clone()]);
+        let opened = read(&build(PASS, &events), PASS).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&opened.records[4].1).unwrap(),
+            exposure
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&opened.records[5].1).unwrap(),
+            refusal
+        );
+        for (number, valid, field) in [
+            (4, exposure, "exposure"),
+            (5, refusal, "connection_refusal"),
+        ] {
+            for extra in [true, false] {
+                let mut bad = valid.clone();
+                if extra {
+                    bad[field]["unexpected"] = true.into();
+                } else {
+                    bad[field]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove(if field == "exposure" {
+                            "session"
+                        } else {
+                            "reason"
+                        });
+                }
+                assert!(check_event(number, &bad).is_err());
+            }
+        }
+    }
 
     #[test]
     fn recorded_access_revision_is_preserved_and_unsupported_shapes_are_refused() {

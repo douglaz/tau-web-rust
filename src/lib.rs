@@ -7,6 +7,7 @@
 //! `testonly` is the tracer's, and only the `tracer` feature compiles it.
 
 pub mod allocation;
+pub mod binding;
 pub mod credential;
 pub mod dispatch;
 pub mod harness;
@@ -139,6 +140,11 @@ mod worker {
             .to_string()
     }
 
+    #[wasm_bindgen]
+    pub async fn bind(request: String) -> String {
+        local().lock().await.bind(&request).await.to_string()
+    }
+
     /// Exercise the real store allocator without adding a served consumer.
     #[cfg(feature = "tracer")]
     #[wasm_bindgen]
@@ -203,18 +209,21 @@ mod worker {
 
     /// The store's journal, which holds the store only inside an append or a read, so a command
     /// awaiting its record never holds it.
-    struct StoreJournal(Rc<Mutex<Harness>>);
+    struct StoreJournal {
+        local: Rc<Mutex<Harness>>,
+        unavailable: bool,
+    }
 
     impl Journal for StoreJournal {
         async fn check(&self, machine: &str) -> Result<(), AppendRefusal> {
-            match self.0.lock().await.store() {
+            match self.local.lock().await.store() {
                 Some(store) => store.check(machine).await,
                 None => Err(AppendRefusal::Storage("the store is locked".into())),
             }
         }
 
         async fn terminal(&mut self, terminal: &Terminal) -> Result<u64, String> {
-            match self.0.lock().await.store() {
+            match self.local.lock().await.store() {
                 Some(store) => store.terminal(terminal).await,
                 None => Err("the store is locked".into()),
             }
@@ -225,28 +234,28 @@ mod worker {
             entry: &Entry,
             approval: &Approval,
         ) -> Result<u64, AppendRefusal> {
-            match self.0.lock().await.store() {
+            match self.local.lock().await.store() {
                 Some(store) => store.append(entry, approval).await,
                 None => Err(AppendRefusal::Storage("the store is locked".into())),
             }
         }
 
         async fn read(&self, seq: u64) -> Option<Entry> {
-            match self.0.lock().await.store() {
+            match self.local.lock().await.store() {
                 Some(store) => store.read(seq).await,
                 None => None,
             }
         }
 
         async fn intent(&self, call: u64) -> Option<crate::dispatch::Intent> {
-            match self.0.lock().await.store() {
+            match self.local.lock().await.store() {
                 Some(store) => store.intent(call).await,
                 None => None,
             }
         }
 
         async fn collectable(&self, machine: &str) -> Result<Vec<crate::dispatch::Intent>, String> {
-            match self.0.lock().await.store() {
+            match self.local.lock().await.store() {
                 Some(store) => store.collectable(machine).await,
                 None => Err("the store is locked".into()),
             }
@@ -256,7 +265,7 @@ mod worker {
             &mut self,
             evidence: &crate::jobs::Evidence,
         ) -> Result<crate::jobs::Report, String> {
-            match self.0.lock().await.store() {
+            match self.local.lock().await.store() {
                 Some(store) => store.job_evidence(evidence).await,
                 None => Err("the store is locked".into()),
             }
@@ -268,7 +277,7 @@ mod worker {
             stop: &crate::harness::Stop,
         ) -> Option<Result<crate::jobs::Report, String>> {
             crate::harness::write::unless_stopped(
-                self.0.lock(),
+                self.local.lock(),
                 stop.notified(),
                 || stop.stopped(),
                 async |mut local| match local.store() {
@@ -280,14 +289,33 @@ mod worker {
         }
     }
 
+    impl crate::harness::BoundJournal for StoreJournal {
+        async fn connection_session(
+            &mut self,
+            machine: &str,
+        ) -> Result<Rc<crate::binding::Session>, crate::binding::AdmissionRefusal> {
+            match self.local.lock().await.store() {
+                Some(store) => store.connection_session(machine).await,
+                None => Err(crate::binding::AdmissionRefusal::Journal(
+                    "the store is locked".into(),
+                )),
+            }
+        }
+        async fn relay_key(&self) -> Option<crate::credential::RelayKey> {
+            self.local.lock().await.store()?.relay_key()
+        }
+        fn credentials_available(&self) -> bool {
+            !self.unavailable
+        }
+    }
+
     /// Runs one command: `request` is JSON naming the machine, the relay's URL, the destination,
     /// the SSH user and the command. The page holds no reference to the worker's instance and
     /// defines no way to reach it; today only the tracer calls it there, over the DevTools
     /// protocol. Another same-origin script can load its own copy of the module, which holds no
     /// unlocked store. While the store is not unlocked, every request is refused before any
     /// contact (`STA-23`). The pins, keys and journal never come from the request: the journal
-    /// is the store's, and the tracer build runs on `testonly`'s pins and keys, the served build
-    /// on what it has stored, which is none yet. The report is JSON and carries no key material.
+    /// is the store's, and both builds use the bound machine's derived client key and the harness-derived relay key. The report is JSON and carries no key material.
     #[wasm_bindgen]
     pub async fn run_command(request: String) -> Result<String, wasm_bindgen::JsValue> {
         request_operation(request, false).await
@@ -313,6 +341,9 @@ mod worker {
         use crate::harness::Target;
         let request: serde_json::Value = serde_json::from_str(&request)
             .map_err(|e| wasm_bindgen::JsValue::from_str(&format!("request: {e}")))?;
+        if let Some(reason) = local().lock().await.dispatch_refusal() {
+            return Ok(serde_json::json!({ "outcome": { "refused": reason } }).to_string());
+        }
         if !crate::harness::valid_request(&request) {
             return Ok(serde_json::json!({"outcome":{"refused":"request"}}).to_string());
         }
@@ -329,10 +360,10 @@ mod worker {
         };
         let command = text("command");
         let local = local();
-        if let Some(reason) = local.lock().await.dispatch_refusal() {
-            return Ok(serde_json::json!({ "outcome": { "refused": reason } }).to_string());
-        }
-        let mut journal = StoreJournal(local);
+        let mut journal = StoreJournal {
+            local,
+            unavailable: false,
+        };
         #[cfg(feature = "tracer")]
         let report =
             crate::testonly::run(&target, command.as_bytes(), &request, &mut journal, collect)
@@ -342,14 +373,7 @@ mod worker {
         let report = {
             if collect {
                 return Ok(
-                    match crate::harness::collect_jobs(
-                        &NothingStored,
-                        &mut journal,
-                        &NothingStored,
-                        &target,
-                    )
-                    .await
-                    {
+                    match crate::harness::collect_jobs(&NoPins, &mut journal, &target).await {
                         Ok(records) => {
                             serde_json::json!({"outcome":{"collected":records}}).to_string()
                         }
@@ -359,14 +383,9 @@ mod worker {
                     },
                 );
             }
-            let outcome = crate::harness::run_command(
-                &NothingStored,
-                &mut journal,
-                &NothingStored,
-                &target,
-                command.as_bytes(),
-            )
-            .await;
+            let outcome =
+                crate::harness::run_command(&NoPins, &mut journal, &target, command.as_bytes())
+                    .await;
             serde_json::json!({ "outcome": crate::harness::report(&outcome) })
         };
         Ok(report.to_string())
@@ -376,41 +395,30 @@ mod worker {
     /// call (`testonly::run`).
     #[cfg(feature = "tracer")]
     impl crate::testonly::FailAppend for StoreJournal {
+        fn withhold_credentials(&mut self, unavailable: bool) {
+            self.unavailable = unavailable;
+        }
         async fn fail_next_append(&self, fail: bool) {
-            if let Some(store) = self.0.lock().await.store() {
+            if let Some(store) = self.local.lock().await.store() {
                 store.storage().fail_next_move.set(fail);
             }
         }
 
         async fn commands(&self) -> Vec<(u64, Entry)> {
-            match self.0.lock().await.store() {
+            match self.local.lock().await.store() {
                 Some(store) => store.commands().to_vec(),
                 None => Vec::new(),
             }
         }
     }
 
-    /// The served build's sources: no pin or key is stored yet (twr-ggw.11). A command to an
-    /// unapproved machine is refused at the journal check; a command to an approved entry, like
-    /// every collection, reaches the pin lookup and is refused there, before any contact and any
-    /// append (`CHN-R4`).
+    /// The served build has no host-key pin source until twr-ggw.43.
     #[cfg(not(feature = "tracer"))]
-    struct NothingStored;
+    struct NoPins;
 
     #[cfg(not(feature = "tracer"))]
-    impl crate::harness::PinSource for NothingStored {
+    impl crate::harness::PinSource for NoPins {
         fn pin(&self, _machine: &str) -> Option<crate::credential::HostKeyPin> {
-            None
-        }
-    }
-
-    #[cfg(not(feature = "tracer"))]
-    impl crate::harness::Credentials for NothingStored {
-        fn ssh_key(&self) -> Option<&crate::credential::SshClientKey> {
-            None
-        }
-
-        fn relay_key(&self) -> Option<&crate::credential::RelayKey> {
             None
         }
     }

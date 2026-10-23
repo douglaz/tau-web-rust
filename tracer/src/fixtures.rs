@@ -1,7 +1,7 @@
 //! The tracer's fixtures, on ephemeral loopback ports, each recording what it observed:
 //!
 //! - **the fixture sshd**: a real SSH server (russh) whose host key the tracer chooses, which
-//!   admits the test client key and records every connection, authentication attempt and
+//!   reads its own authorized_keys and records every connection, authentication attempt and
 //!   channel request, the `exec` command byte for byte. It runs real POSIX shells with fixed
 //!   machine paths mapped into its own persistent scratch directory;
 //! - **the relay fixture**: paid-tcp-relay's handshake at `844e834` over `wss:`, `WIR-4`–`WIR-10`
@@ -16,7 +16,7 @@
 //!   the strict path grammar of `WIR-1`–`WIR-3`, which is not among `CNF-87`'s items;
 //! - **an HTTPS static server** for a built web directory.
 
-use crate::keys::{HOST_KEY_OTHER, HOST_KEY_PINNED, ed25519, ssh_client_public};
+use crate::keys::{HOST_KEY_OTHER, HOST_KEY_PINNED, ed25519};
 use futures_util::{SinkExt, Stream, StreamExt};
 use russh::keys::{HashAlg, PublicKey};
 use russh::server::{self, Auth, Msg, Session};
@@ -189,7 +189,13 @@ struct SshSession {
 impl SshSession {
     fn admit(&self, user: &str, key: &PublicKey) -> Auth {
         let admitted = user == tau_web::testonly::SSH_USER
-            && key.key_data().ed25519().map(|k| k.0) == Some(ssh_client_public());
+            && std::fs::read_to_string(self.machine.root.join("authorized_keys"))
+                .ok()
+                .is_some_and(|file| {
+                    file.lines()
+                        .filter_map(|line| PublicKey::from_openssh(line).ok())
+                        .any(|installed| installed == *key)
+                });
         let fingerprint = key.fingerprint(HashAlg::Sha256).to_string();
         observe(&self.seen, |s| {
             s.ssh_auth.push((user.to_string(), fingerprint, admitted))
@@ -586,6 +592,7 @@ pub struct Relay {
     pub url: String,
     /// Check 6's state, shared by every connection.
     pub pace: Arc<Mutex<Pace>>,
+    pub passes: Arc<Mutex<Vec<Pass>>>,
     /// With `hold`, the fixture waits here between the dial and OK until the test adds a permit,
     /// so a test can put a frame into that interval deterministically. Each permit releases one
     /// connection: the fixture spends it rather than returning it. The relay matrix's.
@@ -595,7 +602,7 @@ pub struct Relay {
 
 struct RelayState {
     url: String,
-    passes: Vec<Pass>,
+    passes: Arc<Mutex<Vec<Pass>>>,
     limits: Limits,
     pace: Arc<Mutex<Pace>>,
     release: Arc<Semaphore>,
@@ -620,12 +627,13 @@ pub async fn relay(seen: Observed, tls: TlsAcceptor, passes: Vec<Pass>, hold: bo
     }));
     let state = Arc::new(RelayState {
         url: url.clone(),
-        passes,
+        passes: Arc::new(Mutex::new(passes)),
         limits,
         pace: pace.clone(),
         release: release.clone(),
         connections: AtomicU32::new(0),
     });
+    let recorded_passes = state.passes.clone();
     tokio::spawn(async move {
         loop {
             let Ok((tcp, _)) = listener.accept().await else {
@@ -658,7 +666,12 @@ pub async fn relay(seen: Observed, tls: TlsAcceptor, passes: Vec<Pass>, hold: bo
             });
         }
     });
-    Relay { url, pace, release }
+    Relay {
+        url,
+        pace,
+        release,
+        passes: recorded_passes,
+    }
 }
 
 type Ws = tokio_tungstenite::WebSocketStream<tokio_rustls::server::TlsStream<TcpStream>>;
@@ -749,8 +762,8 @@ fn wir_6(
         return Err(("auth", "2 signature"));
     }
     // 3. pass: the key holds one, and it has not expired (PAS-3, paid-tcp-relay 844e834)
-    let pass = state
-        .passes
+    let passes = state.passes.lock().expect("passes lock");
+    let pass = passes
         .iter()
         .find(|pass| auth["pubkey"].as_str() == Some(&hex::encode(pass.key)))
         .filter(|pass| pass.expires > now);
@@ -1107,5 +1120,91 @@ mod job_trigger_tests {
                 "{machine}: {command}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod binding_tests {
+    use super::*;
+    use russh::client;
+    use russh::keys::{PrivateKeyWithHashAlg, PublicKeyOrCertificate};
+    struct Pin;
+    impl client::Handler for Pin {
+        type Error = russh::Error;
+        async fn check_server_key(
+            &mut self,
+            key: &PublicKeyOrCertificate,
+        ) -> Result<bool, Self::Error> {
+            Ok(
+                matches!(key, PublicKeyOrCertificate::PublicKey { key, .. } if *key == *ed25519(&HOST_KEY_PINNED).public_key()),
+            )
+        }
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn sshd_refuses_uninstalled_and_other_machine_keys_without_harness() {
+        let seen = Observed::default();
+        let fixture = sshd(seen.clone()).await;
+        let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let own = crate::reader::role_key(mnemonic, 0, 0).unwrap();
+        let other = crate::reader::role_key(mnemonic, 0, 1).unwrap();
+        std::fs::write(
+            fixture.machine.root.join("authorized_keys"),
+            ed25519(&own).public_key().to_openssh().unwrap() + "\n",
+        )
+        .unwrap();
+        for (seed, expected) in [(urandom::<32>(), false), (other, false), (own, true)] {
+            let result = tokio::time::timeout(Duration::from_secs(10), async {
+                let mut connection = client::connect(
+                    Arc::new(client::Config::default()),
+                    ("127.0.0.1", fixture.port),
+                    Pin,
+                )
+                .await
+                .unwrap();
+                let result = connection
+                    .authenticate_publickey(
+                        tau_web::testonly::SSH_USER,
+                        PrivateKeyWithHashAlg::new(Arc::new(ed25519(&seed)), None),
+                    )
+                    .await
+                    .unwrap();
+                connection
+                    .disconnect(russh::Disconnect::ByApplication, "", "en")
+                    .await
+                    .unwrap();
+                result.success()
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                result, expected,
+                "fixture sshd must refuse an uninstalled or another machine's key"
+            );
+        }
+        // The file is read at each attempt; removing the key immediately revokes admission.
+        std::fs::write(fixture.machine.root.join("authorized_keys"), "").unwrap();
+        let mut connection = client::connect(
+            Arc::new(client::Config::default()),
+            ("127.0.0.1", fixture.port),
+            Pin,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !connection
+                .authenticate_publickey(
+                    tau_web::testonly::SSH_USER,
+                    PrivateKeyWithHashAlg::new(Arc::new(ed25519(&own)), None)
+                )
+                .await
+                .unwrap()
+                .success()
+        );
+        connection
+            .disconnect(russh::Disconnect::ByApplication, "", "en")
+            .await
+            .unwrap();
+        drop(connection);
+        fixture.cleanup().await;
     }
 }
