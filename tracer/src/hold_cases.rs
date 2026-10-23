@@ -58,7 +58,16 @@ pub(super) async fn run(
 ) -> Result<Worker, String> {
     let saved = store_files(&run.dump(tab).await?);
     // Independent fixtures start from the same seed, without older collectable disposed calls.
-    let original = reader::build(PASSPHRASE, &events(&saved)?[..2]);
+    let prior = events(&saved)?;
+    let mnemonic = prior[0]["seed"]["mnemonic"]
+        .as_str()
+        .ok_or("fixture seed")?;
+    let mut initial = vec![prior[0].clone()];
+    initial.extend(reader::setup_events(
+        mnemonic,
+        &["fixture", "fixture-other", "unpinned"],
+    ));
+    let original = reader::build(PASSPHRASE, &initial);
     worker = restore(run, tab, worker, &original).await?;
     let selected = |name: &str| {
         std::env::var("TAU_TRACER_HOLD_CASE").map_or(true, |s| {

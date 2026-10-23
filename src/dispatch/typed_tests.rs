@@ -14,56 +14,53 @@ fn pass() -> LocalPassphrase {
     LocalPassphrase::new(b"fixture passphrase only".to_vec())
 }
 
-pub(super) fn associations() -> Vec<Association> {
-    vec![
-        Association {
-            target: Target::Entry("fixture".into()),
-            entry: "fixture".into(),
-        },
-        Association {
-            target: Target::AllocationIndex(0),
-            entry: "fixture".into(),
-        },
-        Association {
-            target: Target::AllocationIndex(1),
-            entry: "fixture".into(),
-        },
-        Association {
-            target: Target::VendorMachine("vendor-7".into()),
-            entry: "fixture".into(),
-        },
-        Association {
-            target: Target::Entry("other".into()),
-            entry: "other".into(),
-        },
-    ]
-}
-
-fn associate(store: &mut Store<MemoryStorage>) {
-    for association in associations() {
-        store.associate(association).unwrap();
-    }
-}
-
-fn fresh() -> (MemoryStorage, Store<MemoryStorage>) {
+fn fresh() -> (MemoryStorage, Store<MemoryStorage>, u32) {
     let storage = MemoryStorage::default();
     let mut store = block_on(store::create(storage.clone(), &FixedKdf, pass())).unwrap();
-    associate(&mut store);
-    (storage, store)
+    block_on(store.seed_backup(crate::allocation::Completion::Skipped)).unwrap();
+    let mut entries = fixture_setup();
+    entries[1].machine = "other".into();
+    // Index 0 belongs to fixture; the extra attempt uses the returned third index.
+    block_on(store.approve_setup(entries)).unwrap();
+    let extra = block_on(store.allocate(crate::allocation::Family::Machines)).unwrap();
+    store
+        .associate(Association {
+            target: Target::AllocationIndex(extra.index),
+            entry: "fixture".into(),
+        })
+        .unwrap();
+    store
+        .associate(Association {
+            target: Target::VendorMachine("vendor-7".into()),
+            entry: "fixture".into(),
+        })
+        .unwrap();
+    (storage, store, extra.index)
 }
 
-fn reopen(storage: &MemoryStorage) -> Store<MemoryStorage> {
+fn reopen(storage: &MemoryStorage, extra_index: u32) -> Store<MemoryStorage> {
     let mut store = block_on(store::unlock(
         MemoryStorage::with_files(storage.files()),
         &FixedKdf,
         pass(),
     ))
     .unwrap();
-    associate(&mut store);
+    store
+        .associate(Association {
+            target: Target::AllocationIndex(extra_index),
+            entry: "fixture".into(),
+        })
+        .unwrap();
+    store
+        .associate(Association {
+            target: Target::VendorMachine("vendor-7".into()),
+            entry: "fixture".into(),
+        })
+        .unwrap();
     store
 }
 
-pub(super) fn request(operation: Operation) -> Request {
+pub(crate) fn request(operation: Operation) -> Request {
     let facts = Facts {
         arguments: BTreeMap::from([("size".into(), "small".into())]),
         cost_bound: 12,
@@ -144,23 +141,29 @@ const CHOICES: [Continuation; 4] = [
 
 #[test]
 fn typed_record_before_send_survives_every_kill_boundary() {
-    let (storage, _) = fresh();
+    let (storage, _, extra_index) = fresh();
     let files = storage.files();
     for at in 1..=4 {
         let storage = MemoryStorage::with_files(files.clone());
-        let mut store = reopen(&storage);
+        let mut store = reopen(&storage, extra_index);
         // Reopen's storage is a new worker; fault the exact storage it owns.
         let active = store.storage().clone();
         active.fault(Fault::Die(at));
         let mut vendor = fixture::Vendor::default();
         let result = block_on(vendor.run(&mut store, &request(Operation::Create)));
+        if at != 4 {
+            assert!(
+                matches!(result, Err(OperationError::Storage(_))),
+                "killed typed append must fail at storage"
+            );
+        }
         assert_eq!(result.is_ok(), at == 4);
         drop(store);
-        let replayed = reopen(&active);
-        assert_eq!(replayed.records(), 0..if at == 4 { 2 } else { 1 });
+        let replayed = reopen(&active, extra_index);
+        assert_eq!(replayed.records(), 0..if at == 4 { 5 } else { 4 });
         assert_eq!(replayed.dispatch().typed_calls.len(), usize::from(at == 4));
         if at == 4 {
-            let recorded = &replayed.dispatch().typed_calls[&1];
+            let recorded = &replayed.dispatch().typed_calls[&4];
             assert_eq!(recorded.state, CallState::Unresolved);
             assert_eq!(
                 recorded.intent.approved,
@@ -178,7 +181,7 @@ fn typed_record_before_send_survives_every_kill_boundary() {
         }
     }
     // Kill the actual request future at the record/send boundary after a successful append.
-    let (_, mut store) = fresh();
+    let (_, mut store, extra_index) = fresh();
     let active = store.storage().clone();
     let mut vendor = fixture::Vendor {
         pause_before_send: true,
@@ -195,13 +198,13 @@ fn typed_record_before_send_survives_every_kill_boundary() {
         );
     }
     drop(store);
-    let replayed = reopen(&active);
+    let replayed = reopen(&active, extra_index);
     assert_eq!(
-        replayed.dispatch().typed_calls[&1].state,
+        replayed.dispatch().typed_calls[&4].state,
         CallState::Unresolved
     );
     assert_eq!(
-        replayed.dispatch().typed_calls[&1].intent.approved,
+        replayed.dispatch().typed_calls[&4].intent.approved,
         request.approved.unwrap()
     );
     assert!(
@@ -212,7 +215,7 @@ fn typed_record_before_send_survives_every_kill_boundary() {
 
 #[test]
 fn lost_create_new_call_session_route_and_index_are_refused_after_replay() {
-    let (storage, mut store) = fresh();
+    let (storage, mut store, extra_index) = fresh();
     let mut vendor = fixture::Vendor::default();
     assert_eq!(fixture::Vendor::RETRY_SAFETY, "reconcile-before-retry");
     let call = block_on(vendor.run(&mut store, &request(Operation::Create))).unwrap();
@@ -220,7 +223,7 @@ fn lost_create_new_call_session_route_and_index_are_refused_after_replay() {
         vendor.received[0],
         store.dispatch().typed_calls[&call].intent
     );
-    for store in [&mut store, &mut reopen(&storage)] {
+    for store in [&mut store, &mut reopen(&storage, extra_index)] {
         assert_eq!(
             store.dispatch().typed_calls[&call].state,
             CallState::Unresolved
@@ -234,7 +237,7 @@ fn lost_create_new_call_session_route_and_index_are_refused_after_replay() {
             for target in [
                 Target::Entry("fixture".into()),
                 Target::AllocationIndex(0),
-                Target::AllocationIndex(1),
+                Target::AllocationIndex(extra_index),
                 Target::VendorMachine("vendor-7".into()),
             ] {
                 let mut next = request(Operation::Create);
@@ -265,13 +268,13 @@ fn lost_create_new_call_session_route_and_index_are_refused_after_replay() {
 
 #[test]
 fn an_entry_target_associates_only_with_its_own_entry() {
-    let (_, mut store) = fresh();
+    let (_, mut store, _) = fresh();
     assert_eq!(
         store.associate(Association {
             target: Target::Entry("stray".into()),
             entry: "fixture".into(),
         }),
-        Err("an entry target names only its own entry".into())
+        Err("only allocation indices and vendor ids can be associated".into())
     );
     assert_eq!(
         store.dispatch().resolve(&Target::Entry("stray".into())),
@@ -281,7 +284,7 @@ fn an_entry_target_associates_only_with_its_own_entry() {
 
 #[test]
 fn approved_facts_are_required_and_are_exactly_what_the_fixture_receives() {
-    let (_, mut store) = fresh();
+    let (_, mut store, _) = fresh();
     let mut vendor = fixture::Vendor::default();
     let before = store.storage().files();
     let mut changed = request(Operation::Create);
@@ -313,7 +316,7 @@ fn approved_facts_are_required_and_are_exactly_what_the_fixture_receives() {
 #[test]
 fn status_reads_pass_and_failed_observation_append_keeps_barrier() {
     for operation in [Operation::Create, Operation::Reset, Operation::Reinstall] {
-        let (_, mut store) = fresh();
+        let (_, mut store, extra_index) = fresh();
         let mut vendor = fixture::Vendor::default();
         let call = block_on(vendor.run(&mut store, &request(operation))).unwrap();
         assert!(store.check_operation(&request(Operation::Read)).is_ok());
@@ -330,7 +333,7 @@ fn status_reads_pass_and_failed_observation_append_keeps_barrier() {
         );
         let snapshot = store.storage().files();
         for (fault, landed) in [(Fault::Fail(3), false), (Fault::LandThenFail(3), true)] {
-            let mut worker = reopen(&MemoryStorage::with_files(snapshot.clone()));
+            let mut worker = reopen(&MemoryStorage::with_files(snapshot.clone()), extra_index);
             let storage = worker.storage().clone();
             let read = worker.dispatch().observation(
                 Resource::Entry("fixture".into()),
@@ -359,7 +362,7 @@ fn status_reads_pass_and_failed_observation_append_keeps_barrier() {
                 ))),
                 "failed-append latch"
             );
-            let replayed = reopen(&storage);
+            let replayed = reopen(&storage, extra_index);
             assert_eq!(
                 replayed.dispatch().typed_calls[&call].state == CallState::Unresolved,
                 !landed
@@ -371,7 +374,7 @@ fn status_reads_pass_and_failed_observation_append_keeps_barrier() {
 #[test]
 fn reset_and_reinstall_stop_commands_at_check_and_append_until_confirmation() {
     for operation in [Operation::Reset, Operation::Reinstall, Operation::Destroy] {
-        let (_, mut store) = fresh();
+        let (_, mut store, _) = fresh();
         let intent = block_on(store.operation(&request(operation))).unwrap();
         let call = intent.call;
         let before = store.storage().files();
@@ -406,14 +409,14 @@ fn disposition_matrix_reads_and_commands_in_core_store_and_replay() {
         Operation::Exec,
     ] {
         for continuation in CHOICES {
-            let (storage, mut store) = fresh();
+            let (storage, mut store, extra_index) = fresh();
             let call = if operation == Operation::Exec {
                 block_on(store.append(&command(), &pin())).unwrap()
             } else {
                 block_on(store.operation(&request(operation))).unwrap().call
             };
             block_on(store.dispose(choice(&[call], continuation))).unwrap();
-            for store in [&mut store, &mut reopen(&storage)] {
+            for store in [&mut store, &mut reopen(&storage, extra_index)] {
                 let standing = store.dispatch().standing["fixture"].clone();
                 command_refused(
                     store,
@@ -429,7 +432,7 @@ fn disposition_matrix_reads_and_commands_in_core_store_and_replay() {
                     Requester::Operator,
                     Requester::HarnessFlow,
                 ] {
-                    let mut worker = reopen(store.storage());
+                    let mut worker = reopen(store.storage(), extra_index);
                     let mut entry = command();
                     entry.provenance = Some(CommandProvenance {
                         target: Target::AllocationIndex(0),
@@ -519,7 +522,7 @@ fn disposition_matrix_reads_and_commands_in_core_store_and_replay() {
                 );
                 // The pinned SSH attempt is exercised by the browser cases.
                 if !continuation.destructive() {
-                    let mut command_worker = reopen(store.storage());
+                    let mut command_worker = reopen(store.storage(), extra_index);
                     assert!(
                         block_on(command_worker.append(&command(), &pin())).is_ok(),
                         "continuing choice dispatches a new command"
@@ -545,7 +548,7 @@ fn continuation_reach_permissions_and_durable_end() {
         Continuation::DestructiveReinstall,
         Continuation::Abandonment,
     ] {
-        let (_, mut initial) = fresh();
+        let (_, mut initial, extra_index) = fresh();
         let call = block_on(initial.operation(&request(Operation::Reset)))
             .unwrap()
             .call;
@@ -593,7 +596,7 @@ fn continuation_reach_permissions_and_durable_end() {
         let mut r = request(permitted);
         r.requester = Requester::HarnessFlow;
         approve(&mut r, Resource::Entry("fixture".into()));
-        let mut failing = reopen(&MemoryStorage::with_files(saved.clone()));
+        let mut failing = reopen(&MemoryStorage::with_files(saved.clone()), extra_index);
         let storage = failing.storage().clone();
         storage.fault(Fault::Fail(3));
         assert_eq!(
@@ -601,10 +604,15 @@ fn continuation_reach_permissions_and_durable_end() {
             Err(OperationError::Storage("move: made to fail".into()))
         );
         assert!(failing.dispatch().standing.contains_key("fixture"));
-        assert!(reopen(&storage).dispatch().standing.contains_key("fixture"));
-        let mut store = reopen(&MemoryStorage::with_files(saved));
+        assert!(
+            reopen(&storage, extra_index)
+                .dispatch()
+                .standing
+                .contains_key("fixture")
+        );
+        let mut store = reopen(&MemoryStorage::with_files(saved), extra_index);
         let intent = block_on(store.operation(&r)).unwrap();
-        for store in [&store, &reopen(store.storage())] {
+        for store in [&store, &reopen(store.storage(), extra_index)] {
             assert!(!store.dispatch().standing.contains_key("fixture"));
             assert_eq!(
                 store.check_operation(&r),
@@ -641,7 +649,7 @@ fn continuation_reach_permissions_and_durable_end() {
 
 #[test]
 fn replacements_drop_calls_permanently_and_later_evidence_keeps_unknown_outcome() {
-    let (_, mut store) = fresh();
+    let (_, mut store, extra_index) = fresh();
     let mut vendor = fixture::Vendor::default();
     let create = block_on(vendor.run(&mut store, &request(Operation::Create))).unwrap();
     let exec = block_on(store.append(&command(), &pin())).unwrap();
@@ -665,7 +673,7 @@ fn replacements_drop_calls_permanently_and_later_evidence_keeps_unknown_outcome(
             .unwrap()
             .is_empty()
     );
-    let mut replayed = reopen(store.storage());
+    let mut replayed = reopen(store.storage(), extra_index);
     for store in [&mut store, &mut replayed] {
         let before = store.storage().files();
         let refusal = block_on(store.dispose(choice(&[create], Continuation::AsIfDone))).unwrap();
@@ -700,7 +708,7 @@ fn replacements_drop_calls_permanently_and_later_evidence_keeps_unknown_outcome(
 
 #[test]
 fn partial_disposition_keeps_abandonment_flow_barred_until_every_call_is_disposed() {
-    let (_, mut store) = fresh();
+    let (_, mut store, extra_index) = fresh();
     let mut vendor = fixture::Vendor::default();
     let create = block_on(vendor.run(&mut store, &request(Operation::Create))).unwrap();
     let exec = block_on(store.append(&command(), &pin())).unwrap();
@@ -723,7 +731,7 @@ fn partial_disposition_keeps_abandonment_flow_barred_until_every_call_is_dispose
         })
     );
     let intent = block_on(store.operation(&destroy)).unwrap();
-    for store in [&store, &reopen(store.storage())] {
+    for store in [&store, &reopen(store.storage(), extra_index)] {
         assert!(!store.dispatch().standing.contains_key("fixture"));
         assert_eq!(
             store.check_operation(&request(Operation::Destroy)),
@@ -736,7 +744,7 @@ fn partial_disposition_keeps_abandonment_flow_barred_until_every_call_is_dispose
 
 #[test]
 fn a_session_approval_cannot_stand_for_the_abandonment_flow() {
-    let (_, mut store) = fresh();
+    let (_, mut store, _) = fresh();
     let mut vendor = fixture::Vendor::default();
     let create = block_on(vendor.run(&mut store, &request(Operation::Create))).unwrap();
     block_on(store.dispose(choice(&[create], Continuation::Abandonment))).unwrap();
@@ -768,7 +776,7 @@ fn a_session_approval_cannot_stand_for_the_abandonment_flow() {
 
 #[test]
 fn delayed_status_cannot_settle_a_later_reissue() {
-    let (_, mut store) = fresh();
+    let (_, mut store, _) = fresh();
     let first = block_on(store.operation(&request(Operation::Create)))
         .unwrap()
         .call;
@@ -795,7 +803,7 @@ fn delayed_status_cannot_settle_a_later_reissue() {
 
 #[test]
 fn typed_disposition_naming_refusals_and_invalid_replayed_replacements_are_reported() {
-    let (_, mut store) = fresh();
+    let (_, mut store, extra_index) = fresh();
     let call = block_on(store.operation(&request(Operation::Reset)))
         .unwrap()
         .call;
@@ -821,7 +829,7 @@ fn typed_disposition_naming_refusals_and_invalid_replayed_replacements_are_repor
     let mut wrong_resource = choice(&[call], Continuation::Abandonment);
     wrong_resource.machine = "other".into();
     block_on(store.dispatch_fixture_record(store::Event::Disposition(wrong_resource))).unwrap();
-    for store in [&store, &reopen(store.storage())] {
+    for store in [&store, &reopen(store.storage(), extra_index)] {
         assert_eq!(
             store.dispatch().typed_calls[&call].state,
             CallState::Unresolved
@@ -862,7 +870,7 @@ fn typed_disposition_naming_refusals_and_invalid_replayed_replacements_are_repor
         ))),
     )
     .unwrap();
-    let replayed = reopen(store.storage());
+    let replayed = reopen(store.storage(), extra_index);
     assert_eq!(
         replayed.dispatch().standing["fixture"]
             .disposition
@@ -878,7 +886,7 @@ fn typed_disposition_naming_refusals_and_invalid_replayed_replacements_are_repor
 
 #[test]
 fn later_confirming_fixture_evidence_is_journaled_without_removing_the_standing_choice() {
-    let (_, mut store) = fresh();
+    let (_, mut store, extra_index) = fresh();
     let mut vendor = fixture::Vendor::default();
     let call = block_on(vendor.run(&mut store, &request(Operation::Reset))).unwrap();
     block_on(store.dispose(choice(&[call], Continuation::Abandonment))).unwrap();
@@ -893,7 +901,7 @@ fn later_confirming_fixture_evidence_is_journaled_without_removing_the_standing_
         .unwrap()
         .is_empty()
     );
-    for store in [&store, &reopen(store.storage())] {
+    for store in [&store, &reopen(store.storage(), extra_index)] {
         assert_eq!(store.dispatch().standing["fixture"], standing);
         assert_eq!(
             store.dispatch().observations[0].observation.reports,
@@ -911,7 +919,7 @@ fn later_confirming_fixture_evidence_is_journaled_without_removing_the_standing_
 
 #[test]
 fn inspection_reports_typed_records_drops_assumptions_and_refused_replay() {
-    let (storage, mut store) = fresh();
+    let (storage, mut store, _) = fresh();
     let create = block_on(store.operation(&request(Operation::Create)))
         .unwrap()
         .call;
@@ -954,7 +962,7 @@ fn inspection_reports_typed_records_drops_assumptions_and_refused_replay() {
     assert_eq!(report["dispositions"][2]["report"]["decision"], "refused");
     assert_eq!(
         report["dispositions"][2]["report"]["issues"][0]["settled_by"],
-        3
+        6
     );
     assert_eq!(
         report["observations"][0]["observation"]["reports"],
@@ -964,18 +972,20 @@ fn inspection_reports_typed_records_drops_assumptions_and_refused_replay() {
 }
 
 #[test]
-fn journal_assignment_alone_keeps_the_running_system_barrier_without_associations() {
-    let (storage, mut store) = fresh();
-    let call = block_on(store.operation(&request(Operation::Reset)))
-        .unwrap()
-        .call;
+fn journal_assignment_keeps_the_running_system_barrier_without_transient_associations() {
+    let (storage, mut store, extra) = fresh();
+    // Dispatched through the transient extra index, which the reopen below does not supply.
+    let mut reset = request(Operation::Reset);
+    reset.target = Target::AllocationIndex(extra);
+    reset.approved.as_mut().unwrap().target = reset.target.clone();
+    let call = block_on(store.operation(&reset)).unwrap().call;
     let replayed = block_on(store::unlock(
         MemoryStorage::with_files(storage.files()),
         &FixedKdf,
         pass(),
     ))
     .unwrap();
-    assert!(replayed.dispatch().associations.is_empty());
+    assert_eq!(replayed.dispatch().associations.len(), 2);
     assert_eq!(
         replayed
             .dispatch()
@@ -989,7 +999,7 @@ fn journal_assignment_alone_keeps_the_running_system_barrier_without_association
 
 #[test]
 fn operation_writer_refuses_commands_and_inference_without_storage_failure() {
-    let (_, mut store) = fresh();
+    let (_, mut store, _) = fresh();
     let before = store.storage().files();
     for operation in [Operation::Exec, Operation::Inference] {
         assert_eq!(

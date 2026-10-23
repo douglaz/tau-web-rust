@@ -33,7 +33,7 @@ pub(super) async fn run(
         .iter()
         .map(|(_, p)| serde_json::from_slice(p).map_err(|e| e.to_string()))
         .collect::<Result<Vec<Value>, _>>()?;
-    let original = events[..2].to_vec();
+    let original = events[..3].to_vec();
     let mut events = original.clone();
     let call = events.len() as u64;
     events.push(intent(call, "reset"));

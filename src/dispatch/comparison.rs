@@ -466,6 +466,8 @@ fn pass() -> LocalPassphrase {
 struct Driver {
     store: Store<MemoryStorage>,
     calls: BTreeMap<u64, u64>,
+    indices: BTreeMap<u32, u32>,
+    transient_associations: Vec<Association>,
 }
 impl Driver {
     fn new(start: &Value) -> Result<Self, String> {
@@ -476,12 +478,33 @@ impl Driver {
         let mut driver = Self {
             store,
             calls: BTreeMap::new(),
+            indices: BTreeMap::new(),
+            transient_associations: Vec::new(),
         };
-        for a in &knowledge.associations {
-            driver.store.associate(Association {
-                target: to_target(&a.target)?,
-                entry: format!("entry-{}", a.entry),
-            })?;
+        block_on(
+            driver
+                .store
+                .seed_backup(crate::allocation::Completion::Skipped),
+        )?;
+        let mut entries = fixture_setup();
+        entries[0].machine = "entry-2".into();
+        entries[1].machine = "entry-1".into();
+        let approval = block_on(driver.store.approve_setup(entries))?;
+        driver.indices.insert(2, approval.entries[0].identity.index);
+        driver.indices.insert(0, approval.entries[1].identity.index);
+        let extra = block_on(driver.store.allocate(crate::allocation::Family::Machines))?;
+        driver.indices.insert(1, extra.index);
+        if driver.indices.values().collect::<BTreeSet<_>>().len() != driver.indices.len() {
+            return Err("allocation map is not injective".into());
+        }
+        // Only these two associations are supplied again after reopen.
+        for target in [WTarget::AllocationIndex(1), WTarget::VendorMachineId(10)] {
+            let association = Association {
+                target: driver.to_target(&target)?,
+                entry: "entry-1".into(),
+            };
+            driver.store.associate(association.clone())?;
+            driver.transient_associations.push(association);
         }
         for c in &knowledge.calls {
             if c.state != "unresolved" {
@@ -524,7 +547,7 @@ impl Driver {
         Ok(driver)
     }
     fn replay(&mut self) -> Result<(), String> {
-        let associations = self.store.dispatch().associations.clone();
+        let associations = self.transient_associations.clone();
         self.store = block_on(store::unlock(
             MemoryStorage::with_files(self.store.storage().files()),
             &FixtureKdf,
@@ -534,6 +557,30 @@ impl Driver {
             self.store.associate(a)?;
         }
         Ok(())
+    }
+    fn to_target(&self, value: &WTarget) -> Result<Target, String> {
+        if let WTarget::AllocationIndex(n) = value {
+            return self
+                .indices
+                .get(n)
+                .copied()
+                .map(Target::AllocationIndex)
+                .ok_or_else(|| "unmapped witness index".into());
+        }
+        to_target(value)
+    }
+    fn witness_target(&self, value: &Target) -> WTarget {
+        if let Target::AllocationIndex(n) = value {
+            return WTarget::AllocationIndex(
+                *self
+                    .indices
+                    .iter()
+                    .find(|(_, actual)| **actual == *n)
+                    .expect("production index bijection")
+                    .0,
+            );
+        }
+        from_target(value)
     }
     fn id(&self, symbolic: u64) -> u64 {
         self.calls
@@ -562,7 +609,7 @@ impl Driver {
         fact: u64,
         approved: Option<&WApproval>,
     ) -> Result<Request, String> {
-        let target = to_target(target)?;
+        let target = self.to_target(target)?;
         let resource = self
             .store
             .dispatch()
@@ -615,7 +662,7 @@ impl Driver {
                 .associations
                 .iter()
                 .map(|a| WAssociation {
-                    target: from_target(&a.target),
+                    target: self.witness_target(&a.target),
                     entry: ordinal(&a.entry, "entry-"),
                 })
                 .collect(),
@@ -627,7 +674,7 @@ impl Driver {
                         if let Some(c) = d.typed_calls.get(id) {
                             let intent = &c.intent;
                             (
-                                from_target(&intent.target),
+                                self.witness_target(&intent.target),
                                 from_resource(&intent.resource),
                                 intent.operation,
                                 ordinal(&intent.session, "session-"),
@@ -653,7 +700,7 @@ impl Driver {
                                 panic!("recorded command admission")
                             };
                             (
-                                from_target(&provenance.target),
+                                self.witness_target(&provenance.target),
                                 from_resource(&Resource::Entry(intent.machine.clone())),
                                 Operation::Exec,
                                 session,
@@ -757,6 +804,9 @@ impl Driver {
             DispatchRefusal::TypedBarrier { calls } => RequestRefusal::Barrier {
                 calls: calls.iter().map(|i| i.call).collect(),
             },
+            other @ (DispatchRefusal::NoEntry { .. } | DispatchRefusal::Provenance) => {
+                panic!("unexpected command refusal: {other:?}")
+            }
             DispatchRefusal::Disposition(in_force) => RequestRefusal::Continuation { in_force },
         };
         self.request_refusal(refusal)
@@ -778,7 +828,7 @@ impl Driver {
                     return Err(format!("unknown request provenance {provenance}"));
                 }
                 let result = if operation == Operation::Exec {
-                    let target = to_target(&target)?;
+                    let target = self.to_target(&target)?;
                     let resource = self
                         .store
                         .dispatch()

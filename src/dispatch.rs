@@ -5,15 +5,17 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+mod setup;
 mod typed;
+pub use setup::*;
 pub use typed::*;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod comparison;
 #[cfg(all(test, not(target_arch = "wasm32")))]
-mod fixture;
+pub(crate) mod fixture;
 #[cfg(all(test, not(target_arch = "wasm32")))]
-mod typed_tests;
+pub(crate) mod typed_tests;
 
 /// The identity of what admitted a command, not approval of its contents.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,6 +166,8 @@ pub struct CommandHold {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DispatchRefusal {
+    NoEntry { machine: String },
+    Provenance,
     Held(CommandHold),
     Disposition(DestructiveDisposition),
     TypedBarrier { calls: Vec<OperationIntent> },
@@ -172,6 +176,7 @@ pub enum DispatchRefusal {
 /// All projections come from committed records applied in journal order.
 #[derive(Clone, Debug, Default)]
 pub struct Dispatch {
+    pub approved_entries: BTreeMap<String, ApprovedMachine>,
     pub intent_order: Vec<u64>,
     pub calls: BTreeMap<u64, Call>,
     pub terminals: Vec<TerminalRecord>,
@@ -187,6 +192,11 @@ pub struct Dispatch {
 
 impl Dispatch {
     pub fn check_command(&self, machine: &str) -> Result<(), DispatchRefusal> {
+        if !self.approved_entries.contains_key(machine) {
+            return Err(DispatchRefusal::NoEntry {
+                machine: machine.into(),
+            });
+        }
         let resource = Resource::Entry(machine.into());
         match self.check_operation(&resource, Operation::Exec, Requester::Session) {
             Ok(()) => Ok(()),
@@ -498,6 +508,48 @@ mod tests {
     #[test]
     fn unresolved_command_hold_includes_every_legacy_and_unreadable_call_only_on_its_machine() {
         let mut dispatch = Dispatch::default();
+        let mut allocation = crate::allocation::Metadata::new("fixture-seed".into());
+        allocation
+            .apply(&crate::allocation::Event::SeedBackup {
+                seed: "fixture-seed".into(),
+                completion: crate::allocation::Completion::Skipped,
+            })
+            .unwrap();
+        let entries = ["fixture", "other"]
+            .into_iter()
+            .map(|name| {
+                let mut entry = fixture_setup().remove(0);
+                entry.machine = name.into();
+                let identity = allocation
+                    .issue(crate::allocation::Family::Machines)
+                    .unwrap();
+                allocation
+                    .apply(&crate::allocation::Event::Reserve(identity.clone()))
+                    .unwrap();
+                ApprovedEntry {
+                    entry,
+                    identity,
+                    access: Some(Access::ad_hoc()),
+                }
+            })
+            .collect();
+        let mut original = crate::allocation::Metadata::new("fixture-seed".into());
+        original
+            .apply(&crate::allocation::Event::SeedBackup {
+                seed: "fixture-seed".into(),
+                completion: crate::allocation::Completion::Skipped,
+            })
+            .unwrap();
+        dispatch
+            .apply_setup(
+                &mut original,
+                &SetupRecord::Approval(SetupApproval {
+                    entries,
+                    monthly_sat: 2000,
+                    annual_sat: 24000,
+                }),
+            )
+            .unwrap();
         dispatch
             .intent(1, intent(1, Some(Approval::LegacyCommand)))
             .unwrap();
@@ -536,7 +588,10 @@ mod tests {
             )
             .unwrap();
         assert!(
-            dispatch.check_command("fixture").is_err(),
+            matches!(
+                dispatch.check_command("fixture"),
+                Err(DispatchRefusal::Held(_))
+            ),
             "criterion 3: a finished call releases only its own hold"
         );
         dispatch

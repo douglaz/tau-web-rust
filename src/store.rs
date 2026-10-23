@@ -23,7 +23,8 @@
 //!   the worker restarts and re-reads the directory.
 //!
 //! - **Allocation** (`STA-22b`). Every allocation event is a record of its own, appended before it
-//!   is applied, and replay applies each through the same core (`crate::allocation`). A record
+//!   is applied; setup approval carries its reservations atomically. Replay applies both
+//!   through the same core (`crate::allocation`). A record
 //!   the core cannot apply stops replay and refuses the store.
 //!
 //! What it does not detect, as the format says: the rollback of the whole store, a missing tail
@@ -181,6 +182,7 @@ pub(crate) enum Event {
     /// One allocation event, recorded before it is applied: a reservation before any external
     /// effect (`STA-22b`), with its seed identifier and derivation version (`STA-22a`).
     Allocation(allocation::Event),
+    Setup(crate::dispatch::SetupRecord),
 }
 
 impl Drop for Event {
@@ -522,6 +524,66 @@ impl<S: Storage> Store<S> {
         Ok(())
     }
 
+    /// One atomic operator approval: reserve on a clone, commit, then apply both projections.
+    pub async fn approve_setup(
+        &mut self,
+        entries: Vec<crate::dispatch::MachineEntry>,
+    ) -> Result<crate::dispatch::SetupApproval, String> {
+        use crate::dispatch::*;
+        let (monthly_sat, annual_sat) = totals(&entries)?;
+        let mut allocation = self.allocation().clone();
+        let mut approved = Vec::new();
+        for entry in entries {
+            let identity = allocation
+                .issue(Family::Machines)
+                .map_err(|e| e.to_string())?;
+            allocation
+                .apply(&allocation::Event::Reserve(identity.clone()))
+                .map_err(|e| e.to_string())?;
+            approved.push(ApprovedEntry {
+                entry,
+                identity,
+                access: Some(Access::ad_hoc()),
+            });
+        }
+        let approval = SetupApproval {
+            entries: approved,
+            monthly_sat,
+            annual_sat,
+        };
+        self.setup_record(SetupRecord::Approval(approval.clone()))
+            .await?;
+        Ok(approval)
+    }
+
+    pub async fn answer_class(
+        &mut self,
+        machine: String,
+        answer: crate::dispatch::ClassAnswer,
+    ) -> Result<(), String> {
+        self.allocation()
+            .issue(Family::Machines)
+            .map_err(|e| e.to_string())?;
+        self.setup_record(crate::dispatch::SetupRecord::Class(
+            crate::dispatch::ClassRecord {
+                machine,
+                answer,
+                class: answer.class(),
+            },
+        ))
+        .await
+    }
+
+    async fn setup_record(&mut self, record: crate::dispatch::SetupRecord) -> Result<(), String> {
+        let mut dispatch = self.dispatch.clone();
+        let mut allocation = self.allocation().clone();
+        dispatch.apply_setup(&mut allocation, &record)?;
+        self.commit(&Event::Setup(record)).await?;
+        self.dispatch = dispatch;
+        self.allocation = Some(allocation);
+        Ok(())
+    }
+
     /// The recorded commands, by call identity; their states are in the dispatch projection.
     pub fn commands(&self) -> &[(u64, Entry)] {
         &self.commands
@@ -554,7 +616,18 @@ impl<S: Storage> Store<S> {
         Ok(())
     }
 
+    /// An index is associated only once the allocation core holds it in the machine family
+    /// (`STA-22b`), so no create can name an index that was never reserved.
     pub fn associate(&mut self, association: crate::dispatch::Association) -> Result<(), String> {
+        if let crate::dispatch::Target::AllocationIndex(index) = &association.target
+            && !self
+                .allocation()
+                .entries()
+                .iter()
+                .any(|e| e.identity.family == Family::Machines && e.identity.index == *index)
+        {
+            return Err("allocation index not reserved".into());
+        }
         self.dispatch.associate(association)
     }
 
@@ -677,6 +750,11 @@ impl<S: Storage> Store<S> {
                     self.seed = Some(seed);
                 }
                 (FIRST, _) => return Err("the first record is not the seed; replay stopped".into()),
+                (_, Event::Setup(record)) => {
+                    self.dispatch
+                        .apply_setup(self.allocation.as_mut().expect("seed first"), record)
+                        .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
+                }
                 (_, Event::Command { machine, command }) => {
                     self.apply_intent(
                         number,
@@ -870,6 +948,14 @@ impl<S: Storage> Journal for Store<S> {
 
     async fn append(&mut self, entry: &Entry, approval: &Approval) -> Result<u64, AppendRefusal> {
         self.check(&entry.machine).await?;
+        if let Some(provenance) = &entry.provenance
+            && self.dispatch.resolve(&provenance.target)
+                != Some(crate::dispatch::Resource::Entry(entry.machine.clone()))
+        {
+            return Err(AppendRefusal::Policy(
+                crate::dispatch::DispatchRefusal::Provenance,
+            ));
+        }
         let intent = Intent {
             call: self.next,
             machine: entry.machine.clone(),
@@ -1110,6 +1196,45 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
         }
     }
 
+    pub async fn setup_approve(&mut self) -> Value {
+        if let Some(reason) = self.dispatch_refusal() {
+            return self.report(Some(reason));
+        }
+        let result = self
+            .store()
+            .expect("unlocked")
+            .approve_setup(crate::dispatch::fixture_setup())
+            .await;
+        self.report(result.as_ref().err().map(String::as_str))
+    }
+
+    pub async fn setup_answer(&mut self, request: &str) -> Value {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Answer {
+            machine: String,
+            answer: crate::dispatch::ClassAnswer,
+        }
+        if let Some(reason) = self.dispatch_refusal() {
+            return self.report(Some(reason));
+        }
+        let Ok(value) = serde_json::from_str::<Value>(request) else {
+            return self.report(Some("invalid class answer"));
+        };
+        if !value.is_object() {
+            return self.report(Some("invalid class answer"));
+        }
+        let Ok(answer) = serde_json::from_value::<Answer>(value) else {
+            return self.report(Some("invalid class answer"));
+        };
+        let result = self
+            .store()
+            .expect("unlocked")
+            .answer_class(answer.machine, answer.answer)
+            .await;
+        self.report(result.as_ref().err().map(String::as_str))
+    }
+
     /// The unlocked store, if any.
     pub fn store(&mut self) -> Option<&mut Store<S>> {
         match &mut self.state {
@@ -1130,6 +1255,8 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
                 "seed_backup_owed": store.allocation().seed_backup_owed(),
                 "seed_backup_completion": store.allocation().seed_backup(),
                 "seed_backup_stage": self.seed_backup,
+                "setup": store.dispatch.setup_view(),
+                "setup_offer": if store.dispatch.approved_entries.is_empty() { serde_json::to_value(crate::dispatch::fixture_setup()).expect("fixture serializes") } else { Value::Null },
             }),
             State::Refused(why) => json!({ "state": "refused", "reason": why }),
         };
@@ -1472,10 +1599,7 @@ mod tests {
     fn store(passphrase: &str, commands: u8) -> (MemoryStorage, Store<MemoryStorage>) {
         let storage = MemoryStorage::default();
         let mut store = block_on(create(storage.clone(), &kdf(), pass(passphrase))).unwrap();
-        if commands > 0 {
-            assert_eq!(block_on(store.append(&command(1), &approval())).unwrap(), 1);
-        }
-        for n in 2..=commands {
+        for n in 1..=commands {
             // An older journal may contain several unresolved commands on one machine.
             // Craft those records: replay preserves them without rechecking admission.
             let intent = Intent {
@@ -1490,6 +1614,22 @@ mod tests {
             assert_eq!(number, u64::from(n));
             store.apply_intent(number, intent).unwrap();
         }
+        (storage, store)
+    }
+
+    /// Admission fixtures retain historical calls, then approve the entries before new dispatch.
+    fn admitted_store(passphrase: &str, commands: u8) -> (MemoryStorage, Store<MemoryStorage>) {
+        let (storage, mut store) = store(passphrase, commands);
+        block_on(store.seed_backup(allocation::Completion::Skipped)).unwrap();
+        let entries = ["fixture", "fixture-2", "fixture-3", "other"]
+            .into_iter()
+            .map(|name| {
+                let mut entry = crate::dispatch::fixture_setup().remove(0);
+                entry.machine = name.into();
+                entry
+            })
+            .collect();
+        block_on(store.approve_setup(entries)).unwrap();
         (storage, store)
     }
 
@@ -1847,15 +1987,18 @@ mod tests {
     fn a_failed_append_is_not_applied() {
         // The staging write's create, its close, and the move: each fails.
         for at in 1..=3 {
-            let (storage, mut store) = store(PASS, 1);
+            let (storage, mut store) = admitted_store(PASS, 1);
             storage.fault(Fault::Fail(at));
             assert!(
-                block_on(store.append(&independent_command(2), &independent_approval(2))).is_err(),
+                matches!(
+                    block_on(store.append(&independent_command(2), &independent_approval(2))),
+                    Err(AppendRefusal::Storage(_))
+                ),
                 "op {at}"
             );
             assert_eq!(recorded(&store), [command(1)], "op {at}: nothing applied");
             assert_eq!(block_on(store.read(2)), None);
-            assert_eq!(store.records(), 0..2);
+            assert_eq!(store.records(), 0..4);
             let reopened = reopen(&storage.files(), PASS).unwrap();
             assert_eq!(
                 recorded(&reopened),
@@ -1867,20 +2010,23 @@ mod tests {
 
     #[test]
     fn a_move_that_lands_but_reports_failure_is_never_overwritten() {
-        let (storage, mut store) = store(PASS, 1);
+        let (storage, mut store) = admitted_store(PASS, 1);
         storage.fault(Fault::LandThenFail(3));
-        assert!(block_on(store.append(&independent_command(2), &independent_approval(2))).is_err());
+        assert!(matches!(
+            block_on(store.append(&independent_command(2), &independent_approval(2))),
+            Err(AppendRefusal::Storage(_))
+        ));
         assert_eq!(storage.memory().log, ["create", "close", "move"]);
         assert_eq!(recorded(&store), [command(1)], "not applied");
-        let landed = storage.files()["2"].clone();
+        let landed = storage.files()["4"].clone();
         let refused =
             block_on(store.append(&independent_command(3), &independent_approval(3))).unwrap_err();
         assert!(
             refused.to_string().contains("until the worker restarts"),
             "{refused}"
         );
-        assert_eq!(storage.files()["2"], landed, "record 2 is not overwritten");
-        assert!(!storage.files().contains_key("3"));
+        assert_eq!(storage.files()["4"], landed, "record 4 is not overwritten");
+        assert!(!storage.files().contains_key("5"));
         // After a restart the directory is read again: the landed record is replayed, and the
         // next append takes the next number.
         let files = storage.files();
@@ -1889,14 +2035,14 @@ mod tests {
         assert_eq!(recorded(&reopened), [command(1), independent_command(2)]);
         assert_eq!(
             block_on(reopened.append(&independent_command(3), &independent_approval(3))),
-            Ok(3)
+            Ok(5)
         );
-        assert_eq!(storage.files()["2"], landed);
+        assert_eq!(storage.files()["4"], landed);
     }
 
     #[test]
     fn appends_stop_before_the_2_to_the_32nd_encryption_under_the_data_key() {
-        let (storage, mut store) = store(PASS, 1);
+        let (storage, mut store) = admitted_store(PASS, 1);
         let last = u64::from(u32::MAX) - 1;
         store.next = last;
         assert_eq!(
@@ -1923,14 +2069,16 @@ mod tests {
     #[test]
     fn a_killed_append_leaves_the_record_wholly_present_or_absent() {
         for at in 1.. {
-            let (storage, mut store) = store(PASS, 1);
+            let (storage, mut store) = admitted_store(PASS, 1);
             storage.fault(Fault::Die(at));
             let appended =
                 block_on(store.append(&independent_command(2), &independent_approval(2)));
             let files = storage.files();
             let reopened = reopen(&files, PASS).unwrap_or_else(|e| panic!("op {at}: {e}"));
             match recorded(&reopened).as_slice() {
-                [one] if *one == command(1) => assert!(appended.is_err()),
+                [one] if *one == command(1) => {
+                    assert!(matches!(appended, Err(AppendRefusal::Storage(_))))
+                }
                 [one, two] if *one == command(1) && *two == independent_command(2) => {}
                 other => panic!("op {at}: {other:?}"),
             }
@@ -2919,11 +3067,63 @@ mod tests {
     }
 
     #[test]
+    fn historical_intents_without_approved_entries_replay_with_their_command_hold() {
+        use crate::dispatch::{
+            CallState, DispatchRefusal, Operation, RequestRefusal, Requester, Resource,
+        };
+        let (storage, store) = store(PASS, 1);
+        let intent = store.dispatch.calls[&1].intent.clone();
+        let reopened = reopen(&storage.files(), PASS).unwrap();
+        for store in [&store, &reopened] {
+            assert_eq!(store.dispatch.calls[&1].intent, intent);
+            assert_eq!(state(store, 1), CallState::Unresolved);
+            assert_eq!(
+                store.dispatch.check_operation(
+                    &Resource::Entry("fixture".into()),
+                    Operation::Exec,
+                    Requester::Session,
+                ),
+                Err(RequestRefusal::Barrier { calls: vec![1] })
+            );
+            assert_eq!(
+                store.dispatch.check_command("fixture"),
+                Err(DispatchRefusal::NoEntry {
+                    machine: "fixture".into()
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn historical_intents_without_approved_entries_remain_collectable_after_reopen() {
+        use crate::dispatch::{CallState, DispatchRefusal};
+        let (storage, store) = store(PASS, 1);
+        let intent = store.dispatch.calls[&1].intent.clone();
+        let reopened = reopen(&storage.files(), PASS).unwrap();
+        for store in [&store, &reopened] {
+            assert_eq!(
+                block_on(store.collectable("fixture")).unwrap(),
+                vec![intent.clone()]
+            );
+            assert_eq!(
+                store.dispatch.check_command("fixture"),
+                Err(DispatchRefusal::NoEntry {
+                    machine: "fixture".into()
+                })
+            );
+            assert_eq!(state(store, 1), CallState::Unresolved);
+        }
+    }
+
+    #[test]
     fn job_terminal_carries_output_and_finding_through_replay_and_settles_mismatch() {
         use crate::jobs::{Comparison, Record};
-        let (storage, mut store) = store(PASS, 1);
+        let (storage, mut store) = admitted_store(PASS, 1);
         assert!(
-            store.dispatch.check_command("fixture").is_err(),
+            matches!(
+                store.dispatch.check_command("fixture"),
+                Err(crate::dispatch::DispatchRefusal::Held(_))
+            ),
             "criterion 3: unresolved command holds before finished evidence"
         );
         let mut evidence = job_evidence(&store, 1, Some(7));
@@ -2964,7 +3164,7 @@ mod tests {
             State::Incomplete,
             State::OtherMachine,
         ] {
-            let (storage, mut store) = store(PASS, 1);
+            let (storage, mut store) = admitted_store(PASS, 1);
             let mut evidence = job_evidence(&store, 1, None);
             match expected {
                 State::Missing => evidence.record = Record::Missing,
@@ -2992,7 +3192,10 @@ mod tests {
             for s in [&store, &reopen(&storage.files(), PASS).unwrap()] {
                 assert_eq!(state(s, 1), crate::dispatch::CallState::Unresolved);
                 assert!(
-                    s.dispatch.check_command("fixture").is_err(),
+                    matches!(
+                        s.dispatch.check_command("fixture"),
+                        Err(crate::dispatch::DispatchRefusal::Held(_))
+                    ),
                     "criterion 3: ended, missing, incomplete and other-machine evidence retain hold"
                 );
                 assert!(s.dispatch.terminals.is_empty());
@@ -3006,18 +3209,30 @@ mod tests {
     fn collection_evidence_preserves_all_four_dispositions_in_core_and_store() {
         use crate::dispatch::Continuation::*;
         for continuation in [DestructiveReinstall, Abandonment, AsIfDone, AsIfNotDone] {
-            let (storage, mut store) = store(PASS, 1);
+            let (storage, mut store) = admitted_store(PASS, 1);
             accepted(&mut store, continuation, &[1]);
             let standing = store.dispatch.standing.clone();
             let before = state(&store, 1);
             let verdict = store.dispatch.check_command("fixture");
-            assert_eq!(verdict.is_err(), continuation.destructive());
+            assert_eq!(
+                verdict,
+                if continuation.destructive() {
+                    Err(crate::dispatch::DispatchRefusal::Disposition(
+                        crate::dispatch::DestructiveDisposition {
+                            disposition: standing["fixture"].number,
+                            continuation,
+                        },
+                    ))
+                } else {
+                    Ok(())
+                }
+            );
             assert_eq!(block_on(store.collectable("fixture")).unwrap().len(), 1);
             let evidence = job_evidence(&store, 1, Some(7));
             let mut core = store.dispatch.clone();
-            core.job_evidence(3, evidence.clone(), true).unwrap();
+            core.job_evidence(5, evidence.clone(), true).unwrap();
             let report = block_on(store.job_evidence(&evidence)).unwrap();
-            assert_eq!(report.number, Some(3));
+            assert_eq!(report.number, Some(5));
             assert_eq!(store.commands.len(), 1, "collection appended an intent");
             for projection in [
                 &core,
@@ -3140,10 +3355,15 @@ mod tests {
                 provenance: None,
             }),
         );
+        block_on(store.seed_backup(allocation::Completion::Skipped)).unwrap();
+        block_on(store.approve_setup(crate::dispatch::fixture_setup())).unwrap();
         let reopened = reopen(&storage.files(), PASS).unwrap();
         assert_eq!(state(&reopened, 1), crate::dispatch::CallState::Unresolved);
         assert!(
-            reopened.dispatch.check_command("fixture").is_err(),
+            matches!(
+                reopened.dispatch.check_command("fixture"),
+                Err(crate::dispatch::DispatchRefusal::Held(_))
+            ),
             "criterion 3: no job identity still holds"
         );
         assert!(
@@ -3191,17 +3411,20 @@ mod tests {
 
     #[test]
     fn intent_identity_is_returned_only_after_commit_and_failure_sends_nothing() {
-        let (storage, mut store) = store(PASS, 0);
+        let (storage, mut store) = admitted_store(PASS, 0);
         storage.memory().log.clear();
         let id = block_on(store.append(&command(1), &approval())).unwrap();
-        assert_eq!(id, 1);
+        assert_eq!(id, 3);
         assert_eq!(storage.memory().log, ["create", "close", "move"]);
-        assert!(storage.files().contains_key("1"));
+        assert!(storage.files().contains_key("3"));
         assert_eq!(store.dispatch.calls[&id].intent.approval, Some(approval()));
         for at in 1..=3 {
-            let (storage, mut store) = self::store(PASS, 0);
+            let (storage, mut store) = self::admitted_store(PASS, 0);
             storage.fault(Fault::Fail(at));
-            assert!(block_on(store.append(&command(1), &approval())).is_err());
+            assert!(matches!(
+                block_on(store.append(&command(1), &approval())),
+                Err(AppendRefusal::Storage(_))
+            ));
             assert!(store.dispatch.calls.is_empty());
             assert!(
                 reopen(&storage.files(), PASS)
@@ -3216,7 +3439,7 @@ mod tests {
     #[test]
     fn unresolved_command_holds_another_command_and_same_bytes_without_writes_after_replay() {
         use crate::dispatch::{CallState, DispatchRefusal};
-        let (storage, mut store) = store(PASS, 1);
+        let (storage, mut store) = admitted_store(PASS, 1);
         let before = storage.files();
         assert_eq!(state(&store, 1), CallState::Unresolved);
         for entry in [
@@ -3302,7 +3525,7 @@ mod tests {
     fn destructive_dispositions_refuse_only_their_machine_without_poisoning_storage() {
         use crate::dispatch::Continuation::{Abandonment, DestructiveReinstall};
         for continuation in [DestructiveReinstall, Abandonment] {
-            let (storage, mut store) = store(PASS, 1);
+            let (storage, mut store) = admitted_store(PASS, 1);
             let number = accepted(&mut store, continuation, &[1]);
             let before = storage.files();
             for entry in [command(1), command(2)] {
@@ -3328,9 +3551,17 @@ mod tests {
                 machine: "other".into(),
                 fingerprint: "SHA256:other".into(),
             };
-            assert_eq!(block_on(store.append(&entry, &other)), Ok(3));
+            assert_eq!(block_on(store.append(&entry, &other)), Ok(5));
             assert!(store.failed.is_none());
-            assert!(store.dispatch.check_command("fixture").is_err());
+            assert_eq!(
+                store.dispatch.check_command("fixture"),
+                Err(crate::dispatch::DispatchRefusal::Disposition(
+                    crate::dispatch::DestructiveDisposition {
+                        disposition: number,
+                        continuation,
+                    }
+                ))
+            );
         }
     }
 
@@ -3342,7 +3573,7 @@ mod tests {
             Unknown,
         };
         for continuation in [AsIfDone, AsIfNotDone] {
-            let (storage, mut store) = store(PASS, 1);
+            let (storage, mut store) = admitted_store(PASS, 1);
             let number = accepted(&mut store, continuation, &[1]);
             assert_eq!(
                 state(&store, 1),
@@ -3355,12 +3586,48 @@ mod tests {
                 store.dispatch.standing["fixture"].disposition.continuation,
                 continuation
             );
-            assert_eq!(block_on(store.append(&command(2), &approval())), Ok(3));
-            assert_eq!(block_on(store.terminal(&terminal(3))), Ok(4));
-            assert_eq!(block_on(store.append(&command(1), &approval())), Ok(5));
+            assert_eq!(block_on(store.append(&command(2), &approval())), Ok(5));
+            assert_eq!(block_on(store.terminal(&terminal(5))), Ok(6));
+            assert_eq!(block_on(store.append(&command(1), &approval())), Ok(7));
             assert_eq!(
                 state(&reopen(&storage.files(), PASS).unwrap(), 1),
                 state(&store, 1)
+            );
+        }
+    }
+
+    #[test]
+    fn historical_intents_without_approved_entries_accept_dispositions_after_reopen() {
+        use crate::dispatch::{CallState, Continuation::Abandonment, DispatchRefusal, Unknown};
+        let (storage, mut store) = store(PASS, 1);
+        let disposition = disposition(Abandonment, &[1]);
+        let report = block_on(store.dispose(disposition.clone())).unwrap();
+        let expected = DispositionReport::Accepted {
+            number: 2,
+            replaces: None,
+            dropped: vec![],
+            assumption: None,
+        };
+        assert_eq!(report, expected);
+        let reopened = reopen(&storage.files(), PASS).unwrap();
+        for store in [&store, &reopened] {
+            assert_eq!(store.dispatch.dispositions[0].report, expected);
+            let standing = &store.dispatch.standing["fixture"];
+            assert_eq!(standing.number, 2);
+            assert_eq!(standing.disposition, disposition);
+            assert_eq!(standing.report, expected);
+            assert_eq!(
+                state(store, 1),
+                CallState::Disposed {
+                    disposition: 2,
+                    outcome: Unknown::Unknown,
+                }
+            );
+            assert_eq!(
+                store.dispatch.check_command("fixture"),
+                Err(DispatchRefusal::NoEntry {
+                    machine: "fixture".into()
+                })
             );
         }
     }
@@ -3415,14 +3682,14 @@ mod tests {
             CallState,
             Continuation::{Abandonment, AsIfDone, AsIfNotDone, DestructiveReinstall},
         };
-        let (storage, mut store) = store(PASS, 2);
+        let (storage, mut store) = admitted_store(PASS, 2);
         let first = accepted(&mut store, DestructiveReinstall, &[1]);
         assert_eq!(state(&store, 2), CallState::Unresolved);
         let replacement = block_on(store.dispose(disposition(AsIfNotDone, &[1]))).unwrap();
         assert_eq!(
             replacement,
             DispositionReport::Accepted {
-                number: 4,
+                number: 6,
                 replaces: Some(first),
                 dropped: vec![],
                 assumption: Some(crate::dispatch::Assumption {
@@ -3440,28 +3707,28 @@ mod tests {
             ),
             "criterion 3: unnamed unresolved command retains its hold after replacement"
         );
-        assert_eq!(block_on(store.terminal(&terminal(2))), Ok(5));
-        assert_eq!(block_on(store.append(&command(1), &approval())), Ok(6));
+        assert_eq!(block_on(store.terminal(&terminal(2))), Ok(7));
+        assert_eq!(block_on(store.append(&command(1), &approval())), Ok(8));
         let current = accepted(&mut store, AsIfDone, &[1]);
         let last = block_on(store.dispose(disposition(Abandonment, &[1]))).unwrap();
         assert_eq!(
             last,
             DispositionReport::Accepted {
-                number: 8,
+                number: 10,
                 replaces: Some(current),
                 dropped: vec![],
                 assumption: None,
             }
         );
         for s in [&mut store, &mut reopen(&storage.files(), PASS).unwrap()] {
-            assert_eq!(s.dispatch.standing["fixture"].number, 8);
+            assert_eq!(s.dispatch.standing["fixture"].number, 10);
             let Err(AppendRefusal::Policy(crate::dispatch::DispatchRefusal::Held(hold))) =
                 block_on(s.append(&command(2), &approval()))
             else {
                 panic!("criterion 3: unnamed call still holds under destructive replacement")
             };
-            assert_eq!(hold.calls.iter().map(|c| c.call).collect::<Vec<_>>(), [6]);
-            assert_eq!(hold.disposition.unwrap().disposition, 8);
+            assert_eq!(hold.calls.iter().map(|c| c.call).collect::<Vec<_>>(), [8]);
+            assert_eq!(hold.disposition.unwrap().disposition, 10);
         }
     }
 
@@ -3469,10 +3736,10 @@ mod tests {
     fn later_terminal_evidence_keeps_disposition_and_destructive_restriction() {
         use crate::dispatch::Continuation::{Abandonment, AsIfNotDone};
         for continuation in [Abandonment, AsIfNotDone] {
-            let (storage, mut store) = store(PASS, 1);
+            let (storage, mut store) = admitted_store(PASS, 1);
             let number = accepted(&mut store, continuation, &[1]);
             let disposed = state(&store, 1);
-            assert_eq!(block_on(store.terminal(&terminal(1))), Ok(3));
+            assert_eq!(block_on(store.terminal(&terminal(1))), Ok(5));
             assert_eq!(state(&store, 1), disposed);
             assert_eq!(store.dispatch.terminals[0].terminal, terminal(1));
             assert_eq!(store.dispatch.standing["fixture"].number, number);
@@ -3480,8 +3747,17 @@ mod tests {
             assert_eq!(state(&reopened, 1), disposed);
             assert_eq!(reopened.dispatch.standing["fixture"].number, number);
             assert_eq!(
-                reopened.dispatch.check_command("fixture").is_err(),
-                continuation.destructive()
+                reopened.dispatch.check_command("fixture"),
+                if continuation.destructive() {
+                    Err(crate::dispatch::DispatchRefusal::Disposition(
+                        crate::dispatch::DestructiveDisposition {
+                            disposition: number,
+                            continuation,
+                        },
+                    ))
+                } else {
+                    Ok(())
+                }
             );
             let entry = Entry {
                 provenance: None,
@@ -3495,7 +3771,17 @@ mod tests {
             assert!(block_on(store.append(&entry, &other)).is_ok());
             assert_eq!(store.dispatch.standing["fixture"].number, number);
             if continuation.destructive() {
-                assert!(block_on(store.append(&command(1), &approval())).is_err());
+                assert_eq!(
+                    block_on(store.append(&command(1), &approval())),
+                    Err(AppendRefusal::Policy(
+                        crate::dispatch::DispatchRefusal::Disposition(
+                            crate::dispatch::DestructiveDisposition {
+                                disposition: number,
+                                continuation,
+                            }
+                        )
+                    ))
+                );
             }
         }
     }
@@ -3507,7 +3793,7 @@ mod tests {
             Continuation::{Abandonment, AsIfDone},
         };
         for case in 0..4 {
-            let (storage, mut store) = store(PASS, 2);
+            let (storage, mut store) = admitted_store(PASS, 2);
             let bad = match case {
                 0 => disposition(Abandonment, &[]),
                 1 => {
@@ -3543,14 +3829,18 @@ mod tests {
                 report["dispositions"].as_array().unwrap().last().unwrap()["report"]["decision"],
                 "refused"
             );
-            assert_eq!(
-                reopened.dispatch.check_command("fixture").is_ok(),
-                case == 3,
-                "refused disposition adds no restriction; unresolved calls still hold"
-            );
+            let verdict = reopened.dispatch.check_command("fixture");
+            if case == 3 {
+                assert_eq!(verdict, Ok(()));
+            } else {
+                assert!(
+                    matches!(verdict, Err(crate::dispatch::DispatchRefusal::Held(_))),
+                    "refused disposition adds no restriction; unresolved calls still hold"
+                );
+            }
             assert!(reopened.dispatch.check_command("other").is_ok());
             if case == 3 {
-                assert_eq!(reopened.dispatch.standing["fixture"].number, 4);
+                assert_eq!(reopened.dispatch.standing["fixture"].number, 6);
                 assert_eq!(state(reopened, 1), state(&store, 1));
             } else {
                 assert!(reopened.dispatch.standing.is_empty());
@@ -3567,7 +3857,7 @@ mod tests {
         use crate::dispatch::{CallState, Continuation::Abandonment};
         for kill in [false, true] {
             for at in 1..=4 {
-                let (storage, mut store) = store(PASS, 1);
+                let (storage, mut store) = admitted_store(PASS, 1);
                 storage.fault(if kill {
                     Fault::Die(at)
                 } else {
@@ -3577,24 +3867,33 @@ mod tests {
                 assert_eq!(result.is_ok(), at == 4);
                 let reopened = reopen(&storage.files(), PASS).unwrap();
                 for s in [&store, &reopened] {
-                    assert!(s.dispatch.check_command("fixture").is_err());
+                    assert!(
+                        matches!(s.dispatch.check_command("fixture"),
+                        Err(crate::dispatch::DispatchRefusal::Disposition(_)) if at == 4)
+                            || matches!(s.dispatch.check_command("fixture"),
+                        Err(crate::dispatch::DispatchRefusal::Held(_)) if at != 4)
+                    );
                     assert_eq!(s.dispatch.standing.contains_key("fixture"), at == 4);
                     assert_eq!(matches!(state(s, 1), CallState::Unresolved), at != 4);
                 }
             }
         }
-        let (storage, mut store) = store(PASS, 1);
+        let (storage, mut store) = admitted_store(PASS, 1);
         storage.fault(Fault::LandThenFail(3));
         assert!(block_on(store.dispose(disposition(Abandonment, &[1]))).is_err());
         assert_eq!(state(&store, 1), CallState::Unresolved);
         assert!(store.dispatch.standing.is_empty());
-        assert!(
+        assert!(matches!(
+            store.dispatch.check_command("fixture"),
+            Err(crate::dispatch::DispatchRefusal::Held(_))
+        ));
+        assert!(matches!(
             reopen(&storage.files(), PASS)
                 .unwrap()
                 .dispatch
-                .check_command("fixture")
-                .is_err()
-        );
+                .check_command("fixture"),
+            Err(crate::dispatch::DispatchRefusal::Disposition(_))
+        ));
     }
 
     #[test]
@@ -3602,12 +3901,19 @@ mod tests {
         use crate::dispatch::CallState;
         for terminal_append in [false, true] {
             for at in 1..=4 {
-                let (storage, mut store) = store(PASS, u8::from(terminal_append));
+                let (storage, mut store) = admitted_store(PASS, u8::from(terminal_append));
                 storage.fault(Fault::Die(at));
                 let committed = if terminal_append {
                     block_on(store.terminal(&terminal(1))).is_ok()
                 } else {
-                    block_on(store.append(&command(1), &approval())).is_ok()
+                    let result = block_on(store.append(&command(1), &approval()));
+                    if at != 4 {
+                        assert!(
+                            matches!(result, Err(AppendRefusal::Storage(_))),
+                            "killed append must fail at storage"
+                        );
+                    }
+                    result.is_ok()
                 };
                 assert_eq!(committed, at == 4);
                 let replay_storage = MemoryStorage::with_files(storage.files());
@@ -3623,7 +3929,7 @@ mod tests {
                         state(reopened, 1),
                         if committed {
                             CallState::Finished {
-                                terminal: 2,
+                                terminal: 4,
                                 exit_status: 7,
                             }
                         } else {
@@ -3635,7 +3941,7 @@ mod tests {
                         if committed { "finished" } else { "unresolved" }
                     );
                 } else if committed {
-                    assert_eq!(state(reopened, 1), CallState::Unresolved);
+                    assert_eq!(state(reopened, 3), CallState::Unresolved);
                     assert_eq!(calls[0]["state"], "unresolved");
                 } else {
                     assert!(calls.is_empty());
@@ -3763,3 +4069,6 @@ mod tests {
         assert_eq!(replay_storage.files(), files);
     }
 }
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod setup_tests;

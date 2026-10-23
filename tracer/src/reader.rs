@@ -307,6 +307,7 @@ fn check_event(number: u64, event: &Value) -> Result<(), String> {
                 return Err("disposition has no call identities".into());
             }
         }
+        "setup" => check_setup(body)?,
         "allocation" => {
             if let Some(record) = body.get("seed_backup")
                 && (record.as_object().is_none_or(|o| o.len() != 2)
@@ -324,6 +325,124 @@ fn check_event(number: u64, event: &Value) -> Result<(), String> {
         _ => return Err(format!("unknown event kind {kind}")),
     }
     Ok(())
+}
+
+fn access(value: &Value) -> Result<(), String> {
+    exact(value, &["model", "profile", "revision"])?;
+    if value["model"] != "maintained"
+        || value["profile"] != "ad-hoc"
+        || value["revision"]
+            .as_u64()
+            .is_none_or(|n| u32::try_from(n).is_err())
+    {
+        return Err("invalid ad-hoc access".into());
+    }
+    Ok(())
+}
+fn check_setup(value: &Value) -> Result<(), String> {
+    let object = value.as_object().ok_or("setup is not an object")?;
+    if object.len() != 1 {
+        return Err("setup must name one act".into());
+    }
+    let (kind, body) = object.iter().next().unwrap();
+    match kind.as_str() {
+        "approval" => {
+            exact(body, &["entries", "monthly_sat", "annual_sat"])?;
+            let entries = body["entries"]
+                .as_array()
+                .filter(|e| !e.is_empty())
+                .ok_or("empty setup")?;
+            let mut names = std::collections::BTreeSet::new();
+            let mut total = 0u64;
+            for approved in entries {
+                exact(approved, &["entry", "identity", "access"])?;
+                let entry = &approved["entry"];
+                exact(entry, &["machine", "vendor", "product", "region", "cost"])?;
+                for key in ["machine", "vendor", "product", "region"] {
+                    if entry[key].as_str().is_none_or(str::is_empty) {
+                        return Err("invalid machine fact".into());
+                    }
+                }
+                if !names.insert(entry["machine"].as_str().unwrap()) {
+                    return Err("duplicate approved entry".into());
+                }
+                exact(&entry["cost"], &["amount", "unit", "period"])?;
+                if entry["cost"]["unit"] != "sat" || entry["cost"]["period"] != "month" {
+                    return Err("invalid recurring cost".into());
+                }
+                total = total
+                    .checked_add(
+                        entry["cost"]["amount"]
+                            .as_u64()
+                            .ok_or("cost is not integer")?,
+                    )
+                    .ok_or("cost overflow")?;
+                let id = &approved["identity"];
+                exact(id, &["seed", "derivation_version", "family", "index"])?;
+                if id["seed"].as_str().is_none_or(|s| {
+                    s.len() != 64
+                        || !s
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                }) || id["derivation_version"] != 1
+                    || id["family"] != "machines"
+                    || !id["index"].as_u64().is_some_and(|n| n < (1 << 31))
+                {
+                    return Err("invalid approved allocation identity".into());
+                }
+                if !approved["access"].is_null() {
+                    access(&approved["access"])?;
+                }
+            }
+            let monthly = body["monthly_sat"]
+                .as_u64()
+                .ok_or("monthly total is not integer")?;
+            let annual = body["annual_sat"]
+                .as_u64()
+                .ok_or("annual total is not integer")?;
+            let expected_annual = total.checked_mul(12).ok_or("annual cost overflow")?;
+            if monthly != total || annual != expected_annual {
+                return Err("incorrect setup totals".into());
+            }
+        }
+        "class" => {
+            exact(body, &["machine", "answer", "class"])?;
+            if !body["machine"].is_string() {
+                return Err("class needs a machine".into());
+            }
+            let class = match body["answer"].as_str() {
+                Some("yes" | "not_sure") => "multi_tenant",
+                Some("no") => "single_purpose",
+                _ => return Err("unknown class answer".into()),
+            };
+            if body["class"] != class {
+                return Err("class differs from answer".into());
+            }
+        }
+        "access" => {
+            exact(body, &["machine", "access"])?;
+            if !body["machine"].is_string() {
+                return Err("access needs a machine".into());
+            }
+            access(&body["access"])?;
+        }
+        _ => return Err("unknown setup act".into()),
+    }
+    Ok(())
+}
+
+/// Independent fixture records, preceding every reader-built store's new dispatches.
+pub fn setup_events(mnemonic: &str, machines: &[&str]) -> Vec<Value> {
+    let seed = seed_id(mnemonic).expect("fixture mnemonic");
+    let entries: Vec<_> = machines.iter().enumerate().map(|(index, machine)| json!({
+        "entry":{"machine":machine,"vendor":"Fixture vendor","product":"Fixture machine","region":"Fixture region","cost":{"amount":1000,"unit":"sat","period":"month"}},
+        "identity":{"seed":seed,"derivation_version":1,"family":"machines","index":index},
+        "access":{"model":"maintained","profile":"ad-hoc","revision":3}
+    })).collect();
+    vec![
+        json!({"allocation":{"seed_backup":{"seed":seed,"completion":"skipped"}}}),
+        json!({"setup":{"approval":{"entries":entries,"monthly_sat":1000*machines.len(),"annual_sat":12000*machines.len()}}}),
+    ]
 }
 
 fn exact(value: &Value, fields: &[&str]) -> Result<(), String> {
@@ -753,6 +872,18 @@ pub fn record_findings<'a>(
             }
         }
     }
+    if let Some(entries) = event
+        .pointer_mut("/setup/approval/entries")
+        .and_then(Value::as_array_mut)
+    {
+        for entry in entries {
+            if let Some(value) = entry.pointer_mut("/identity/seed")
+                && value == seed_id
+            {
+                *value = Value::Null;
+            }
+        }
+    }
     found(needles, event.to_string().as_bytes())
 }
 
@@ -762,6 +893,129 @@ mod tests {
     use super::*;
     use tau_web::harness::{Entry, Journal};
     use tau_web::store::{MemoryStorage, Pbkdf2, block_on, create, unlock};
+
+    #[test]
+    fn recorded_access_revision_is_preserved_and_unsupported_shapes_are_refused() {
+        let mnemonic = bip39::Mnemonic::from_entropy(&[7; 16]).unwrap().to_string();
+        for revision in [4u32, u32::MAX] {
+            let mut events = vec![json!({"seed":{"mnemonic":mnemonic}})];
+            events.extend(setup_events(&mnemonic, &["fixture", "fixture-other"]));
+            events[2]["setup"]["approval"]["entries"][0]["access"]["revision"] = revision.into();
+            events.push(
+                json!({"setup":{"access":{"machine":"fixture-other","access":{
+                    "model":"maintained","profile":"ad-hoc","revision":revision
+                }}}}),
+            );
+            let opened = read(&build(PASS, &events), PASS).unwrap();
+            for index in [2, 3] {
+                let actual: Value = serde_json::from_slice(&opened.records[index].1).unwrap();
+                assert_eq!(actual, events[index]);
+            }
+        }
+        let valid = json!({"model":"maintained","profile":"ad-hoc","revision":4});
+        assert!(access(&valid).is_ok());
+        for (key, value) in [
+            ("model", json!("sealed")),
+            ("profile", json!("other")),
+            ("revision", json!(u64::from(u32::MAX) + 1)),
+            ("revision", json!(-1)),
+            ("revision", json!(1.5)),
+            ("revision", json!("4")),
+            ("revision", json!(true)),
+            ("revision", Value::Null),
+        ] {
+            let mut bad = valid.clone();
+            bad[key] = value;
+            assert!(access(&bad).is_err(), "{bad}");
+        }
+        for key in ["model", "profile", "revision"] {
+            let mut bad = valid.clone();
+            bad.as_object_mut().unwrap().remove(key);
+            assert!(access(&bad).is_err(), "missing {key}");
+        }
+        let mut extra = valid;
+        extra["extra"] = true.into();
+        assert!(access(&extra).is_err());
+        assert!(access(&json!(["maintained", "ad-hoc", 4])).is_err());
+    }
+
+    #[test]
+    fn setup_totals_refuse_overflow_and_non_unsigned_integers() {
+        let mnemonic = bip39::Mnemonic::from_entropy(&[7; 16]).unwrap().to_string();
+        let mut approval = setup_events(&mnemonic, &["fixture"])[1]["setup"].clone();
+        approval["approval"]["entries"][0]["entry"]["cost"]["amount"] = json!(u64::MAX);
+        approval["approval"]["monthly_sat"] = json!(u64::MAX);
+        approval["approval"]["annual_sat"] = Value::Null;
+        assert!(
+            check_setup(&approval).is_err(),
+            "annual overflow with null total"
+        );
+
+        let valid = setup_events(&mnemonic, &["fixture"])[1]["setup"].clone();
+        for key in ["monthly_sat", "annual_sat"] {
+            for value in [
+                Value::Null,
+                json!(-1),
+                json!(1.5),
+                json!("12000"),
+                json!(true),
+            ] {
+                let mut bad = valid.clone();
+                bad["approval"][key] = value;
+                assert!(check_setup(&bad).is_err(), "{key}: {bad}");
+            }
+        }
+        let mut sum = setup_events(&mnemonic, &["fixture", "fixture-other"])[1]["setup"].clone();
+        sum["approval"]["entries"][0]["entry"]["cost"]["amount"] = json!(u64::MAX);
+        assert!(check_setup(&sum).is_err(), "monthly sum overflow");
+        assert!(check_setup(&valid).is_ok());
+    }
+
+    #[test]
+    fn setup_shapes_are_exact_and_seed_custody_is_position_specific() {
+        let mnemonic = bip39::Mnemonic::from_entropy(&[7; 16]).unwrap().to_string();
+        let seed = seed_id(&mnemonic).unwrap();
+        let mut events = vec![json!({"seed":{"mnemonic":mnemonic}})];
+        events.extend(setup_events(&mnemonic, &["fixture", "fixture-other"]));
+        events.push(json!({"setup":{"class":{"machine":"fixture","answer":"not_sure","class":"multi_tenant"}}}));
+        events.push(json!({"setup":{"access":{"machine":"fixture-other","access":{"model":"maintained","profile":"ad-hoc","revision":3}}}}));
+        let opened = read(&build(PASS, &events), PASS).unwrap();
+        assert_eq!(opened.records.len(), 5);
+        let needles = seed_needles(&mnemonic).unwrap();
+        for (_, plain) in &opened.records[1..] {
+            assert!(record_findings(&needles, plain, &seed).is_empty());
+        }
+        for (index, path, value) in [
+            (2, "/setup/approval/entries/0/entry/vendor", json!(seed)),
+            (2, "/setup/approval/entries/0/identity/seed", json!("wrong")),
+            (2, "/setup/approval/monthly_sat", json!(0)),
+            (2, "/setup/approval/entries/0/access/model", json!("sealed")),
+            (3, "/setup/class/answer", json!("unknown")),
+            (3, "/setup/class/class", json!("single_purpose")),
+            (4, "/setup/access/access/model", json!("sealed")),
+        ] {
+            let mut bad = events[index].clone();
+            *bad.pointer_mut(path).unwrap() = value;
+            if path.ends_with("vendor") {
+                assert!(
+                    !record_findings(&needles, &serde_json::to_vec(&bad).unwrap(), &seed)
+                        .is_empty()
+                );
+            } else {
+                assert!(check_event(index as u64, &bad).is_err(), "{path}");
+            }
+        }
+        for (index, event) in events.iter().enumerate().skip(2) {
+            let mut bad = event.clone();
+            bad["setup"]
+                .as_object_mut()
+                .unwrap()
+                .values_mut()
+                .next()
+                .unwrap()["unknown"] = true.into();
+            assert!(check_event(index as u64, &bad).is_err());
+        }
+    }
 
     const PASS: &str = "correct horse battery staple";
 
@@ -817,11 +1071,14 @@ mod tests {
         let storage = MemoryStorage::default();
         let pass = || tau_web::credential::LocalPassphrase::new(PASS.as_bytes().to_vec());
         let mut store = block_on(create(storage.clone(), &Pbkdf2, pass())).unwrap();
+        block_on(store.seed_backup(tau_web::allocation::Completion::Skipped)).unwrap();
+        let approval = block_on(store.approve_setup(tau_web::dispatch::fixture_setup())).unwrap();
+        let index = approval.entries[0].identity.index;
         let entry = Entry {
             machine: "fixture".into(),
             command: b"true".to_vec(),
             provenance: Some(tau_web::dispatch::CommandProvenance {
-                target: tau_web::dispatch::Target::AllocationIndex(7),
+                target: tau_web::dispatch::Target::AllocationIndex(index),
                 session: Some("later-session".into()),
                 requester: tau_web::dispatch::Requester::Operator,
             }),
@@ -833,10 +1090,10 @@ mod tests {
         assert_eq!(block_on(store.check("fixture")), Ok(()));
         let call = block_on(store.append(&entry, &admission)).unwrap();
         let opened = read(&storage.files(), PASS).unwrap();
-        let intent: Value = serde_json::from_slice(&opened.records[1].1).unwrap();
+        let intent: Value = serde_json::from_slice(&opened.records[3].1).unwrap();
         assert_eq!(
             intent["intent"]["provenance"],
-            json!({"target":{"allocation_index":7},
+            json!({"target":{"allocation_index":index},
             "session":"later-session","requester":"operator"})
         );
         assert_eq!(
@@ -857,7 +1114,7 @@ mod tests {
             entry.provenance
         );
         let evidence = tau_web::jobs::Evidence {
-            call: 1,
+            call,
             job,
             record: tau_web::jobs::Record::Present {
                 machine: hex::encode("fixture"),
@@ -874,8 +1131,8 @@ mod tests {
         block_on(store.job_evidence(&evidence)).unwrap();
         let opened = read(&store.storage().files(), PASS).unwrap();
         assert_eq!(
-            serde_json::from_slice::<Value>(&opened.records[2].1).unwrap()["job_terminal"]["call"],
-            1
+            serde_json::from_slice::<Value>(&opened.records[4].1).unwrap()["job_terminal"]["call"],
+            call
         );
     }
 
@@ -1058,6 +1315,10 @@ mod tests {
             tau_web::credential::LocalPassphrase::new(PASS.as_bytes().to_vec()),
         ))
         .unwrap();
+        block_on(store.seed_backup(tau_web::allocation::Completion::Skipped)).unwrap();
+        let mut entries = tau_web::dispatch::fixture_setup();
+        entries[1].machine = "other".into();
+        block_on(store.approve_setup(entries)).unwrap();
         for n in 1..=2 {
             let mut entry = command(n);
             if n == 2 {
@@ -1073,13 +1334,13 @@ mod tests {
             .unwrap();
         }
         block_on(store.terminal(&tau_web::dispatch::Terminal {
-            call: 1,
+            call: 3,
             exit_status: 7,
         }))
         .unwrap();
         block_on(store.dispose(tau_web::dispatch::Disposition {
             machine: "other".into(),
-            calls: vec![2],
+            calls: vec![4],
             continuation: tau_web::dispatch::Continuation::AsIfNotDone,
             uncertainty: "the command outcome is unknown".into(),
         }))
@@ -1088,21 +1349,21 @@ mod tests {
         let opened = read(&files, PASS).unwrap();
         assert_eq!(
             opened.records.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
-            [0, 1, 2, 3, 4]
+            [0, 1, 2, 3, 4, 5, 6]
         );
         assert_eq!(
             opened.commands(),
             [
-                (1, "fixture".to_string(), b"echo 1".to_vec()),
-                (2, "other".to_string(), b"echo 2".to_vec())
+                (3, "fixture".to_string(), b"echo 1".to_vec()),
+                (4, "other".to_string(), b"echo 2".to_vec())
             ]
         );
         assert_eq!(
-            serde_json::from_slice::<Value>(&opened.records[3].1).unwrap(),
-            json!({"terminal":{"call":1,"exit_status":7}})
+            serde_json::from_slice::<Value>(&opened.records[5].1).unwrap(),
+            json!({"terminal":{"call":3,"exit_status":7}})
         );
         assert_eq!(
-            serde_json::from_slice::<Value>(&opened.records[4].1).unwrap()["disposition"]["continuation"],
+            serde_json::from_slice::<Value>(&opened.records[6].1).unwrap()["disposition"]["continuation"],
             "as_if_not_done"
         );
         let mnemonic = opened.mnemonic().unwrap();
@@ -1129,7 +1390,11 @@ mod tests {
                     "the seed record holds only the mnemonic: {found:?}"
                 );
             } else {
-                assert_eq!(found, Vec::<&str>::new(), "record {number}");
+                assert_eq!(
+                    record_findings(&needles, plaintext, &opened.seed_id().unwrap()),
+                    Vec::<&str>::new(),
+                    "record {number}"
+                );
             }
         }
     }
