@@ -11,6 +11,7 @@ use std::any::Any;
 pub(crate) trait Given {
     fn row(&self) -> u8;
     fn value(&self) -> &dyn Any;
+    fn response_bytes(&self) -> Option<&[u8]>;
 }
 
 impl<T: Credential + 'static> Given for T {
@@ -19,6 +20,29 @@ impl<T: Credential + 'static> Given for T {
     }
     fn value(&self) -> &dyn Any {
         self
+    }
+    fn response_bytes(&self) -> Option<&[u8]> {
+        let value = self.value();
+        macro_rules! bytes {
+            ($($ty:ty),*) => { $(
+                if let Some(key) = value.downcast_ref::<$ty>() {
+                    return Some(&key.0);
+                }
+            )* };
+        }
+        bytes!(
+            SshClientKey,
+            crate::credential::AttestSenderKey,
+            crate::credential::AttestRecipientKey,
+            crate::credential::RelayKey,
+            crate::credential::PostHarnessCredential,
+            crate::credential::DataKey,
+            crate::credential::WrappingKey,
+            crate::credential::LocalPassphrase
+        );
+        value
+            .downcast_ref::<crate::seed::Seed>()
+            .map(|seed| seed.bytes())
     }
 }
 

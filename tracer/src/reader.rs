@@ -245,6 +245,16 @@ fn check_event(number: u64, event: &Value) -> Result<(), String> {
                 }
             }
         }
+        "operation_response" => {
+            exact(body, &["call", "body"])?;
+            let bytes = text("body")?;
+            if body["call"].as_u64().is_none()
+                || hex::decode(bytes).is_err()
+                || bytes.to_ascii_lowercase() != bytes
+            {
+                return Err("invalid operation response".into());
+            }
+        }
         "operation_observation" => {
             exact(body, &["resource", "operation", "reports", "calls"])?;
             resource(&body["resource"])?;
@@ -1167,6 +1177,45 @@ mod tests {
             bad["operation_observation"]["extra"] = json!(true);
             assert!(check_event(2, &bad).is_err());
         }
+    }
+
+    #[test]
+    fn operation_response_has_exact_members_and_lowercase_hex() {
+        let mnemonic = bip39::Mnemonic::from_entropy(&[7; 16]).unwrap().to_string();
+        let response = json!({"operation_response":{"call":1,"body":"ff00"}});
+        let events = [
+            json!({"seed":{"mnemonic":mnemonic}}),
+            super::super::typed_cases::intent(1, "reset"),
+            response.clone(),
+        ];
+        let files = build(PASS, &events);
+        let opened = read(&files, PASS).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&opened.records[2].1).unwrap(),
+            response
+        );
+        for bad in [
+            json!({"operation_response":{"call":1,"body":"FF00"}}),
+            json!({"operation_response":{"call":1,"body":"f"}}),
+            json!({"operation_response":{"call":1,"body":"zz"}}),
+            json!({"operation_response":{"call":"1","body":""}}),
+            json!({"operation_response":[1,"ff00"]}),
+        ] {
+            assert!(check_event(2, &bad).is_err());
+        }
+        let mut bad = response;
+        bad["operation_response"]["extra"] = json!(true);
+        assert!(check_event(2, &bad).is_err());
+        let store = block_on(unlock(
+            MemoryStorage::with_files(files),
+            &Pbkdf2,
+            tau_web::credential::LocalPassphrase::new(PASS.as_bytes().to_vec()),
+        ))
+        .unwrap();
+        assert_eq!(
+            store.dispatch().typed_calls[&1].state,
+            tau_web::dispatch::CallState::Unresolved
+        );
     }
 
     #[test]

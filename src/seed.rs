@@ -108,6 +108,10 @@ impl Drop for Seed {
 }
 
 impl Seed {
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
     /// A new seed from 16 bytes of the CSPRNG: the browser's on wasm32, the OS's on the host. A
     /// CSPRNG failure is an error, never a fallback.
     pub fn generate() -> Result<Seed, getrandom::Error> {

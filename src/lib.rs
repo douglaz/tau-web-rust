@@ -12,6 +12,7 @@ pub mod credential;
 pub mod dispatch;
 pub mod harness;
 pub mod jobs;
+pub mod redaction;
 pub mod relay_auth;
 pub mod seed;
 pub mod store;

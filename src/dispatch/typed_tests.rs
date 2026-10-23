@@ -3,7 +3,7 @@ use crate::credential::{LocalPassphrase, WrappingKey};
 use crate::harness::{AppendRefusal, Entry, Journal};
 use crate::store::{self, Fault, Kdf, MemoryStorage, OperationError, Salt, Store, block_on};
 
-struct FixedKdf;
+pub(crate) struct FixedKdf;
 impl Kdf for FixedKdf {
     async fn derive(&self, _: LocalPassphrase, _: &Salt) -> Result<WrappingKey, String> {
         Ok(WrappingKey([7; 32]))
@@ -14,7 +14,7 @@ fn pass() -> LocalPassphrase {
     LocalPassphrase::new(b"fixture passphrase only".to_vec())
 }
 
-fn fresh() -> (MemoryStorage, Store<MemoryStorage>, u32) {
+pub(crate) fn fresh() -> (MemoryStorage, Store<MemoryStorage>, u32) {
     let storage = MemoryStorage::default();
     let mut store = block_on(store::create(storage.clone(), &FixedKdf, pass())).unwrap();
     block_on(store.seed_backup(crate::allocation::Completion::Skipped)).unwrap();
@@ -38,7 +38,7 @@ fn fresh() -> (MemoryStorage, Store<MemoryStorage>, u32) {
     (storage, store, extra.index)
 }
 
-fn reopen(storage: &MemoryStorage, extra_index: u32) -> Store<MemoryStorage> {
+pub(crate) fn reopen(storage: &MemoryStorage, extra_index: u32) -> Store<MemoryStorage> {
     let mut store = block_on(store::unlock(
         MemoryStorage::with_files(storage.files()),
         &FixedKdf,
@@ -69,7 +69,7 @@ fn bind_entries(store: &mut Store<MemoryStorage>) {
     }
 }
 
-fn bound_fresh() -> (MemoryStorage, Store<MemoryStorage>, u32) {
+pub(crate) fn bound_fresh() -> (MemoryStorage, Store<MemoryStorage>, u32) {
     let (storage, mut store, extra) = fresh();
     bind_entries(&mut store);
     (storage, store, extra)
@@ -81,7 +81,11 @@ fn bound_reopen(storage: &MemoryStorage, extra: u32) -> Store<MemoryStorage> {
     store
 }
 
-fn bound_request(store: &Store<MemoryStorage>, operation: Operation, machine: &str) -> Request {
+pub(crate) fn bound_request(
+    store: &Store<MemoryStorage>,
+    operation: Operation,
+    machine: &str,
+) -> Request {
     let caller = store
         .sessions()
         .into_iter()
