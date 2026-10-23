@@ -8,6 +8,7 @@ use crate::store::{OperationError, Storage, Store};
 pub struct Vendor {
     pub received: Vec<OperationIntent>,
     pub pause_before_send: bool,
+    pub response: Option<Vec<u8>>,
 }
 
 impl Vendor {
@@ -19,6 +20,17 @@ impl Vendor {
         caller: Option<&str>,
         request: &Request,
     ) -> Result<u64, OperationError> {
+        self.run_response(store, caller, request)
+            .await
+            .map(|(call, _)| call)
+    }
+
+    pub async fn run_response<S: Storage>(
+        &mut self,
+        store: &mut Store<S>,
+        caller: Option<&str>,
+        request: &Request,
+    ) -> Result<(u64, Option<crate::redaction::Redacted>), OperationError> {
         store
             .check_bound_operation(caller, request)
             .map_err(OperationError::Policy)?;
@@ -32,7 +44,16 @@ impl Vendor {
         }
         self.received.push(intent);
         // A lost response has no record. The intent remains unresolved.
-        Ok(call)
+        let output = match &self.response {
+            Some(body) => Some(
+                store
+                    .operation_response(call, body, &["/root_password"])
+                    .await
+                    .map_err(OperationError::Storage)?,
+            ),
+            None => None,
+        };
+        Ok((call, output))
     }
 
     pub async fn status<S: Storage>(
@@ -59,3 +80,14 @@ impl Vendor {
             .map_err(OperationError::Storage)
     }
 }
+
+/// Arbitrary-byte stand-in, journaled against a fixture typed call; enables no untyped call.
+pub async fn injected_response<S: Storage>(
+    store: &mut Store<S>,
+    call: u64,
+    body: &[u8],
+) -> Result<crate::redaction::Redacted, String> {
+    store.operation_response(call, body, &[]).await
+}
+
+pub const ROOT_PASSWORD: &str = "fixture-root-password-ggw9!";

@@ -99,6 +99,10 @@ pub fn needles() -> Vec<(String, Vec<u8>)> {
     ] {
         needles.push((format!("test switch: {switch}"), switch.as_bytes().to_vec()));
     }
+    needles.push((
+        "fixture root password".into(),
+        b"fixture-root-password-ggw9!".to_vec(),
+    ));
     needles
 }
 
@@ -299,6 +303,16 @@ mod tests {
             .unwrap();
         std::fs::write(dir.join("pkg/tau_web_bg.wasm"), key).unwrap();
         assert!(super::absence(&dir).unwrap_err().contains(&name));
+        std::fs::write(
+            dir.join("pkg/tau_web_bg.wasm"),
+            b"fixture-root-password-ggw9!",
+        )
+        .unwrap();
+        assert!(
+            super::absence(&dir)
+                .unwrap_err()
+                .contains("fixture root password")
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

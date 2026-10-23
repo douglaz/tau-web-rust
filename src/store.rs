@@ -179,6 +179,10 @@ pub(crate) enum Event {
     Intent(Intent),
     OperationIntent(crate::dispatch::OperationIntent),
     OperationObservation(crate::dispatch::Observation),
+    OperationResponse {
+        call: u64,
+        body: String,
+    },
     Terminal(Terminal),
     JobTerminal(crate::jobs::Evidence),
     JobObservation(crate::jobs::Evidence),
@@ -326,6 +330,7 @@ pub struct Store<S> {
     commands: Vec<(u64, Entry)>,
     dispatch: Dispatch,
     sessions: Vec<Rc<Session>>,
+    response_calls: std::collections::BTreeSet<u64>,
     exposure_ledger: Vec<Exposure>,
     connection_refusals: Vec<ConnectionRefusal>,
     /// Set by a failed append, whose move may have landed: no append follows in this worker.
@@ -450,6 +455,7 @@ impl<S: Storage> Store<S> {
             commands: Vec::new(),
             dispatch: Dispatch::default(),
             sessions: Vec::new(),
+            response_calls: std::collections::BTreeSet::new(),
             exposure_ledger: Vec::new(),
             connection_refusals: Vec::new(),
             failed: None,
@@ -843,6 +849,92 @@ impl<S: Storage> Store<S> {
         Ok(self.dispatch.typed_calls[&number].intent.clone())
     }
 
+    /// The only response entry: enumerate current holdings, redact, commit, then release output.
+    /// A response records no observation and never settles its call.
+    pub async fn operation_response(
+        &mut self,
+        call: u64,
+        body: &[u8],
+        fields: &[&str],
+    ) -> Result<crate::redaction::Redacted, String> {
+        self.check_response(call)?;
+        let output = crate::redaction::Redacted::for_store(self, body, fields)?;
+        self.append_response(call, &output).await?;
+        Ok(output)
+    }
+
+    async fn append_response(
+        &mut self,
+        call: u64,
+        output: &crate::redaction::Redacted,
+    ) -> Result<(), String> {
+        self.commit(&Event::OperationResponse {
+            call,
+            body: hex::encode(output.as_bytes()),
+        })
+        .await?;
+        self.response_calls.insert(call);
+        Ok(())
+    }
+
+    fn check_response(&self, call: u64) -> Result<(), String> {
+        if !self.dispatch.typed_calls.contains_key(&call) {
+            return Err("response names no earlier typed call".into());
+        }
+        if self.response_calls.contains(&call) {
+            return Err("typed call already has a response".into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn held_credentials(&self) -> Result<crate::redaction::Held<'_>, String> {
+        use crate::redaction::{Derived, Held};
+        let seed = self
+            .seed
+            .as_ref()
+            .ok_or("response requires an unlocked seed")?;
+        let mut held = Held {
+            borrowed: vec![seed.bytes(), &self.key.0],
+            mnemonic: seed.phrase(),
+            derived: Vec::new(),
+        };
+        for session in &self.sessions {
+            for holding in &session.given {
+                held.borrowed.push(
+                    holding
+                        .credential
+                        .response_bytes()
+                        .ok_or("session credential has no response scan representation")?,
+                );
+            }
+        }
+        for entry in self.allocation().entries() {
+            let identity = &entry.identity;
+            if identity.seed != seed.id() {
+                continue;
+            }
+            let (v, i) = (identity.derivation_version, identity.index);
+            let derived = (|| -> Result<(), crate::seed::DeriveError> {
+                match identity.family {
+                    Family::Machines => {
+                        held.derived.push(Derived::Ssh(seed.ssh_client_key(v, i)?));
+                        held.derived
+                            .push(Derived::Sender(seed.attest_sender_key(v, i)?));
+                        held.derived
+                            .push(Derived::Recipient(seed.attest_recipient_key(v, i)?));
+                    }
+                    Family::Passes => held.derived.push(Derived::Relay(seed.relay_key(v, i)?)),
+                    Family::Handoffs => held
+                        .derived
+                        .push(Derived::Handoff(seed.post_harness_credential(v, i)?)),
+                }
+                Ok(())
+            })();
+            derived.map_err(|_| "held credential derivation refused".to_string())?;
+        }
+        Ok(held)
+    }
+
     pub async fn operation_observation(
         &mut self,
         observation: crate::dispatch::Observation,
@@ -985,6 +1077,16 @@ impl<S: Storage> Store<S> {
                         .operation_intent(number, intent.clone())
                         .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
                 }
+                (_, Event::OperationResponse { call, body }) => {
+                    self.check_response(*call)
+                        .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
+                    if hex::decode(body).is_err() || *body != body.to_ascii_lowercase() {
+                        return Err(format!(
+                            "record {number}: response body is not lowercase hex; replay stopped"
+                        ));
+                    }
+                    self.response_calls.insert(*call);
+                }
                 (_, Event::OperationObservation(observation)) => {
                     self.dispatch
                         .observe(number, observation.clone())
@@ -1079,9 +1181,18 @@ impl<S: Storage> Store<S> {
         // duplicate members are rejected and mnemonic buffers retain Event's zeroization.
         let event: Event = serde_json::from_slice(&plaintext)
             .map_err(|_| "its event is not one this version reads".to_string())?;
-        if matches!(event, Event::Exposure(_) | Event::ConnectionRefusal(_)) {
+        if matches!(
+            event,
+            Event::Exposure(_) | Event::ConnectionRefusal(_) | Event::OperationResponse { .. }
+        ) {
             let value: Value = serde_json::from_slice(&plaintext)
                 .map_err(|_| "invalid binding record shape".to_string())?;
+            if value
+                .get("operation_response")
+                .is_some_and(|body| !body.is_object())
+            {
+                return Err("invalid operation response shape".into());
+            }
             if let Some(exposure) = value.get("exposure") {
                 let objects = exposure.is_object()
                     && exposure
@@ -3166,7 +3277,7 @@ mod tests {
     /// and the last two inside a longer encoded value too. There the item starts at a byte offset
     /// `k` modulo 3, so for each `k` it is the characters of `k` filler bytes and the item that
     /// depend on the item's bits alone.
-    fn encodings(what: &str, bytes: &[u8]) -> Vec<(String, Vec<u8>)> {
+    pub(super) fn encodings(what: &str, bytes: &[u8]) -> Vec<(String, Vec<u8>)> {
         use base64::engine::general_purpose::STANDARD_NO_PAD;
         let mut out = vec![
             (format!("{what}, raw"), bytes.to_vec()),
@@ -4328,3 +4439,6 @@ impl<S: Storage> crate::harness::BoundJournal for Store<S> {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod binding_tests;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod redaction_tests;

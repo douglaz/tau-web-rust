@@ -147,6 +147,21 @@ impl Drop for SshClientKey {
         zeroize::Zeroize::zeroize(&mut self.0);
     }
 }
+impl Drop for AttestSenderKey {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
+impl Drop for AttestRecipientKey {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
+impl Drop for PostHarnessCredential {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
 impl Drop for RelayKey {
     fn drop(&mut self) {
         zeroize::Zeroize::zeroize(&mut self.0);

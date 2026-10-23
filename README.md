@@ -109,6 +109,71 @@ There are two builds of the same page, both release builds:
   The writer, allocator, seed-backup append and completed-read exports remain tracer-only.
   Neither build contains a compiled client key or relay key.
 
+### The credential-redaction boundary
+
+Every typed adapter response and the injected response stand-in pass `src/redaction.rs` through
+`Store::operation_response` before journal append or return. It applies the declared JSON field
+redactions, then scans the exact resulting bytes for the store's held credentials. The boundary
+and store entry compile in every build; the served build has no response-producing adapter yet.
+
+The following are **implementation readings**, with deliberately limited claims:
+
+- **Exact copies:** only raw bytes exactly as held. Hex, HEX, base64, base64url,
+  JSON-escaped, partial and transformed copies pass the scan. Random 32- or 64-byte keys
+  essentially cannot occur verbatim in valid UTF-8 JSON; typed JSON responses therefore catch
+  credentials held as text (the mnemonic today, a vendor credential later). The arbitrary-byte
+  injected stand-in exercises binary keys. JSON field editing serializes before the scan, so
+  an escaped copy that serialization makes exact is caught. That serialization is serde_json's
+  default: object members come back sorted, escapes and number text are rewritten, and an
+  integer outside the 64-bit range is read as a float, losing precision. A recorded typed
+  response with declared fields keeps its members' values within those limits, never the
+  vendor's exact bytes.
+- **Marker:** both mechanisms leave the fixed ASCII `<redacted>`. A declared password
+  field keeps its name and becomes that JSON string; an absent field stays absent and a null
+  stays null. Overlapping scan matches become one marker. If a marker would itself leave a
+  held value in the output, the boundary refuses. A marker claims nothing about the rest of
+  the response being scrubbed; named placed-secret markers belong to twr-ggw.23.
+- **Recording:** `operation_response` carries exactly `call` and `body`, the response
+  bytes in lowercase hex. It follows its typed intent, occurs at most once per call, settles
+  nothing and changes no call state. Append failure returns the storage error and no output;
+  the call stays unresolved and the existing failed-append latch applies. Older journals
+  without responses replay unchanged. No response body appears in `store_state` or page reports.
+- **Model context:** the boundary's returned `Redacted` bytes are the stand-in for model
+  context, the only response form an adapter hands on. Model tools are twr-ggw.14's; inference
+  and model request bodies are twr-ggw.17's. There is no model request body to check against
+  STG-10 in this build.
+- **Two mechanisms:** the typed adapter declares root-password fields as RFC 6901 JSON
+  Pointers; the fixture declares `/root_password`. Declared fields require JSON: malformed
+  JSON refuses with no response record or output, leaving the call unresolved. Only the
+  declared fields are covered. A copy of the vendor-generated root password elsewhere is
+  not caught, since the harness does not hold it. The injected stand-in declares no fields,
+  receives only the exact-value scan and has no password heuristic.
+- **Held set:** the store enumerates the seed's 64 bytes and canonical mnemonic sentence,
+  the data key, every credential given to live sessions, and roles 0–4 at every listed identity
+  under the current seed, including reserved, failed and destroyed entries. Machines supply
+  roles 0–2, passes role 3, handoffs role 4. A derived key counts as held because the held seed
+  derives it at a listed identity. Existing holders are borrowed; derived copies keep their
+  registered credential types and zeroize after scanning. The passphrase and wrapping key
+  are cleared during create, unlock or re-display before responses can pass; neither lifetime
+  is extended to scan for it. They are consequently absent from the scan set at response time.
+  Later additions belong in the store's enumeration: the vendor credential, session inference
+  key (twr-ggw.17) and role-5 LNVPS key (twr-ggw.47).
+- **Routing:** only the boundary constructs `Redacted`, whose field is private and which
+  has no constructor from bytes, `Deserialize`, `Default` or `From`. The response append and
+  adapter return accept only that output; its entry obtains holdings from the store itself.
+  Passing and failing doctests protect the public construction restriction.
+
+CNF-14's host fixture injects a root password into the typed adapter's response. CNF-17's
+stage-1 evidence uses the host-only injected arbitrary-byte response fixture, journaled against
+an ordinary fixture typed call through the same boundary. This enables no untyped call or
+untyped vendor scope. **The repeat against real untyped responses is still owed before scopes
+are enabled.** Independent tests derive absence needles separately, search every decrypted
+record and decoded response body (except the intentional mnemonic in record 0), and search
+returned bytes in raw, hex, HEX, base64 and base64url, including embedded byte alignments.
+The tracer checks app-origin requests and logs for STG-10. Box-plane output does not pass this
+boundary: placed-secret scanning, named markers, cross-chunk windows and withheld bytes are
+twr-ggw.23's; the minimum secret length is twr-ggw.38's.
+
 ### Dispatch
 
 `src/dispatch.rs` is the shared, synchronous core, written from the pinned Markdown requirements.
@@ -196,6 +261,11 @@ Typed operations share that derivation with commands. The fixture adapter offers
 is a status observation reporting that operation's effect observed; an ended system or a boot
 change establishes no success. This is fixture evidence, not an LNVPS reconciliation contract.
 The fixture vendor and its receive log compile only in host tests, never in the served build.
+A configured response can carry `root_password` plus unrelated members. `run_response` routes
+it through the store boundary with `/root_password` declared and returns only `Redacted`
+response bytes alongside the call identity. No configured response preserves the lost-response
+behavior: no response record, with the typed intent still unresolved. Status responses use
+the same route before the separate status observation.
 
 A typed request carries its target, operation, session, requester and structured facts
 (arguments, cost bound and bundle commit), with an approval on exactly those values and the
@@ -583,7 +653,8 @@ bound machine, and it receives neither the seed nor the relay key.
   not a proof: it cannot see a key carried in a `String` or a `Vec<u8>`, a union's fields, or a
   key type imported under another name. Three types it flags are exempt, each with its reason:
   the store's ID, the PBKDF2 salt and a record's content address, all persisted in the clear by
-  design. The three local-store types, SSH client key and relay key zeroize their bytes on drop.
+  design. All secret-bearing credential types zeroize their bytes on drop; the seed clears its
+  bytes and retains only pointers into the public word list.
 
 The local store generates the seed in the worker and keeps its mnemonic in its first record
 (below). Only seed-backup exports display and accept mnemonic words; no export returns a seed
@@ -709,6 +780,11 @@ the host tests run.
     replay and the independent reader reject such typed records and intents naming the inference
     resource or target, naming the record.
     No command text is accepted for a typed act.
+  - `{"operation_response":{"call":1,"body":"<lowercase hex>"}}`: the boundary's response
+    bytes, recorded after the typed intent and before return. Replay refuses a reference to no
+    earlier typed call, a box-plane call, a second response for one call, non-lowercase-hex
+    body bytes or an extra member. Refusals name the record and quote no plaintext. Responses
+    do not settle calls and do not appear in page reports. Earlier journals contain none.
   - `{"operation_observation":{"resource":{"entry":"fixture"},"operation":"reset","reports":"confirmed","calls":[1]}}`.
     `reports` is `confirmed`, `ended` or `unknown`; `calls` is the snapshot at read time.
     Only the fixture's confirming observation settles an unresolved matching mutation.
@@ -1124,6 +1200,10 @@ members; unknown fields or values are refused or ignored with no journal entry.
 
 ### The tracer
 
+The independent reader accepts the exact-member `operation_response` shape (`call`, lowercase-hex
+`body`) and rejects extra members. `check-absence` also searches independently for the host
+fixture's injected root-password literal; a planted-password test proves that row can fail.
+
 `scripts/tracer.sh` builds both directories, then runs `tracer/`. That is a host binary, never
 compiled for wasm32 and never served. It starts these fixtures on ephemeral loopback ports:
 
@@ -1365,6 +1445,9 @@ owns them and `CNF-111`'s integrated evidence.
 never skips it. The tracer stops only the processes it started.
 
 ### Building and checking it locally
+
+`check-absence dist/served` includes the host fixture's root-password row as well as fixture
+keys, pins and test switches; host tests plant that password to exercise the refusal.
 
 These are the `web` job's steps. They need the `wasm32-unknown-unknown` target, the wasm-bindgen
 CLI at the version `Cargo.lock` pins for the crate (0.2.127; `scripts/build-web.sh` refuses any
