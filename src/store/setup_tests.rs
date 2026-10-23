@@ -632,6 +632,10 @@ fn replay_refuses_invalid_setup_records_naming_only_the_record() {
     let mut cases = Vec::new();
     for (path, value) in [
         ("/approval/entries/1/entry/machine", json!("fixture")),
+        ("/approval/entries/0/entry/machine", json!("")),
+        ("/approval/entries/0/entry/vendor", json!("")),
+        ("/approval/entries/0/entry/product", json!("")),
+        ("/approval/entries/0/entry/region", json!("")),
         ("/approval/entries/0/identity/index", json!(1)),
         ("/approval/entries/0/identity/derivation_version", json!(2)),
         ("/approval/entries/0/access/model", json!("sealed")),

@@ -701,7 +701,7 @@ the host tests run.
     The independent reader requires exact object members and enum values throughout these setup
     shapes. Production always writes objects and refuses unknown members and enum values, but
     its derived replay deserializers also accept positional arrays for setup struct bodies.
-    Repeated entries/answers, unapproved facts, inconsistent
+    Repeated entries/answers, an empty machine, vendor, product or region, unapproved facts, inconsistent
     classes/totals, invalid allocation order or gate, and sealed ad-hoc access refuse replay,
     naming the record without quoting plaintext. None carries derived key material.
   - a later record, one allocation event appended before it is applied ("Allocation", below):

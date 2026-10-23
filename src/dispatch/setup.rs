@@ -210,9 +210,16 @@ impl Dispatch {
                     return Err("setup totals differ from approved costs".into());
                 }
                 for approved in &approval.entries {
-                    let name = &approved.entry.machine;
-                    if name.is_empty() || self.approved_entries.contains_key(name) {
-                        return Err("approved entry name reused or empty".into());
+                    let entry = &approved.entry;
+                    let name = &entry.machine;
+                    if [name, &entry.vendor, &entry.product, &entry.region]
+                        .iter()
+                        .any(|fact| fact.is_empty())
+                    {
+                        return Err("approved entry has an empty machine fact".into());
+                    }
+                    if self.approved_entries.contains_key(name) {
+                        return Err("approved entry name reused".into());
                     }
                     if approved.identity.family != Family::Machines {
                         return Err("approved entry needs a machine-family index".into());
