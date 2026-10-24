@@ -32,7 +32,7 @@ impl ResultCell {
 
 thread_local! {
     static RESULTS: RefCell<BTreeMap<u64, Rc<ResultCell>>> = RefCell::default();
-    static WAITS: RefCell<Vec<(String, std::rc::Weak<Stop>)>> = RefCell::default();
+    static WAITS: RefCell<Vec<(Option<String>, std::rc::Weak<Stop>)>> = RefCell::default();
 }
 
 pub(super) fn result(call: u64) -> Option<Rc<ResultCell>> {
@@ -75,17 +75,26 @@ pub struct Stop {
 
 impl Stop {
     pub fn new(machine: &str) -> Rc<Self> {
+        Self::register(Some(machine))
+    }
+
+    /// Collection evidence is stopped by session end, independently of held-request stops.
+    pub(super) fn collection() -> Rc<Self> {
+        Self::register(None)
+    }
+
+    fn register(machine: Option<&str>) -> Rc<Self> {
         let stop = Rc::new(Self::default());
         WAITS.with(|waits| {
             let mut waits = waits.borrow_mut();
             waits.retain(|(_, stop)| stop.strong_count() != 0);
-            waits.push((machine.into(), Rc::downgrade(&stop)));
+            waits.push((machine.map(str::to_owned), Rc::downgrade(&stop)));
         });
         stop
     }
 
     pub fn stopped(&self) -> bool {
-        self.stopped.get()
+        self.stopped.get() || super::inference::ending()
     }
 
     pub async fn until<T>(&self, work: impl Future<Output = T>) -> Option<T> {
@@ -101,13 +110,29 @@ impl Stop {
     }
 }
 
+/// Session end stops every registered wait before acquiring the store writer.
+pub(super) fn stop_all() {
+    WAITS.with(|waits| {
+        for (_, stop) in waits.borrow().iter() {
+            if let Some(stop) = stop.upgrade() {
+                stop.stopped.set(true);
+                stop.ready.notify_waiters();
+            }
+        }
+    });
+}
+
 /// Stop only unresolved-command waits already registered for this machine.
 pub fn stop_waits(machine: &str) -> usize {
     WAITS.with(|waits| {
         waits
             .borrow()
             .iter()
-            .filter_map(|(name, stop)| (name == machine).then(|| stop.upgrade()).flatten())
+            .filter_map(|(name, stop)| {
+                (name.as_deref() == Some(machine))
+                    .then(|| stop.upgrade())
+                    .flatten()
+            })
             .filter(|stop| {
                 let changed = !stop.stopped.replace(true);
                 stop.ready.notify_waiters();

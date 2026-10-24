@@ -110,6 +110,142 @@ There are two builds of the same page, both release builds:
   The writer, allocator, seed-backup append and completed-read exports remain tracer-only.
   Neither build contains a compiled client key or relay key.
 
+### Procured inference
+
+`src/inference.rs` owns composition, response metadata parsing, the probe and record-before-send
+order over a small transport interface. Host fixtures never touch a network. The wasm transport
+in `src/harness/inference.rs` uses real fetch without holding the store writer while waiting.
+Every fetch uses manual redirects, omitted browser credentials and no-store caching. Unreadable
+responses, redirects and lost responses leave unresolved intents; a readable error has a terminal.
+Once its terminal commits, the report says the call finished; a later failure has its own
+refusal, and a late-revoke preparation failure says no revoke was recorded and leaves the key
+to the next unlock's sweep or its expiry. The shared `inference::infer` driver preserves that
+committed mint's call id, finished status and refusal even when its later session-key lookup
+fails. An unresolved mint likewise retains its call id and `unresolved: true` beside its refusal,
+whether the session is live or ended, its response was lost or session end prevented send
+after append. The host test
+`infer_preserves_committed_mint_report_when_sessions_end_in_flight` ends sessions inside the
+fake mint exchange and checks both a failed late-revoke preparation and a successfully
+recorded late revoke, including durable terminal replay.
+No inference intent ends a machine disposition or bars the next inference request. The existing
+typed-inference refusals remain in place.
+
+A real unload can kill the dedicated worker before its asynchronous revoke completes. After a
+crash or real unload, the session inference key stays usable until the next unlock or its
+expiry, bounded by its cap. A revoke whose intent committed but whose terminal was cut off
+stays unresolved and is never retried; that key is bounded only by its expiry.
+
+The following are **implementation readings**, not claims about the real account endpoints:
+
+- **Credential entry:** `test_inference_account` is tracer-only, called in the worker context.
+  It clears the supplied array on every exit and requires an unlocked store outside the
+  seed-backup ceremony. The production store method commits one encrypted account-credential
+  record before installing it; a second credential is refused. There is no operator control
+  or page message for entry or funding. Their ownership is tracked by twr-ggw.84.
+- **Mint timing and custody:** the first inference request mints, never binding. Concurrent
+  requests for the same session share that attempt. Row 14 remains in the store, and row 2
+  lives only in that session's worker-memory holding. The held-credential enumeration scans
+  both tiers. Neither management calls nor completion bodies carry the session inference key;
+  completions carry it only in Authorization. Model responses and composed request bodies pass
+  the existing exact-value redaction boundary. Decoded response metadata passes the boundary
+  again before any terminal append, including account reads, mints and revokes. The scan uses
+  held credentials and the request's transient credentials even after holdings are cleared.
+  Unsafe identifiers and values the marker cannot exclude are withheld. A readable response
+  still commits its status and safe metadata if body redaction refuses; the caller receives a
+  refusal naming the boundary and no body. Response bodies are never journaled here.
+- **One attempt:** any recorded mint prevents another mint in that session. An identifier-only
+  readable mint records its identifier, cap and expiry without installing a holding, so both
+  session end and replay can revoke it. Only the mint attempt is serialized; completions can
+  proceed while an earlier completion's response is withheld. A lost response
+  cannot supply an identifier for revocation; its cap and expiry bound that key. A new binding
+  has a fresh session identity and may mint its own key.
+- **Top-up:** the latest account read for that same session must explicitly report automatic
+  top-up off before mint, both live and on replay. An on, missing or unreadable setting refuses
+  the request. An unresolved account read retains its call id and `unresolved: true` beside
+  a refusal explaining that no mint is sent without a recorded top-up-off read; a finished
+  read that refuses also keeps its call id. Nothing writes account configuration.
+- **Bounds:** `SESSION_CAP` is `0.10` fixture account units and `SESSION_LIFETIME_SECONDS` is
+  900 seconds, measured from the injected host clock or worker clock at mint. The page's
+  `END_SESSIONS_BOUND_MS` is 5000. The pin assigns no cap or expiry values or owner; twr-ggw.83
+  asks for that decision. These constants add no bundle field.
+- **Route:** worker memory records direct routes by exact origin. Before the first credentialed
+  request, a dedicated unauthenticated OPTIONS request asks for the same headers using fixed
+  placeholders. Browser CORS preflight is additional to that dedicated probe. Any readable
+  status selects direct. An unreadable or redirected probe selects no route and sends no
+  credentialed call; a later request may probe again. A real call's failure leaves the route
+  chosen. With no aggregator tunnel built, no route means refusal. This is separate from
+  twr-ggw.18's model-list read and never substitutes for it.
+- **Session ends:** the bounded worker step stops dispatch and drops holdings before revoking
+  independently per identifier. A post-append check prevents a concurrent intent from sending
+  after the end begins. Readable responses still receive terminals; no response body is handed
+  back after the end. A mint that supplies an identifier after the end's first snapshot
+  commits and sends its own revoke; the end step waits for the mint guards and those revokes,
+  subject to the page's bound. The response boundary also scans the request's transient
+  credentials, so an echoed session inference key cannot enter late terminal metadata after
+  its session holding was cleared, including when JSON escapes concealed its wire bytes.
+  After replay, unlock and re-display answer first, then a separate worker step sweeps only
+  the identifiers captured at unlock with no revoke intent. Keys minted by the current worker
+  never enter that sweep. A revoke intent whose answer was cut off is never retried.
+- **Unaccounted spend:** `store_state.inference_calls` lists every call and state. Unresolved
+  completions name their key identifier and cap as unaccounted spend; unresolved account reads,
+  mints and revokes remain listed too. Each live-session line shows its unresolved completion
+  count against its cap. The disposition screen remains twr-ggw.66's.
+- **Fixture protocol:** a loopback TLS server records raw request lines, headers and bodies.
+  GET `/account`, POST `/keys` and POST `/revoke` authenticate only with X-Inference-Account.
+  Mint asks for `cap` and `expires` and returns `key_id` and `key`; revoke names only `key_id`.
+  POST `/completion` authenticates only with the session inference key. Response fixtures use
+  the recorded case-I envelope with a reported provider and cost, case-H without either, and
+  case-C's readable routing refusal, with fixture values and leading whitespace on successes.
+  The fixture enforces requested caps, expiry, revocation and management-endpoint separation.
+- **Served refusal:** the served build compiles the bundle's origin but has no candidate.
+  An inference request refuses for missing session-start selection before contact. Only the
+  tracer build carries `fixture-model`, `fixture-maker`, `fixture-provider` and the worker-state
+  origin switch. In the served no-plaintext case, both new credential needles are vacuous by
+  construction; the tracer build provides their nonvacuous evidence.
+- **Comparison:** inference remains core-only in the companion comparison; no witness changes
+  or typed-inference records are introduced.
+
+| End | What happens |
+|---|---|
+| Lock button | revoked at once |
+| `visibilitychange` hidden, document alive | revoked at once |
+| `pagehide` dispatched while the document lives | revoked at once (synthetic in the tracer) |
+| bfcache restore | revoked at once (synthetic in the tracer) |
+| seed-backup re-display | revoked at once |
+| real unload: reload, navigation away, tab close | refused at once if its revoke completed; otherwise next-unlock sweep or expiry; if the unload cut off a recorded revoke, expiry only |
+| crash | next-unlock sweep or expiry |
+| revoke cut off by the bound | expiry only |
+| lost mint response | expiry only |
+
+**Inference record shapes.** These are compact encrypted event objects with exact members;
+optional terminal members are absent, never null. Empty decoded optional text is omitted for
+every terminal kind. The account credential is exempt only in
+its own field when decrypted records are searched. No session inference key is exempt anywhere.
+
+- `inference_account`: `{credential:<text>}`, zeroized after parsing and replayed into its
+  registered row-14 type.
+- `inference_intent`: exactly one nested kind: `account_read:{call,session}`;
+  `mint:{call,session,cap,expires}`;
+  `completion:{call,session,key_id,model,requested_provider,zdr}`; or `revoke:{call,key_id}`.
+  `call` is the intent record number. A completion must name an earlier exposure and its mint.
+- `inference_terminal`: required `call,status`; account reads may add `automatic_top_up`;
+  mint adds `key_id,cap,expires` when available; completion requires `model,requested_provider`
+  and may add `reported_provider,prompt_tokens,completion_tokens,total_tokens,spend,request_id`.
+  Revoke adds no fields. Spend is the exact original JSON number text, stored as text, without
+  floating-point conversion. Neither prompts nor raw responses appear in these shapes.
+
+Replay and the tracer's independently written reader reject extra members, wrong types,
+unknown intent references, repeated terminals and selections inconsistent with the intent.
+Old journals continue to replay. Host tests exercise each storage kill boundary, metadata,
+redaction, top-up and routing refusals, unresolved spend and the disposition matrix.
+
+The focused browser selectors are `TAU_TRACER_INFERENCE`, `TAU_TRACER_INFERENCE_PHASE` and
+`TAU_TRACER_INFERENCE_END`; unset all three for the full gate. The full browser gate covers
+request order and bodies, header separation, held responses, crash/reload recovery, bounded
+revocation, expiry and both builds' planted no-plaintext controls. The mutation evidence below
+records each required production break and its restored rerun.
+`spec/bundle/cors-probe.sh` is withheld by the no-live-vendor fence for this work.
+
 ### The credential-redaction boundary
 
 Every typed adapter response and the injected response stand-in pass `src/redaction.rs` through
@@ -140,9 +276,7 @@ The following are **implementation readings**, with deliberately limited claims:
   the call stays unresolved and the existing failed-append latch applies. Older journals
   without responses replay unchanged. No response body appears in `store_state` or page reports.
 - **Model context:** the boundary's returned `Redacted` bytes are the stand-in for model
-  context, the only response form an adapter hands on. Model tools are twr-ggw.14's; inference
-  and model request bodies are twr-ggw.17's. There is no model request body to check against
-  STG-10 in this build.
+  context, the only response form an adapter hands on. Model tools are twr-ggw.14's. The inference adapter composes model request bodies; the fixture inspects every received body and the tracer searches them for credential needles under STG-10.
 - **Two mechanisms:** the typed adapter declares root-password fields as RFC 6901 JSON
   Pointers; the fixture declares `/root_password`. Declared fields require JSON: malformed
   JSON refuses with no response record or output, leaving the call unresolved. Only the
@@ -157,8 +291,9 @@ The following are **implementation readings**, with deliberately limited claims:
   registered credential types and zeroize after scanning. The passphrase and wrapping key
   are cleared during create, unlock or re-display before responses can pass; neither lifetime
   is extended to scan for it. They are consequently absent from the scan set at response time.
-  Later additions belong in the store's enumeration: the vendor credential, session inference
-  key (twr-ggw.17) and role-5 LNVPS key (twr-ggw.47).
+  The inference account credential and each live session inference key also join this set.
+  Later additions belong in the store's enumeration: the vendor credential and role-5 LNVPS
+  key (twr-ggw.47).
 - **Routing:** only the boundary constructs `Redacted`, whose field is private and which
   has no constructor from bytes, `Deserialize`, `Default` or `From`. The response append and
   adapter return accept only that output; its entry obtains holdings from the store itself.
@@ -298,7 +433,8 @@ The production command append resolves any provenance target against its command
 before commit. Existing intents retain their recorded resource, holds and dispositions without
 requiring approval records; replay never treats those historical calls as a store refusal.
 Inference has a distinct resource type, so no entry name can collide with it; this core admits
-it, while twr-ggw.17 owns its journal.
+it through the shared admission rule. Its own inference intents and metadata terminals record
+account reads, mints, completions and revokes, separately from typed operations.
 
 Every unresolved machine call bars cloud-plane mutations on that entry, whatever its call id,
 session or requester, including the operator flow. A second index for the same entry changes
@@ -344,7 +480,9 @@ dispositions, including the invalid historical disposition. Only the extra index
 associations remain supplied in memory, including after reopen, until twr-ggw.21 journals them.
 Every outcome and projection member is compared at every step. Oldest-first
 members stay lists; resource/entry members are keyed sets. Unmoved members must stay empty.
-Inference and dispositions on its resource run in the core without store records. Replay
+Inference and dispositions on its resource run in the core without store records. This
+comparison remains core-only for inference and does not use the new inference journal path;
+the witness file and its recorded outcomes are unchanged. Replay
 actually reopens the store. Command requests use the existing intent and job-evidence path,
 with target, session and requester provenance recorded by the production append. The file's
 approval facts map bijectively to the recorded pin admission's fingerprint, and its approval
@@ -406,7 +544,10 @@ This comparison is evidence about harness knowledge alone; the storage and brows
 carry ordering and contact evidence. Approved entries and their approval-time indices are
 journaled here. Live bindings are enforced above this core; actual session tools/routes wait for twr-ggw.14. The
 per-tool create case waits there; no extra route is invented here. Creating/paying and learning
-the vendor id are twr-ggw.21's; inference records twr-ggw.17's; the abandonment flow and its
+the vendor id are twr-ggw.21's; inference records now use their own store path; session-start
+selection is twr-ggw.18's, the disposition screen twr-ggw.66's and the model twr-ggw.14's;
+account-credential sheet export is twr-ggw.27's and Replace's statement about it twr-ggw.29's;
+the real account checks and CNF-78's override measurement remain twr-ggw.51's; the abandonment flow and its
 authorization twr-ggw.31's; LNVPS fixture and criterion 23's LNVPS half twr-ggw.32's; stop and
 renewal-off twr-ggw.40's; LNVPS reinstall twr-ggw.45's; operator rendering twr-ggw.66's and
 refused request results twr-ggw.67's. Rescue rules and remaining reboot traces belong to
@@ -527,6 +668,21 @@ but an append already begun completes whole and its evidence stands. A stopped w
 held with what was read so far and why the other calls were not read. It settles nothing and
 arms no later dispatch. There is no timer for the wait.
 
+Session end stops every held wait as soon as its flag is set, before acquiring the store
+writer. Both collection and held requests check that flag immediately before each job-read
+`exec`; unread calls report `not_read` with a reason naming session end. A read whose `exec`
+was sent keeps its own error in `why` even if sessions end before it returns: collection uses
+`failed: true`, and a held request retains its `not_read: true` read-error shape. Collection uses the
+same stoppable evidence-append boundary: an append already begun completes whole, and no new
+append begins after session end. Nothing is retried. The browser cases suspend collection
+and held reads after channel opening and before `exec`, begin session end while another
+operation holds the writer, then release the read. The sshd receives no read exec, unread
+calls name session end, and no job evidence or terminal is added. The held variant also
+checks that the wait was stopped before the writer became available. Two further browser
+cases wait until sshd receives a read of a running job, then end sessions: the held read
+keeps its stop reason, and collection keeps its own error from a malformed fixture exit
+record supplied after session end. Neither appends evidence or settles the command.
+
 The held answer is distinct from `done`, `unresolved` and `refused`. For example, a stopped
 request reports:
 
@@ -603,8 +759,10 @@ then does a live session receive the key. A failed append creates no session.
 
 Session inspection and transport read the same credential collection. The type supplies its
 `Credential::ROW`; inspection names each row and machine, with no key material. A session is
-neither a credential type nor a credential-scan exemption. Its only holding is row 3 for its
-bound machine, and it receives neither the seed nor the relay key.
+neither a credential type nor a credential-scan exemption. At binding it holds only row 3 for
+its bound machine. Once the first inference request mints a session inference key, it holds
+row 2 as well, with `machine:null` denoting the session. It never receives row 14, the seed or
+the relay key.
 
 ### Acceptable weaker modes
 
@@ -909,6 +1067,8 @@ the host tests run.
     `run_command` supplies its directly named entry, the bound session identity, and requester `session`.
     No command carries typed operation facts or an `OperationApproval`. A new-format intent with `approval:null`
     (or an absent approval member) means never dispatched. No path in this build writes one.
+  - inference account, intent and terminal events use the exact shapes under "Procured
+    inference" above, separately from typed operations.
   - a typed intent under `operation_intent`: `call` (its record number), `resource`
     (`{"entry":"fixture"}`), `target` (`{"entry":"fixture"}`, `{"allocation_index":0}` or
     `{"vendor_machine":"id"}`), `operation`, `session`, `requester` (`session`, `operator` or
@@ -996,7 +1156,8 @@ the host tests run.
   The independent reader in the tracer crate decrypts every record and reads the seed, legacy
   command, intent, typed intent, typed observation, terminal, job terminal, job observation,
   disposition, seed-backup, setup approval/class/access, exposure, connection-refusal, mode-acceptance and signature-refusal shapes,
-  with exact members on the new records.
+  with exact members on the new records. It also independently parses and validates the
+  inference account, intent and metadata-terminal shapes described above.
   It checks a completion against the seed identifier it derives independently, and inspects reservations.
 - **`staging`**, the one staging name, which is never a record name or the envelope's.
 
@@ -1060,20 +1221,15 @@ the host tests run.
   - The passphrase is zeroized once the derivation has run, and the wrapping key right after
     the unwrap. The data key lives until the worker ends.
   - The harness never persists the passphrase.
-- **Lock is termination.** The page terminates the harness worker and starts a fresh one, which
-  loads locked, on each of these:
-  - `visibilitychange` to hidden;
-  - `pagehide`;
-  - a back/forward-cache restore, a `pageshow` with `persisted` set;
-  - the Lock button.
-
-  A lock also empties both passphrase fields, so text typed and never submitted does not
-  outlive it (`SEC-5` row 18: "Input UI briefly"). A reload and a killed worker reach the same
-  state by themselves. There is no grace timer, and
-  nothing is journaled on the way out (`STA-23`: "No unload callback is relied on for
-  journaling"). Terminating the worker ends everything inside it: its relay WebSocket, the SSH
-  connection that WebSocket carries, and its exec. A detached job continues on the machine,
-  to be collected after unlock; the worker replays the journal.
+- **Lock ends sessions before termination.** On the Lock button, hidden visibility, pagehide,
+  bfcache restore and seed-backup re-display, the page clears words and inputs immediately and
+  posts the exact-member `{end_sessions:true}` message. The worker stops dispatch, clears
+  session holdings, and independently records and sends each owed revoke. The page terminates
+  it on its answer or the named 5000 ms bound, then the fresh worker loads locked. A detached
+  machine job continues and can be collected after unlock.
+  A killed worker cannot act. After a crash or real unload, the next-unlock sweep revokes a
+  recorded minted identifier with no revoke intent, or expiry bounds the key. A revoke whose
+  intent committed but whose terminal was cut off stays unresolved and is never retried.
 - **The single writer.** `worker.js` takes an exclusive Web Lock, `tau-web-store`, before the
   module reads the store, and holds it for the worker's whole life (`STA-1`, `STA-7`).
   - A worker that cannot get the lock queues for it, and the page says "Waiting for the local
@@ -1477,7 +1633,7 @@ browser holds:
 In headless Chromium 154 a new tab hides the one before it, which then restarts its worker, as
 page hide must. The cases account for it.
 
-The full run has 108 cases.
+The full run defines 130 cases.
 
 The cases:
 
@@ -1497,6 +1653,11 @@ The cases:
 | seed-backup interruption, twelve cases per build | display and answering each meet explicit lock, visibility hidden, pagehide, bfcache restore, close and renderer crash; words and input disappear and next unlock still owes the same record |
 | seed-backup re-display, each build | fresh passphrase is required; wrong passphrase shows no word; answering removes words; tracer relay and SSH connections end before display, held waits end, no stopped request resumes and the cut-off call stays unresolved |
 | 1. recorded, then sent (`CNF-30`, `ARC-8`) | exactly one relay connection; the sshd received exactly the wrapper recomposed from the journal entry, and its job record holds exactly the journal command; the replayed state holds the command intent after the setup approval and its following job terminal (exit status 7), and the output and exit status came back. With the append made to fail, the sshd received no `exec`, read only once that SSH connection has ended at the sshd |
+| session end during box-plane intent commit | a tracer-only switch suspends the intent's OPFS move while it holds the writer; end-sessions begins before release, the sshd receives no exec, the report is unresolved, and unlock recovers the committed call as unresolved |
+| session end before job-record reads, collection and held request | suspend the read after opening its channel, start end-sessions while the writer is held, release, and check no read exec, per-call `not_read` with session-end reasons, and no appended evidence; the held wait is stopped before the writer becomes available |
+| session end after job-record reads are sent, collection and held request | wait until sshd receives the running job's read exec, then end sessions; the held read keeps `not_read` with its own stop reason and collection keeps `failed` with its malformed-record error; no further exec, evidence or terminal |
+| procured inference | real fetch, mint, independent metadata parsing, unresolved spend, routing and manual redirects; concurrent held completions, identifier-only mints, unlock during a held sweep, and every session end and crash/reload/sweep/expiry |
+| inference no-plaintext and loopback | account and all minted key needles, planted-needle controls, OPFS/decrypted-record inspection, browser storage, messages, store inspection, request bodies and logs; CDP blocks the off-loopback negative control |
 | a failed append is not applied (twr-ggw.5 AC2, `STA-3`) | that failed append failed at its `move()`, a real OPFS call; the replayed state has no record for it, and none appears after a reload and an unlock |
 | acceptable weaker modes, two cases (one per build) | installation history on fixture renders unpinned with its standing label and no artifact claim; two lowering forms commit one refusal each with no intent, relay connection or SSH connection; tracer controls run harmless commands, and a host-key halt adds no mode |
 | 2. a wrong host key halts (`CNF-21`, `SEC-11`) | no authentication attempt, no `exec`, no journal entry, and exactly one connection |
@@ -1702,12 +1863,12 @@ rest of `CNF-88` has no code here yet.
 | `spec-checks` | `spec/bundle/cors-probe.sh` | `CNF-4` |
 | | `spec/prototypes/spec-checks/check-install-disks.py`, and `--baseline`, which must fail | evidence for `CNF-85` |
 | `build` (the job is `CNF-1`) | `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings` | `CNF-2`, at that strictness |
-| | `cargo test --locked` | runs `build.rs`, so the gates above run here, and the `[session]` fixtures (`CNF-88`'s build fixtures); the relay matrix, `CNF-87`'s fixture half; the seed's tests, `CNF-83`'s derivation tests and `CNF-13`'s tests; the local store's, `CNF-82`'s and `CNF-15`'s host half (below); dispatch and journal recovery for `CNF-29`'s box-plane case, including the unresolved-command hold before contact and at append, identical bytes and reads, no writes on refusal, replay, every holding call and other-machine independence, `CNF-30`, `CNF-39` and `STA-24` dispositions; job classification, channel deliveries, unresolved evidence, append failures, replay and all four dispositions, plus real-shell signals, high exit codes, missing and unreadable record files, NUL-corrupted scalars, exact scalar forms, the reader and replay exit ceiling, incomplete unreadable entries, owned-child cleanup, recycled PIDs, stale fixture groups, exact sentinel matching, drop, duplicate-id, boot, output and cross-store identity tests for `CNF-40`'s dropped command not re-run, waiting on its job record, `CNF-54`–`CNF-56` and `CNF-110`'s collection case; and allocation's, `CNF-72`'s tests and the companion comparison against the allocation witness file (ADR-0032), with `CNF-3`'s three breaks as its unit tests; atomic setup approval and indices, ceremony gates, unanswered classes, maintained access/profile, binding prerequisites and acts, exclusive live bindings, session credential inspection, durable exposure/refusal records, caller-bound adapter admission before approval, ceremony and Restore restrictions, independent sshd rejection of uninstalled and other-machine keys, provenance resolution and replay; typed fixture operations through the adapter's send path at every append kill boundary and a suspended record/send boundary, the resource barrier across both planes, all requester provenances through production command admission/append, disposition reach/end/replacement, exact collectable calls and committed job evidence in the 20-row matrix, unsupported typed-record replay refusals, and the dispatch companion's production-path stage1 comparison and complete vocabulary negative controls; acceptable weaker mode acceptance windows and atomicity, restatement through adapter and direct store admission, trust-display completeness, both lowering forms, durable refusal records, old shapes and independently parsed acceptance windows |
+| | `cargo test --locked` | procured-inference host invariants, post-append end admission, late terminals and preservation of the committed mint report through `inference::infer`, per-session top-up reads and independent fixture/reader checks; runs `build.rs`, so the gates above run here, and the `[session]` fixtures (`CNF-88`'s build fixtures); the relay matrix, `CNF-87`'s fixture half; the seed's tests, `CNF-83`'s derivation tests and `CNF-13`'s tests; the local store's, `CNF-82`'s and `CNF-15`'s host half (below); dispatch and journal recovery for `CNF-29`'s box-plane case, including the unresolved-command hold before contact and at append, identical bytes and reads, no writes on refusal, replay, every holding call and other-machine independence, `CNF-30`, `CNF-39` and `STA-24` dispositions; job classification, channel deliveries, unresolved evidence, append failures, replay and all four dispositions, plus real-shell signals, high exit codes, missing and unreadable record files, NUL-corrupted scalars, exact scalar forms, the reader and replay exit ceiling, incomplete unreadable entries, owned-child cleanup, recycled PIDs, stale fixture groups, exact sentinel matching, drop, duplicate-id, boot, output and cross-store identity tests for `CNF-40`'s dropped command not re-run, waiting on its job record, `CNF-54`–`CNF-56` and `CNF-110`'s collection case; and allocation's, `CNF-72`'s tests and the companion comparison against the allocation witness file (ADR-0032), with `CNF-3`'s three breaks as its unit tests; atomic setup approval and indices, ceremony gates, unanswered classes, maintained access/profile, binding prerequisites and acts, exclusive live bindings, session credential inspection, durable exposure/refusal records, caller-bound adapter admission before approval, ceremony and Restore restrictions, independent sshd rejection of uninstalled and other-machine keys, provenance resolution and replay; typed fixture operations through the adapter's send path at every append kill boundary and a suspended record/send boundary, the resource barrier across both planes, all requester provenances through production command admission/append, disposition reach/end/replacement, exact collectable calls and committed job evidence in the 20-row matrix, unsupported typed-record replay refusals, and the dispatch companion's production-path stage1 comparison and complete vocabulary negative controls; acceptable weaker mode acceptance windows and atomicity, restatement through adapter and direct store admission, trust-display completeness, both lowering forms, durable refusal records, old shapes and independently parsed acceptance windows |
 | `web` (the job is `CNF-1` for the browser build) | `cargo clippy -D warnings` on wasm32, the served and the tracer build | `CNF-2`, on the new target |
 | | `scripts/check-adr-0024.sh` | spec ADR-0024's build check |
 | | `scripts/build-web.sh served`, then `tracer check-absence dist/served` | the served build (`ARC-32`) carries no fixture-derived key, pin source or test switch |
 | | `tracer check-csp dist/served` | `ARC-33`'s policy, exactly |
-| | `scripts/tracer.sh`, in headless Chrome | `CNF-30`, `CNF-21`, `CNF-23`'s no-pin case and `ARC-33`, as above, the relay refusals of `CNF-87` a correct client meets, and the local store's `CNF-82` and `CNF-15` in the browser; seed-backup display, hiding, full re-entry/skip, interruptions, re-display and custody in both builds (`CNF-44`, `CNF-82`), and integrated allocation refusals, completions and failed OPFS appends (`CNF-72`); `CNF-40`'s dropped command not re-run, waiting on its job record, `CNF-54`–`CNF-56`, `STA-20a` and `CNF-110`'s box-plane collection case; unresolved-command hold, concurrent admission and shared results, stopped waits with the writer free, unreachable answers and destructive replacement; typed reset confirmation and every continuation on the real pinned connection; setup batch costs and indices, unanswered class controls, Not sure and No, maintained access and non-operator boundaries in both builds; binding, derived client authentication, machine authorized_keys, ledger restart and re-display in both builds; acceptable weaker mode display and two pre-contact lowering refusals in both builds, with completed controls and unchanged modes at a host-key halt; these browser cases supply the pinned SSH attempt evidence, which has no host form |
+| | `scripts/tracer.sh`, in headless Chrome | procured-inference browser cases, crash/reload/sweep/expiry, held completion and sweep responses, and loopback enforcement; `CNF-30`, `CNF-21`, `CNF-23`'s no-pin case and `ARC-33`, as above, the relay refusals of `CNF-87` a correct client meets, and the local store's `CNF-82` and `CNF-15` in the browser; seed-backup display, hiding, full re-entry/skip, interruptions, re-display and custody in both builds (`CNF-44`, `CNF-82`), and integrated allocation refusals, completions and failed OPFS appends (`CNF-72`); `CNF-40`'s dropped command not re-run, waiting on its job record, `CNF-54`–`CNF-56`, `STA-20a` and `CNF-110`'s box-plane collection case; unresolved-command hold, concurrent admission and shared results, stopped waits with the writer free, unreachable answers and destructive replacement; typed reset confirmation and every continuation on the real pinned connection; setup batch costs and indices, unanswered class controls, Not sure and No, maintained access and non-operator boundaries in both builds; binding, derived client authentication, machine authorized_keys, ledger restart and re-display in both builds; acceptable weaker mode display and two pre-contact lowering refusals in both builds, with completed controls and unchanged modes at a host-key halt; these browser cases supply the pinned SSH attempt evidence, which has no host form |
 
 The `build` job's `cargo test --locked` also gates mode acceptance windows and atomicity,
 restatement through both typed admission paths, trust-display completeness, durable lowering
@@ -1790,7 +1951,8 @@ are included in `check-absence`.
 
 For focused setup checks, set `TAU_TRACER_SETUP_CASE=all`. The `existing` value runs the existing
 dispatch/job cases without seed-display-dependent custody controls. The full gate leaves
-`TAU_TRACER_SETUP_CASE`, `TAU_TRACER_SEED_CASE` and `TAU_TRACER_HOLD_CASE` unset and runs all 108 cases. `TAU_TRACER_MODE_CASE` must also be unset.
+`TAU_TRACER_SETUP_CASE`, `TAU_TRACER_SEED_CASE` and `TAU_TRACER_HOLD_CASE` unset and runs all 130 cases. `TAU_TRACER_MODE_CASE`, `TAU_TRACER_INFERENCE`, `TAU_TRACER_INFERENCE_PHASE` and
+`TAU_TRACER_INFERENCE_END` must also be unset.
 
 The weaker-mode boundaries were mutation-checked on 2026-10-23 with Rust 1.97.1.
 M1–M7, M12 and M14 retain their evidence from that date. M8–M11 and M13 were rerun,
@@ -2457,3 +2619,1181 @@ This is a tracer assertion, not a Rust panic. The production source was restored
 saved copy and compared byte-for-byte. With all three focus variables unset, the restored
 full `CHROME=<chromium> scripts/tracer.sh` gate reruns that same case; it exited 0 with
 `TRACER PASS` after all 106 cases.
+
+### Procured inference mutation evidence (I1–I39)
+
+On 2026-10-24, each mutation below changed production code, or the named tracer check. Every
+red command ran in the foreground with output redirected to a log. Saved source bytes were
+restored and compared byte for byte before the same command ran green. The initial I1–I24
+record contains 32 red/green pairs: I10 removes six fields, I12 checks both an unresolved barrier and a held completion
+lock, I18 uses both wrong sources, and I22 checks both a served export and the planted needles.
+The full gate follows these focused checks with every selector unset.
+
+The first top-up-driver and post-failure-route mutants stayed green. The tests were strengthened
+to observe mint preparation and the next request's route, then rerun as recorded below. The
+cut-off case explicitly awaits a sweep invocation after unlock so its count assertion observes
+the duplicate transmission before the independent reader can refuse the record. A preliminary
+cache mutant did not compile and is excluded from this evidence.
+
+The initial browser commands used `/var/tmp/twr17-round2/wasm` with these exact contents:
+
+```sh
+#!/usr/bin/env bash
+export TMPDIR=/var/tmp
+export PATH=/nix/store/dys0df46hm84hikqkr0jx4shdnfhqwbn-wasm-bindgen-cli-0.2.127/bin:$PATH
+export CC_wasm32_unknown_unknown=/nix/store/n90xmancjp0b1dg4ybnya9qfg5yrw62m-clang-21.1.7/bin/clang
+export AR_wasm32_unknown_unknown=/nix/store/n96mcsx6qisxrpljz1lvzcxxqyip9z2m-llvm-21.1.7/bin/llvm-ar
+export CHROME=/nix/store/s8l73vx0mmvmdarhx2i893iysdiklqh7-chromium-154.0.8037.97/bin/chromium
+exec nix shell nixpkgs#gcc -c env RUSTUP_TOOLCHAIN=1.97.1 CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-Clinker-features=-lld "$@"
+```
+
+I22's `/var/tmp/twr17-round2/check-served` first runs that wrapper with
+`bash scripts/build-web.sh served`, then runs
+`nix shell nixpkgs#gcc -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 run --locked -p tracer -- check-absence dist/served`,
+stopping on any nonzero exit. The host commands below include their complete environment.
+
+**I1** — Give the inference account credential to each session as a row-14 holding. Files: `src/store/inference.rs`. Exact command:
+
+```sh
+nix shell 'nixpkgs#gcc' -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web session_inspection_and_terminal_metadata_and_no_prompt_or_session_inference_key_in_records -- --nocapture
+```
+
+Red exit: 101. Failing assertion:
+
+```text
+thread 'store::inference::tests::session_inspection_and_terminal_metadata_and_no_prompt_or_session_inference_key_in_records' (427682) panicked at src/store/inference/tests.rs:130:5:
+assertion `left == right` failed
+  left: Array [Object {"machine": String("fixture"), "row": Number(3)}, Object {"machine": Null, "row": Number(14)}]
+ right: Array [Object {"machine": String("fixture"), "row": Number(3)}]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+```
+
+Restored byte-identically; green exit: 0.
+
+**I2** — Journal the session inference key as completion metadata. Files: `src/store/inference.rs`. Exact command:
+
+```sh
+nix shell 'nixpkgs#gcc' -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web decrypted_records_never_contain_session_inference_key_or_prompt -- --nocapture
+```
+
+Red exit: 101. Failing assertion:
+
+```text
+thread 'store::inference::tests::decrypted_records_never_contain_session_inference_key_or_prompt' (435942) panicked at src/store/inference/tests.rs:503:9:
+decrypted record contains session inference key
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test store::inference::tests::decrypted_records_never_contain_session_inference_key_or_prompt ... FAILED
+
+```
+
+Restored byte-identically; green exit: 0.
+
+**I3** — Persist the session inference key in browser Cache Storage. Files: `Cargo.toml`, `src/harness/inference.rs`. Exact command:
+
+```sh
+env TAU_TRACER_INFERENCE=1 TAU_TRACER_INFERENCE_PHASE=core /var/tmp/twr17-round2/wasm bash scripts/tracer.sh
+```
+
+Red exit: 1. Failing assertion:
+
+```text
+[FAILED] browser storage empty and no service worker
+```
+
+Restored byte-identically; green exit: 0.
+
+**I4** — Omit cap from the mint body. Files: `src/inference.rs`. Exact command:
+
+```sh
+nix shell 'nixpkgs#gcc' -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web refused_probe_top_up_and_lost_mint_contact_nothing_further -- --nocapture
+```
+
+Red exit: 101. Failing assertion:
+
+```text
+thread 'store::inference::tests::refused_probe_top_up_and_lost_mint_contact_nothing_further' (440400) panicked at src/store/inference/tests.rs:304:5:
+assertion `left == right` failed
+  left: Object {"expires": Number(1000)}
+ right: Object {"cap": String("0.10"), "expires": Number(1000)}
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+```
+
+Restored byte-identically; green exit: 0.
+
+**I5** — Omit expiry from the mint body. Files: `src/inference.rs`. Exact command:
+
+```sh
+env TAU_TRACER_INFERENCE=1 /var/tmp/twr17-round2/wasm bash scripts/tracer.sh
+```
+
+Red exit: 1. Failing assertion:
+
+```text
+[FAILED] fixture refuses past the requested expiry without an unlock
+```
+
+Restored byte-identically; green exit: 0.
+
+**I6** — Skip revocation at the bounded session end. Files: `src/harness/inference.rs`. Exact command:
+
+```sh
+env TAU_TRACER_INFERENCE=1 TAU_TRACER_INFERENCE_END=lock /var/tmp/twr17-round2/wasm bash scripts/tracer.sh
+```
+
+Red exit: 1. Failing assertion:
+
+```text
+[FAILED] the tracer uses the ended session's key and the fixture refuses it
+```
+
+Restored byte-identically; green exit: 0.
+
+**I7** — Accept automatic top-up on in the driver. Files: `src/inference.rs`. Exact command:
+
+```sh
+nix shell 'nixpkgs#gcc' -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web top_up_on_refuses_before_preparing_an_inference_mint -- --nocapture
+```
+
+Red exit: 101. Failing assertion:
+
+```text
+thread 'store::inference::tests::top_up_on_refuses_before_preparing_an_inference_mint' (444894) panicked at src/store/inference/tests.rs:890:5:
+assertion `left == right` failed: top-up on must refuse before preparing a mint
+  left: 1
+ right: 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+```
+
+Restored byte-identically; green exit: 0.
+
+**I8** — Append intent in finish, after transmission. Files: `src/store/inference.rs`. Exact command:
+
+```sh
+nix shell 'nixpkgs#gcc' -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web committed_intents_survive_suspended_send_and_every_storage_kill_boundary -- --nocapture
+```
+
+Red exit: 101. Failing assertion:
+
+```text
+thread 'store::inference::tests::committed_intents_survive_suspended_send_and_every_storage_kill_boundary' (448269) panicked at src/store/inference/tests.rs:436:17:
+send has no durable intent: mint, boundary 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test store::inference::tests::committed_intents_survive_suspended_send_and_every_storage_kill_boundary ... FAILED
+
+```
+
+Restored byte-identically; green exit: 0.
+
+**I9** — Omit the durable inference intent. Files: `src/store/inference.rs`. Exact command:
+
+```sh
+nix shell 'nixpkgs#gcc' -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web committed_intents_survive_suspended_send_and_every_storage_kill_boundary -- --nocapture
+```
+
+Red exit: 101. Failing assertion:
+
+```text
+thread 'store::inference::tests::committed_intents_survive_suspended_send_and_every_storage_kill_boundary' (459505) panicked at src/store/inference/tests.rs:427:14:
+called `Result::unwrap()` on an `Err` value: "record 7: terminal has no earlier inference intent; replay stopped"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test store::inference::tests::committed_intents_survive_suspended_send_and_every_storage_kill_boundary ... FAILED
+
+```
+
+Restored byte-identically; green exit: 0.
+
+**I10-model** — Drop terminal model. Files: `src/inference.rs`. Exact command:
+
+```sh
+nix shell 'nixpkgs#gcc' -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web session_inspection_and_terminal_metadata_and_no_prompt_or_session_inference_key_in_records -- --nocapture
+```
+
+Red exit: 101. Failing assertion:
+
+```text
+thread 'store::inference::tests::session_inspection_and_terminal_metadata_and_no_prompt_or_session_inference_key_in_records' (492134) panicked at src/store/inference/tests.rs:135:5:
+assertion `left == right` failed: {"call":11,"unresolved":true,"why":"the response terminal could not be committed"}
+  left: Null
+ right: true
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+```
+
+Restored byte-identically; green exit: 0.
+
+**I10-reported_provider** — Drop terminal reported_provider. Files: `src/inference.rs`. Exact command:
+
+```sh
+nix shell 'nixpkgs#gcc' -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web session_inspection_and_terminal_metadata_and_no_prompt_or_session_inference_key_in_records -- --nocapture
+```
+
+Red exit: 101. Failing assertion:
+
+```text
+thread 'store::inference::tests::session_inspection_and_terminal_metadata_and_no_prompt_or_session_inference_key_in_records' (535473) panicked at src/store/inference/tests.rs:154:5:
+assertion `left == right` failed
+  left: None
+ right: Some("Fixture Provider")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+```
+
+Restored byte-identically; green exit: 0.
+
+**I10-request_id** — Drop terminal request_id. Files: `src/inference.rs`. Exact command:
+
+```sh
+nix shell 'nixpkgs#gcc' -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web session_inspection_and_terminal_metadata_and_no_prompt_or_session_inference_key_in_records -- --nocapture
+```
+
+Red exit: 101. Failing assertion:
+
+```text
+thread 'store::inference::tests::session_inspection_and_terminal_metadata_and_no_prompt_or_session_inference_key_in_records' (612842) panicked at src/store/inference/tests.rs:170:5:
+assertion `left == right` failed
+  left: None
+ right: Some("gen-fixture")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+```
+
+Restored byte-identically; green exit: 0.
+
+**I10-requested_provider** — Drop terminal requested_provider. Files: `src/inference.rs`. Exact command:
+
+```sh
+nix shell 'nixpkgs#gcc' -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web session_inspection_and_terminal_metadata_and_no_prompt_or_session_inference_key_in_records -- --nocapture
+```
+
+Red exit: 101. Failing assertion:
+
+```text
+thread 'store::inference::tests::session_inspection_and_terminal_metadata_and_no_prompt_or_session_inference_key_in_records' (513071) panicked at src/store/inference/tests.rs:135:5:
+assertion `left == right` failed: {"call":11,"unresolved":true,"why":"the response terminal could not be committed"}
+  left: Null
+ right: true
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+```
+
+Restored byte-identically; green exit: 0.
+
+**I10-spend** — Drop terminal spend. Files: `src/inference.rs`. Exact command:
+
+```sh
+nix shell 'nixpkgs#gcc' -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web session_inspection_and_terminal_metadata_and_no_prompt_or_session_inference_key_in_records -- --nocapture
+```
+
+Red exit: 101. Failing assertion:
+
+```text
+thread 'store::inference::tests::session_inspection_and_terminal_metadata_and_no_prompt_or_session_inference_key_in_records' (586388) panicked at src/store/inference/tests.rs:166:5:
+assertion `left == right` failed
+  left: None
+ right: Some("0.000000123456789012345678901234567890")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+```
+
+Restored byte-identically; green exit: 0.
+
+**I10-token_counts** — Drop terminal token_counts. Files: `src/inference.rs`. Exact command:
+
+```sh
+nix shell 'nixpkgs#gcc' -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web session_inspection_and_terminal_metadata_and_no_prompt_or_session_inference_key_in_records -- --nocapture
+```
+
+Red exit: 101. Failing assertion:
+
+```text
+thread 'store::inference::tests::session_inspection_and_terminal_metadata_and_no_prompt_or_session_inference_key_in_records' (558091) panicked at src/store/inference/tests.rs:158:5:
+assertion `left == right` failed
+  left: (None, None, None)
+ right: (Some(3), Some(5), Some(8))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+```
+
+Restored byte-identically; green exit: 0.
+
+**I11** — Include the composed prompt body in the intent model field. Files: `src/store/inference.rs`. Exact command:
+
+```sh
+nix shell 'nixpkgs#gcc' -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web decrypted_records_never_contain_session_inference_key_or_prompt -- --nocapture
+```
+
+Red exit: 101. Failing assertion:
+
+```text
+thread 'store::inference::tests::decrypted_records_never_contain_session_inference_key_or_prompt' (645384) panicked at src/store/inference/tests.rs:507:9:
+decrypted record contains prompt body
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test store::inference::tests::decrypted_records_never_contain_session_inference_key_or_prompt ... FAILED
+
+```
+
+Restored byte-identically; green exit: 0.
+
+**I12-barrier** — Refuse the next inference request while a completion is unresolved. Files: `src/store/inference.rs`. Exact command:
+
+```sh
+nix shell 'nixpkgs#gcc' -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web unresolved_is_unaccounted_never_resent_and_next_request_dispatches_after_reopen -- --nocapture
+```
+
+Red exit: 101. Failing assertion:
+
+```text
+thread 'store::inference::tests::unresolved_is_unaccounted_never_resent_and_next_request_dispatches_after_reopen' (673256) panicked at src/store/inference/tests.rs:327:5:
+assertion `left == right` failed
+  left: Null
+ right: true
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+```
+
+Restored byte-identically; green exit: 0.
+
+**I12-lock** — Hold the mint guard across completion fetch; both requests must have their own committed intents and fixture arrivals. Files: `src/inference.rs`. Exact command:
+
+```sh
+env TAU_TRACER_INFERENCE=1 TAU_TRACER_INFERENCE_PHASE=core /var/tmp/twr17-round3/wasm bash scripts/tracer.sh
+```
+
+Red exit: 1. Failing output:
+
+```text
+[FAILED] second completion finishes while the first response is withheld
+[FAILED] both intents committed and both completions reached the fixture
+```
+
+Saved bytes restored and compared byte for byte. Green exit: 0.
+
+**I13** — Describe an unreadable completion as failed. Files: `src/inference.rs`. Exact command:
+
+```sh
+nix shell 'nixpkgs#gcc' -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web unresolved_is_unaccounted_never_resent_and_next_request_dispatches_after_reopen -- --nocapture
+```
+
+Red exit: 101. Failing assertion:
+
+```text
+thread 'store::inference::tests::unresolved_is_unaccounted_never_resent_and_next_request_dispatches_after_reopen' (702778) panicked at src/store/inference/tests.rs:318:5:
+assertion `left == right` failed: {"call":11,"failed":true}
+  left: Null
+ right: true
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+```
+
+Restored byte-identically; green exit: 0.
+
+**I14** — Automatically resend an unresolved completion. Files: `src/inference.rs`. Exact command:
+
+```sh
+nix shell 'nixpkgs#gcc' -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web unresolved_is_unaccounted_never_resent_and_next_request_dispatches_after_reopen -- --nocapture
+```
+
+Red exit: 101. Failing assertion:
+
+```text
+thread 'store::inference::tests::unresolved_is_unaccounted_never_resent_and_next_request_dispatches_after_reopen' (730285) panicked at src/store/inference/tests.rs:332:5:
+assertion `left == right` failed
+  left: 4
+ right: 3
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+```
+
+Restored byte-identically; green exit: 0.
+
+**I15** — Clear the chosen route after a real 5xx response. Files: `src/store/inference.rs`. Exact command:
+
+```sh
+nix shell 'nixpkgs#gcc' -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web every_composition_and_route_and_readable_error -- --nocapture
+```
+
+Red exit: 101. Failing assertion:
+
+```text
+thread 'store::inference::tests::every_composition_and_route_and_readable_error' (754437) panicked at src/store/inference/tests.rs:218:5:
+assertion `left == right` failed
+  left: 2
+ right: 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+```
+
+Restored byte-identically; green exit: 0.
+
+**I16** — Send account read and mint before the route probe. Files: `src/inference.rs`. Exact command:
+
+```sh
+nix shell 'nixpkgs#gcc' -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web every_composition_and_route_and_readable_error -- --nocapture
+```
+
+Red exit: 101. Failing assertion:
+
+```text
+thread 'store::inference::tests::every_composition_and_route_and_readable_error' (777987) panicked at src/store/inference/tests.rs:219:5:
+assertion `left == right` failed
+  left: "/account"
+ right: "/"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+```
+
+Restored byte-identically; green exit: 0.
+
+**I17** — Omit retention on a later completion only. Files: `src/store/inference.rs`. Exact command:
+
+```sh
+nix shell 'nixpkgs#gcc' -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web every_composition_and_route_and_readable_error -- --nocapture
+```
+
+Red exit: 101. Failing assertion:
+
+```text
+thread 'store::inference::tests::every_composition_and_route_and_readable_error' (798933) panicked at src/store/inference/tests.rs:221:9:
+assertion `left == right` failed
+  left: Object {"only": Array [String("fixture-provider")]}
+ right: Object {"only": Array [String("fixture-provider")], "zdr": Bool(true)}
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+```
+
+Restored byte-identically; green exit: 0.
+
+**I18-maker** — Derive only from candidate maker. Files: `src/inference.rs`. Exact command:
+
+```sh
+nix shell 'nixpkgs#gcc' -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web every_composition_and_route_and_readable_error -- --nocapture
+```
+
+Red exit: 101. Failing assertion:
+
+```text
+thread 'store::inference::tests::every_composition_and_route_and_readable_error' (833171) panicked at src/store/inference/tests.rs:221:9:
+assertion `left == right` failed
+  left: Object {"only": Array [String("fixture-maker")], "zdr": Bool(true)}
+ right: Object {"only": Array [String("fixture-provider")], "zdr": Bool(true)}
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+```
+
+Restored byte-identically; green exit: 0.
+
+**I18-slug** — Derive only from candidate slug. Files: `src/inference.rs`. Exact command:
+
+```sh
+nix shell 'nixpkgs#gcc' -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web every_composition_and_route_and_readable_error -- --nocapture
+```
+
+Red exit: 101. Failing assertion:
+
+```text
+thread 'store::inference::tests::every_composition_and_route_and_readable_error' (818895) panicked at src/store/inference/tests.rs:221:9:
+assertion `left == right` failed
+  left: Object {"only": Array [String("fixture-model")], "zdr": Bool(true)}
+ right: Object {"only": Array [String("fixture-provider")], "zdr": Bool(true)}
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+```
+
+Restored byte-identically; green exit: 0.
+
+**I19** — Refuse inference under standing dispositions. Files: `src/dispatch/typed.rs`. Exact command:
+
+```sh
+nix shell 'nixpkgs#gcc' -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web disposition_matrix_reads_and_commands_in_core_store_and_replay -- --nocapture
+```
+
+Red exit: 101. Failing assertion:
+
+```text
+thread 'dispatch::typed_tests::disposition_matrix_reads_and_commands_in_core_store_and_replay' (843323) panicked at src/dispatch/typed_tests.rs:544:21:
+assertion `left == right` failed: {"refused":"inference admission refused"}
+  left: Null
+ right: true
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+```
+
+Restored byte-identically; green exit: 0.
+
+**I20** — Let an inference intent clear the standing restriction. Files: `src/store/inference.rs`. Exact command:
+
+```sh
+nix shell 'nixpkgs#gcc' -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web disposition_matrix_reads_and_commands_in_core_store_and_replay -- --nocapture
+```
+
+Red exit: 101. Failing assertion:
+
+```text
+thread 'dispatch::typed_tests::disposition_matrix_reads_and_commands_in_core_store_and_replay' (875266) panicked at src/dispatch/typed_tests.rs:547:53:
+no entry found for key
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test dispatch::typed_tests::disposition_matrix_reads_and_commands_in_core_store_and_replay ... FAILED
+
+```
+
+Restored byte-identically; green exit: 0.
+
+**I21** — Delete the per-build search site's call to add aggregator needles, leaving its independent control intact. Files: `tracer/src/main.rs`. Exact command:
+
+```sh
+env -u TAU_TRACER_SETUP_CASE -u TAU_TRACER_SEED_CASE -u TAU_TRACER_HOLD_CASE -u TAU_TRACER_MODE_CASE -u TAU_TRACER_INFERENCE -u TAU_TRACER_INFERENCE_PHASE -u TAU_TRACER_INFERENCE_END /var/tmp/twr17-round3/wasm bash scripts/tracer.sh
+```
+
+Red exit: 1. Failing output:
+
+```text
+[FAILED] per-build search includes every aggregator needle
+[FAILED] per-build search includes every aggregator needle
+== summary (125 cases)
+```
+
+Saved bytes restored and compared byte for byte. The green is the final full gate recorded below.
+
+**I22-export** — Compile the fixture-origin switch into the served build. Files: `src/harness/inference.rs`. Exact command:
+
+```sh
+/var/tmp/twr17-round2/check-served
+```
+
+Red exit: 1. Failing assertion:
+
+```text
+FAIL: test-only parts found:
+  dist/served/pkg/tau_web.js: test switch: test_inference_origin
+  dist/served/pkg/tau_web_bg.wasm: test switch: test_inference_origin
+```
+
+Restored byte-identically; green exit: 0.
+
+**I22-needles** — Drop the new check-absence needles. Files: `tracer/src/checks.rs`. Exact command:
+
+```sh
+nix shell 'nixpkgs#gcc' -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tracer absence_detects_each_planted_inference_needle -- --nocapture
+```
+
+Red exit: 101. Failing assertion:
+
+```text
+thread 'checks::tests::absence_detects_each_planted_inference_needle' (892001) panicked at tracer/src/checks.rs:341:22:
+planted inference needle escaped check-absence: ()
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test checks::tests::absence_detects_each_planted_inference_needle ... FAILED
+
+```
+
+Restored byte-identically; green exit: 0.
+
+**I23** — Sweep and send another revoke even when a revoke intent exists. Files: `src/store/inference.rs`. Exact command:
+
+```sh
+env TAU_TRACER_INFERENCE=1 TAU_TRACER_INFERENCE_PHASE=cutoff /var/tmp/twr17-round2/wasm bash scripts/tracer.sh
+```
+
+Red exit: 1. Failing assertion:
+
+```text
+[FAILED] exactly one revoke was sent, with no sweep retry
+```
+
+Restored byte-identically; green exit: 0.
+
+**I24** — Follow completion redirects automatically. Files: `src/harness/inference.rs`. Exact command:
+
+```sh
+env TAU_TRACER_INFERENCE=1 TAU_TRACER_INFERENCE_PHASE=core /var/tmp/twr17-round2/wasm bash scripts/tracer.sh
+```
+
+Red exit: 1. Failing assertion:
+
+```text
+[FAILED] redirect target received nothing
+```
+
+Restored byte-identically; green exit: 0.
+
+The late-response metadata regression was also run before and after its fix. A completion
+arrives after session end with the session inference key as its reported provider and the
+inference account credential as its request id. The terminal must contain redaction markers
+and no response body is handed back. Exact command:
+
+```sh
+nix shell nixpkgs#gcc -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web late_completion_metadata_redacts_the_request_credential_after_holdings_clear
+```
+
+Before the request-token scan, exit 101:
+
+```text
+assertion `left == right` failed: late metadata must not journal a cleared session inference key
+  left: Some("fixture-session-private-value")
+ right: Some("<redacted>")
+```
+
+With the request's transient credential included in the boundary, exit 0. All host mutation
+variants above were rerun red and green after this addition, with byte-identical restoration.
+
+The following reruns and I25–I32 use rooted tools. `/var/tmp/twr17-round3/host` contains:
+
+```sh
+#!/usr/bin/env bash
+export TMPDIR=/var/tmp
+exec nix shell nixpkgs#gcc -c env RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 "$@"
+```
+
+`/var/tmp/twr17-round3/wasm` contains:
+
+```sh
+#!/usr/bin/env bash
+export TMPDIR=/var/tmp
+export PATH=/var/tmp/rev-twr17/wbg/bin:$PATH
+export CC_wasm32_unknown_unknown=/var/tmp/twr17-round3-tools/clang/bin/clang
+export AR_wasm32_unknown_unknown=/var/tmp/twr17-round3-tools/llvm/bin/llvm-ar
+export CHROME=/var/tmp/twr17-round3-tools/chromium/bin/chromium
+exec nix shell nixpkgs#gcc -c env RUSTUP_TOOLCHAIN=1.97.1 CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-Clinker-features=-lld "$@"
+```
+
+GCC, Chromium 154, clang and llvm-ar are retained by the named Nix out-links. The
+wasm-bindgen executable is a regular installed binary at version 0.2.127. Each browser
+command rebuilds both directories. No two cargo or tracer processes run together.
+The final full gate and final host suite supply the restored green for every earlier mutation.
+
+An initial full I21 attempt exited 1 after 115 passing cases with an OPFS `NotFoundError`
+during the unlock sweep, before reaching the planted control. It is excluded from I21's red
+evidence. The dump now retries its whole snapshot after an atomic move, discards the partial
+snapshot, bounds retries at ten and propagates unrelated errors. I32 checks all three behaviours.
+The completed I21 rerun reached 125 cases and failed only the two independent per-build controls.
+
+**I2-redo** — Insert a session inference key into terminal metadata after the decoded-value scan. Files: `src/store/inference.rs`. Exact command:
+
+```sh
+/var/tmp/twr17-round3/host test --locked -p tau-web decrypted_records_never -- --nocapture
+```
+
+Red exit: 101. Failing output:
+
+```text
+decrypted record contains session inference key
+```
+
+Saved bytes restored and compared byte for byte. Green exit: 0.
+
+**I6-redo** — Skip the end step's snapshot revokes. Files: `src/harness/inference.rs`. Exact command:
+
+```sh
+env TAU_TRACER_INFERENCE=1 TAU_TRACER_INFERENCE_END=lock /var/tmp/twr17-round3/wasm bash scripts/tracer.sh
+```
+
+Red exit: 1. Failing output:
+
+```text
+[FAILED] the tracer uses the ended session's key and the fixture refuses it
+```
+
+Saved bytes restored and compared byte for byte. Green exit: 0.
+
+**I23-redo** — Select an identifier again despite an existing revoke intent. Files: `src/store/inference.rs`. Exact command:
+
+```sh
+/var/tmp/twr17-round3/host test --locked -p tau-web session_end_sweep_skips -- --nocapture
+```
+
+Red exit: 101. Failing output:
+
+```text
+assertion failed: reopen(&s).inference_sweep().is_empty()
+```
+
+Saved bytes restored and compared byte for byte. Green exit: 0.
+
+**I25** — Remove the decoded terminal metadata scan. Files: `src/store/inference.rs`. Exact command:
+
+```sh
+/var/tmp/twr17-round3/host test --locked -p tau-web escaped_ -- --nocapture
+```
+
+Red exit: 101. Failing output:
+
+```text
+assertion `left == right` failed
+  left: Some("fixture-account-private-value")
+ right: Some("<redacted>")
+assertion `left == right` failed
+  left: Some("fixture-session-private-value")
+ right: Some("<redacted>")
+```
+
+Saved bytes restored and compared byte for byte. Green exit: 0.
+
+The `escaped_` filter ran three regressions: the escaped session inference key in `provider`,
+the escaped inference account credential in `id`, and both after session end. All three
+failed with the scan removed and passed after restoration.
+
+**I26** — Propagate the body-redaction refusal before committing the terminal. Files: `src/store/inference.rs`. Exact command:
+
+```sh
+/var/tmp/twr17-round3/host test --locked -p tau-web redaction_refusal_still -- --nocapture
+```
+
+Red exit: 101. Failing output:
+
+```text
+called `Result::unwrap()` on an `Err` value: "redaction marker cannot exclude held credentials"
+```
+
+Saved bytes restored and compared byte for byte. Green exit: 0.
+
+**I27** — Include current-worker minted identifiers in the unlock sweep. Files: `src/store/inference.rs`. Exact command:
+
+```sh
+/var/tmp/twr17-round3/host test --locked -p tau-web delayed_unlock_sweep -- --nocapture
+```
+
+Red exit: 101. Failing output:
+
+```text
+assertion `left == right` failed
+  left: ["fixture-key-id", "current-worker-key-id"]
+ right: ["fixture-key-id"]
+```
+
+Saved bytes restored and compared byte for byte. Green exit: 0.
+
+**I28** — Drop the late-mint revoke from finish. Files: `src/store/inference.rs`. Exact command:
+
+```sh
+/var/tmp/twr17-round3/host test --locked -p tau-web mint_finishing_during_session_end -- --nocapture
+```
+
+Red exit: 101. Failing output:
+
+```text
+late mint owes an immediate revoke
+```
+
+Saved bytes restored and compared byte for byte. Green exit: 0.
+
+**I29** — Revoke only keys that installed a row-2 holding at session end. Files: `src/store/inference.rs`. Exact command:
+
+```sh
+env TAU_TRACER_INFERENCE=1 /var/tmp/twr17-round3/wasm bash scripts/tracer.sh
+```
+
+Red exit: 1. Failing output:
+
+```text
+[FAILED] identifier-only key is refused immediately after end, before unlock
+```
+
+Saved bytes restored and compared byte for byte. Green exit: 0.
+
+**I30** — Freeze the fixture clock at process start. Files: `tracer/src/aggregator.rs`. Exact command:
+
+```sh
+/var/tmp/twr17-round3/host test --locked -p tracer fixture_clock_advances -- --nocapture
+```
+
+Red exit: 101. Failing output:
+
+```text
+assertion failed: state.now() >= state.now + 600
+```
+
+Saved bytes restored and compared byte for byte. Green exit: 0.
+
+**I31** — Require acceptance before reload unlock even when a revoke terminal committed. Files: `tracer/src/inference_cases.rs`. Exact command:
+
+```sh
+/var/tmp/twr17-round3/host test --locked -p tracer reload_checks_all_three -- --nocapture
+```
+
+Red exit: 101. Failing output:
+
+```text
+[FAILED] reload key status before unlock matches its recorded revoke
+assertion failed: case.failures.is_empty()
+```
+
+Saved bytes restored and compared byte for byte. Green exit: 0.
+
+**I32** — Remove the OPFS dump's atomic-move retry. Files: `tracer/src/main.rs`. Exact command:
+
+```sh
+env TAU_TRACER_INFERENCE=1 TAU_TRACER_INFERENCE_PHASE=core /var/tmp/twr17-round3/wasm bash scripts/tracer.sh
+```
+
+Red exit: 1. Failing output:
+
+```text
+[FAILED] OPFS dump retries a move and discards the partial snapshot
+[FAILED] OPFS dump bounds move retries and preserves unrelated errors
+```
+
+Saved bytes restored and compared byte for byte. Green exit: 0.
+
+**I33** — Remove both post-commit session-end checks from the box-plane command path.
+File: `src/harness/run.rs`. The tracer-only `test_hold_move` suspends the real OPFS move
+while the intent append owns the writer. The case begins end-sessions with the revoke
+response withheld, then releases the move and checks the sshd and replayed state.
+
+The round-four commands use `/var/tmp/twr17-round4/host`:
+
+```sh
+#!/usr/bin/env bash
+export TMPDIR=/var/tmp
+exec systemd-run --user --scope -p MemoryMax=16G -p MemorySwapMax=0 nix shell nixpkgs#gcc -c env RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 "$@"
+```
+
+And `/var/tmp/twr17-round4/wasm`:
+
+```sh
+#!/usr/bin/env bash
+export TMPDIR=/var/tmp
+export PATH=/var/tmp/rev-twr17/wbg/bin:$PATH
+export CC_wasm32_unknown_unknown=/var/tmp/twr17-tools/clang/bin/clang
+export AR_wasm32_unknown_unknown=/var/tmp/twr17-tools/llvm/bin/llvm-ar
+export CHROME=/var/tmp/twr17-tools/chromium/bin/chromium
+exec systemd-run --user --scope -p MemoryMax=16G -p MemorySwapMax=0 nix shell nixpkgs#gcc -c env RUSTUP_TOOLCHAIN=1.97.1 CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-Clinker-features=-lld "$@"
+```
+
+The Nix out-links `/var/tmp/twr17-tools/{gcc,clang,llvm,chromium}` retain the tools;
+wasm-bindgen is the installed 0.2.127 binary. Every process runs in the foreground.
+Exact red and restored-green command:
+
+```sh
+TAU_TRACER_INFERENCE=1 TAU_TRACER_INFERENCE_PHASE=dispatch /var/tmp/twr17-round4/wasm bash scripts/tracer.sh
+```
+
+Red, exit 1:
+
+```text
+== session end during box-plane intent commit prevents exec
+   [FAILED] committed command reports unresolved after end begins
+   [FAILED] sshd receives no exec after the held intent commits
+   [FAILED] unlock recovers the committed command as unresolved
+```
+
+The saved source bytes were restored and compared byte for byte. Green, exit 0:
+
+```text
+== session end during box-plane intent commit prevents exec
+   [ok] committed command reports unresolved after end begins
+   [ok] sshd receives no exec after the held intent commits
+   [ok] unlock recovers the committed command as unresolved
+== summary (5 cases)
+   PASS session end during box-plane intent commit prevents exec
+TRACER PASS
+```
+
+Three focused host regressions were also run red and restored green with the round-four
+`host test --locked <selector> -- --nocapture` command. Each red exited 101; each green exited 0:
+
+| Selector | Removed behavior | Red evidence |
+|---|---|---|
+| `empty_completion_text` | empty decoded terminal text omission | independent reader: `record 11: inference text missing` |
+| `reload_checks_all_three` | allow refusal after a logged revoke whose terminal was cut off | recorded revoke, `sent=true, status=402`: expected accepted observation, got refusal |
+| `post_terminal_failures_report_finished` | report post-terminal failures as separate refusals | `Result::unwrap()` on `Err("second session inference key")` |
+
+The empty-text regression commits both an empty provider and an empty request id, retaining
+the other nonempty field and passing the complete independent reader. The post-terminal
+regression covers both an existing row-2 holding and a late-revoke create failure; both mint
+terminals survive replay, and the latter key remains in the next unlock's sweep.
+
+**I34** — Remove the session-end check immediately before the job-read `exec` in
+`read_job_record`. File: `src/harness/run.rs`. The collection case suspends its first read
+after channel opening, begins session end while the store writer is held, then releases it.
+A second mutation removes the immediate `stop_all` call from `src/harness/inference.rs`;
+the held-request variant checks the wait is stopped before end-sessions acquires that writer.
+
+The round-five `host` and `wasm` wrappers under `/var/tmp/twr17-round5.zgH4I7PG/` have exactly
+the round-four wrapper contents above. Exact command for both red and restored-green runs:
+
+```sh
+TAU_TRACER_INFERENCE=1 TAU_TRACER_INFERENCE_PHASE=dispatch /var/tmp/twr17-round5.zgH4I7PG/wasm bash scripts/tracer.sh
+```
+
+Read-check mutation red, exit 1:
+
+```text
+== session end before collection read prevents exec
+   [FAILED] unread calls report not_read with session end as the reason
+   [FAILED] sshd receives no read exec after session end begins
+```
+
+Immediate-stop mutation red, exit 1:
+
+```text
+== session end stops held read before acquiring writer
+   [FAILED] held wait is stopped while end-sessions still awaits the writer
+```
+
+Each saved source file was restored and compared byte for byte before its green run. Both
+greens exited 0; the final focused run printed:
+
+```text
+== session end before collection read prevents exec
+   [ok] unread calls report not_read with session end as the reason
+   [ok] sshd receives no read exec after session end begins
+   [ok] session end appends no job evidence and settles no command
+== session end stops held read before acquiring writer
+   [ok] held wait is stopped while end-sessions still awaits the writer
+   [ok] unread calls report not_read with session end as the reason
+   [ok] sshd receives no read exec after session end begins
+   [ok] session end appends no job evidence and settles no command
+== summary (7 cases)
+TRACER PASS
+```
+
+**I35** — Restore the post-mint `has_key(...).await?` path, discarding the committed mint
+report. File: `src/inference.rs`. Exact red and restored-green command:
+
+```sh
+/var/tmp/twr17-round5.zgH4I7PG/host test --locked infer_preserves_committed_mint_report -- --nocapture
+```
+
+Red, exit 101:
+
+```text
+assertion `left == right` failed: {"refused":"sessions ended"}
+  left: Null
+ right: true
+test store::inference::tests::infer_preserves_committed_mint_report_when_sessions_end_in_flight ... FAILED
+```
+
+The saved source file was restored and compared byte for byte. Green, exit 0:
+
+```text
+test store::inference::tests::infer_preserves_committed_mint_report_when_sessions_end_in_flight ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 204 filtered out
+```
+
+This test goes through `inference::infer` and the fake transport. Session end occurs inside
+the mint exchange, after the intent commits and before its response returns. When late-revoke
+preparation fails, the report preserves the mint call id, `finished:true`, and the refusal
+saying no revoke was recorded and leaving the key to the next unlock's sweep or its expiry.
+When the late revoke succeeds but the subsequent session-key lookup fails, the report still
+preserves that committed mint's call id and finished status. Replay retains both mint terminals;
+no completion is sent.
+
+**I36** — Restore the finished-only condition after the mint's session-key lookup fails.
+File: `src/inference.rs`. The round-six `host` and `wasm` wrappers under
+`/var/tmp/twr17-round6.7cnd2U0i/` have the round-four contents above. Exact red and
+restored-green command:
+
+```sh
+/var/tmp/twr17-round6.7cnd2U0i/host test --locked infer_preserves_unresolved_mint_report -- --nocapture
+```
+
+Red, exit 101, for both the lost-response and post-append legs:
+
+```text
+assertion `left == right` failed: after_append=false: {"refused":"sessions ended"}
+  left: Null
+ right: true
+assertion `left == right` failed: after_append=true: {"refused":"sessions ended"}
+  left: Null
+ right: true
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 208 filtered out
+```
+
+The saved source bytes were restored and compared byte for byte. Green, exit 0:
+
+```text
+test store::inference::tests::infer_preserves_unresolved_mint_report_when_sessions_end_after_append ... ok
+test store::inference::tests::infer_preserves_unresolved_mint_report_when_sessions_end_after_send ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 208 filtered out
+```
+
+Both tests go through `inference::infer` and assert call 9, `unresolved: true`, the session-end
+refusal and the unresolved mint on replay. The lost leg sent `/keys`; the append leg sent
+nothing after its committed mint. Neither sent a completion or revoke.
+
+**I37** — Relabel every read error as session end whenever the flag is set, ignoring whether
+its `exec` was sent. File: `src/harness/job_read.rs`; remove `!self.sent.get() &&` from the
+session-end condition. Exact red and restored-green command:
+
+```sh
+/var/tmp/twr17-round6.7cnd2U0i/host test --locked sent_read_error_survives_session_end -- --nocapture
+```
+
+Red, exit 101:
+
+```text
+assertion `left == right` failed
+  left: String("sessions ended before record was read")
+ right: "job record read: missing exit status"
+assertion `left == right` failed: {"call":9,"job":"fixture-job","not_read":true,"why":"sessions ended before record was read"}
+  left: Null
+ right: true
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 208 filtered out
+```
+
+The saved source bytes were restored and compared byte for byte. Green, exit 0:
+
+```text
+test harness::job_read::tests::sent_read_error_survives_session_end_in_held_report ... ok
+test harness::job_read::tests::sent_read_error_survives_session_end_in_collection_report ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 208 filtered out
+```
+
+The transport in `run.rs` compiles only on wasm32. These host tests exercise the shared
+reporting function used by both read paths: mark the read sent, set the session-end flag,
+then report its own read error. Collection retains `failed: true` and held reads retain
+`not_read: true`, both with the original error. A separate host test checks both unsent
+shapes name session end. The full browser gate also retains both pre-exec session-end cases.
+
+**I38** — Discard the tracked send state at the job-read reporting sites in
+`src/harness/run.rs`: replace each `progress.failure(...)` with
+`super::job_read::Read::default().failure(...)`. This covers both held-read error branches
+and the collection error branch. The two new browser cases wait for sshd to receive the
+read `exec` before calling `end_sessions()`.
+
+The wrappers in `/var/tmp/twr17-k-fixes.I4mWTYPE/` supply the environment for I38, I39 and
+the final gates. `host` contains:
+
+```sh
+#!/usr/bin/env bash
+export TMPDIR=/var/tmp
+exec nix shell nixpkgs#gcc -c env RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 "$@"
+```
+
+`wasm` contains:
+
+```sh
+#!/usr/bin/env bash
+export TMPDIR=/var/tmp
+export PATH=/var/tmp/rev-twr17/wbg/bin:$PATH
+export CC_wasm32_unknown_unknown=/var/tmp/twr17-tools/clang/bin/clang
+export AR_wasm32_unknown_unknown=/var/tmp/twr17-tools/llvm/bin/llvm-ar
+export CHROME=/var/tmp/twr17-tools/chromium/bin/chromium
+exec nix shell nixpkgs#gcc -c env RUSTUP_TOOLCHAIN=1.97.1 CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-Clinker-features=-lld "$@"
+```
+
+The tools have persistent roots, and the commands inherit a 16 GiB memory limit with no swap.
+Exact red and restored-green command:
+
+```sh
+env TAU_TRACER_INFERENCE=1 TAU_TRACER_INFERENCE_PHASE=dispatch /var/tmp/twr17-k-fixes.I4mWTYPE/wasm bash scripts/tracer.sh
+```
+
+Red, exit 1. Both sent reads wrongly reported `not_read: true` with
+`why: "sessions ended before record was read"`; the existing pre-exec cases still passed:
+
+```text
+== summary (9 cases)
+   PASS session end before collection read prevents exec
+   PASS session end stops held read before acquiring writer
+   FAIL session end preserves a sent held read's stop reason: sent read retains its own outcome and reason after session end
+   FAIL session end preserves a sent collection read's error: sent read retains its own outcome and reason after session end
+FAIL: tracer cases failed: session end preserves a sent held read's stop reason, session end preserves a sent collection read's error
+```
+
+The saved source bytes were restored and compared byte for byte. Green, exit 0:
+
+```text
+== summary (9 cases)
+   PASS session end preserves a sent held read's stop reason
+   PASS session end preserves a sent collection read's error
+TRACER PASS
+```
+
+The held read retains `not_read: true` with `why: "stopped while reading record"`.
+Collection retains `failed: true`, its job identity and its own wrapper-status/read-file
+error after a malformed fixture exit record is supplied following session end. Both cases
+check that no further exec, job evidence or terminal appears.
+
+**I39** — Restore the bare top-up refusal after an account read in `src/inference.rs`,
+discarding the read's call id and unresolved state. Exact red and restored-green command:
+
+```sh
+/var/tmp/twr17-k-fixes.I4mWTYPE/host test --locked infer_preserves_unresolved_account_read_report -- --nocapture
+```
+
+Red, exit 101. Both tests reported:
+
+```text
+assertion `left == right` failed: {"refused":"account read 7: automatic top-up must read off"}
+  left: Null
+ right: 7
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 210 filtered out
+```
+
+The saved source bytes were restored and compared byte for byte. Green, exit 0:
+
+```text
+test store::inference::tests::infer_preserves_unresolved_account_read_report_after_lost_response ... ok
+test store::inference::tests::infer_preserves_unresolved_account_read_report_when_sessions_end_after_append ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 210 filtered out
+```
+
+Both tests call `inference::infer`, check call 7, `unresolved: true` and the refusal
+`no mint is sent without a recorded top-up-off read`, and replay the unresolved account
+read. The lost-response test sends `/account`; the session-end test ends sessions during
+its durable append and sends no account read. Neither prepares or sends a mint. The
+finished top-up-on regression also checks that its refusal keeps the call id and finished
+status.
+
+### Procured inference final verification
+
+The final tree passed on 2026-10-24 with Rust 1.97.1, wasm-bindgen 0.2.127 and rooted
+Chromium 154. Every command ran in the foreground, unpiped, with its output redirected to a
+log and its exit code inspected. The I38 host and wasm wrappers above supply the exact environments.
+
+| Gate | Command (wrapper defined above) | Exit |
+|---|---|---|
+| Format | `host fmt --check` | 0 |
+| Host clippy | `host clippy --locked --all-targets -- -D warnings` | 0 |
+| Host tests, pin and bundle checks | `host test --locked` | 0 |
+| Disk check | `python3 spec/prototypes/spec-checks/check-install-disks.py` | 0 |
+| Disk baseline negative control | `python3 spec/prototypes/spec-checks/check-install-disks.py --baseline` | 1, required |
+| Served wasm clippy | `wasm cargo clippy --locked -p tau-web --target wasm32-unknown-unknown --all-targets -- -D warnings` | 0 |
+| Tracer wasm clippy | `wasm cargo clippy --locked -p tau-web --target wasm32-unknown-unknown --all-targets --features tracer -- -D warnings` | 0 |
+| Dependency boundary | `wasm bash scripts/check-adr-0024.sh` | 0 |
+| Served build | `wasm bash scripts/build-web.sh served` | 0 |
+| Served absence | `host run --locked -p tracer -- check-absence dist/served` | 0 |
+| Served CSP | `host run --locked -p tracer -- check-csp dist/served` | 0 |
+| Full browser gate, rebuilding both directories | command below | 0 |
+
+The host suite passed 212 library, 4 bundle, 69 tracer and 3 doc tests. Absence inspected
+5 served files against 229 needles. The full browser command was:
+
+```sh
+env -u TAU_TRACER_SETUP_CASE -u TAU_TRACER_SEED_CASE -u TAU_TRACER_HOLD_CASE -u TAU_TRACER_MODE_CASE -u TAU_TRACER_INFERENCE -u TAU_TRACER_INFERENCE_PHASE -u TAU_TRACER_INFERENCE_END /var/tmp/twr17-k-fixes.I4mWTYPE/wasm bash scripts/tracer.sh
+```
+
+It printed `== summary (130 cases)` and `TRACER PASS`, exiting 0. This is I21's restored
+green and the final green for every earlier mutation. All companion comparison outcomes
+remain unchanged; the dispatch witness file was not edited.
+
+`spec/bundle/cors-probe.sh`: **withheld by the no-live-vendor fence**. No live-account
+check is claimed. No new follow-up was needed; twr-ggw.83 and twr-ggw.84 are unchanged.
+
+The final README consistency check, `python3 /var/tmp/twr17-k-fixes.I4mWTYPE/check-readme.py`,
+compares both documented browser counts and the final summary with the printed PASS count,
+checks the host counts, and compares the protected source and beads bytes with their saved
+contents. It exits 0.
+
+**Initial README consistency control (E10).** Exact command:
+
+```sh
+python3 /var/tmp/twr17-round6.7cnd2U0i/check-readme.py
+```
+
+The checker contains:
+
+```python
+from pathlib import Path
+import re
+log=Path('/var/tmp/twr17-round6.7cnd2U0i/final-tracer.log').read_text()
+counts=re.findall(r'^== summary \((\d+) cases\)$',log,re.M)
+assert len(counts)==1 and '\nTRACER PASS\n' in log, 'full gate has no passing summary'
+count=int(counts[0])
+readme=Path('README.md').read_text()
+documented=[int(n) for n in re.findall(r'(?:The full run defines|unset and runs all) (\d+) cases',readme)]
+assert len(documented)==2 and all(n==count for n in documented), f'documented counts {documented} differ from {count}'
+stale = 'the browser case ' + 'currently fails'
+assert stale not in readme, 'stale progress wording remains'
+print(f'README matches the {count}-case passing full gate and contains no stale session-end claim')
+```
+
+Restoring the old documented counts produced exit 1:
+
+```text
+AssertionError: documented counts [126, 126] differ from 128
+```
+
+Restoring the stale session-end progress claim separately produced exit 1:
+
+```text
+AssertionError: stale progress wording remains
+```
+
+Each control restored and compared the README bytes exactly. Restored checker exit: 0.

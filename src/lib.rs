@@ -11,6 +11,7 @@ pub mod binding;
 pub mod credential;
 pub mod dispatch;
 pub mod harness;
+pub mod inference;
 pub mod jobs;
 pub mod modes;
 pub mod redaction;
@@ -46,7 +47,7 @@ mod worker {
             Rc::new(Mutex::new(Local::new(Opfs::default(), WebCrypto)));
     }
 
-    fn local() -> Rc<Mutex<Harness>> {
+    pub(crate) fn local() -> Rc<Mutex<Harness>> {
         LOCAL.with(Rc::clone)
     }
 
@@ -247,7 +248,11 @@ mod worker {
             entry: &Entry,
             approval: &Approval,
         ) -> Result<u64, AppendRefusal> {
-            match self.local.lock().await.store() {
+            let mut local = self.local.lock().await;
+            if crate::harness::inference::ending() {
+                return Err(AppendRefusal::Storage("sessions ended".into()));
+            }
+            match local.store() {
                 Some(store) => store.append(entry, approval).await,
                 None => Err(AppendRefusal::Storage("the store is locked".into())),
             }
@@ -354,6 +359,9 @@ mod worker {
         use crate::harness::Target;
         let request: serde_json::Value = serde_json::from_str(&request)
             .map_err(|e| wasm_bindgen::JsValue::from_str(&format!("request: {e}")))?;
+        if crate::harness::inference::ending() {
+            return Ok(serde_json::json!({"outcome":{"refused":"sessions ended"}}).to_string());
+        }
         if let Some(reason) = local().lock().await.dispatch_refusal() {
             return Ok(serde_json::json!({ "outcome": { "refused": reason } }).to_string());
         }

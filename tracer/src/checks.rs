@@ -93,9 +93,16 @@ pub fn needles() -> Vec<(String, Vec<u8>)> {
         "test_relay_key",
         "test_no_credentials",
         "test_writer",
+        "test_hold_move",
+        "test_hold_job_read",
         "test_allocate",
         "test_seed_backup_fail_append",
         "test_completed_reads",
+        "test_inference_origin",
+        "test_inference_account",
+        "fixture-model",
+        "fixture-maker",
+        "fixture-provider",
     ] {
         needles.push((format!("test switch: {switch}"), switch.as_bytes().to_vec()));
     }
@@ -313,6 +320,35 @@ mod tests {
                 .unwrap_err()
                 .contains("fixture root password")
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn absence_detects_each_planted_inference_needle() {
+        let dir = std::env::temp_dir().join(format!(
+            "tau-inference-absence-{}-{}",
+            std::process::id(),
+            hex::encode(crate::fixtures::urandom::<8>())
+        ));
+        std::fs::create_dir_all(dir.join("pkg")).unwrap();
+        for file in super::SERVED_FILES {
+            std::fs::write(dir.join(file), b"").unwrap();
+        }
+        assert!(super::absence(&dir).is_ok());
+        for needle in [
+            "test_inference_origin",
+            "test_inference_account",
+            "fixture-model",
+            "fixture-maker",
+            "fixture-provider",
+        ] {
+            std::fs::write(dir.join("pkg/tau_web_bg.wasm"), needle).unwrap();
+            assert!(
+                super::absence(&dir)
+                    .expect_err("planted inference needle escaped check-absence")
+                    .contains(needle)
+            );
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

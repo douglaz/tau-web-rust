@@ -7,6 +7,10 @@
 //! A refusal ends the attempt: nothing here retries or reconnects (`ARC-41`).
 
 #[cfg(target_arch = "wasm32")]
+pub(crate) mod inference;
+#[cfg(any(target_arch = "wasm32", test))]
+mod job_read;
+#[cfg(target_arch = "wasm32")]
 mod run;
 #[cfg(target_arch = "wasm32")]
 mod wait;

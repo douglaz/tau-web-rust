@@ -63,8 +63,9 @@ console_error_panic_hook = "0.1"
 web-sys = { version = "0.3", features = [
   "Blob", "Crypto", "CryptoKey", "FileSystemDirectoryHandle", "FileSystemFileHandle",
   "FileSystemGetDirectoryOptions", "FileSystemGetFileOptions", "FileSystemWritableFileStream",
-  "Pbkdf2Params", "StorageManager", "SubtleCrypto", "WorkerGlobalScope", "WorkerNavigator",
-  "WritableStream",
+  "Pbkdf2Params", "StorageManager", "SubtleCrypto", "WorkerGlobalScope", "WorkerNavigator", "DedicatedWorkerGlobalScope",
+  "WritableStream", "Request", "RequestInit", "RequestRedirect", "RequestMode",
+  "RequestCredentials", "RequestCache", "Headers", "Response", "ResponseType",
 ] }
 
 [build-dependencies]

@@ -49,6 +49,48 @@ pub struct WrappingKey(pub(crate) [u8; 32]);
 /// Zeroized on drop, when the store is dropped or its worker ends.
 pub struct DataKey(pub(crate) [u8; 32]);
 
+/// SEC-5 row 14, encrypted at rest and given to no session.
+pub struct InferenceAccountCredential(pub(crate) Vec<u8>);
+
+/// SEC-5 row 2, a capped expiring holding in one live session.
+pub struct SessionInferenceKey(pub(crate) Vec<u8>);
+
+impl InferenceAccountCredential {
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+}
+impl sealed::Sealed for InferenceAccountCredential {}
+impl Credential for InferenceAccountCredential {
+    const ROW: u8 = 14;
+    const NAME: &'static str = "Inference account credential";
+}
+impl Drop for InferenceAccountCredential {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
+impl fmt::Debug for InferenceAccountCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        redacted("InferenceAccountCredential", f)
+    }
+}
+impl sealed::Sealed for SessionInferenceKey {}
+impl Credential for SessionInferenceKey {
+    const ROW: u8 = 2;
+    const NAME: &'static str = "Inference **session** key";
+}
+impl Drop for SessionInferenceKey {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
+impl fmt::Debug for SessionInferenceKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        redacted("SessionInferenceKey", f)
+    }
+}
+
 /// A machine's host-key pin: the `SHA256:…` fingerprint of its host key. An integrity
 /// reference, not a secret: what the row says it authorizes is "Nothing — integrity reference".
 #[derive(Debug, PartialEq, Eq)]
@@ -321,6 +363,8 @@ mod tests {
             entry::<LocalPassphrase>(),
             entry::<WrappingKey>(),
             entry::<DataKey>(),
+            entry::<InferenceAccountCredential>(),
+            entry::<SessionInferenceKey>(),
         ]
     }
 

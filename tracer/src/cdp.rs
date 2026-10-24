@@ -37,6 +37,10 @@ impl Browser {
                 "--headless=new",
                 "--no-sandbox",
                 "--disable-gpu",
+                "--disable-background-networking",
+                "--disable-component-update",
+                "--disable-sync",
+                "--disable-default-apps",
                 "--no-first-run",
                 "--no-default-browser-check",
                 "--remote-debugging-port=0",
@@ -102,6 +106,7 @@ impl Browser {
             }
         });
         let (pending, events) = (self.pending.clone(), self.events.clone());
+        let interception = send.clone();
         tokio::spawn(async move {
             while let Some(Ok(Message::Text(text))) = read.next().await {
                 let Ok(message) = serde_json::from_str::<Value>(&text) else {
@@ -113,7 +118,46 @@ impl Browser {
                             let _ = reply.send(message);
                         }
                     }
-                    None => events.lock().expect("events lock").push(message),
+                    None => {
+                        static AUTO_ID: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(1_000_000);
+                        if message["method"] == "Target.attachedToTarget"
+                            && message["params"]["targetInfo"]["type"] == "worker"
+                        {
+                            // Every worker must run, including ones no case explicitly visits.
+                            // Install the network fence before releasing its startup pause.
+                            for (method, params) in [
+                                ("Network.enable", json!({})),
+                                (
+                                    "Fetch.enable",
+                                    json!({"patterns":[{"urlPattern":"*","requestStage":"Request"}]}),
+                                ),
+                                ("Runtime.runIfWaitingForDebugger", json!({})),
+                            ] {
+                                let id = AUTO_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                let _ = interception.send(json!({"id":id,"sessionId":message["params"]["sessionId"],"method":method,"params":params}).to_string());
+                            }
+                        }
+                        if message["method"] == "Fetch.requestPaused" {
+                            let url = message["params"]["request"]["url"]
+                                .as_str()
+                                .unwrap_or_default();
+                            let allowed = loopback_url(url);
+                            let method = if allowed {
+                                "Fetch.continueRequest"
+                            } else {
+                                "Fetch.failRequest"
+                            };
+                            let mut params = json!({"requestId":message["params"]["requestId"]});
+                            if !allowed {
+                                params["errorReason"] = "BlockedByClient".into();
+                            }
+                            // Automated replies have their own id range and require no caller.
+                            let id = AUTO_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let _ = interception.send(json!({"id":id,"sessionId":message["sessionId"],"method":method,"params":params}).to_string());
+                        }
+                        events.lock().expect("events lock").push(message);
+                    }
                 }
             }
         });
@@ -201,4 +245,22 @@ fn remove_profile(profile: &Path) {
             profile.display()
         );
     }
+}
+
+/// Exact loopback origins only; rejecting an unknown spelling happens before transmission.
+pub fn loopback_url(url: &str) -> bool {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return false;
+    };
+    if !["http", "https", "ws", "wss"].contains(&scheme) {
+        return false;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    ["127.0.0.1", "localhost", "[::1]"].iter().any(|host| {
+        authority == *host
+            || authority
+                .strip_prefix(host)
+                .and_then(|p| p.strip_prefix(':'))
+                .is_some_and(|p| !p.is_empty() && p.parse::<u16>().is_ok())
+    })
 }

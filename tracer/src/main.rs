@@ -14,11 +14,14 @@
 //!
 //! `scripts/tracer.sh` builds both directories and runs the first.
 
+mod aggregator;
 mod binding_cases;
 mod cdp;
 mod checks;
 mod fixtures;
 mod hold_cases;
+mod inference_cases;
+mod inference_reader;
 mod job_cases;
 mod keys;
 mod machine;
@@ -121,6 +124,7 @@ async fn run(served: &Path, tracer: &Path) -> Result<(), String> {
 
     let seen = Observed::default();
     let tls = fixtures::tls();
+    let aggregator = aggregator::Aggregator::start(tls.acceptor.clone(), tls.cert.clone()).await;
     let sshd = fixtures::sshd(seen.clone()).await;
     let sshd_other = fixtures::sshd(seen.clone()).await;
     let relay = fixtures::relay(seen.clone(), tls.acceptor.clone(), vec![], false).await;
@@ -150,6 +154,7 @@ async fn run(served: &Path, tracer: &Path) -> Result<(), String> {
     let browser = cdp::Browser::launch(&chrome, profile, &tls.spki_sha256).await?;
     let context = Run {
         browser: &browser,
+        aggregator: &aggregator,
         seen: &seen,
         sshd: &sshd,
         sshd_other: &sshd_other,
@@ -172,7 +177,7 @@ async fn run(served: &Path, tracer: &Path) -> Result<(), String> {
     sshd_other.cleanup().await;
 
     // The summary names every case that ran, even when one stopped the run.
-    println!("\n== summary");
+    println!("\n== summary ({} cases)", cases.len());
     for case in &cases {
         match case.failures.as_slice() {
             [] => println!("   PASS {}", case.name),
@@ -323,23 +328,33 @@ const VIEW: &str = "(() => {
 })()";
 
 /// Every file in the origin-private file system, recursively, as `path: base64`.
-const DUMP: &str = "(async () => {
-    const out = {};
-    const walk = async (directory, prefix) => {
-        for await (const [name, handle] of directory.entries()) {
-            if (handle.kind === 'directory') {
-                await walk(handle, `${prefix}${name}/`);
-            } else {
-                const bytes = new Uint8Array(await (await handle.getFile()).arrayBuffer());
-                let text = '';
-                for (const byte of bytes) text += String.fromCharCode(byte);
-                out[`${prefix}${name}`] = btoa(text);
+const DUMP: &str = r#"(async () => {
+    const snapshot = async () => {
+        const out = {};
+        const walk = async (directory, prefix) => {
+            for await (const [name, handle] of directory.entries()) {
+                if (handle.kind === 'directory') {
+                    await walk(handle, `${prefix}${name}/`);
+                } else {
+                    const bytes = new Uint8Array(await (await handle.getFile()).arrayBuffer());
+                    let text = '';
+                    for (const byte of bytes) text += String.fromCharCode(byte);
+                    out[`${prefix}${name}`] = btoa(text);
+                }
             }
-        }
+        };
+        await walk(await navigator.storage.getDirectory(), '');
+        return out;
     };
-    await walk(await navigator.storage.getDirectory(), '');
-    return out;
-})()";
+    // An append can move a staging file after enumeration but before getFile. Start
+    // over, retaining no partial snapshot; a stable or unrelated error still refuses.
+    for (let attempt = 0; ; attempt++) {
+        try { return await snapshot(); }
+        catch (error) {
+            if (error.name !== 'NotFoundError' || attempt >= 9) throw error;
+        }
+    }
+})()"#;
 
 /// The page's other storage: local and session storage, IndexedDB's databases, Cache Storage's
 /// caches and their entries, and service-worker registrations.
@@ -372,6 +387,7 @@ struct Worker {
 /// The browser, the fixtures, and what the tracer gathers across cases.
 struct Run<'a> {
     browser: &'a cdp::Browser,
+    aggregator: &'a aggregator::Aggregator,
     seen: &'a Observed,
     sshd: &'a fixtures::Sshd,
     sshd_other: &'a fixtures::Sshd,
@@ -404,9 +420,21 @@ impl Run<'_> {
             .as_str()
             .ok_or("no page session")?
             .to_string();
-        for method in ["Page.enable", "Runtime.enable", "Log.enable"] {
+        for method in [
+            "Page.enable",
+            "Runtime.enable",
+            "Log.enable",
+            "Network.enable",
+        ] {
             self.browser.call(Some(&session), method, json!({})).await?;
         }
+        self.browser
+            .call(
+                Some(&session),
+                "Fetch.enable",
+                json!({"patterns":[{"urlPattern":"*","requestStage":"Request"}]}),
+            )
+            .await?;
         self.browser
             .call(
                 Some(&session),
@@ -418,7 +446,7 @@ impl Run<'_> {
             .call(
                 Some(&session),
                 "Target.setAutoAttach",
-                json!({ "autoAttach": true, "waitForDebuggerOnStart": false, "flatten": true }),
+                json!({ "autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true }),
             )
             .await?;
         self.browser
@@ -505,6 +533,17 @@ impl Run<'_> {
                     }
                     return Err(error);
                 }
+                self.browser
+                    .call(Some(&worker.session), "Network.enable", json!({}))
+                    .await?;
+                self.browser.call(Some(&worker.session),"Network.setBlockedURLs",json!({"urlPatterns":[{"urlPattern":"https://127.0.0.1:*/*","block":false},{"urlPattern":"wss://127.0.0.1:*/*","block":false},{"urlPattern":"*://*:*/*","block":true}]})).await?;
+                self.browser
+                    .call(
+                        Some(&worker.session),
+                        "Runtime.runIfWaitingForDebugger",
+                        json!({}),
+                    )
+                    .await?;
                 self.settled(tab, in_use).await?;
                 return Ok(worker.clone());
             }
@@ -772,6 +811,10 @@ fn console_custody_searches_entire_payloads_including_property_names_urls_and_st
     }
 }
 
+fn add_inference_needles(run: &Run<'_>, needles: &mut Vec<(String, Vec<u8>)>) {
+    needles.extend(run.aggregator.needles());
+}
+
 async fn run_cases(
     run: &Run<'_>,
     served_origin: &str,
@@ -780,6 +823,22 @@ async fn run_cases(
     requests: &[&fixtures::Requests],
     cases: &mut Vec<Case>,
 ) -> Result<(), String> {
+    if std::env::var_os("TAU_TRACER_INFERENCE").is_some() {
+        let (mut tab, mut worker) = run.open(tracer_origin, false).await?;
+        let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let mut events = vec![json!({"seed":{"mnemonic":mnemonic}})];
+        events.extend(reader::setup_events(
+            mnemonic,
+            &["fixture", "fixture-other"],
+        ));
+        for machine in ["fixture", "fixture-other"] {
+            events.push(json!({"setup":{"class":{"machine":machine,"answer":"no","class":"single_purpose"}}}));
+        }
+        run.put(&tab, &reader::build(PASSPHRASE, &events)).await?;
+        inference_cases::run(run, &mut tab, &mut worker, cases).await?;
+        inference_cases::no_plaintext(run, &tab, &worker, cases).await?;
+        return Ok(());
+    }
     let (browser, seen, sshd, relay) = (run.browser, run.seen, run.sshd, run.relay);
     let pinned = PINS
         .iter()
@@ -968,7 +1027,7 @@ async fn run_cases(
     case.check(
         "the worker's replayed state is record 0 alone",
         run.inspect(&worker).await?
-            == json!({ "state": "unlocked", "seed_backup_owed": true, "seed_backup_completion": null, "seed_backup_stage": "showing_words", "locked": false, "records": [0], "commands": [], "calls": [], "terminals": [], "dispositions": [], "standing": {}, "jobs": [], "typed_calls": [], "observations": [], "current_installations": {}, "setup": [], "setup_offer": tau_web::dispatch::fixture_setup(), "sessions":[],"exposure_ledger":[],"connection_refusals":[],"mode_acceptances":[],"signature_refusals":[],"installations":[] }),
+            == json!({ "state": "unlocked", "seed_backup_owed": true, "seed_backup_completion": null, "seed_backup_stage": "showing_words", "locked": false, "records": [0], "commands": [], "calls": [], "terminals": [], "dispositions": [], "standing": {}, "jobs": [], "typed_calls": [], "inference_calls": [], "observations": [], "current_installations": {}, "setup": [], "setup_offer": tau_web::dispatch::fixture_setup(), "sessions":[],"exposure_ledger":[],"connection_refusals":[],"mode_acceptances":[],"signature_refusals":[],"installations":[] }),
     );
     let host = reader::build(
         HOST_PASSPHRASE,
@@ -2214,6 +2273,16 @@ async fn run_cases(
         cases,
     )
     .await?;
+    run.browser
+        .call(
+            None,
+            "Target.activateTarget",
+            json!({"targetId":tab.target}),
+        )
+        .await?;
+    worker = run.worker(&tab, None, false).await?;
+    inference_cases::run(run, &mut tab, &mut worker, cases).await?;
+    inference_cases::no_plaintext(run, &tab, &worker, cases).await?;
     // twr-ggw.5 AC4, AC5: no plaintext secret in any storage, message, request or log, in both builds.
     run.collect(&tab).await?;
     run.collect(&served_tab).await?;
@@ -2260,6 +2329,15 @@ async fn run_cases(
         let dumped = run.dump(page).await?;
         let opened = reader::read(&store_files(&dumped), passphrase)?;
         let mut needles = reader::needles(passphrase, &opened)?;
+        add_inference_needles(run, &mut needles);
+        // Independent of the helper: removing its call must break this search's control.
+        case.check(
+            "per-build search includes every aggregator needle",
+            run.aggregator
+                .needles()
+                .iter()
+                .all(|needle| needles.contains(needle)),
+        );
         // Include seeds from earlier interrupted/replaced fixture stores, not only the final one.
         for phrase in &displayed {
             needles.extend(reader::seed_needles(phrase)?);

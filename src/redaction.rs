@@ -39,6 +39,17 @@ impl Redacted {
         &self.bytes
     }
 
+    /// Include the request's transient credentials even after session holdings are cleared.
+    pub(crate) fn for_inference<S: Storage>(
+        store: &Store<S>,
+        body: &[u8],
+        credentials: &[&[u8]],
+    ) -> Result<Self, String> {
+        let mut held = store.held_credentials()?;
+        held.borrowed.extend_from_slice(credentials);
+        redact(body, &[], &held)
+    }
+
     pub(crate) fn for_store<S: Storage>(
         store: &Store<S>,
         body: &[u8],
@@ -60,6 +71,7 @@ pub(crate) struct Held<'a> {
     pub borrowed: Vec<&'a [u8]>,
     pub mnemonic: Zeroizing<String>,
     pub derived: Vec<Derived>,
+    pub bindings: Vec<std::cell::Ref<'a, Vec<crate::binding::Holding>>>,
 }
 
 pub(crate) enum Derived {
@@ -75,6 +87,11 @@ impl Held<'_> {
         self.borrowed
             .iter()
             .copied()
+            .chain(
+                self.bindings
+                    .iter()
+                    .flat_map(|given| given.iter().filter_map(|h| h.credential.response_bytes())),
+            )
             .chain(std::iter::once(self.mnemonic.as_bytes()))
             .chain(self.derived.iter().map(|key| match key {
                 Derived::Ssh(key) => key.0.as_slice(),
@@ -159,6 +176,7 @@ mod tests {
             borrowed: vec![b"abc", b"bcd", b""],
             mnemonic: Zeroizing::new(String::new()),
             derived: vec![],
+            bindings: vec![],
         };
         assert_eq!(
             redact(b"zabcd!abc", &[], &held).unwrap().as_bytes(),
