@@ -622,6 +622,7 @@ impl Driver {
             requester: Requester::Session,
             facts: facts(fact),
             approved: approved.map(|a| OperationApproval {
+                restated_modes: Vec::new(),
                 resource,
                 target,
                 operation,
@@ -871,6 +872,9 @@ impl Driver {
                             return Ok(self.command_refusal(refusal));
                         }
                         Err(AppendRefusal::Storage(e)) => Err(e),
+                        Err(AppendRefusal::SignatureLowering(_)) => {
+                            Err("unexpected signature lowering".into())
+                        }
                     }
                 } else {
                     let request =

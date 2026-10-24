@@ -14,7 +14,7 @@ use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 use ring::digest::{SHA256, digest};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 
 pub type Files = BTreeMap<String, Vec<u8>>;
@@ -104,7 +104,13 @@ fn check_event(number: u64, event: &Value) -> Result<(), String> {
     };
     match kind.as_str() {
         "exposure" => {
-            exact(body, &["session", "bound_set"])?;
+            exact_optional(body, &["session", "bound_set"], "accepted_modes")?;
+            if body.get("accepted_modes").is_some()
+                && body["accepted_modes"] != json!([])
+                && body["accepted_modes"] != json!(["no_artifact_pin"])
+            {
+                return Err("invalid binding acceptance".into());
+            }
             if text("session")? != format!("session-{number}") {
                 return Err("exposure identity differs from record number".into());
             }
@@ -127,6 +133,20 @@ fn check_event(number: u64, event: &Value) -> Result<(), String> {
                 {
                     return Err("invalid bound identity".into());
                 }
+            }
+        }
+        "mode_acceptance" => {
+            exact(body, &["session", "mode"])?;
+            if text("session")?.is_empty() || text("mode")? != "no_brief" {
+                return Err("invalid conduct acceptance".into());
+            }
+        }
+        "signature_refusal" => {
+            exact(body, &["machine", "form"])?;
+            if text("machine")?.is_empty()
+                || !["signature_level_never", "untrusted_repository"].contains(&text("form")?)
+            {
+                return Err("invalid signature refusal".into());
             }
         }
         "connection_refusal" => {
@@ -193,7 +213,7 @@ fn check_event(number: u64, event: &Value) -> Result<(), String> {
             }
         }
         "operation_intent" => {
-            exact(
+            exact_optional(
                 body,
                 &[
                     "call",
@@ -205,6 +225,7 @@ fn check_event(number: u64, event: &Value) -> Result<(), String> {
                     "facts",
                     "approved",
                 ],
+                "restated_modes",
             )?;
             if body["call"].as_u64() != Some(number) {
                 return Err("typed identity differs from record number".into());
@@ -221,7 +242,7 @@ fn check_event(number: u64, event: &Value) -> Result<(), String> {
             }
             text("session")?;
             facts(&body["facts"])?;
-            exact(
+            exact_optional(
                 &body["approved"],
                 &[
                     "resource",
@@ -231,7 +252,19 @@ fn check_event(number: u64, event: &Value) -> Result<(), String> {
                     "requester",
                     "facts",
                 ],
+                "restated_modes",
             )?;
+            let list = body.get("restated_modes").cloned().unwrap_or(json!([]));
+            mode_list(&list)?;
+            if list
+                != body["approved"]
+                    .get("restated_modes")
+                    .cloned()
+                    .unwrap_or(json!([]))
+                || (!["destroy", "reinstall"].contains(&text("operation")?) && list != json!([]))
+            {
+                return Err("invalid restated modes".into());
+            }
             for key in [
                 "resource",
                 "target",
@@ -536,6 +569,84 @@ fn facts(value: &Value) -> Result<(), String> {
     Ok(())
 }
 
+fn exact_optional(value: &Value, required: &[&str], optional: &str) -> Result<(), String> {
+    let mut fields = required.to_vec();
+    if value.get(optional).is_some() {
+        fields.push(optional);
+    }
+    exact(value, &fields)
+}
+
+fn mode_list(value: &Value) -> Result<(), String> {
+    let modes = value.as_array().ok_or("modes are not a list")?;
+    let mut seen = Vec::new();
+    for mode in modes {
+        if ![json!("no_artifact_pin"), json!("no_brief")].contains(mode) || seen.contains(mode) {
+            return Err("unknown or repeated mode".into());
+        }
+        seen.push(mode.clone());
+    }
+    Ok(())
+}
+
+/// Facts from earlier checked records, parsed once and independent of production's projections.
+#[derive(Default)]
+struct ModeHistory {
+    exposed_machines: BTreeSet<String>,
+    exposed_sessions: BTreeSet<String>,
+    closed_conduct_windows: BTreeSet<String>,
+    unpinned_installations: BTreeSet<String>,
+}
+
+impl ModeHistory {
+    fn check_and_apply(&mut self, event: &Value) -> Result<(), String> {
+        if let Some(exposure) = event.get("exposure") {
+            let machine = exposure["bound_set"][0]["machine"]
+                .as_str()
+                .expect("checked exposure");
+            let accepted = exposure
+                .get("accepted_modes")
+                .is_some_and(|m| m != &json!([]));
+            if accepted && self.exposed_machines.contains(machine) {
+                return Err("binding acceptance follows an earlier exposure".into());
+            }
+            self.exposed_machines.insert(machine.into());
+            self.exposed_sessions.insert(
+                exposure["session"]
+                    .as_str()
+                    .expect("checked session")
+                    .into(),
+            );
+            if accepted {
+                self.unpinned_installations.insert(machine.into());
+            }
+        }
+        if let Some(acceptance) = event.get("mode_acceptance") {
+            let session = acceptance["session"].as_str().expect("checked acceptance");
+            if !self.exposed_sessions.contains(session)
+                || self.closed_conduct_windows.contains(session)
+            {
+                return Err("conduct acceptance outside its window".into());
+            }
+            self.closed_conduct_windows.insert(session.into());
+        }
+        if let Some(session) = event
+            .pointer("/intent/provenance/session")
+            .and_then(Value::as_str)
+        {
+            self.closed_conduct_windows.insert(session.into());
+        }
+        if let Some(refusal) = event.get("signature_refusal")
+            && !self
+                .unpinned_installations
+                .contains(refusal["machine"].as_str().expect("checked refusal"))
+        {
+            return Err("signature refusal has no installation mode".into());
+        }
+        Ok(())
+    }
+}
+
 fn b64(field: &Value, name: &str) -> Result<Vec<u8>, String> {
     let text = field[name]
         .as_str()
@@ -627,6 +738,7 @@ pub fn read(files: &Files, passphrase: &str) -> Result<Opened, String> {
     numbers.sort_unstable();
     let mut previous = "0".repeat(64);
     let mut records = Vec::new();
+    let mut mode_history = ModeHistory::default();
     for (expected, number) in (0..).zip(numbers) {
         if number != expected {
             return Err(format!("record {expected} missing"));
@@ -652,6 +764,9 @@ pub fn read(files: &Files, passphrase: &str) -> Result<Opened, String> {
         let event: Value =
             serde_json::from_slice(&plaintext).map_err(|e| format!("record {number}: {e}"))?;
         check_event(number, &event).map_err(|e| format!("record {number}: {e}"))?;
+        mode_history
+            .check_and_apply(&event)
+            .map_err(|e| format!("record {number}: {e}"))?;
         records.push((number, plaintext));
         previous = address(bytes);
     }
@@ -962,6 +1077,167 @@ mod tests {
     use super::*;
     use tau_web::harness::{Entry, Journal};
     use tau_web::store::{MemoryStorage, Pbkdf2, block_on, create, unlock};
+
+    #[test]
+    fn weaker_mode_records_and_windows_are_independently_checked() {
+        use tau_web::credential::LocalPassphrase;
+        use tau_web::dispatch::{
+            ClassAnswer, Facts, Operation, OperationApproval, Request, Requester, Resource, Target,
+            fixture_setup,
+        };
+        use tau_web::modes::Mode;
+        let storage = MemoryStorage::default();
+        let mut store = block_on(create(
+            storage.clone(),
+            &Pbkdf2,
+            LocalPassphrase::new(PASS.as_bytes().to_vec()),
+        ))
+        .unwrap();
+        block_on(store.seed_backup(tau_web::allocation::Completion::Skipped)).unwrap();
+        block_on(store.approve_setup(fixture_setup())).unwrap();
+        block_on(store.answer_class("fixture".into(), ClassAnswer::No)).unwrap();
+        let session = block_on(store.bind_with_modes("fixture", &[Mode::NoArtifactPin])).unwrap();
+        block_on(store.accept_mode(&session, Mode::NoBrief)).unwrap();
+        assert!(
+            block_on(store.append(
+                &Entry {
+                    machine: "fixture".into(),
+                    command: b"SigLevel=Never".to_vec(),
+                    provenance: None
+                },
+                &tau_web::dispatch::Approval::LegacyCommand
+            ))
+            .is_err()
+        );
+        let facts = Facts {
+            arguments: Default::default(),
+            cost_bound: 0,
+            bundle_commit: tau_web::SPEC_COMMIT.into(),
+        };
+        let approved = OperationApproval {
+            resource: Resource::Entry("fixture".into()),
+            target: Target::Entry("fixture".into()),
+            operation: Operation::Destroy,
+            session: session.clone(),
+            requester: Requester::Session,
+            facts: facts.clone(),
+            restated_modes: vec![Mode::NoArtifactPin, Mode::NoBrief],
+        };
+        block_on(store.operation(&Request {
+            target: approved.target.clone(),
+            operation: approved.operation,
+            session: session.clone(),
+            requester: approved.requester,
+            facts,
+            approved: Some(approved),
+        }))
+        .unwrap();
+        let opened = read(&storage.files(), PASS).unwrap();
+        let events: Vec<Value> = opened
+            .records
+            .iter()
+            .map(|(_, p)| serde_json::from_slice(p).unwrap())
+            .collect();
+        assert_eq!(
+            events[4]["exposure"]["accepted_modes"],
+            json!(["no_artifact_pin"])
+        );
+        assert_eq!(
+            events[5],
+            json!({"mode_acceptance":{"session":session,"mode":"no_brief"}})
+        );
+        assert_eq!(
+            events[6],
+            json!({"signature_refusal":{"machine":"fixture","form":"signature_level_never"}})
+        );
+        assert_eq!(
+            events[7]["operation_intent"]["restated_modes"],
+            json!(["no_artifact_pin", "no_brief"])
+        );
+        let mut bad_records = Vec::new();
+        for (number, path, replacement) in [
+            (4, "/exposure/accepted_modes", json!(["unpinned"])),
+            (4, "/exposure/accepted_modes", json!(["no_brief"])),
+            (5, "/mode_acceptance/mode", json!("untyped_scope")),
+            (5, "/mode_acceptance/mode", json!("no_artifact_pin")),
+            (5, "/mode_acceptance/session", json!("plaintext-marker")),
+            (
+                7,
+                "/operation_intent/restated_modes",
+                json!(["no_artifact_pin", "no_brief", "no_brief"]),
+            ),
+        ] {
+            let mut bad = events.clone();
+            *bad[number].pointer_mut(path).unwrap() = replacement;
+            bad_records.push((bad, number));
+        }
+        for (number, kind) in [
+            (4, "exposure"),
+            (5, "mode_acceptance"),
+            (6, "signature_refusal"),
+            (7, "operation_intent"),
+        ] {
+            let mut bad = events.clone();
+            bad[number][kind]["plaintext-marker"] = true.into();
+            bad_records.push((bad, number));
+        }
+        let mut late = events.clone();
+        let mut exposure = events[4].clone();
+        exposure["exposure"]["session"] = "session-8".into();
+        late.push(exposure);
+        bad_records.push((late, 8));
+        let mut duplicate = events.clone();
+        duplicate.push(events[5].clone());
+        bad_records.push((duplicate, 8));
+        let mut late = events[..5].to_vec();
+        late.push(json!({"intent":{"call":5,"machine":"fixture","command":"74727565","approval":{"harness_pin":{"machine":"fixture","fingerprint":"SHA256:fixture"}},"provenance":{"target":{"entry":"fixture"},"session":session,"requester":"session"}}}));
+        late.push(events[5].clone());
+        bad_records.push((late, 6));
+        for (bad, number) in bad_records {
+            let files = build(PASS, &bad);
+            let independent = read(&files, PASS)
+                .err()
+                .expect("independent reader must refuse");
+            let production = block_on(unlock(
+                MemoryStorage::with_files(files),
+                &Pbkdf2,
+                LocalPassphrase::new(PASS.as_bytes().to_vec()),
+            ))
+            .err()
+            .expect("production must refuse");
+            for error in [independent, production] {
+                assert!(error.contains(&format!("record {number}")), "{error}");
+                assert!(!error.contains("plaintext-marker"), "plaintext in error");
+            }
+        }
+        // Older exposure and typed intent shapes retain their meanings with no new members.
+        let mut old = events[..5].to_vec();
+        old[4]["exposure"]
+            .as_object_mut()
+            .unwrap()
+            .remove("accepted_modes");
+        let mut intent = events[7].clone();
+        intent["operation_intent"]["call"] = 5.into();
+        intent["operation_intent"]
+            .as_object_mut()
+            .unwrap()
+            .remove("restated_modes");
+        intent["operation_intent"]["approved"]
+            .as_object_mut()
+            .unwrap()
+            .remove("restated_modes");
+        old.push(intent);
+        let files = build(PASS, &old);
+        assert!(read(&files, PASS).is_ok());
+        assert!(
+            block_on(unlock(
+                MemoryStorage::with_files(files),
+                &Pbkdf2,
+                LocalPassphrase::new(PASS.as_bytes().to_vec())
+            ))
+            .is_ok()
+        );
+    }
 
     #[test]
     fn exposure_and_connection_refusal_shapes_are_exact_and_builder_readable() {

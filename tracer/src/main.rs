@@ -24,6 +24,7 @@ mod keys;
 mod machine;
 #[cfg(test)]
 mod matrix;
+mod mode_cases;
 mod reader;
 mod seed_cases;
 mod setup_cases;
@@ -967,7 +968,7 @@ async fn run_cases(
     case.check(
         "the worker's replayed state is record 0 alone",
         run.inspect(&worker).await?
-            == json!({ "state": "unlocked", "seed_backup_owed": true, "seed_backup_completion": null, "seed_backup_stage": "showing_words", "locked": false, "records": [0], "commands": [], "calls": [], "terminals": [], "dispositions": [], "standing": {}, "jobs": [], "typed_calls": [], "observations": [], "current_installations": {}, "setup": [], "setup_offer": tau_web::dispatch::fixture_setup(), "sessions":[],"exposure_ledger":[],"connection_refusals":[] }),
+            == json!({ "state": "unlocked", "seed_backup_owed": true, "seed_backup_completion": null, "seed_backup_stage": "showing_words", "locked": false, "records": [0], "commands": [], "calls": [], "terminals": [], "dispositions": [], "standing": {}, "jobs": [], "typed_calls": [], "observations": [], "current_installations": {}, "setup": [], "setup_offer": tau_web::dispatch::fixture_setup(), "sessions":[],"exposure_ledger":[],"connection_refusals":[],"mode_acceptances":[],"signature_refusals":[],"installations":[] }),
     );
     let host = reader::build(
         HOST_PASSPHRASE,
@@ -1004,6 +1005,20 @@ async fn run_cases(
     // Keep the independent-reader and write-free unlock checks above before any completion.
     seed_cases::skip(run, &tab).await?;
     let completed = store_files(&run.dump(&tab).await?);
+    if std::env::var_os("TAU_TRACER_MODE_CASE").is_some() {
+        mode_cases::run(run, &tab, &mut worker, PASSPHRASE, true, &args, cases).await?;
+        mode_cases::run(
+            run,
+            &served_tab,
+            &mut served_worker,
+            SERVED_PASSPHRASE,
+            false,
+            &served_args,
+            cases,
+        )
+        .await?;
+        return Ok(());
+    }
     if std::env::var_os("TAU_TRACER_HOLD_CASE").is_none()
         && std::env::var_os("TAU_TRACER_SETUP_CASE").is_none()
     {
@@ -2186,6 +2201,19 @@ async fn run_cases(
     if std::env::var("TAU_TRACER_SETUP_CASE").as_deref() == Ok("existing") {
         return Ok(());
     }
+    worker = run.worker(&tab, None, false).await?;
+    served_worker = run.worker(&served_tab, None, false).await?;
+    mode_cases::run(run, &tab, &mut worker, PASSPHRASE, true, &args, cases).await?;
+    mode_cases::run(
+        run,
+        &served_tab,
+        &mut served_worker,
+        SERVED_PASSPHRASE,
+        false,
+        &served_args,
+        cases,
+    )
+    .await?;
     // twr-ggw.5 AC4, AC5: no plaintext secret in any storage, message, request or log, in both builds.
     run.collect(&tab).await?;
     run.collect(&served_tab).await?;

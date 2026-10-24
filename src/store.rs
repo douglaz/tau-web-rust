@@ -40,6 +40,7 @@ use crate::binding::{
 use crate::credential::{DataKey, LocalPassphrase, WrappingKey};
 use crate::dispatch::{Approval, Dispatch, Disposition, DispositionReport, Intent, Terminal};
 use crate::harness::{AppendRefusal, Entry, Journal};
+use crate::modes::{Acceptance, Mode, SignatureRefusal};
 use crate::seed::Seed;
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit};
@@ -192,6 +193,8 @@ pub(crate) enum Event {
     Allocation(allocation::Event),
     Setup(crate::dispatch::SetupRecord),
     Exposure(Exposure),
+    ModeAcceptance(Acceptance),
+    SignatureRefusal(SignatureRefusal),
     ConnectionRefusal(ConnectionRefusal),
 }
 
@@ -332,6 +335,8 @@ pub struct Store<S> {
     sessions: Vec<Rc<Session>>,
     response_calls: std::collections::BTreeSet<u64>,
     exposure_ledger: Vec<Exposure>,
+    conduct_acceptances: Vec<Acceptance>,
+    signature_refusals: Vec<SignatureRefusal>,
     connection_refusals: Vec<ConnectionRefusal>,
     /// Set by a failed append, whose move may have landed: no append follows in this worker.
     failed: Option<String>,
@@ -457,6 +462,8 @@ impl<S: Storage> Store<S> {
             sessions: Vec::new(),
             response_calls: std::collections::BTreeSet::new(),
             exposure_ledger: Vec::new(),
+            conduct_acceptances: Vec::new(),
+            signature_refusals: Vec::new(),
             connection_refusals: Vec::new(),
             failed: None,
         }
@@ -604,6 +611,15 @@ impl<S: Storage> Store<S> {
 
     /// Binding allocates nothing. The key uses the approved entry's journaled identity.
     pub async fn bind(&mut self, machine: &str) -> Result<String, String> {
+        self.bind_with_modes(machine, &[]).await
+    }
+
+    pub async fn bind_with_modes(
+        &mut self,
+        machine: &str,
+        modes: &[Mode],
+    ) -> Result<String, String> {
+        self.check_binding_modes(machine, modes)?;
         self.dispatch
             .check_binding(machine)
             .map_err(|e| format!("{e:?}"))?;
@@ -634,6 +650,7 @@ impl<S: Storage> Store<S> {
             .map_err(|_| "client key derivation refused")?;
         let session = format!("session-{}", self.next);
         let exposure = Exposure {
+            accepted_modes: modes.to_vec(),
             session: session.clone(),
             bound_set: vec![BoundMachine {
                 machine: machine.into(),
@@ -648,7 +665,133 @@ impl<S: Storage> Store<S> {
     }
 
     pub fn sessions(&self) -> Vec<Value> {
-        self.sessions.iter().map(|s| s.inspect()).collect()
+        self.sessions
+            .iter()
+            .map(|s| {
+                let mut view = s.inspect();
+                view["standing_modes"] = self
+                    .standing_modes(&s.bound_set[0])
+                    .iter()
+                    .map(|m| m.label())
+                    .collect::<Vec<_>>()
+                    .into();
+                view
+            })
+            .collect()
+    }
+
+    fn check_binding_modes(&self, machine: &str, modes: &[Mode]) -> Result<(), String> {
+        if modes.is_empty() {
+            return Ok(());
+        }
+        if modes != [Mode::NoArtifactPin]
+            || self
+                .exposure_ledger
+                .iter()
+                .any(|e| e.bound_set.iter().any(|b| b.machine == machine))
+        {
+            return Err("mode is not acceptable at this binding".into());
+        }
+        Ok(())
+    }
+
+    fn check_acceptance(&self, acceptance: &Acceptance) -> Result<(), String> {
+        if acceptance.mode != Mode::NoBrief
+            || !self
+                .exposure_ledger
+                .iter()
+                .any(|e| e.session == acceptance.session)
+            || self
+                .conduct_acceptances
+                .iter()
+                .any(|a| a.session == acceptance.session)
+            || self.dispatch.calls.values().any(|c| {
+                c.intent
+                    .provenance
+                    .as_ref()
+                    .and_then(|p| p.session.as_ref())
+                    == Some(&acceptance.session)
+            })
+        {
+            return Err("mode acceptance is outside its window".into());
+        }
+        Ok(())
+    }
+
+    pub async fn accept_mode(&mut self, session: &str, mode: Mode) -> Result<(), String> {
+        if !self.sessions.iter().any(|s| s.identity == session) {
+            return Err("mode acceptance requires a live session".into());
+        }
+        let acceptance = Acceptance {
+            session: session.into(),
+            mode,
+        };
+        self.check_acceptance(&acceptance)?;
+        self.commit(&Event::ModeAcceptance(acceptance.clone()))
+            .await?;
+        self.conduct_acceptances.push(acceptance);
+        Ok(())
+    }
+
+    pub fn installation_unpinned(&self, machine: &str) -> bool {
+        self.exposure_ledger.iter().any(|e| {
+            e.accepted_modes.contains(&Mode::NoArtifactPin)
+                && e.bound_set.iter().any(|b| b.machine == machine)
+        })
+    }
+
+    /// One restatement hook, keyed on the target's holder rather than the requester.
+    pub fn standing_modes(&self, machine: &str) -> Vec<Mode> {
+        let mut modes = Vec::new();
+        for exposure in &self.exposure_ledger {
+            if exposure.bound_set.iter().any(|b| b.machine == machine) {
+                for mode in &exposure.accepted_modes {
+                    if !modes.contains(mode) {
+                        modes.push(*mode);
+                    }
+                }
+            }
+        }
+        if let Some(session) = self
+            .sessions
+            .iter()
+            .find(|s| s.bound_set.iter().any(|m| m == machine))
+        {
+            for acceptance in self
+                .conduct_acceptances
+                .iter()
+                .filter(|a| a.session == session.identity)
+            {
+                if !modes.contains(&acceptance.mode) {
+                    modes.push(acceptance.mode);
+                }
+            }
+        }
+        modes
+    }
+
+    pub fn mode_acceptances(&self) -> Vec<Value> {
+        let history = self.exposure_ledger.iter().flat_map(|exposure| {
+            exposure
+                .accepted_modes
+                .iter()
+                .map(move |mode| (&exposure.session, *mode, true))
+        });
+        let conduct = self.conduct_acceptances.iter().map(|acceptance| {
+            let standing = self
+                .sessions
+                .iter()
+                .any(|s| s.identity == acceptance.session);
+            (&acceptance.session, acceptance.mode, standing)
+        });
+        history.chain(conduct).map(|(session, mode, standing)| {
+            let exposure = self.exposure_ledger.iter().find(|e| &e.session == session).expect("acceptance follows exposure");
+            json!({"session":session,"mode":mode.label(),"bound_set":exposure.bound_set.iter().map(|b| &b.machine).collect::<Vec<_>>(),"standing":standing})
+        }).collect()
+    }
+
+    pub fn signature_refusals(&self) -> &[SignatureRefusal] {
+        &self.signature_refusals
     }
 
     pub fn exposure_ledger(&self) -> &[Exposure] {
@@ -742,6 +885,7 @@ impl<S: Storage> Store<S> {
             return Err("invalid exposure ledger entry".into());
         }
         for bound in &exposure.bound_set {
+            self.check_binding_modes(&bound.machine, &exposure.accepted_modes)?;
             let approved = self
                 .dispatch
                 .approved_entries
@@ -818,7 +962,22 @@ impl<S: Storage> Store<S> {
         &self,
         request: &crate::dispatch::Request,
     ) -> Result<(), crate::dispatch::RequestRefusal> {
-        self.dispatch.check_request(request).map(|_| ())
+        use crate::dispatch::{Operation, RequestRefusal, Resource};
+        let resource = self.dispatch.check_request(request)?;
+        let expected = match (&resource, request.operation) {
+            (Resource::Entry(machine), Operation::Destroy | Operation::Reinstall) => {
+                self.standing_modes(machine)
+            }
+            _ => Vec::new(),
+        };
+        if request
+            .approved
+            .as_ref()
+            .is_none_or(|a| a.restated_modes != expected)
+        {
+            return Err(RequestRefusal::Modes);
+        }
+        Ok(())
     }
 
     /// Typed adapters check before contact and again under the writer at append. The return
@@ -835,6 +994,8 @@ impl<S: Storage> Store<S> {
                 },
             ));
         }
+        self.check_operation(request)
+            .map_err(OperationError::Policy)?;
         let intent = self
             .dispatch
             .prepare(self.next, request)
@@ -1023,6 +1184,19 @@ impl<S: Storage> Store<S> {
                     self.replay_exposure(number, exposure)
                         .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
                 }
+                (_, Event::ModeAcceptance(acceptance)) => {
+                    self.check_acceptance(acceptance)
+                        .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
+                    self.conduct_acceptances.push(acceptance.clone());
+                }
+                (_, Event::SignatureRefusal(refusal)) => {
+                    if !self.installation_unpinned(&refusal.machine) {
+                        return Err(format!(
+                            "record {number}: signature refusal has no installation mode; replay stopped"
+                        ));
+                    }
+                    self.signature_refusals.push(refusal.clone());
+                }
                 (_, Event::ConnectionRefusal(refusal)) => {
                     if !self
                         .dispatch
@@ -1183,10 +1357,19 @@ impl<S: Storage> Store<S> {
             .map_err(|_| "its event is not one this version reads".to_string())?;
         if matches!(
             event,
-            Event::Exposure(_) | Event::ConnectionRefusal(_) | Event::OperationResponse { .. }
+            Event::Exposure(_)
+                | Event::ConnectionRefusal(_)
+                | Event::ModeAcceptance(_)
+                | Event::SignatureRefusal(_)
+                | Event::OperationResponse { .. }
         ) {
             let value: Value = serde_json::from_slice(&plaintext)
                 .map_err(|_| "invalid binding record shape".to_string())?;
+            for kind in ["mode_acceptance", "signature_refusal"] {
+                if value.get(kind).is_some_and(|body| !body.is_object()) {
+                    return Err("invalid mode record shape".into());
+                }
+            }
             if value
                 .get("operation_response")
                 .is_some_and(|body| !body.is_object())
@@ -1270,6 +1453,27 @@ impl<S: Storage> Store<S> {
 }
 
 impl<S: Storage> Journal for Store<S> {
+    async fn check_signature(
+        &mut self,
+        machine: &str,
+        command: &[u8],
+    ) -> Result<(), AppendRefusal> {
+        if self.installation_unpinned(machine)
+            && let Some(form) = crate::modes::lowering(command)
+        {
+            let refusal = SignatureRefusal {
+                machine: machine.into(),
+                form,
+            };
+            self.commit(&Event::SignatureRefusal(refusal.clone()))
+                .await
+                .map_err(AppendRefusal::Storage)?;
+            self.signature_refusals.push(refusal.clone());
+            return Err(AppendRefusal::SignatureLowering(refusal));
+        }
+        Ok(())
+    }
+
     async fn check(&self, machine: &str) -> Result<(), AppendRefusal> {
         self.dispatch
             .check_command(machine)
@@ -1277,6 +1481,7 @@ impl<S: Storage> Journal for Store<S> {
     }
 
     async fn append(&mut self, entry: &Entry, approval: &Approval) -> Result<u64, AppendRefusal> {
+        self.check_signature(&entry.machine, &entry.command).await?;
         self.check(&entry.machine).await?;
         if let Some(provenance) = &entry.provenance
             && self.dispatch.resolve(&provenance.target)
@@ -1609,6 +1814,9 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
                 "seed_backup_stage": self.seed_backup,
                 "setup": store.dispatch.setup_view(),
                 "sessions": store.sessions(),
+                "mode_acceptances": store.mode_acceptances(),
+                "signature_refusals": store.signature_refusals(),
+                "installations": store.dispatch.approved_entries.keys().filter(|m| store.installation_unpinned(m)).map(|m| json!({"machine":m,"installation":"unpinned"})).collect::<Vec<_>>(),
                 "exposure_ledger": store.exposure_ledger().iter().map(|e| json!({"session":e.session,"bound_set":e.bound_set.iter().map(|b| json!({"machine":b.machine,"family":b.identity.family,"index":b.identity.index})).collect::<Vec<_>>()})).collect::<Vec<_>>(),
                 "connection_refusals": store.connection_refusals(),
                 "setup_offer": if store.dispatch.approved_entries.is_empty() { serde_json::to_value(crate::dispatch::fixture_setup()).expect("fixture serializes") } else { Value::Null },
@@ -1898,6 +2106,7 @@ mod tests {
                 bundle_commit: crate::SPEC_COMMIT.into(),
             };
             let intent = OperationIntent {
+                restated_modes: Vec::new(),
                 call: 1,
                 resource: resource.clone(),
                 target: target.clone(),
@@ -1906,6 +2115,7 @@ mod tests {
                 requester: Requester::Session,
                 facts: facts.clone(),
                 approved: OperationApproval {
+                    restated_modes: Vec::new(),
                     resource,
                     target,
                     operation,
@@ -4442,3 +4652,6 @@ mod binding_tests;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod redaction_tests;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod mode_tests;

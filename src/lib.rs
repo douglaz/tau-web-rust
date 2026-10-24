@@ -12,6 +12,7 @@ pub mod credential;
 pub mod dispatch;
 pub mod harness;
 pub mod jobs;
+pub mod modes;
 pub mod redaction;
 pub mod relay_auth;
 pub mod seed;
@@ -216,6 +217,17 @@ mod worker {
     }
 
     impl Journal for StoreJournal {
+        async fn check_signature(
+            &mut self,
+            machine: &str,
+            command: &[u8],
+        ) -> Result<(), AppendRefusal> {
+            match self.local.lock().await.store() {
+                Some(store) => store.check_signature(machine, command).await,
+                None => Err(AppendRefusal::Storage("the store is locked".into())),
+            }
+        }
+
         async fn check(&self, machine: &str) -> Result<(), AppendRefusal> {
             match self.local.lock().await.store() {
                 Some(store) => store.check(machine).await,
