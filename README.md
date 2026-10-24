@@ -159,11 +159,13 @@ The following are **implementation readings**, not claims about the real account
   proceed while an earlier completion's response is withheld. A lost response
   cannot supply an identifier for revocation; its cap and expiry bound that key. A new binding
   has a fresh session identity and may mint its own key.
-- **Top-up:** the latest account read for that same session must explicitly report automatic
-  top-up off before mint, both live and on replay. An on, missing or unreadable setting refuses
+- **Top-up:** the latest account read for that same session must be 2xx and explicitly report
+  automatic top-up off before mint, both live and on replay. A non-2xx, on, missing or unreadable setting refuses
   the request. An unresolved account read retains its call id and `unresolved: true` beside
   a refusal explaining that no mint is sent without a recorded top-up-off read; a finished
-  read that refuses also keeps its call id. Nothing writes account configuration.
+  read that refuses also keeps its call id, HTTP status and `finished: true`, including a
+  non-2xx body that says top-up is off. No mint is prepared or sent after that read.
+  Nothing writes account configuration.
 - **Bounds:** `SESSION_CAP` is `0.10` fixture account units and `SESSION_LIFETIME_SECONDS` is
   900 seconds, measured from the injected host clock or worker clock at mint. The page's
   `END_SESSIONS_BOUND_MS` is 5000. The pin assigns no cap or expiry values or owner; twr-ggw.83
@@ -175,10 +177,22 @@ The following are **implementation readings**, not claims about the real account
   credentialed call; a later request may probe again. A real call's failure leaves the route
   chosen. With no aggregator tunnel built, no route means refusal. This is separate from
   twr-ggw.18's model-list read and never substitutes for it.
-- **Session ends:** the bounded worker step stops dispatch and drops holdings before revoking
-  independently per identifier. A post-append check prevents a concurrent intent from sending
-  after the end begins. Readable responses still receive terminals; no response body is handed
-  back after the end. A mint that supplies an identifier after the end's first snapshot
+- **Session ends:** the bounded worker step stops dispatch, closes registered SSH WebSockets
+  synchronously and drops holdings before revoking independently per identifier. A cold route
+  probe rechecks session end after its route read; the revoke's own probe remains permitted.
+  A post-append check prevents a concurrent intent from sending after the end begins.
+  Readable responses still receive terminal records. The last response boundary withholds a
+  completion body whenever ending has begun, including a finish ahead of the end snapshot
+  and a body already built before the last writer wait. **Implementation reading:** retain
+  `call`, `status` and `finished`, remove `body`, and add `refused: "sessions ended"` only if
+  no refusal is already present. Admission and signature checks recheck ending under the
+  writer, and the store also refuses them after its end snapshot. These requests stop before
+  the binding or signature check, so they append neither `ConnectionRefusal` nor
+  `SignatureRefusal`; ordinary unbound attempts and signature-lowering attempts still record
+  their refusals. **Implementation reading** (`STA-23`, `CNF-7`): session end stops dispatch,
+  so a request it stops is refused for session end before the binding check, as a request
+  arriving after the end already is at request entry; it is not a connection attempt that
+  the binding check refuses and records. A mint that supplies an identifier after the end's first snapshot
   commits and sends its own revoke; the end step waits for the mint guards and those revokes,
   subject to the page's bound. The response boundary also scans the request's transient
   credentials, so an echoed session inference key cannot enter late terminal metadata after
@@ -662,26 +676,38 @@ No job identity means nothing can be read and only a disposition can release tha
 
 Both builds export `stop_waits(machine: string): number`: it stops all currently registered
 unresolved-command waits on that machine and returns their count. It leaves other requests
-and detached commands running. An interrupted read is abandoned without appending evidence;
+and detached commands running. It also closes each stopped held wait's browser socket at once;
+that wait makes no further SSH use. Command dispatch and collection use separate stops.
+An interrupted read is abandoned without appending evidence;
 waiting to acquire the writer is also stoppable. No evidence append begins after a stop,
 but an append already begun completes whole and its evidence stands. A stopped wait answers
 held with what was read so far and why the other calls were not read. It settles nothing and
 arms no later dispatch. There is no timer for the wait.
 
-Session end stops every held wait as soon as its flag is set, before acquiring the store
-writer. Both collection and held requests check that flag immediately before each job-read
-`exec`; unread calls report `not_read` with a reason naming session end. A read whose `exec`
-was sent keeps its own error in `why` even if sessions end before it returns: collection uses
-`failed: true`, and a held request retains its `not_read: true` read-error shape. Collection uses the
-same stoppable evidence-append boundary: an append already begun completes whole, and no new
-append begins after session end. Nothing is retried. The browser cases suspend collection
-and held reads after channel opening and before `exec`, begin session end while another
-operation holds the writer, then release the read. The sshd receives no read exec, unread
-calls name session end, and no job evidence or terminal is added. The held variant also
-checks that the wait was stopped before the writer became available. Two further browser
-cases wait until sshd receives a read of a running job, then end sessions: the held read
-keeps its stop reason, and collection keeps its own error from a malformed fixture exit
-record supplied after session end. Neither appends evidence or settles the command.
+Session end fires every command, held-wait and collection stop before acquiring the store
+writer. Channels close when the end begins: the stop closes the registered browser socket
+without awaiting the close event, the SSH driver's queue or a suspended append. Registration
+outlives the byte stream's move into the driver; an already stopped registration closes
+immediately. Connect, channel opening, command transmission and record reads are stoppable,
+including SSH identification, key exchange, authentication and rekey stalls. A stopped path
+sends no SSH DISCONNECT, and a stop cancels a normal disconnect wait already underway.
+
+Held and collection read failures use one rule: after session end a sent read reports
+`"sessions ended while reading record"`; an unsent read reports
+`"sessions ended before record was read"`. Collection retains `failed: true` for a sent read
+and `not_read: true` for an unsent one; held requests retain `not_read: true` in both cases.
+Outside session end the read's own reason remains. A cancelled read whose `exec` was sent is
+never described as unsent. **Implementation reading:** a stopped, sent command reports
+unresolved with `"sessions ended while awaiting job record"`; before transmission it
+retains `"sessions ended before command transmission"`. It stays collectable after unlock.
+All three sites use the stoppable evidence-append boundary: no new append begins after a stop,
+and a begun append completes whole. An uncommitted job record is returned as evidence
+with an unresolved call. **Implementation reading:** when session end stops that command's
+evidence append before it begins, `why` is
+`"job evidence append: sessions ended before journaling job evidence"`.
+Inference terminal records and mint/revoke cleanup remain permitted.
+Nothing is retried. Browser cases observe socket closure while a revoke withholds the end
+step, before worker termination, including while an intent or evidence append is suspended.
 
 The held answer is distinct from `done`, `unresolved` and `refused`. For example, a stopped
 request reports:
@@ -1223,7 +1249,8 @@ the host tests run.
   - The harness never persists the passphrase.
 - **Lock ends sessions before termination.** On the Lock button, hidden visibility, pagehide,
   bfcache restore and seed-backup re-display, the page clears words and inputs immediately and
-  posts the exact-member `{end_sessions:true}` message. The worker stops dispatch, clears
+  posts the exact-member `{end_sessions:true}` message. Channels close when this end step
+  begins, before the store writer is acquired. The worker stops dispatch, clears
   session holdings, and independently records and sends each owed revoke. The page terminates
   it on its answer or the named 5000 ms bound, then the fresh worker loads locked. A detached
   machine job continues and can be collected after unlock.
@@ -1633,7 +1660,7 @@ browser holds:
 In headless Chromium 154 a new tab hides the one before it, which then restarts its worker, as
 page hide must. The cases account for it.
 
-The full run defines 130 cases.
+The full run defines 171 cases.
 
 The cases:
 
@@ -1653,9 +1680,16 @@ The cases:
 | seed-backup interruption, twelve cases per build | display and answering each meet explicit lock, visibility hidden, pagehide, bfcache restore, close and renderer crash; words and input disappear and next unlock still owes the same record |
 | seed-backup re-display, each build | fresh passphrase is required; wrong passphrase shows no word; answering removes words; tracer relay and SSH connections end before display, held waits end, no stopped request resumes and the cut-off call stays unresolved |
 | 1. recorded, then sent (`CNF-30`, `ARC-8`) | exactly one relay connection; the sshd received exactly the wrapper recomposed from the journal entry, and its job record holds exactly the journal command; the replayed state holds the command intent after the setup approval and its following job terminal (exit status 7), and the output and exit status came back. With the append made to fail, the sshd received no `exec`, read only once that SSH connection has ended at the sshd |
-| session end during box-plane intent commit | a tracer-only switch suspends the intent's OPFS move while it holds the writer; end-sessions begins before release, the sshd receives no exec, the report is unresolved, and unlock recovers the committed call as unresolved |
+| session end during box-plane intent commit | a tracer-only switch suspends the intent's OPFS move while it holds the writer; the relay and sshd observe connection end before the append is released; the append completes, the sshd receives no exec, the report is unresolved, and unlock recovers the committed call as unresolved |
 | session end before job-record reads, collection and held request | suspend the read after opening its channel, start end-sessions while the writer is held, release, and check no read exec, per-call `not_read` with session-end reasons, and no appended evidence; the held wait is stopped before the writer becomes available |
-| session end after job-record reads are sent, collection and held request | wait until sshd receives the running job's read exec, then end sessions; the held read keeps `not_read` with its own stop reason and collection keeps `failed` with its malformed-record error; no further exec, evidence or terminal |
+| session end after job-record reads are sent, collection and held request | wait until sshd receives the running job's read exec, then hold revocation open and end sessions; relay and sshd see connection end before termination; both reads report `sessions ended while reading record`, with held `not_read: true` and collection `failed: true`; no further exec, evidence or terminal |
+| cold probe at session end and revoke control, two cases | queue a cold route read behind the writer, then begin ending; only the revoke's dedicated probe is sent; separately, the revoke and its cold probe both go out while the end step remains open |
+| SSH stages at session end, 21 cases | command, held request and collection each hold before the relay challenge, after dial before verdict, at SSH identification, first key exchange, authentication without rekey or pending data, rekey during authentication, and rekey after connect; the authentication-rekey cases receive an authentication banner before starting the real rekey; sockets close during the held end step, dialed sshd connections end, a pre-dial hold makes no sshd contact, and no later channel or exec is sent |
+| writer admission races at session end, six cases | approved unbound command admission and an unpinned installation's signature check queue ahead of and behind the end snapshot; bound command and collectable-call admission queue ahead; every answer is the session-end journal refusal, with no connection or signature refusal record |
+| completion bodies at session end, two cases | finish queues ahead of the end snapshot, or the body is already built before the final writer wait; terminal metadata remains and body handback is suppressed in both cases |
+| evidence append boundaries at session end, six cases | command, held request and collection each queue evidence behind the end or suspend an already begun OPFS move; queued appends add nothing, begun appends complete, and sockets close before the held append is released; command evidence remains unresolved after unlock when its append never began |
+| evidence append with rekey stalled, three cases | command, held request and collection start a real rekey after reading their record and suspend a begun evidence append; the relay withholds the key-exchange response, yet relay and sshd see connection end before the append is released, and the append still completes |
+| running command at session end | while revocation is withheld, the socket closes without SSH DISCONNECT, the sent command reports unresolved with session end as its reason, and no evidence or terminal is appended; unlock reads it unresolved and collection can finish it |
 | procured inference | real fetch, mint, independent metadata parsing, unresolved spend, routing and manual redirects; concurrent held completions, identifier-only mints, unlock during a held sweep, and every session end and crash/reload/sweep/expiry |
 | inference no-plaintext and loopback | account and all minted key needles, planted-needle controls, OPFS/decrypted-record inspection, browser storage, messages, store inspection, request bodies and logs; CDP blocks the off-loopback negative control |
 | a failed append is not applied (twr-ggw.5 AC2, `STA-3`) | that failed append failed at its `move()`, a real OPFS call; the replayed state has no record for it, and none appears after a reload and an unlock |
@@ -1669,7 +1703,7 @@ The cases:
 | 7. an unrecorded destination (`CNF-87`) | the pinned machine `fixture` at `127.0.0.2`, a host the pass does not record: `destination` and 1008 |
 | 8. pace (`CNF-87`) | the tracer puts the sshd's host at its window cap just before the run, so the refusal holds whatever the timing: `pace` and 1008 |
 | fail closed (twr-ggw.5 AC1, `CNF-82`) | five edits to OPFS: a wrong passphrase, one byte of the envelope's salt, one byte of record 1's ciphertext, another store's record at the same number, and an envelope of version 2. For each, unlock is refused and the page offers neither Create nor Unlock; for the first two it says "wrong passphrase, or the store was modified". A create request creates nothing, a request is refused before any contact, and OPFS is byte-identical afterwards |
-| reload, explicit lock, page hide and a killed worker (twr-ggw.5 AC3, `CNF-82`) | one case each. The old worker target is gone and one new harness worker exists. The page offers Unlock alone. A request is refused with no TCP connection at the relay. After an unlock, the replayed state lists every command recorded before. Explicit lock, page hide and the killed worker also catch a running command: once the sshd has its `exec`, the lock comes, and the sshd sees its connection end; explicit lock and page hide also check that the relay fixture sees the client's WebSocket end. After the unlock the command reads unresolved in the replayed state and the sshd receives no second `exec`. Before the Lock button is pressed, text is typed into both passphrase fields and never submitted; both are empty once it is pressed |
+| reload, explicit lock, page hide and a killed worker (twr-ggw.5 AC3, `CNF-82`) | one case each. The old worker target is gone and one new harness worker exists. The page offers Unlock alone. A request is refused with no TCP connection at the relay. After an unlock, the replayed state lists every command recorded before. Explicit lock and page hide invoke the end step: its socket-close guarantee begins there, as the held-end cases above observe before termination. A killed worker closes its transport by termination. These three lifecycle cases catch a running command after sshd receives its `exec` and observe connection end; explicit lock and page hide also observe the relay's WebSocket end. After unlock the command reads unresolved and sshd receives no second `exec`. Before the Lock button is pressed, text is typed into both passphrase fields and never submitted; both are empty once it is pressed |
 | close without exit status (twr-ggw.7, `STA-8`) | the sshd closes without an exit status; replay preserves the unresolved call. A second command answers held, reads its finished record and records no intent or launch |
 | dispositions (twr-ggw.7, `STA-24`) | the independent reader builds a destructive disposition: the request is refused before contact, with no relay connection, SSH connection or append. Replacing it with a continuing disposition admits the command and journals its terminal record |
 | typed reset bars commands before contact until durable confirmation (twr-ggw.8, `STA-24`) | an independently written unresolved reset refuses a command, names its intent and makes no relay or SSH contact or append; a confirming observation permits the command |
@@ -1951,8 +1985,11 @@ are included in `check-absence`.
 
 For focused setup checks, set `TAU_TRACER_SETUP_CASE=all`. The `existing` value runs the existing
 dispatch/job cases without seed-display-dependent custody controls. The full gate leaves
-`TAU_TRACER_SETUP_CASE`, `TAU_TRACER_SEED_CASE` and `TAU_TRACER_HOLD_CASE` unset and runs all 130 cases. `TAU_TRACER_MODE_CASE`, `TAU_TRACER_INFERENCE`, `TAU_TRACER_INFERENCE_PHASE` and
-`TAU_TRACER_INFERENCE_END` must also be unset.
+`TAU_TRACER_SETUP_CASE`, `TAU_TRACER_SEED_CASE` and `TAU_TRACER_HOLD_CASE` unset and runs all 171 cases. `TAU_TRACER_MODE_CASE`, `TAU_TRACER_INFERENCE`, `TAU_TRACER_INFERENCE_PHASE`,
+`TAU_TRACER_INFERENCE_END` and `TAU_TRACER_SESSION_END` must also be unset. The focused
+`session-end`, `sent-reads` and `command-intent` inference phases exercise the corresponding
+session-end boundaries. `TAU_TRACER_SESSION_END` selects comma-separated case-name fragments
+within the `session-end` phase; a fragment prefixed with `=` selects an exact case name.
 
 The weaker-mode boundaries were mutation-checked on 2026-10-23 with Rust 1.97.1.
 M1–M7, M12 and M14 retain their evidence from that date. M8–M11 and M13 were rerun,
@@ -2620,7 +2657,7 @@ saved copy and compared byte-for-byte. With all three focus variables unset, the
 full `CHROME=<chromium> scripts/tracer.sh` gate reruns that same case; it exited 0 with
 `TRACER PASS` after all 106 cases.
 
-### Procured inference mutation evidence (I1–I39)
+### Procured inference mutation evidence (I1–I53)
 
 On 2026-10-24, each mutation below changed production code, or the named tracer check. Every
 red command ran in the foreground with output redirected to a log. Saved source bytes were
@@ -3596,7 +3633,9 @@ Both tests go through `inference::infer` and assert call 9, `unresolved: true`, 
 refusal and the unresolved mint on replay. The lost leg sent `/keys`; the append leg sent
 nothing after its committed mint. Neither sent a completion or revoke.
 
-**I37** — Relabel every read error as session end whenever the flag is set, ignoring whether
+**I37 — superseded by I44 and I45.** This is historical evidence for the removed
+sent-read-keeps-its-error rule; its test names and expected reasons are no longer current.
+Relabel every read error as session end whenever the flag is set, ignoring whether
 its `exec` was sent. File: `src/harness/job_read.rs`; remove `!self.sent.get() &&` from the
 session-end condition. Exact red and restored-green command:
 
@@ -3626,18 +3665,20 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 208 filtered out
 
 The transport in `run.rs` compiles only on wasm32. These host tests exercise the shared
 reporting function used by both read paths: mark the read sent, set the session-end flag,
-then report its own read error. Collection retains `failed: true` and held reads retain
-`not_read: true`, both with the original error. A separate host test checks both unsent
+then report its own read error. At that time collection retained `failed: true` and held
+reads retained `not_read: true`, both with the original error. A separate host test checks both unsent
 shapes name session end. The full browser gate also retains both pre-exec session-end cases.
 
-**I38** — Discard the tracked send state at the job-read reporting sites in
+**I38 — superseded by I44, I45 and I51.** This is historical evidence for the removed
+sent-read-keeps-its-error rule. The current sent-read reason is session end, with send history
+preserved and collection reads cancelled. Discard the tracked send state at the job-read reporting sites in
 `src/harness/run.rs`: replace each `progress.failure(...)` with
 `super::job_read::Read::default().failure(...)`. This covers both held-read error branches
 and the collection error branch. The two new browser cases wait for sshd to receive the
 read `exec` before calling `end_sessions()`.
 
-The wrappers in `/var/tmp/twr17-k-fixes.I4mWTYPE/` supply the environment for I38, I39 and
-the final gates. `host` contains:
+The wrappers in `/var/tmp/twr17-k-fixes.I4mWTYPE/` supplied the environment for I38, I39 and
+that round's final gates; the current final gates use the I40–I53 wrappers. `host` contains:
 
 ```sh
 #!/usr/bin/env bash
@@ -3685,10 +3726,11 @@ The saved source bytes were restored and compared byte for byte. Green, exit 0:
 TRACER PASS
 ```
 
-The held read retains `not_read: true` with `why: "stopped while reading record"`.
-Collection retains `failed: true`, its job identity and its own wrapper-status/read-file
-error after a malformed fixture exit record is supplied following session end. Both cases
-check that no further exec, job evidence or terminal appears.
+Under that superseded rule the held read retained `not_read: true` with
+`why: "stopped while reading record"`, and collection retained `failed: true`, its job
+identity and its own wrapper-status/read-file error after a malformed fixture exit record was
+supplied following session end. Both cases checked that no further exec, job evidence or
+terminal appeared.
 
 **I39** — Restore the bare top-up refusal after an account read in `src/inference.rs`,
 discarding the read's call id and unresolved state. Exact red and restored-green command:
@@ -3721,45 +3763,631 @@ its durable append and sends no account read. Neither prepares or sends a mint. 
 finished top-up-on regression also checks that its refusal keeps the call id and finished
 status.
 
+### Session-end follow-up evidence (I40–I53)
+
+These checks ran on 2026-10-24. I40–I52 add 18 red/green command pairs; I53 runs
+controls against the production behavior at `8dbfcee` and the restored fix. Every command
+ran in the foreground, unpiped, with stdout/stderr redirected to its named log and the exit
+status inspected. Before each green, the saved source bytes were restored and compared
+byte for byte (`RESTORE BYTES MATCH`). Each browser command was preceded by
+`/var/tmp/twr17-session-end-20261024/wasm scripts/build-web.sh tracer`, exit 0, on both trees.
+The final full gate supplies an additional green for every case with all selectors unset.
+
+The wrappers used below are `/var/tmp/twr17-session-end-20261024/host`:
+
+```sh
+#!/usr/bin/env bash
+export TMPDIR=/var/tmp
+exec nix shell nixpkgs#gcc -c env RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 "$@"
+```
+
+and `/var/tmp/twr17-session-end-20261024/wasm`:
+
+```sh
+#!/usr/bin/env bash
+export TMPDIR=/var/tmp
+export PATH=/var/tmp/rev-twr17/wbg/bin:$PATH
+export CC_wasm32_unknown_unknown=/var/tmp/twr17-tools/clang/bin/clang
+export AR_wasm32_unknown_unknown=/var/tmp/twr17-tools/llvm/bin/llvm-ar
+export CHROME=/var/tmp/twr17-tools/chromium/bin/chromium
+exec nix shell nixpkgs#gcc -c env RUSTUP_TOOLCHAIN=1.97.1 CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-Clinker-features=-lld "$@"
+```
+
+**I40** — Remove the post-route probe fence. Host starts with no chosen route and ends inside route(); the browser queues its cold route read behind the writer and holds revocation open. Files: `src/inference.rs`.
+
+Exact red and restored-green command:
+
+```sh
+/var/tmp/twr17-session-end-20261024/host test --locked cold_probe_refuses -- --nocapture
+```
+
+Red, exit 101, `I40-red-0.log`:
+
+```text
+thread 'store::inference::tests::cold_probe_refuses_when_route_await_ends_sessions' (2562253) panicked at src/store/inference/tests.rs:1448:5:
+assertion `left == right` failed
+  left: Ok(())
+ right: Err("sessions ended")
+test store::inference::tests::cold_probe_refuses_when_route_await_ends_sessions ... FAILED
+```
+
+Restored green, exit 0, `I40-green-0.log`:
+
+```text
+test store::inference::tests::cold_probe_refuses_when_route_await_ends_sessions ... ok
+```
+
+Exact red and restored-green command:
+
+```sh
+env TAU_TRACER_INFERENCE=1 TAU_TRACER_INFERENCE_PHASE=session-end TAU_TRACER_SESSION_END='fences a cold probe' /var/tmp/twr17-session-end-20261024/wasm cargo run --locked -p tracer -- run dist/served dist/tracer
+```
+
+Red, exit 1, `I40-red-1.log`:
+
+```text
+   FAIL session end fences a cold probe queued ahead of the end writer: only the revoke probe is sent after ending; revoke itself is sent
+FAIL: tracer cases failed: session end fences a cold probe queued ahead of the end writer
+```
+
+Restored green, exit 0, `I40-green-1.log`:
+
+```text
+   PASS session end fences a cold probe queued ahead of the end writer
+TRACER PASS
+```
+
+**I41** — Remove the 2xx condition from the account-read predicate, leaving the top-up-off body check. The refusal loses its call id and HTTP status when prepare refuses the mint. Files: `src/inference.rs`.
+
+Exact red and restored-green command:
+
+```sh
+/var/tmp/twr17-session-end-20261024/host test --locked non_success_account_read_keeps -- --nocapture
+```
+
+Red, exit 101, `I41-red-0.log`:
+
+```text
+thread 'store::inference::tests::non_success_account_read_keeps_call_status_and_prepares_no_mint' (2641720) panicked at src/store/inference/tests.rs:1508:5:
+assertion `left == right` failed: {"refused":"mint has no top-up-off read"}
+  left: Null
+ right: 7
+test store::inference::tests::non_success_account_read_keeps_call_status_and_prepares_no_mint ... FAILED
+```
+
+Restored green, exit 0, `I41-green-0.log`:
+
+```text
+test store::inference::tests::non_success_account_read_keeps_call_status_and_prepares_no_mint ... ok
+```
+
+**I42** — Remove both connection-admission end fences. The host checks the store directly; the browser queues admission behind the end snapshot. I46 separately isolates the journal fence. Files: `src/store.rs`, `src/lib.rs`.
+
+Exact red and restored-green command:
+
+```sh
+/var/tmp/twr17-session-end-20261024/host test --locked connection_admission_after_end -- --nocapture
+```
+
+Red, exit 101, `I42-red-0.log`:
+
+```text
+thread 'store::inference::tests::connection_admission_after_end_records_no_refusal_live_or_replayed' (3373146) panicked at src/store/inference/tests.rs:1535:5:
+assertion failed: matches!(block_on(store.connection_session("fixture-other")),
+test store::inference::tests::connection_admission_after_end_records_no_refusal_live_or_replayed ... FAILED
+```
+
+Restored green, exit 0, `I42-green-0.log`:
+
+```text
+test store::inference::tests::connection_admission_after_end_records_no_refusal_live_or_replayed ... ok
+```
+
+Exact red and restored-green command:
+
+```sh
+env TAU_TRACER_INFERENCE=1 TAU_TRACER_INFERENCE_PHASE=session-end TAU_TRACER_SESSION_END='fences unbound writer behind' /var/tmp/twr17-session-end-20261024/wasm cargo run --locked -p tracer -- run dist/served dist/tracer
+```
+
+Red, exit 1, `I42-red-1.log`:
+
+```text
+   FAIL session end fences unbound writer behind end snapshot: session-end refusal replaces admission or collected answer; no connection or signature refusal is committed
+FAIL: tracer cases failed: session end fences unbound writer behind end snapshot
+```
+
+Restored green, exit 0, `I42-green-1.log`:
+
+```text
+   PASS session end fences unbound writer behind end snapshot
+TRACER PASS
+```
+
+**I43** — Remove both signature end fences for a lowering form on an unpinned installation. The host checks the store directly; the browser queues the check behind the end snapshot. I47 separately isolates the journal fence. Files: `src/store.rs`, `src/lib.rs`.
+
+Exact red and restored-green command:
+
+```sh
+/var/tmp/twr17-session-end-20261024/host test --locked signature_check_after_end -- --nocapture
+```
+
+Red, exit 101, `I43-red-0.log`:
+
+```text
+thread 'store::inference::tests::signature_check_after_end_records_no_refusal_live_or_replayed' (2786490) panicked at src/store/inference/tests.rs:1552:5:
+assertion failed: matches!(block_on(store.check_signature("fixture-other",
+test store::inference::tests::signature_check_after_end_records_no_refusal_live_or_replayed ... FAILED
+```
+
+Restored green, exit 0, `I43-green-0.log`:
+
+```text
+test store::inference::tests::signature_check_after_end_records_no_refusal_live_or_replayed ... ok
+```
+
+Exact red and restored-green command:
+
+```sh
+env TAU_TRACER_INFERENCE=1 TAU_TRACER_INFERENCE_PHASE=session-end TAU_TRACER_SESSION_END='fences signature writer behind' /var/tmp/twr17-session-end-20261024/wasm cargo run --locked -p tracer -- run dist/served dist/tracer
+```
+
+Red, exit 1, `I43-red-1.log`:
+
+```text
+   FAIL session end fences signature writer behind end snapshot: session-end refusal replaces admission or collected answer; no connection or signature refusal is committed
+FAIL: tracer cases failed: session end fences signature writer behind end snapshot
+```
+
+Restored green, exit 0, `I43-green-1.log`:
+
+```text
+   PASS session end fences signature writer behind end snapshot
+TRACER PASS
+```
+
+**I44** — Restore the sent-read-keeps-its-own-error branch. Both host report shapes and both sent browser reads must instead name session end. This replaces I37 and the reason part of I38. Files: `src/harness/job_read.rs`.
+
+Exact red and restored-green command:
+
+```sh
+/var/tmp/twr17-session-end-20261024/host test --locked sent_read_names_session_end -- --nocapture
+```
+
+Red, exit 101, `I44-red-0.log`:
+
+```text
+thread 'harness::job_read::tests::sent_read_names_session_end_in_collection_report' (2862190) panicked at src/harness/job_read.rs:66:9:
+assertion `left == right` failed
+  left: String("job record read: missing exit status")
+ right: "sessions ended while reading record"
+thread 'harness::job_read::tests::sent_read_names_session_end_in_held_report' (2862191) panicked at src/harness/job_read.rs:66:9:
+assertion `left == right` failed
+  left: String("job record read: missing exit status")
+ right: "sessions ended while reading record"
+test harness::job_read::tests::sent_read_names_session_end_in_held_report ... FAILED
+test harness::job_read::tests::sent_read_names_session_end_in_collection_report ... FAILED
+```
+
+Restored green, exit 0, `I44-green-0.log`:
+
+```text
+test harness::job_read::tests::unsent_read_names_session_end_in_collection_and_held_reports ... ok
+test harness::job_read::tests::sent_read_names_session_end_in_collection_report ... ok
+test harness::job_read::tests::sent_read_names_session_end_in_held_report ... ok
+```
+
+Exact red and restored-green command:
+
+```sh
+env -u TAU_TRACER_SESSION_END TAU_TRACER_INFERENCE=1 TAU_TRACER_INFERENCE_PHASE=sent-reads /var/tmp/twr17-session-end-20261024/wasm cargo run --locked -p tracer -- run dist/served dist/tracer
+```
+
+Red, exit 1, `I44-red-1.log`:
+
+```text
+   FAIL session end cancels a sent held read: sent read names session end and preserves its send history
+   FAIL session end cancels a sent collection read: sent read names session end and preserves its send history
+FAIL: tracer cases failed: session end cancels a sent held read, session end cancels a sent collection read
+```
+
+Restored green, exit 0, `I44-green-1.log`:
+
+```text
+   PASS session end cancels a sent held read
+   PASS session end cancels a sent collection read
+TRACER PASS
+```
+
+**I45** — Omit mark_sent after successfully queuing exec. Both sent-read browser shapes then claim the read was unsent. This replaces the send-history part of I37/I38. Files: `src/harness/run.rs`.
+
+Exact red and restored-green command:
+
+```sh
+env -u TAU_TRACER_SESSION_END TAU_TRACER_INFERENCE=1 TAU_TRACER_INFERENCE_PHASE=sent-reads /var/tmp/twr17-session-end-20261024/wasm cargo run --locked -p tracer -- run dist/served dist/tracer
+```
+
+Red, exit 1, `I45-red-0.log`:
+
+```text
+   FAIL session end cancels a sent held read: sent read names session end and preserves its send history
+   FAIL session end cancels a sent collection read: sent read names session end and preserves its send history
+FAIL: tracer cases failed: session end cancels a sent held read, session end cancels a sent collection read
+```
+
+Restored green, exit 0, `I45-green-0.log`:
+
+```text
+   PASS session end cancels a sent held read
+   PASS session end cancels a sent collection read
+TRACER PASS
+```
+
+**I46** — Remove only StoreJournal::connection_session's ENDING fence. Queue approved unbound admission and bound collectable-call admission ahead of the end snapshot but run them after ENDING, while the store flag is still unset. Files: `src/lib.rs`.
+
+Exact red and restored-green command:
+
+```sh
+env TAU_TRACER_INFERENCE=1 TAU_TRACER_INFERENCE_PHASE=session-end TAU_TRACER_SESSION_END='fences unbound writer ahead,fences collection writer ahead' /var/tmp/twr17-session-end-20261024/wasm cargo run --locked -p tracer -- run dist/served dist/tracer
+```
+
+Red, exit 1, `I46-red-0.log`:
+
+```text
+   FAIL session end fences unbound writer ahead of end snapshot: session-end refusal replaces admission or collected answer; no connection or signature refusal is committed
+   FAIL session end fences collection writer ahead of end snapshot: session-end refusal replaces admission or collected answer
+FAIL: tracer cases failed: session end fences unbound writer ahead of end snapshot, session end fences collection writer ahead of end snapshot
+```
+
+Restored green, exit 0, `I46-green-0.log`:
+
+```text
+   PASS session end fences unbound writer ahead of end snapshot
+   PASS session end fences collection writer ahead of end snapshot
+TRACER PASS
+```
+
+**I47** — Remove only StoreJournal::check_signature's ENDING fence. Queue a lowering form on an unpinned installation ahead of the end snapshot but run it after ENDING, while the store flag is still unset. Files: `src/lib.rs`.
+
+Exact red and restored-green command:
+
+```sh
+env TAU_TRACER_INFERENCE=1 TAU_TRACER_INFERENCE_PHASE=session-end TAU_TRACER_SESSION_END='fences signature writer ahead' /var/tmp/twr17-session-end-20261024/wasm cargo run --locked -p tracer -- run dist/served dist/tracer
+```
+
+Red, exit 1, `I47-red-0.log`:
+
+```text
+   FAIL session end fences signature writer ahead of end snapshot: session-end refusal replaces admission or collected answer; no connection or signature refusal is committed
+FAIL: tracer cases failed: session end fences signature writer ahead of end snapshot
+```
+
+Restored green, exit 0, `I47-green-0.log`:
+
+```text
+   PASS session end fences signature writer ahead of end snapshot
+TRACER PASS
+```
+
+**I48** — Remove the final completion-body fence. Exercise finish ahead of the end snapshot and a body already built before the last writer wait; both terminal records remain committed. Files: `src/harness/inference.rs`.
+
+Exact red and restored-green command:
+
+```sh
+env TAU_TRACER_INFERENCE=1 TAU_TRACER_INFERENCE_PHASE=session-end TAU_TRACER_SESSION_END='withholds completion body' /var/tmp/twr17-session-end-20261024/wasm cargo run --locked -p tracer -- run dist/served dist/tracer
+```
+
+Red, exit 1, `I48-red-0.log`:
+
+```text
+   FAIL session end withholds completion body at finish_writer: body absent with session-end refusal and finished call metadata
+   FAIL session end withholds completion body at response_writer: body absent with session-end refusal and finished call metadata
+FAIL: tracer cases failed: session end withholds completion body at finish_writer, session end withholds completion body at response_writer
+```
+
+Restored green, exit 0, `I48-green-0.log`:
+
+```text
+   PASS session end withholds completion body at finish_writer
+   PASS session end withholds completion body at response_writer
+TRACER PASS
+```
+
+**I49** — Disable registered-socket close on Stop firing and on already stopped registration. Observe every first-key-exchange and rekey stall, suspended held/collection evidence appends, all three rekey-stalled evidence appends, and a suspended command intent before releasing its append. Files: `src/harness/wait.rs`.
+
+Exact red and restored-green command:
+
+```sh
+env TAU_TRACER_INFERENCE=1 TAU_TRACER_INFERENCE_PHASE=session-end TAU_TRACER_SESSION_END='at kex,-rekey,append with rekey,completes begun held,completes begun collection' /var/tmp/twr17-session-end-20261024/wasm cargo run --locked -p tracer -- run dist/served dist/tracer
+```
+
+Red, exit 1, `I49-red-0.log`:
+
+```text
+   FAIL session end closes command at kex: relay observes browser socket close during end step; every dialed sshd observes connection end
+   FAIL session end closes command at auth-rekey: relay observes browser socket close during end step; every dialed sshd observes connection end
+   FAIL session end closes command at connected-rekey: relay observes browser socket close during end step; every dialed sshd observes connection end
+   FAIL session end closes held at kex: relay observes browser socket close during end step; every dialed sshd observes connection end
+   FAIL session end closes held at auth-rekey: relay observes browser socket close during end step; every dialed sshd observes connection end
+   FAIL session end closes held at connected-rekey: relay observes browser socket close during end step; every dialed sshd observes connection end
+   FAIL session end closes collection at kex: relay observes browser socket close during end step; every dialed sshd observes connection end
+   FAIL session end closes collection at auth-rekey: relay observes browser socket close during end step; every dialed sshd observes connection end
+   FAIL session end closes collection at connected-rekey: relay observes browser socket close during end step; every dialed sshd observes connection end
+   FAIL session end closes command during begun evidence append with rekey stalled: relay observes browser socket close during end step; every dialed sshd observes connection end
+   FAIL session end closes held during begun evidence append with rekey stalled: relay observes browser socket close during end step; every dialed sshd observes connection end
+   FAIL session end closes collection during begun evidence append with rekey stalled: relay observes browser socket close during end step; every dialed sshd observes connection end
+   FAIL session end completes begun held evidence append: relay observes browser socket close during end step; every dialed sshd observes connection end
+   FAIL session end completes begun collection evidence append: relay observes browser socket close during end step; every dialed sshd observes connection end
+FAIL: tracer cases failed: session end closes command at kex, session end closes command at auth-rekey, session end closes command at connected-rekey, session end closes held at kex, session end closes held at auth-rekey, session end closes held at connected-rekey, session end closes collection at kex, session end closes collection at auth-rekey, session end closes collection at connected-rekey, session end closes command during begun evidence append with rekey stalled, session end closes held during begun evidence append with rekey stalled, session end closes collection during begun evidence append with rekey stalled, session end completes begun held evidence append, session end completes begun collection evidence append
+```
+
+Restored green, exit 0, `I49-green-0.log`:
+
+```text
+   PASS session end closes command at kex
+   PASS session end closes command at auth-rekey
+   PASS session end closes command at connected-rekey
+   PASS session end closes held at kex
+   PASS session end closes held at auth-rekey
+   PASS session end closes held at connected-rekey
+   PASS session end closes collection at kex
+   PASS session end closes collection at auth-rekey
+   PASS session end closes collection at connected-rekey
+   PASS session end closes command during begun evidence append with rekey stalled
+   PASS session end closes held during begun evidence append with rekey stalled
+   PASS session end closes collection during begun evidence append with rekey stalled
+   PASS session end completes begun held evidence append
+   PASS session end completes begun collection evidence append
+TRACER PASS
+```
+
+Exact red and restored-green command:
+
+```sh
+env -u TAU_TRACER_SESSION_END TAU_TRACER_INFERENCE=1 TAU_TRACER_INFERENCE_PHASE=command-intent /var/tmp/twr17-session-end-20261024/wasm cargo run --locked -p tracer -- run dist/served dist/tracer
+```
+
+Red, exit 1, `I49-red-1.log`:
+
+```text
+   FAIL session end during box-plane intent commit prevents exec: relay observes browser socket close during end step; every dialed sshd observes connection end
+FAIL: tracer cases failed: session end during box-plane intent commit prevents exec
+```
+
+Restored green, exit 0, `I49-green-1.log`:
+
+```text
+   PASS session end during box-plane intent commit prevents exec
+TRACER PASS
+```
+
+**I50** — Remove run_command's stop wrappers around connect, channel opening and exec_record, retaining socket close and the evidence fence. Observe each relay/SSH handshake hold and a sent command; the report must name session end and preserve transmission history. Files: `src/harness/run.rs`.
+
+Exact red and restored-green command:
+
+```sh
+env TAU_TRACER_INFERENCE=1 TAU_TRACER_INFERENCE_PHASE=session-end TAU_TRACER_SESSION_END='closes command at challenge,closes command at verdict,closes command at identification,closes command at auth,running command' /var/tmp/twr17-session-end-20261024/wasm cargo run --locked -p tracer -- run dist/served dist/tracer
+```
+
+Red, exit 1, `I50-red-0.log`:
+
+```text
+   FAIL session end closes command at challenge: command stopped before intent reports session-end journal refusal
+   FAIL session end closes command at verdict: command stopped before intent reports session-end journal refusal
+   FAIL session end closes command at identification: command stopped before intent reports session-end journal refusal
+   FAIL session end closes command at auth: command stopped before intent reports session-end journal refusal
+   FAIL session end closes command at auth-rekey: command stopped before intent reports session-end journal refusal
+   FAIL session end closes a running command without DISCONNECT and preserves unresolved replay: sent command reports unresolved with session end and its send history
+FAIL: tracer cases failed: session end closes command at challenge, session end closes command at verdict, session end closes command at identification, session end closes command at auth, session end closes command at auth-rekey, session end closes a running command without DISCONNECT and preserves unresolved replay
+```
+
+Restored green, exit 0, `I50-green-0.log`:
+
+```text
+   PASS session end closes command at challenge
+   PASS session end closes command at verdict
+   PASS session end closes command at identification
+   PASS session end closes command at auth
+   PASS session end closes command at auth-rekey
+   PASS session end closes a running command without DISCONNECT and preserves unresolved replay
+TRACER PASS
+```
+
+**I51** — Remove collection's stop wrapper around channel opening/read and unregister its socket before the loop. A sent collection read no longer closes or answers during the held end step. The held-read case remains a control in the same command. Files: `src/harness/run.rs`.
+
+Exact red and restored-green command:
+
+```sh
+env -u TAU_TRACER_SESSION_END TAU_TRACER_INFERENCE=1 TAU_TRACER_INFERENCE_PHASE=sent-reads /var/tmp/twr17-session-end-20261024/wasm cargo run --locked -p tracer -- run dist/served dist/tracer
+```
+
+Red, exit 1, `I51-red-0.log`:
+
+```text
+== session end cancels a sent held read
+   [ok] sshd received the read exec while the detached command is still alive
+== session end cancels a sent collection read
+   [ok] sshd received the read exec while the detached command is still alive
+   [FAILED] relay observes browser socket close during end step
+   [FAILED] every dialed sshd observes connection end
+   sent read reported: {"read_wait_expired":true}
+FAIL: the run stopped after 4 cases: sent read report has no calls; cases failed:
+```
+
+Restored green, exit 0, `I51-green-0.log`:
+
+```text
+   PASS session end cancels a sent held read
+   PASS session end cancels a sent collection read
+TRACER PASS
+```
+
+**I52** — Use the unconditional command job_evidence append instead of job_evidence_unless_stopped, retaining the tracer hold point. Its evidence acquisition follows the end snapshot in the writer queue. Files: `src/harness/run.rs`.
+
+Exact red and restored-green command:
+
+```sh
+env TAU_TRACER_INFERENCE=1 TAU_TRACER_INFERENCE_PHASE=session-end TAU_TRACER_SESSION_END='fences queued command evidence' /var/tmp/twr17-session-end-20261024/wasm cargo run --locked -p tracer -- run dist/served dist/tracer
+```
+
+Red, exit 1, `I52-red-0.log`:
+
+```text
+   FAIL session end fences queued command evidence append: begun append completes whole; queued append commits nothing; uncommitted job record is reported as unresolved evidence; uncommitted evidence leaves command unresolved after unlock
+FAIL: tracer cases failed: session end fences queued command evidence append
+```
+
+Restored green, exit 0, `I52-green-0.log`:
+
+```text
+   PASS session end fences queued command evidence append
+TRACER PASS
+```
+
+**I53 — baseline controls.** Restore the `8dbfcee` production bodies in
+`src/inference.rs`, `src/store.rs`, `src/lib.rs`, `src/harness/job_read.rs`,
+`src/harness/run.rs`, `src/harness/wait.rs` and `src/harness/inference.rs`. Retain only
+tracer hold points, the tracer cold-cache helper and the probe argument arity needed to run
+the same cases. No session-end production fix remains. After these controls, restore and
+compare all seven saved files byte for byte and run the identical commands again.
+The authentication and command evidence controls have no rekey or pending data.
+
+Exact baseline and restored command:
+
+```sh
+/var/tmp/twr17-session-end-20261024/host test --locked readable_completion_after_session_end_commits_terminal_without_handback -- --nocapture
+```
+
+Baseline green, exit 0, `I53-baseline-0.log`:
+
+```text
+test store::inference::tests::readable_completion_after_session_end_commits_terminal_without_handback ... ok
+```
+
+Restored green, exit 0, `I53-green-0.log`:
+
+```text
+test store::inference::tests::readable_completion_after_session_end_commits_terminal_without_handback ... ok
+```
+
+Exact baseline and restored command:
+
+```sh
+/var/tmp/twr17-session-end-20261024/host test --locked non_success_account_read_sends_no_mint_control -- --nocapture
+```
+
+Baseline green, exit 0, `I53-baseline-1.log`:
+
+```text
+test store::inference::tests::non_success_account_read_sends_no_mint_control ... ok
+```
+
+Restored green, exit 0, `I53-green-1.log`:
+
+```text
+test store::inference::tests::non_success_account_read_sends_no_mint_control ... ok
+```
+
+Exact baseline and restored command:
+
+```sh
+/var/tmp/twr17-session-end-20261024/host test --locked revoke_probe_still_sends -- --nocapture
+```
+
+Baseline green, exit 0, `I53-baseline-2.log`:
+
+```text
+test store::inference::tests::revoke_probe_still_sends_when_route_await_ends_sessions ... ok
+```
+
+Restored green, exit 0, `I53-green-2.log`:
+
+```text
+test store::inference::tests::revoke_probe_still_sends_when_route_await_ends_sessions ... ok
+```
+
+Exact baseline and restored command:
+
+```sh
+env TAU_TRACER_INFERENCE=1 TAU_TRACER_INFERENCE_PHASE=session-end TAU_TRACER_SESSION_END='=session end closes held at challenge,=session end closes held at verdict,=session end closes held at identification,=session end closes held at auth,=session end closes collection at challenge,=session end closes collection at verdict,=session end closes collection at identification,=session end closes collection at auth,=session end completes begun command evidence append,=session end fences bound writer ahead of end snapshot,=revoke cold probe control during session end' /var/tmp/twr17-session-end-20261024/wasm cargo run --locked -p tracer -- run dist/served dist/tracer
+```
+
+Baseline green, exit 0, `I53-baseline-3.log`:
+
+```text
+   PASS revoke cold probe control during session end
+   PASS session end closes held at challenge
+   PASS session end closes held at verdict
+   PASS session end closes held at identification
+   PASS session end closes held at auth
+   PASS session end closes collection at challenge
+   PASS session end closes collection at verdict
+   PASS session end closes collection at identification
+   PASS session end closes collection at auth
+   PASS session end fences bound writer ahead of end snapshot
+   PASS session end completes begun command evidence append
+TRACER PASS
+```
+
+Restored green, exit 0, `I53-green-3.log`:
+
+```text
+   PASS revoke cold probe control during session end
+   PASS session end closes held at challenge
+   PASS session end closes held at verdict
+   PASS session end closes held at identification
+   PASS session end closes held at auth
+   PASS session end closes collection at challenge
+   PASS session end closes collection at verdict
+   PASS session end closes collection at identification
+   PASS session end closes collection at auth
+   PASS session end fences bound writer ahead of end snapshot
+   PASS session end completes begun command evidence append
+TRACER PASS
+```
+
 ### Procured inference final verification
 
 The final tree passed on 2026-10-24 with Rust 1.97.1, wasm-bindgen 0.2.127 and rooted
-Chromium 154. Every command ran in the foreground, unpiped, with its output redirected to a
-log and its exit code inspected. The I38 host and wasm wrappers above supply the exact environments.
+Chromium 154. Every command ran in the foreground, unpiped, with stdout/stderr redirected to
+its log under `/var/tmp/twr17-session-end-20261024/` and its exit status inspected. The host
+and wasm wrappers are defined in I40–I53 above. The source hashes were unchanged throughout
+all twelve commands and are retained in `source-digests.json` beside those logs.
 
-| Gate | Command (wrapper defined above) | Exit |
+| Gate | Exact command | Exit |
 |---|---|---|
-| Format | `host fmt --check` | 0 |
-| Host clippy | `host clippy --locked --all-targets -- -D warnings` | 0 |
-| Host tests, pin and bundle checks | `host test --locked` | 0 |
+| Format | `/var/tmp/twr17-session-end-20261024/host fmt --check` | 0 |
+| Host clippy | `/var/tmp/twr17-session-end-20261024/host clippy --locked --all-targets -- -D warnings` | 0 |
+| Host tests, pin and bundle checks | `/var/tmp/twr17-session-end-20261024/host test --locked` | 0 |
 | Disk check | `python3 spec/prototypes/spec-checks/check-install-disks.py` | 0 |
-| Disk baseline negative control | `python3 spec/prototypes/spec-checks/check-install-disks.py --baseline` | 1, required |
-| Served wasm clippy | `wasm cargo clippy --locked -p tau-web --target wasm32-unknown-unknown --all-targets -- -D warnings` | 0 |
-| Tracer wasm clippy | `wasm cargo clippy --locked -p tau-web --target wasm32-unknown-unknown --all-targets --features tracer -- -D warnings` | 0 |
-| Dependency boundary | `wasm bash scripts/check-adr-0024.sh` | 0 |
-| Served build | `wasm bash scripts/build-web.sh served` | 0 |
-| Served absence | `host run --locked -p tracer -- check-absence dist/served` | 0 |
-| Served CSP | `host run --locked -p tracer -- check-csp dist/served` | 0 |
-| Full browser gate, rebuilding both directories | command below | 0 |
+| Disk baseline negative control | `python3 spec/prototypes/spec-checks/check-install-disks.py --baseline` | 1, required nonzero |
+| Served wasm clippy | `/var/tmp/twr17-session-end-20261024/wasm cargo clippy --locked -p tau-web --target wasm32-unknown-unknown --all-targets -- -D warnings` | 0 |
+| Tracer wasm clippy | `/var/tmp/twr17-session-end-20261024/wasm cargo clippy --locked -p tau-web --target wasm32-unknown-unknown --all-targets --features tracer -- -D warnings` | 0 |
+| Dependency boundary | `/var/tmp/twr17-session-end-20261024/wasm bash scripts/check-adr-0024.sh` | 0 |
+| Served build | `/var/tmp/twr17-session-end-20261024/wasm bash scripts/build-web.sh served` | 0 |
+| Served absence | `/var/tmp/twr17-session-end-20261024/host run --locked -p tracer -- check-absence dist/served` | 0 |
+| Served CSP | `/var/tmp/twr17-session-end-20261024/host run --locked -p tracer -- check-csp dist/served` | 0 |
+| Full browser gate, rebuilding both directories | `env -u TAU_TRACER_HOLD_CASE -u TAU_TRACER_INFERENCE -u TAU_TRACER_INFERENCE_END -u TAU_TRACER_INFERENCE_PHASE -u TAU_TRACER_MODE_CASE -u TAU_TRACER_SEED_CASE -u TAU_TRACER_SESSION_END -u TAU_TRACER_SETUP_CASE /var/tmp/twr17-session-end-20261024/wasm bash scripts/tracer.sh` | 0 |
 
-The host suite passed 212 library, 4 bundle, 69 tracer and 3 doc tests. Absence inspected
-5 served files against 229 needles. The full browser command was:
+The host suite passed 218 library, 4 bundle, 69 tracer and 3 doc tests. Absence inspected
+5 served files against 245 needles. The full run, with every `TAU_TRACER_*` selector unset,
+printed `== summary (171 cases)` and `TRACER PASS`, exiting 0. It includes the 41 additional
+session-end cases and the rewritten sent-read cases. All companion comparison tests passed;
+the witness files were not edited.
+
+`spec/bundle/cors-probe.sh`: **withheld by the no-live-vendor fence**. No live-account check
+is claimed. The existing issue-tracker bytes were preserved; twr-ggw.83 and twr-ggw.84 were
+left as filed.
+
+The final README consistency command was:
 
 ```sh
-env -u TAU_TRACER_SETUP_CASE -u TAU_TRACER_SEED_CASE -u TAU_TRACER_HOLD_CASE -u TAU_TRACER_MODE_CASE -u TAU_TRACER_INFERENCE -u TAU_TRACER_INFERENCE_PHASE -u TAU_TRACER_INFERENCE_END /var/tmp/twr17-k-fixes.I4mWTYPE/wasm bash scripts/tracer.sh
+python3 /var/tmp/twr17-session-end-20261024/check-readme.py
 ```
 
-It printed `== summary (130 cases)` and `TRACER PASS`, exiting 0. This is I21's restored
-green and the final green for every earlier mutation. All companion comparison outcomes
-remain unchanged; the dispatch witness file was not edited.
-
-`spec/bundle/cors-probe.sh`: **withheld by the no-live-vendor fence**. No live-account
-check is claimed. No new follow-up was needed; twr-ggw.83 and twr-ggw.84 are unchanged.
-
-The final README consistency check, `python3 /var/tmp/twr17-k-fixes.I4mWTYPE/check-readme.py`,
-compares both documented browser counts and the final summary with the printed PASS count,
-checks the host counts, and compares the protected source and beads bytes with their saved
-contents. It exits 0.
+It exited 0, matching both documented browser counts and the final summary to the 171 printed
+PASS lines, the host totals, 245 absence needles and all 18 red/green command pairs. It also
+checked the final source hashes, restored production bytes, preserved issue-tracker bytes,
+the clean specification worktree and the required branch.
 
 **Initial README consistency control (E10).** Exact command:
 

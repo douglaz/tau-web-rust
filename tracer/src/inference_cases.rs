@@ -1,4 +1,6 @@
-//! Browser evidence uses real fetch against the loopback fixture, then searches its key needles.
+#[path = "session_end_cases.rs"]
+mod session_end_cases;
+// Browser evidence uses real fetch against the loopback fixture, then searches its key needles.
 use super::*;
 use std::sync::Arc;
 use tau_web::jobs;
@@ -193,6 +195,7 @@ async fn command_during_end(
     infer(run, worker).await?;
     let mut case = Case::new("session end during box-plane intent commit prevents exec");
     let before = run.seen.lock().unwrap().ssh_exec.len();
+    let log_before = run.seen.lock().unwrap().relay_log.len();
     run.aggregator.state.lock().unwrap().hold_revoke = true;
     module(run, worker, "self.moveAcquired=new Promise(ready=>m.test_hold_move(new Promise(release=>self.releaseMove=release),ready));return true;").await?;
     let request = json!({"machine":"fixture", "relay":run.relay.url, "host":"127.0.0.1",
@@ -204,6 +207,7 @@ async fn command_during_end(
         )
         .await?;
     module(run, worker, "await self.moveAcquired;self.heldEnd=m.end_sessions();await new Promise(r=>setTimeout(r,0));return true;").await?;
+    session_end_cases::closed(run, log_before, &mut case).await;
     let report = module(
         run,
         worker,
@@ -348,10 +352,22 @@ async fn sent_job_read_during_end(
         )
         .await?;
         *worker = new;
-        // This fixture has no inference account credential or session inference key.
+        restart(run, tab, worker).await?;
+        module(
+            run,
+            worker,
+            &format!(
+                "return await m.test_inference_account(new TextEncoder().encode({}));",
+                json!(run.aggregator.state.lock().unwrap().account)
+            ),
+        )
+        .await?;
+        infer(run, worker).await?;
+        run.aggregator.state.lock().unwrap().hold_revoke = true;
         let before = run.inspect(worker).await?;
         let execs = run.seen.lock().unwrap().ssh_exec.len();
         fresh_pace(run.relay);
+        let log_before = run.seen.lock().unwrap().relay_log.len();
         let expression = run_expression(&request);
         let expression = if collect {
             expression.replace("module.run_command(", "module.collect_jobs(")
@@ -373,22 +389,21 @@ async fn sent_job_read_during_end(
             return Err("sshd did not receive the job-read exec before session end".into());
         }
         let mut case = Case::new(if collect {
-            "session end preserves a sent collection read's error"
+            "session end cancels a sent collection read"
         } else {
-            "session end preserves a sent held read's stop reason"
+            "session end cancels a sent held read"
         });
         case.check(
             "sshd received the read exec while the detached command is still alive",
             machine::alive(run.sshd.machine.observe()[&job].pid),
         );
-        module(run, worker, "await m.end_sessions();return true;").await?;
-        if collect {
-            // Collection keeps awaiting its sent exec. Release the real read with a bad
-            // exit record only after session end, so its own error must survive the race.
-            std::fs::write(run.sshd.machine.path(&job, "exit"), b"invalid\n")
-                .map_err(|e| e.to_string())?;
-        }
-        let report = module(run, worker, "return await self.sentReadEnd;").await?;
+        module(run, worker, "self.sentEndDone=false;self.heldEnd=m.end_sessions().then(()=>self.sentEndDone=true);return true;").await?;
+        session_end_cases::closed(run, log_before, &mut case).await;
+        case.check(
+            "end step remains open",
+            module(run, worker, "return self.sentEndDone;").await? == false,
+        );
+        let report = module(run, worker, "return await Promise.race([self.sentReadEnd,new Promise(r=>setTimeout(()=>r({read_wait_expired:true}),3000))]);").await?;
         println!("   sent read reported: {report}");
         let reports = report["outcome"][if collect { "collected" } else { "calls" }]
             .as_array()
@@ -398,21 +413,15 @@ async fn sent_job_read_during_end(
             .find(|r| r["call"] == call)
             .ok_or("sent read report lost its call")?;
         case.check(
-            "sent read retains its own outcome and reason after session end",
-            if collect {
-                read["failed"] == true
-                    && read.get("not_read").is_none()
-                    && read["job"] == job
-                    && read["why"].as_str().is_some_and(|why| {
-                        why.contains("job read ended without a complete record")
-                            && why.contains("cannot read complete job record file")
-                    })
-            } else {
-                report["outcome"]["held"] == true
-                    && read["not_read"] == true
-                    && read.get("failed").is_none()
-                    && read["why"] == "stopped while reading record"
-            },
+            "sent read names session end and preserves its send history",
+            read["why"] == "sessions ended while reading record"
+                && if collect {
+                    read["failed"] == true && read.get("not_read").is_none() && read["job"] == job
+                } else {
+                    report["outcome"]["held"] == true
+                        && read["not_read"] == true
+                        && read.get("failed").is_none()
+                },
         );
         let after = run.inspect(worker).await?;
         case.check(
@@ -422,6 +431,8 @@ async fn sent_job_read_during_end(
                 && after["calls"] == before["calls"],
         );
         run.sshd.machine.reboot();
+        run.aggregator.state.lock().unwrap().hold_revoke = false;
+        *worker = run.reload(tab, worker).await?;
         cases.push(case);
     }
     run.put(tab, &saved).await?;
@@ -727,6 +738,15 @@ pub(super) async fn run(
     cases.push(case);
 
     let phase = std::env::var("TAU_TRACER_INFERENCE_PHASE").unwrap_or_default();
+    if phase == "sent-reads" {
+        return sent_job_read_during_end(run, tab, worker, cases).await;
+    }
+    if phase == "command-intent" {
+        return command_during_end(run, tab, worker, cases).await;
+    }
+    if phase == "session-end" {
+        return session_end_cases::run(run, tab, worker, cases).await;
+    }
     let selected_end = std::env::var("TAU_TRACER_INFERENCE_END").ok();
     if phase == "core" {
         return Ok(());
@@ -735,6 +755,7 @@ pub(super) async fn run(
         command_during_end(run, tab, worker, cases).await?;
         job_read_during_end(run, tab, worker, cases).await?;
         sent_job_read_during_end(run, tab, worker, cases).await?;
+        session_end_cases::run(run, tab, worker, cases).await?;
     }
     if phase == "dispatch" {
         return Ok(());

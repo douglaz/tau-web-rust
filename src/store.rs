@@ -823,6 +823,9 @@ impl<S: Storage> Store<S> {
         &mut self,
         machine: &str,
     ) -> Result<Rc<Session>, AdmissionRefusal> {
+        if self.inference.ended {
+            return Err(AdmissionRefusal::Journal("sessions ended".into()));
+        }
         if !self.dispatch.approved_entries.contains_key(machine) {
             return Err(AdmissionRefusal::NoEntry);
         }
@@ -1518,6 +1521,9 @@ impl<S: Storage> Journal for Store<S> {
         machine: &str,
         command: &[u8],
     ) -> Result<(), AppendRefusal> {
+        if self.inference.ended {
+            return Err(AppendRefusal::Storage("sessions ended".into()));
+        }
         if self.installation_unpinned(machine)
             && let Some(form) = crate::modes::lowering(command)
         {

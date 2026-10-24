@@ -14,17 +14,25 @@ impl Read {
         self.sent.set(true);
     }
 
+    pub fn sent(&self) -> bool {
+        self.sent.get()
+    }
+
     pub fn failure(&self, call: u64, job: Option<&str>, ending: bool, why: &str) -> Value {
         let mut report = json!({"call":call});
         if let Some(job) = job {
             report["job"] = json!(job);
         }
-        if !self.sent.get() && ending {
+        if !self.sent() && ending {
             report["not_read"] = json!(true);
             report["why"] = json!("sessions ended before record was read");
         } else {
             report[if job.is_some() { "failed" } else { "not_read" }] = json!(true);
-            report["why"] = json!(why);
+            report["why"] = json!(if ending {
+                "sessions ended while reading record"
+            } else {
+                why
+            });
         }
         report
     }
@@ -35,16 +43,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sent_read_error_survives_session_end_in_collection_report() {
-        sent_read_error_survives_session_end(Some("fixture-job"));
+    fn sent_read_names_session_end_in_collection_report() {
+        sent_read_names_session_end(Some("fixture-job"));
     }
 
     #[test]
-    fn sent_read_error_survives_session_end_in_held_report() {
-        sent_read_error_survives_session_end(None);
+    fn sent_read_names_session_end_in_held_report() {
+        sent_read_names_session_end(None);
     }
 
-    fn sent_read_error_survives_session_end(job: Option<&str>) {
+    fn sent_read_names_session_end(job: Option<&str>) {
         let read = Read::default();
         let ending = Cell::new(false);
         read.mark_sent();
@@ -59,7 +67,11 @@ mod tests {
             assert_eq!(report["not_read"], true, "{report}");
             assert!(report.get("failed").is_none(), "{report}");
         }
-        assert_eq!(report["why"], "job record read: missing exit status");
+        assert_eq!(report["why"], "sessions ended while reading record");
+        assert_eq!(
+            read.failure(9, job, false, "read error")["why"],
+            "read error"
+        );
         assert_eq!(report.get("job").cloned(), job.map(|j| json!(j)));
     }
 

@@ -71,6 +71,19 @@ impl Drop for DispatchResult {
 pub struct Stop {
     stopped: Cell<bool>,
     ready: Notify,
+    sockets: RefCell<BTreeMap<u64, web_sys::WebSocket>>,
+    next_socket: Cell<u64>,
+}
+
+pub(super) struct SocketRegistration {
+    stop: Rc<Stop>,
+    id: u64,
+}
+
+impl Drop for SocketRegistration {
+    fn drop(&mut self) {
+        self.stop.sockets.borrow_mut().remove(&self.id);
+    }
 }
 
 impl Stop {
@@ -78,7 +91,7 @@ impl Stop {
         Self::register(Some(machine))
     }
 
-    /// Collection evidence is stopped by session end, independently of held-request stops.
+    /// Dispatch and collection stop at session end, independently of held-request stops.
     pub(super) fn collection() -> Rc<Self> {
         Self::register(None)
     }
@@ -91,6 +104,28 @@ impl Stop {
             waits.push((machine.map(str::to_owned), Rc::downgrade(&stop)));
         });
         stop
+    }
+
+    pub(super) fn socket(self: &Rc<Self>, socket: web_sys::WebSocket) -> SocketRegistration {
+        let id = self.next_socket.get();
+        self.next_socket.set(id + 1);
+        if self.stopped() {
+            let _ = socket.close();
+        }
+        self.sockets.borrow_mut().insert(id, socket);
+        SocketRegistration {
+            stop: self.clone(),
+            id,
+        }
+    }
+
+    fn fire(&self) -> bool {
+        let changed = !self.stopped.replace(true);
+        self.ready.notify_waiters();
+        for socket in self.sockets.borrow().values() {
+            let _ = socket.close();
+        }
+        changed
     }
 
     pub fn stopped(&self) -> bool {
@@ -115,8 +150,7 @@ pub(super) fn stop_all() {
     WAITS.with(|waits| {
         for (_, stop) in waits.borrow().iter() {
             if let Some(stop) = stop.upgrade() {
-                stop.stopped.set(true);
-                stop.ready.notify_waiters();
+                stop.fire();
             }
         }
     });
@@ -133,11 +167,7 @@ pub fn stop_waits(machine: &str) -> usize {
                     .then(|| stop.upgrade())
                     .flatten()
             })
-            .filter(|stop| {
-                let changed = !stop.stopped.replace(true);
-                stop.ready.notify_waiters();
-                changed
-            })
+            .filter(|stop| stop.fire())
             .count()
     })
 }

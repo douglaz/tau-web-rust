@@ -206,6 +206,11 @@ impl<S: Storage> Store<S> {
             Err("inference intent names no earlier exposure".into())
         }
     }
+    #[cfg(all(feature = "tracer", target_arch = "wasm32"))]
+    pub(crate) fn test_cold_inference_route(&mut self) {
+        self.inference.routes.clear();
+    }
+
     fn top_up_off(&self, session: &str) -> bool {
         self.inference.calls.values().rev()
             .find(|c| matches!(&c.intent, InferenceIntent::AccountRead { session: s, .. } if s == session))

@@ -167,6 +167,21 @@ struct PinCheck {
 impl client::Handler for PinCheck {
     type Error = russh::Error;
 
+    #[cfg(feature = "tracer")]
+    async fn auth_banner(
+        &mut self,
+        _banner: &str,
+        session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        if let Some(released) = crate::testonly::session_point_receiver("session_authentication") {
+            released.await.expect("fixture authentication release");
+        }
+        if crate::testonly::rekey_session("session_authentication") {
+            session.initiate_rekey()?;
+        }
+        Ok(())
+    }
+
     async fn check_server_key(
         &mut self,
         key: &PublicKeyOrCertificate,
@@ -214,18 +229,23 @@ pub async fn run_command(
     if !jobs::launch_fits(bytes) {
         return Err(Refusal::LaunchTooLong { bytes });
     }
-    let (ssh, pinned, host_key) = connect(
-        pins,
-        journal,
-        &session,
-        target,
-        #[cfg(feature = "tracer")]
-        tamper_auth,
-    )
-    .await?;
-    let mut channel = ssh
-        .channel_open_session()
+    let stop = wait::Stop::collection();
+    let (ssh, pinned, host_key, _socket) = stop
+        .until(connect(
+            pins,
+            journal,
+            &session,
+            target,
+            &stop,
+            #[cfg(feature = "tracer")]
+            tamper_auth,
+        ))
         .await
+        .ok_or_else(|| Refusal::Journal("sessions ended".into()))??;
+    let mut channel = stop
+        .until(ssh.channel_open_session())
+        .await
+        .ok_or_else(|| Refusal::Journal("sessions ended".into()))?
         .map_err(|e| Refusal::Failed(format!("session channel: {e}")))?;
 
     // ARC-8, STA-4: the record is appended immediately before the bytes leave, and a failed
@@ -288,10 +308,25 @@ pub async fn run_command(
             });
         }
         let sent = jobs::launch(job, &entry.machine, &entry.command).into_bytes();
-        let result = exec_record(&mut channel, &sent, None).await;
-        let _ = ssh
-            .disconnect(russh::Disconnect::ByApplication, "", "en")
-            .await;
+        let progress = super::job_read::Read::default();
+        let result = stop
+            .until(exec_record(&mut channel, &sent, Some(&progress)))
+            .await
+            .unwrap_or_else(|| {
+                Err(if progress.sent() {
+                    "sessions ended while awaiting job record"
+                } else {
+                    "sessions ended before command transmission"
+                }
+                .into())
+            });
+        #[cfg(feature = "tracer")]
+        ssh_point(&ssh, "session_evidence").await;
+        if !stop.stopped() {
+            let _ = stop
+                .until(ssh.disconnect(russh::Disconnect::ByApplication, "", "en"))
+                .await;
+        }
         // CNF-30: the journal determines the wrapper's exact transmitted bytes.
         let recorded = journal.read(seq).await;
         let replayed = journal.intent(seq).await;
@@ -331,19 +366,19 @@ pub async fn run_command(
             job: job.into(),
             record,
         };
-        let evidence =
-            journal
-                .job_evidence(&received)
-                .await
-                .map_err(|why| Refusal::Unresolved {
-                    call: seq,
-                    why: format!("job evidence append: {why}"),
-                    evidence: Some(Box::new(jobs::uncommitted(
-                        &received,
-                        &entry.machine,
-                        &hex::encode(&entry.command),
-                    ))),
-                })?;
+        let evidence = journal
+            .job_evidence_unless_stopped(&received, &stop)
+            .await
+            .unwrap_or_else(|| Err("sessions ended before journaling job evidence".into()))
+            .map_err(|why| Refusal::Unresolved {
+                call: seq,
+                why: format!("job evidence append: {why}"),
+                evidence: Some(Box::new(jobs::uncommitted(
+                    &received,
+                    &entry.machine,
+                    &hex::encode(&entry.command),
+                ))),
+            })?;
         if evidence.state != jobs::State::Finished {
             return Err(Refusal::Unresolved {
                 call: seq,
@@ -453,12 +488,13 @@ async fn held(
                     journal,
                     session,
                     target,
+                    &stop,
                     #[cfg(feature = "tracer")]
                     tamper_auth,
                 ))
                 .await
             {
-                Some(Ok((ssh, _, _))) => connection = Some(ssh),
+                Some(Ok((ssh, _, _, socket))) => connection = Some((ssh, socket)),
                 Some(Err(why)) => {
                     let reason = match why {
                         Refusal::Failed(why) => json!({"connection":"unavailable","why":why}),
@@ -475,7 +511,7 @@ async fn held(
                 }
             }
         }
-        let ssh = connection.as_ref().expect("connected for collection");
+        let (ssh, _socket) = connection.as_ref().expect("connected for collection");
         let progress = super::job_read::Read::default();
         let read = async {
             let mut channel = ssh
@@ -510,6 +546,8 @@ async fn held(
         };
         #[cfg(feature = "tracer")]
         crate::testonly::completed_read();
+        #[cfg(feature = "tracer")]
+        ssh_point(ssh, "session_evidence").await;
         match journal.job_evidence_unless_stopped(&received, &stop).await {
             Some(Ok(report)) => {
                 reports.push(serde_json::to_value(report).expect("report serialization"))
@@ -572,11 +610,12 @@ pub async fn collect_jobs(
             journal,
             &session,
             target,
+            &stop,
             #[cfg(feature = "tracer")]
             tamper_auth,
         ))
         .await;
-    let (ssh, _, _) = match connection {
+    let (ssh, _, _, _socket) = match connection {
         Some(result) => result?,
         None => {
             reports.extend(calls.into_iter().map(|intent| {
@@ -600,18 +639,30 @@ pub async fn collect_jobs(
             continue;
         }
         let progress = super::job_read::Read::default();
-        let result = match ssh.channel_open_session().await {
-            Ok(mut channel) => read_job_record(&mut channel, &job, &progress).await,
-            Err(e) => Err(format!("session channel: {e}")),
+        let read = async {
+            let mut channel = ssh
+                .channel_open_session()
+                .await
+                .map_err(|e| format!("session channel: {e}"))?;
+            read_job_record(&mut channel, &job, &progress).await
         };
-        let record = match result {
-            Ok(record) => record,
-            Err(why) => {
+        let record = match stop.until(read).await {
+            Some(Ok(record)) => record,
+            Some(Err(why)) => {
                 reports.push(progress.failure(
                     intent.call,
                     Some(&job),
                     super::inference::ending(),
                     &why,
+                ));
+                continue;
+            }
+            None => {
+                reports.push(progress.failure(
+                    intent.call,
+                    Some(&job),
+                    super::inference::ending(),
+                    "stopped while reading record",
                 ));
                 continue;
             }
@@ -621,6 +672,8 @@ pub async fn collect_jobs(
             job,
             record,
         };
+        #[cfg(feature = "tracer")]
+        ssh_point(&ssh, "session_evidence").await;
         match journal.job_evidence_unless_stopped(&received, &stop).await {
             Some(Ok(report)) => {
                 reports.push(serde_json::to_value(report).expect("report serialization"))
@@ -636,9 +689,11 @@ pub async fn collect_jobs(
             })),
         }
     }
-    let _ = ssh
-        .disconnect(russh::Disconnect::ByApplication, "", "en")
-        .await;
+    if !stop.stopped() {
+        let _ = stop
+            .until(ssh.disconnect(russh::Disconnect::ByApplication, "", "en"))
+            .await;
+    }
     Ok(reports)
 }
 
@@ -690,8 +745,17 @@ async fn connect(
     journal: &impl BoundJournal,
     session: &Session,
     target: &Target,
+    stop: &std::rc::Rc<wait::Stop>,
     #[cfg(feature = "tracer")] tamper_auth: bool,
-) -> Result<(client::Handle<PinCheck>, String, String), Refusal> {
+) -> Result<
+    (
+        client::Handle<PinCheck>,
+        String,
+        String,
+        wait::SocketRegistration,
+    ),
+    Refusal,
+> {
     // CHN-R4: with no pin there is nothing to check a key against, so nothing is contacted.
     let pinned = pins.pin(&target.machine).ok_or(Refusal::NoPin)?.0;
     if !journal.credentials_available() {
@@ -716,6 +780,7 @@ async fn connect(
     let (mut meta, mut ws) = WsMeta::connect(&url, None)
         .await
         .map_err(|e| Refusal::Failed(format!("relay websocket: {e}")))?;
+    let socket = stop.socket(meta.wrapped().clone());
     let mut events = meta
         .observe(ObserveConfig::default())
         .await
@@ -805,7 +870,16 @@ async fn connect(
     if !auth.success() {
         return Err(Refusal::Failed(format!("authentication refused: {auth:?}")));
     }
-    Ok((ssh, pinned, host_key))
+    #[cfg(feature = "tracer")]
+    {
+        crate::testonly::session_point("session_connected").await;
+        if crate::testonly::rekey_session("session_connected") {
+            ssh.rekey_soon()
+                .await
+                .map_err(|e| Refusal::Failed(format!("rekey: {e}")))?;
+        }
+    }
+    Ok((ssh, pinned, host_key, socket))
 }
 
 /// The next frame, which the handshake requires to be a JSON text frame.
@@ -831,4 +905,12 @@ async fn resolve(
             AdmissionRefusal::Unbound => Refusal::Unbound(machine.into()),
             AdmissionRefusal::Journal(why) => Refusal::Journal(why),
         })
+}
+
+#[cfg(feature = "tracer")]
+async fn ssh_point(ssh: &client::Handle<PinCheck>, point: &str) {
+    crate::testonly::session_point(point).await;
+    if crate::testonly::rekey_session(point) {
+        ssh.rekey_soon().await.expect("fixture rekey request");
+    }
 }

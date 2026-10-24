@@ -54,10 +54,13 @@ pub struct Seen {
     /// Every relay connection's events, in order, by connection (`Seen::relay_logs`).
     pub relay_log: Vec<(u32, Event)>,
     pub ssh_connections: u32,
+    pub ssh_channels: u32,
+    pub ssh_authentication_banners: u32,
     /// `(user, key fingerprint, admitted)` for every publickey attempt; `none` attempts too.
     pub ssh_auth: Vec<(String, String, bool)>,
     pub ssh_exec: Vec<Vec<u8>>,
     pub ssh_exit: Vec<u32>,
+    pub ssh_ends: Vec<String>,
     /// Requests a command-at-a-time client never makes: pty, shell, subsystem (`ARC-7`).
     pub ssh_other_requests: Vec<String>,
 }
@@ -81,6 +84,7 @@ pub fn urandom<const N: usize>() -> [u8; N] {
 // ---------------------------------------------------------------------------------------------
 
 pub struct Sshd {
+    pub auth_banner: Arc<AtomicBool>,
     pub port: u16,
     /// Present `HOST_KEY_OTHER` instead of the pinned key, for the wrong-key case.
     pub present_other: Arc<AtomicBool>,
@@ -124,6 +128,8 @@ pub async fn sshd(seen: Observed) -> Sshd {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("sshd bind");
     let port = listener.local_addr().expect("sshd address").port();
     let present_other = Arc::new(AtomicBool::new(false));
+    let auth_banner = Arc::new(AtomicBool::new(false));
+    let authentication_banner = auth_banner.clone();
     let disconnect_read = Arc::new(AtomicBool::new(false));
     let read_disconnect = disconnect_read.clone();
     let (accepted, ended) = (Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0)));
@@ -156,17 +162,24 @@ pub async fn sshd(seen: Observed) -> Sshd {
                 execs: Arc::default(),
                 tasks: exec_tasks.clone(),
                 disconnect_read: read_disconnect.clone(),
+                auth_banner: authentication_banner.clone(),
             };
             let ends = ends.clone();
+            let observations = seen.clone();
             tokio::spawn(async move {
-                if let Ok(session) = server::run_stream(config, stream, handler).await {
-                    let _ = session.await;
-                }
+                let result = match server::run_stream(config, stream, handler).await {
+                    Ok(session) => session.await,
+                    Err(error) => Err(error),
+                };
+                observe(&observations, |seen| {
+                    seen.ssh_ends.push(format!("{result:?}"))
+                });
                 ends.fetch_add(1, Ordering::SeqCst);
             });
         }
     });
     Sshd {
+        auth_banner,
         port,
         present_other,
         disconnect_read,
@@ -179,6 +192,7 @@ pub async fn sshd(seen: Observed) -> Sshd {
 }
 
 struct SshSession {
+    auth_banner: Arc<AtomicBool>,
     seen: Observed,
     disconnect_read: Arc<AtomicBool>,
     machine: Arc<crate::machine::Machine>,
@@ -223,6 +237,15 @@ impl SshSession {
 impl server::Handler for SshSession {
     type Error = russh::Error;
 
+    async fn authentication_banner(&mut self) -> Result<Option<String>, Self::Error> {
+        Ok(if self.auth_banner.swap(false, Ordering::SeqCst) {
+            observe(&self.seen, |seen| seen.ssh_authentication_banners += 1);
+            Some("fixture authentication stage".into())
+        } else {
+            None
+        })
+    }
+
     async fn auth_none(&mut self, user: &str) -> Result<Auth, Self::Error> {
         observe(&self.seen, |s| {
             s.ssh_auth.push((user.to_string(), "none".into(), false))
@@ -248,6 +271,7 @@ impl server::Handler for SshSession {
         reply: server::ChannelOpenHandle,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
+        observe(&self.seen, |seen| seen.ssh_channels += 1);
         reply.accept().await;
         Ok(())
     }
@@ -545,6 +569,7 @@ impl Pace {
 /// a test read the order of `WIR-10`'s two invariants (paid-tcp-relay `844e834`), not counts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
+    Held(String),
     ChallengeSent,
     AuthReceived,
     Accepted,
@@ -587,7 +612,49 @@ impl Seen {
     }
 }
 
+/// One protocol stage held while still polling the browser socket for its close.
+#[derive(Default)]
+pub struct SessionGate {
+    stage: Mutex<String>,
+    pub reached: AtomicBool,
+}
+impl SessionGate {
+    pub fn arm(&self, stage: &str) {
+        let mut current = self.stage.lock().unwrap();
+        self.reached.store(false, Ordering::SeqCst);
+        *current = stage.into();
+    }
+    pub fn clear(&self) {
+        self.stage.lock().unwrap().clear();
+    }
+    fn is(&self, stage: &str) -> bool {
+        *self.stage.lock().unwrap() == stage
+    }
+    async fn hold(&self, stage: &str, ws: &mut Ws, log: &Log) -> bool {
+        if !self.is(stage) {
+            return true;
+        }
+        self.reached.store(true, Ordering::SeqCst);
+        log.event(Event::Held(stage.into()));
+        while self.is(stage) {
+            tokio::select! {
+                frame = ws.next() => match frame {
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => {
+                        log.event(Event::Ended);
+                        let _ = ws.close(None).await;
+                        return false;
+                    }
+                    Some(Ok(frame)) => log.event(Event::Frame(kind(&frame))),
+                },
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+        }
+        true
+    }
+}
+
 pub struct Relay {
+    pub session_gate: Arc<SessionGate>,
     /// `wss://127.0.0.1:<port>/`, the URL the AUTH's `relay` tag must name.
     pub url: String,
     /// Check 6's state, shared by every connection.
@@ -601,6 +668,7 @@ pub struct Relay {
 }
 
 struct RelayState {
+    session_gate: Arc<SessionGate>,
     url: String,
     passes: Arc<Mutex<Vec<Pass>>>,
     limits: Limits,
@@ -625,7 +693,9 @@ pub async fn relay(seen: Observed, tls: TlsAcceptor, passes: Vec<Pass>, hold: bo
     } else {
         Semaphore::MAX_PERMITS
     }));
+    let session_gate = Arc::new(SessionGate::default());
     let state = Arc::new(RelayState {
+        session_gate: session_gate.clone(),
         url: url.clone(),
         passes: Arc::new(Mutex::new(passes)),
         limits,
@@ -667,6 +737,7 @@ pub async fn relay(seen: Observed, tls: TlsAcceptor, passes: Vec<Pass>, hold: bo
         }
     });
     Relay {
+        session_gate,
         url,
         pace,
         release,
@@ -849,6 +920,9 @@ async fn relay_connection(mut ws: Ws, path: &str, state: &RelayState, log: &Log)
 
     // WIR-4 (paid-tcp-relay 844e834): a fresh challenge per connection.
     let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(urandom::<32>());
+    if !state.session_gate.hold("challenge", &mut ws, log).await {
+        return;
+    }
     let frame = json!({ "challenge": challenge, "relay": state.url }).to_string();
     if ws.send(Message::text(frame)).await.is_err() {
         return;
@@ -866,7 +940,10 @@ async fn relay_connection(mut ws: Ws, path: &str, state: &RelayState, log: &Log)
             close(&mut ws, 1002, log).await;
             return;
         }
-        _ => return,
+        _ => {
+            log.event(Event::Ended);
+            return;
+        }
     };
     if let Err((reason, check)) = wir_6(&auth, state, &challenge, &path) {
         // WIR-7 (paid-tcp-relay 844e834): one text frame and close 1008, before any dial.
@@ -900,14 +977,20 @@ async fn relay_connection(mut ws: Ws, path: &str, state: &RelayState, log: &Log)
         match pre_ok(&mut ws, &mut dial).await {
             PreOk::Dialed(tcp) => break tcp,
             PreOk::Frame(frame) => {
-                let Some(Ok(frame)) = frame else { return };
+                let Some(Ok(frame)) = frame else {
+                    log.event(Event::Ended);
+                    return;
+                };
                 log.event(Event::Frame(kind(&frame)));
                 match frame {
                     Message::Binary(_) => {
                         close(&mut ws, 1002, log).await;
                         return;
                     }
-                    Message::Close(_) => return,
+                    Message::Close(_) => {
+                        log.event(Event::Ended);
+                        return;
+                    }
                     _ => {}
                 }
             }
@@ -923,6 +1006,9 @@ async fn relay_connection(mut ws: Ws, path: &str, state: &RelayState, log: &Log)
         close(&mut ws, 1011, log).await;
         return;
     };
+    if !state.session_gate.hold("verdict", &mut ws, log).await {
+        return;
+    }
     if ws
         .send(Message::text(json!({ "ok": true }).to_string()))
         .await
@@ -937,6 +1023,8 @@ async fn relay_connection(mut ws: Ws, path: &str, state: &RelayState, log: &Log)
     // banner) follow OK. A text frame closes with 1002, none of its bytes forwarded, and the TCP
     // connection with it.
     let mut buffer = vec![0; 16 * 1024];
+    let auth_before = log.seen.lock().unwrap().ssh_auth.len();
+    let mut banner_sent = false;
     let code = loop {
         tokio::select! {
             frame = ws.next() => match frame {
@@ -962,6 +1050,26 @@ async fn relay_connection(mut ws: Ws, path: &str, state: &RelayState, log: &Log)
             },
             read = tcp.read(&mut buffer) => match read {
                 Ok(n) if n > 0 => {
+                    if !banner_sent {
+                        if !state.session_gate.hold("identification", &mut ws, log).await { break None; }
+                        if let Some(end) = buffer[..n].iter().position(|b| *b == b'\n') {
+                            let end = end + 1;
+                            if ws.send(Message::binary(buffer[..end].to_vec())).await.is_err() { break None; }
+                            log.event(Event::Forwarded(Toward::Client, end));
+                            banner_sent = true;
+                            if end == n { continue; }
+                            buffer.copy_within(end..n, 0);
+                            let bytes = buffer[..n-end].to_vec();
+                            if !state.session_gate.hold("kex", &mut ws, log).await { break None; }
+                            if ws.send(Message::binary(bytes)).await.is_err() { break None; }
+                            log.event(Event::Forwarded(Toward::Client, n-end));
+                            continue;
+                        }
+                    }
+                    if !state.session_gate.hold("kex", &mut ws, log).await { break None; }
+                    let authenticating = log.seen.lock().unwrap().ssh_auth.len() > auth_before;
+                    if authenticating && !state.session_gate.hold("auth", &mut ws, log).await { break None; }
+                    if !state.session_gate.hold("rekey", &mut ws, log).await { break None; }
                     if ws.send(Message::binary(buffer[..n].to_vec())).await.is_err() {
                         break None;
                     }

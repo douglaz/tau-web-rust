@@ -206,9 +206,13 @@ pub async fn probe(
     journal: &mut impl Journal,
     transport: &mut impl Transport,
     origin: &str,
+    revoke: bool,
 ) -> Result<(), String> {
     if journal.route(origin, false).await {
         return Ok(());
+    }
+    if !journal.can_send(revoke) {
+        return Err("sessions ended".into());
     }
     let request = Request {
         method: "OPTIONS",
@@ -299,7 +303,7 @@ async fn run(
     let mint_guard = journal.mint_guard(&session).await;
     // A recorded mint attempt is checked before even a probe on subsequent requests.
     if !journal.has_key(&session).await? {
-        probe(journal, transport, origin).await?;
+        probe(journal, transport, origin, false).await?;
         let mut read = send(
             journal,
             transport,
@@ -312,7 +316,11 @@ async fn run(
             Value::Null,
         )
         .await?;
-        if read.get("automatic_top_up") != Some(&Value::Bool(false)) {
+        if !read["status"]
+            .as_u64()
+            .is_some_and(|s| (200..300).contains(&s))
+            || read.get("automatic_top_up") != Some(&Value::Bool(false))
+        {
             read["refused"] = if read["unresolved"] == true {
                 json!("no mint is sent without a recorded top-up-off read")
             } else {
@@ -359,7 +367,7 @@ async fn run(
         }
     }
     drop(mint_guard);
-    probe(journal, transport, origin).await?;
+    probe(journal, transport, origin, false).await?;
     send(
         journal,
         transport,

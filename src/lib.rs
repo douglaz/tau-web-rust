@@ -223,7 +223,13 @@ mod worker {
             machine: &str,
             command: &[u8],
         ) -> Result<(), AppendRefusal> {
-            match self.local.lock().await.store() {
+            #[cfg(feature = "tracer")]
+            crate::testonly::session_point("signature_writer").await;
+            let mut local = self.local.lock().await;
+            if crate::harness::inference::ending() {
+                return Err(AppendRefusal::Storage("sessions ended".into()));
+            }
+            match local.store() {
                 Some(store) => store.check_signature(machine, command).await,
                 None => Err(AppendRefusal::Storage("the store is locked".into())),
             }
@@ -294,6 +300,8 @@ mod worker {
             evidence: &crate::jobs::Evidence,
             stop: &crate::harness::Stop,
         ) -> Option<Result<crate::jobs::Report, String>> {
+            #[cfg(feature = "tracer")]
+            crate::testonly::session_point("evidence_writer").await;
             crate::harness::write::unless_stopped(
                 self.local.lock(),
                 stop.notified(),
@@ -312,7 +320,15 @@ mod worker {
             &mut self,
             machine: &str,
         ) -> Result<Rc<crate::binding::Session>, crate::binding::AdmissionRefusal> {
-            match self.local.lock().await.store() {
+            #[cfg(feature = "tracer")]
+            crate::testonly::session_point("connection_writer").await;
+            let mut local = self.local.lock().await;
+            if crate::harness::inference::ending() {
+                return Err(crate::binding::AdmissionRefusal::Journal(
+                    "sessions ended".into(),
+                ));
+            }
+            match local.store() {
                 Some(store) => store.connection_session(machine).await,
                 None => Err(crate::binding::AdmissionRefusal::Journal(
                     "the store is locked".into(),

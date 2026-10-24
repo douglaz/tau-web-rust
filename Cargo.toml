@@ -65,7 +65,7 @@ web-sys = { version = "0.3", features = [
   "FileSystemGetDirectoryOptions", "FileSystemGetFileOptions", "FileSystemWritableFileStream",
   "Pbkdf2Params", "StorageManager", "SubtleCrypto", "WorkerGlobalScope", "WorkerNavigator", "DedicatedWorkerGlobalScope",
   "WritableStream", "Request", "RequestInit", "RequestRedirect", "RequestMode",
-  "RequestCredentials", "RequestCache", "Headers", "Response", "ResponseType",
+  "RequestCredentials", "RequestCache", "Headers", "Response", "ResponseType", "WebSocket",
 ] }
 
 [build-dependencies]

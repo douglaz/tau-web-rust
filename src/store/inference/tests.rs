@@ -794,6 +794,7 @@ fn mint_requires_the_latest_account_read_for_its_own_session_live_and_replayed()
 
 struct ObservedJournal {
     store: Store<MemoryStorage>,
+    end_on_route: bool,
     end_after_append: bool,
     end_before_finish: bool,
     mint_prepares: usize,
@@ -834,7 +835,11 @@ impl InferenceJournal for ObservedJournal {
         self.store.inference_finish(c, r, sent).await
     }
     async fn route(&mut self, o: &str, c: bool) -> bool {
-        self.store.route(o, c).await
+        let chosen = self.store.route(o, c).await;
+        if !c && self.end_on_route {
+            self.store.end_inference_sessions();
+        }
+        chosen
     }
 }
 #[test]
@@ -845,6 +850,7 @@ fn end_during_intent_append_prevents_send_but_preserves_unresolved_intent() {
     let session = block_on(s.session("fixture")).unwrap();
     let mut journal = ObservedJournal {
         store: s,
+        end_on_route: false,
         end_after_append: true,
         end_before_finish: false,
         mint_prepares: 0,
@@ -883,6 +889,7 @@ fn end_during_intent_append_prevents_send_but_preserves_unresolved_intent() {
 fn top_up_on_refuses_before_preparing_an_inference_mint() {
     let mut journal = ObservedJournal {
         store: ready(),
+        end_on_route: false,
         end_after_append: false,
         end_before_finish: false,
         mint_prepares: 0,
@@ -925,6 +932,7 @@ fn infer_preserves_unresolved_account_read_report_when_sessions_end_after_append
 fn unresolved_account_read(ended: bool) {
     let mut journal = ObservedJournal {
         store: ready(),
+        end_on_route: false,
         end_after_append: ended,
         end_before_finish: false,
         mint_prepares: 0,
@@ -963,6 +971,7 @@ fn unresolved_account_read(ended: bool) {
 fn late_completion_metadata_redacts_the_request_credential_after_holdings_clear() {
     let mut journal = ObservedJournal {
         store: ready(),
+        end_on_route: false,
         end_after_append: false,
         end_before_finish: true,
         mint_prepares: 0,
@@ -1424,4 +1433,127 @@ fn unresolved_mint_at_session_end(after_append: bool) {
     assert_eq!(mint.intent.kind(), "mint");
     assert!(mint.terminal.is_none());
     assert_eq!(replay.inference.calls.len(), 2);
+}
+
+#[test]
+fn cold_probe_refuses_when_route_await_ends_sessions() {
+    let mut journal = ObservedJournal {
+        store: ready(),
+        end_on_route: true,
+        end_after_append: false,
+        end_before_finish: false,
+        mint_prepares: 0,
+    };
+    let mut transport = Fake::default();
+    assert_eq!(
+        block_on(inference::probe(
+            &mut journal,
+            &mut transport,
+            "https://127.0.0.1:1",
+            false
+        )),
+        Err("sessions ended".into())
+    );
+    assert!(
+        transport.seen.is_empty(),
+        "OPTIONS sent after route await ended sessions"
+    );
+    assert!(!block_on(journal.store.route("https://127.0.0.1:1", false)));
+}
+
+#[test]
+fn revoke_probe_still_sends_when_route_await_ends_sessions() {
+    let mut journal = ObservedJournal {
+        store: ready(),
+        end_on_route: true,
+        end_after_append: false,
+        end_before_finish: false,
+        mint_prepares: 0,
+    };
+    let mut transport = Fake::default();
+    assert_eq!(
+        block_on(inference::probe(
+            &mut journal,
+            &mut transport,
+            "https://127.0.0.1:1",
+            true
+        )),
+        Ok(())
+    );
+    assert_eq!(transport.seen.len(), 1);
+    assert_eq!(transport.seen[0].0, "/");
+}
+
+#[test]
+fn non_success_account_read_keeps_call_status_and_prepares_no_mint() {
+    let mut journal = ObservedJournal {
+        store: ready(),
+        end_on_route: false,
+        end_after_append: false,
+        end_before_finish: false,
+        mint_prepares: 0,
+    };
+    let mut transport = Fake {
+        fail: Some("/account"),
+        ..Fake::default()
+    };
+    let report = block_on(inference::infer(
+        &mut journal,
+        &mut transport,
+        "https://127.0.0.1:1",
+        Some(&candidate()),
+        &request(),
+        || 100,
+    ));
+    assert_eq!(report["call"], 7, "{report}");
+    assert_eq!(report["status"], 503, "{report}");
+    assert_eq!(report["finished"], true, "{report}");
+    assert_eq!(
+        report["refused"],
+        "account read 7: automatic top-up must read off"
+    );
+    assert_eq!(journal.mint_prepares, 0);
+    assert!(!transport.seen.iter().any(|r| r.0 == "/keys"));
+}
+
+#[test]
+fn non_success_account_read_sends_no_mint_control() {
+    let mut store = ready();
+    let mut transport = Fake {
+        fail: Some("/account"),
+        ..Fake::default()
+    };
+    infer(&mut store, &mut transport);
+    assert!(!transport.seen.iter().any(|r| r.0 == "/keys"));
+}
+
+#[test]
+fn connection_admission_after_end_records_no_refusal_live_or_replayed() {
+    let mut store = ready();
+    store.end_inference_sessions();
+    let before = store.storage.files();
+    assert!(
+        matches!(block_on(store.connection_session("fixture-other")),
+        Err(crate::binding::AdmissionRefusal::Journal(why)) if why == "sessions ended")
+    );
+    assert_eq!(store.storage.files(), before);
+    assert!(store.connection_refusals().is_empty());
+    assert!(reopen(&store).connection_refusals().is_empty());
+}
+
+#[test]
+fn signature_check_after_end_records_no_refusal_live_or_replayed() {
+    let mut store = ready();
+    block_on(store.bind_with_modes("fixture-other", &[crate::modes::Mode::NoArtifactPin])).unwrap();
+    assert!(store.installation_unpinned("fixture-other"));
+    // End both sessions before checking the unpinned installation's lowering form.
+    store.end_inference_sessions();
+    let before = store.storage.files();
+    assert!(
+        matches!(block_on(store.check_signature("fixture-other", b"echo SigLevel = Never >> /etc/pacman.conf")),
+        Err(AppendRefusal::Storage(why)) if why == "sessions ended")
+    );
+    assert_eq!(store.storage.files(), before);
+    assert!(store.signature_refusals().is_empty());
+    assert!(reopen(&store).signature_refusals().is_empty());
 }

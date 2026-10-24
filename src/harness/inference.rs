@@ -152,6 +152,8 @@ impl Journal for Writer {
         response: &Response,
         request: &Request,
     ) -> Result<Finished, String> {
+        #[cfg(feature = "tracer")]
+        crate::testonly::session_point("finish_writer").await;
         self.0
             .lock()
             .await
@@ -161,6 +163,10 @@ impl Journal for Writer {
             .await
     }
     async fn route(&mut self, origin: &str, chosen: bool) -> bool {
+        #[cfg(feature = "tracer")]
+        if !chosen {
+            crate::testonly::session_point("route_writer").await;
+        }
         match self.0.lock().await.store() {
             Some(s) => s.route(origin, chosen).await,
             None => false,
@@ -173,7 +179,7 @@ pub async fn inference_request(request: String) -> String {
     let Ok(request) = serde_json::from_str::<Value>(&request) else {
         return json!({"refused":"request"}).to_string();
     };
-    let result = inference::infer(
+    let mut result = inference::infer(
         &mut Writer(crate::worker::local()),
         &mut Fetch,
         &origin(),
@@ -182,7 +188,15 @@ pub async fn inference_request(request: String) -> String {
         || (js_sys::Date::now() / 1000.) as u64,
     )
     .await;
+    #[cfg(feature = "tracer")]
+    crate::testonly::session_point("response_writer").await;
     let mut report = crate::worker::local().lock().await.report(None);
+    if ending()
+        && let Some(fields) = result.as_object_mut()
+    {
+        fields.remove("body");
+        fields.entry("refused").or_insert(json!("sessions ended"));
+    }
     if let Some(fields) = report.as_object_mut()
         && let Some(state) = fields.remove("state")
     {
@@ -197,7 +211,7 @@ pub async fn inference_request(request: String) -> String {
 
 async fn revoke(local: LocalStore, origin: String, key_id: String) {
     let mut journal = Writer(local);
-    if inference::probe(&mut journal, &mut Fetch, &origin)
+    if inference::probe(&mut journal, &mut Fetch, &origin, true)
         .await
         .is_err()
     {
@@ -288,5 +302,13 @@ pub async fn test_inference_account(input: js_sys::Uint8Array) -> bool {
     match local.store() {
         Some(s) => s.set_inference_account(credential).await.is_ok(),
         None => false,
+    }
+}
+
+#[cfg(feature = "tracer")]
+#[wasm_bindgen]
+pub async fn test_cold_inference_route() {
+    if let Some(store) = crate::worker::local().lock().await.store() {
+        store.test_cold_inference_route();
     }
 }
