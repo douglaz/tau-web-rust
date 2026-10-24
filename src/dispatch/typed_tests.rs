@@ -109,6 +109,7 @@ pub(crate) fn request(operation: Operation) -> Request {
     };
     let target = Target::Entry("fixture".into());
     let approved = OperationApproval {
+        restated_modes: Vec::new(),
         resource: Resource::Entry("fixture".into()),
         target: target.clone(),
         operation,
@@ -128,6 +129,7 @@ pub(crate) fn request(operation: Operation) -> Request {
 
 fn approve(request: &mut Request, resource: Resource) {
     request.approved = Some(OperationApproval {
+        restated_modes: Vec::new(),
         resource,
         target: request.target.clone(),
         operation: request.operation,

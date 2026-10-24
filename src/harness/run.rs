@@ -41,6 +41,7 @@ pub struct Done {
 /// Why an attempt ended without the command being sent, or without its result.
 #[derive(Debug)]
 pub enum Refusal {
+    SignatureLowering(crate::modes::SignatureRefusal),
     /// No pin for the machine: refused before the relay is contacted (`CHN-R4`, `CNF-23`).
     NoPin,
     NoEntry(String),
@@ -79,6 +80,9 @@ pub enum Refusal {
 impl Refusal {
     pub fn to_json(&self) -> Value {
         match self {
+            Refusal::SignatureLowering(record) => {
+                json!({"refused":"signature-lowering","machine":record.machine,"form":record.form})
+            }
             Refusal::Held(answer) => answer.clone(),
             Refusal::Barrier(calls) => json!({"refused":"barrier","calls":calls}),
             Refusal::LaunchTooLong { bytes } => json!({
@@ -136,6 +140,7 @@ pub fn report(outcome: &Result<Done, Refusal>) -> Value {
 
 fn append_refusal(refusal: AppendRefusal) -> Refusal {
     match refusal {
+        AppendRefusal::SignatureLowering(record) => Refusal::SignatureLowering(record),
         AppendRefusal::Policy(DispatchRefusal::NoEntry { machine }) => Refusal::NoEntry(machine),
         AppendRefusal::Policy(DispatchRefusal::Provenance) => Refusal::Provenance,
         AppendRefusal::Storage(why) => Refusal::Journal(why),
@@ -189,6 +194,10 @@ pub async fn run_command(
     #[cfg(feature = "tracer")] tamper_auth: bool,
 ) -> Result<Done, Refusal> {
     let session = resolve(journal, &target.machine).await?;
+    journal
+        .check_signature(&target.machine, command)
+        .await
+        .map_err(append_refusal)?;
     if let Err(refusal) = journal.check(&target.machine).await {
         return Err(admission_refusal(
             pins,

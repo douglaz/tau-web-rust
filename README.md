@@ -70,7 +70,8 @@ that refusal before reporting it. The connection path is whole in the served was
 - **Entry first.** Connection admission (`Store::connection_session`, through `resolve`) refuses
   `no-entry` before contact or append, then resolves the live session holding the machine or
   appends a `connection_refusal` record and refuses `unbound`, creating no binding or intent.
-  Only then does the journal check (`Store::check`) check unresolved calls and dispositions,
+  Then signature-lowering admission records and refuses literal lowering commands where the
+  installation mode stands, before any contact. Only then does the journal check (`Store::check`) check unresolved calls and dispositions,
   before contact or intent append.
 - **Pin next.** It looks up the machine's host-key pin, and with none it contacts nothing.
   `CHN-R4` says "the harness MUST NOT do it through the relay".
@@ -220,7 +221,8 @@ identity is not its record number or whose command is not lowercase hex.
 `store_state` shows calls and their job identities, approval decisions and states, terminals,
 job-record evidence and findings, all disposition reports and the disposition standing per
 machine, plus `typed_calls`, `observations`, `current_installations`, `setup`, `setup_offer`,
-`sessions`, `exposure_ledger` and `connection_refusals`, without key material.
+`sessions` (with `standing_modes`), `exposure_ledger`, `connection_refusals`, `installations`,
+`mode_acceptances` and `signature_refusals`, without key material.
 `setup` lists each entry's facts and cost, allocation family/index, nullable answer and class, and access model/profile/revision.
 It contains no seed identifier; the page's store report carries the same setup projection.
 Disposition records include both `machine` and `resource`: `machine` retains the command-era
@@ -604,6 +606,143 @@ Session inspection and transport read the same credential collection. The type s
 neither a credential type nor a credential-scan exemption. Its only holding is row 3 for its
 bound machine, and it receives neither the seed nor the relay key.
 
+### Acceptable weaker modes
+
+The tracer's machine named `unpinned` has no host-key pin; it is unrelated to ARC-25's
+unpinned installation. Installation history below is exercised on `fixture`.
+
+The closed `Mode` type implements two SEC-14 labels: **An installation with no artifact pin**
+(`no_artifact_pin`) and **Acting on a goal with no brief** (`no_brief`). Other identifiers,
+including `unpinned`, are refused by deserialization and replay. Later modes need explicit
+variants; the standing-mode hook and rendering iterate the modes present.
+
+The acceptance surfaces and windows are **implementation readings**:
+
+- Acceptance is a store act, following the dispositions precedent. Neither build exports an
+  acceptance function or adds a page message or control. The binding message retains exactly
+  `{"bind":{"machine":"fixture"}}`.
+- `Store::bind_with_modes(machine, &[Mode::NoArtifactPin])` accepts the installation mode only
+  on the machine's first binding, before any exposure record names it. The binding act stands
+  in for before first contact: connection admission requires a live binding. Acceptance and
+  binding share one encrypted exposure record. A failed append binds and accepts nothing;
+  a move that lands and reports failure restores the exposure and mode on replay, with no
+  live session. Asking for an invalid mode refuses the entire binding without a record.
+- `Store::accept_mode(session, Mode::NoBrief)` requires a live session and precedes its first
+  journaled command intent, identified by `provenance.session`. That intent stands in for the
+  model's first command until goals and tools exist. A duplicate, unknown or ended session,
+  the installation mode through this act, and a no-brief acceptance inside binding all refuse
+  without writing. This ticket does not require an acceptance for existing operator commands;
+  that requirement belongs to twr-ggw.14.
+
+Installation history stands for the life of this store, through restarts, later sessions,
+fixture destroy and fixture reinstall. A later binding shows it and refuses to accept it
+again. No-brief is conduct of its accepting live session alone: ending the worker ends the
+mode, while its journal record remains inspectable. Replay restores no session. Full re-entry
+and what earlier conduct left live belong to twr-ggw.24. **Never entered by failing** means only
+these two acceptance acts write acceptances; a host-key halt, failed admission, hold,
+disposition, barrier, restatement refusal or signature refusal adds no mode.
+
+`Store::standing_modes(machine)` is the single restatement hook: the target machine's history
+plus conduct of the live session holding that target, including when an operator requests the
+act. At fixture **destroy** and **reinstall**, approval's `restated_modes` must equal that
+ordered list exactly. Missing, extra, duplicate or reordered entries refuse before append or
+send, both through `Vendor::run` and direct `Store::operation`. Create, reset and read require
+an empty list. The intent records the list beside its matching approval; old records omit it
+and retain their meaning. **Implementation reading:** the approval is the restatement's
+stand-in until an approval screen exists. Paid invoices (twr-ggw.21), added machines
+(twr-ggw.22), placed secrets (twr-ggw.23), and LNVPS reinstall (twr-ggw.45) call this hook when
+built.
+
+**Implementation reading: fixture reinstall restates and does not re-accept.** This adapter
+installs nothing. SEC-14 limits when history may be accepted again to a new installation;
+its permission does not require a fixture acceptance. Spec `TASKS.md`, T47, leaves reinstall's
+attest identity undecided and gives CNF-93's reinstall case to the jump-host route. The nearest
+owner is twr-ggw.45, which today restates only; the jump-host route is stage 2. Re-acceptance
+remains owed and has no owning ticket yet.
+
+**Implementation reading: the trust display surface** until twr-ggw.18 is the page's live
+session and bound-set view plus `store_state` inspection. Both report and inspection add:
+
+- `sessions[].standing_modes`: every standing SEC-14 display label, in hook order;
+- `installations`: approved machines with history, each `{"machine":"fixture","installation":"unpinned"}`;
+- `mode_acceptances`: every acceptance, including ended sessions, with `session`, `mode`
+  (display label), `bound_set` (machine names), and `standing` (boolean);
+- `signature_refusals`: each refusal's `machine` and `form`.
+
+The page renders `Installation: unpinned.` in that machine's section, and every standing label
+as `Standing mode: <label>.` alongside its existing session and bound-set line, generically.
+The unpinned installation names no bootstrap URL, hash or signer, including nothing from the
+compiled Alpine artifact policy. History remains visible with no live session. **Implementation
+reading: the no-brief browser gap** is deliberate: there is no acceptance export, and replay
+restores no session. Host tests cover both labels on report and inspection; browser cases
+cover only installation history. Trust layers and Delivered labels remain with their owners.
+
+**Implementation readings: signature lowering.** On a machine with installation history, two
+literal pacman assignment forms are refused (ARC-25a, CNF-67). `SigLevel`, `LocalFileSigLevel`
+and `RemoteFileSigLevel` values containing whole `Never`, `PackageNever` or `DatabaseNever`
+tokens are the signature-level form; `TrustAll`, `PackageTrustAll` or `DatabaseTrustAll` tokens
+are the untrusted-repository form. Omarchy's `SigLevel = Optional TrustAll`, including inside
+its repository heredoc, is inside the latter. A bare `Optional` is a presence level and passes
+this check. **Implementation reading: matching** is case-sensitive, on raw bytes split at
+newline bytes; lines whose first byte other than ASCII whitespace is `#` are ignored. A word is a
+maximal run of ASCII letters, digits and underscore. Every whole directive word anywhere on
+a line is examined: its next `=` on that line opens a value extending to the line's end.
+Any whole lowering word in that value refuses, with the first such word determining the form.
+Whitespace, quoting, backslashes, shell syntax, other directives and all other punctuation
+between the directive and `=`, or between `=` and the lowering word, end nothing. Non-word
+bytes delimit words rather than joining fragments; no shell evaluation runs. This deliberately
+over-refuses: `echo SigLevel = Required; echo Never`, `echo /SigLevel=Never` and
+`echo SigLevel = 'Never'more` all refuse. Quoted fragments such as `'Never'more` are separate
+words in the raw bytes even when the shell would join them into `Nevermore`.
+
+**Implementation reading:** the refusal applies **only where the installation mode stands**, computed from durable history,
+so restart and rebind cannot evade it. `Journal::append` checks before the hold and before any
+intent. `run_command` checks immediately after binding admission, before holds, launch size,
+pin lookup, relay contact and SSH channels. A refusal commits its own encrypted record before
+reporting `{"refused":"signature-lowering","machine":"fixture","form":"signature_level_never"}`
+or form `untrusted_repository`. It writes no intent and sends nothing. Failed refusal appends
+still refuse and latch the store. **Implementation reading:** records omit command bytes and
+carry only the machine and first matching form.
+
+**Implementation reading: matcher limits.** Fragments are never joined: a directive or
+lowering word split by quoting, a brace or an escape (`Sig"Level"`, `Nev'er'`, `Nev{er,}`,
+`Sig\Level`, or `printf 'Required\tNever'`, whose final word is `tNever`) remains outside.
+Line continuations, lowering words absent literally from the bytes (`SigLevel = $LEVEL` or
+`SigLevel = $(printf 'Nev%s' er)`), encodings (base64 and printf escapes), files written
+elsewhere and pulled through `Include` or `--config`, substitutions such as
+`sed 's/Required/Never/'` that never spell the directive, bare `SigLevel = Optional`, a commented
+directive later uncommented by another stage, and scripts fetched at runtime are outside
+these two forms. A lowering word counts only after a directive's `=` on the same raw line, so
+one written earlier on the line or on another line and carried in by a variable
+(`L=Never; echo "SigLevel = $L"`) stays outside. A raw line whose first byte other than ASCII
+whitespace is `#` is skipped even where the shell does not read it as a comment, for example
+when that `#` closes a string quoted across the line before. Those limits are owed to a
+follow-up ticket; this matcher claims no general shell policy enforcement.
+
+**Criterion 5 has a given half and an owed half; it is not claimed met.** Given here is refusal
+of these lowering commands while leaving distribution checking on, plus the byte-for-byte
+stock Arch configuration in `tests/vectors/pacman-c8ccc368.conf`, from Arch's packaging project
+at `c8ccc368`. It sets `SigLevel = Required DatabaseOptional` and
+`LocalFileSigLevel = Optional`. Under Required, missing or invalid signatures are fatal
+([pacman.conf(5)](https://man.archlinux.org/man/pacman.conf.5.en)). **Implementation reading:**
+this concerns unsigned repository packages. Stock Arch accepts a local unsigned `pacman -U`
+file; the harness neither refuses it nor raises that setting. Owed is an observed refusal of
+an unsigned repository package on real Arch in twr-ggw.51's live run. No fixture box plane runs
+pacman, and CI's Ubuntu runner has neither pacman nor Nix; adding either was excluded. No gate
+claims to demonstrate a package refusal. twr-ggw.51's live run owes that observation.
+
+Host tests exercise late and atomic acceptance, unchanged modes after every existing failure,
+all display members, both irreversible operations through adapter and direct store admission,
+restart lifetimes, the two lowering forms, stock configuration admission and failed refusal
+appends. The independent reader checks these records with its own shapes and acceptance-window
+logic, keeping prior exposure, acceptance and command facts incrementally so each event is
+parsed once. Browser cases seed a store independently, bind through the page in both builds, assert
+exact rendered phrases and artifact absence, and refuse harmless printf commands before any
+relay or SSH connection. Tracer controls complete the same printf bytes on `fixture-other`
+without the mode and `echo ok; exit 7` on `fixture`; a wrong host key leaves existing modes and
+acceptance records unchanged. Set `TAU_TRACER_MODE_CASE=all` for just these cases; unset every
+selector for the full gate. The mutation evidence below records the boundary checks.
+
 ### The seed
 
 `src/seed.rs` holds the operator seed and its child keys, credential format v1 (spec `STA-22`,
@@ -779,7 +918,9 @@ the host tests run.
     `reinstall`, `destroy` and `read`; the writer refuses `exec` and `inference` as policy, and
     replay and the independent reader reject such typed records and intents naming the inference
     resource or target, naming the record.
-    No command text is accepted for a typed act.
+    Optional `restated_modes` on both intent and approval is a list of closed mode identifiers,
+    omitted when empty; the two lists agree exactly. Destroy and reinstall carry the restatement;
+    create, reset and read carry no modes. No command text is accepted for a typed act.
   - `{"operation_response":{"call":1,"body":"<lowercase hex>"}}`: the boundary's response
     bytes, recorded after the typed intent and before return. Replay refuses a reference to no
     earlier typed call, a box-plane call, a second response for one call, non-lowercase-hex
@@ -836,6 +977,14 @@ the host tests run.
     encrypted record, where credential format v1 puts it.
 
   - at binding, `{"exposure":{"session":"session-<record number>","bound_set":[{"machine":"fixture","identity":{"seed":"<seed identifier>","derivation_version":1,"family":"machines","index":0}}]}}`;
+    Optional `accepted_modes:["no_artifact_pin"]` is inside the exposure body on a first binding,
+    omitted when empty. Older records remain unchanged. Repeated-machine acceptances refuse replay.
+  - `{"mode_acceptance":{"session":"session-5","mode":"no_brief"}}`: follows that session's
+    exposure and precedes its first command intent; duplicates, unknown labels, installation
+    modes here, and extra members refuse replay, naming the record without plaintext.
+  - `{"signature_refusal":{"machine":"fixture","form":"signature_level_never"}}`, or
+    form `untrusted_repository`: exact members, requires earlier installation history, changes
+    no calls and contains no command bytes. Both new bodies refuse positional arrays.
   - an approved unbound connection attempt, `{"connection_refusal":{"machine":"fixture","reason":"unbound"}}`.
     These shapes have exact members and refuse positional arrays. Replay accepts serde's
     alternative enum encodings, as for setup and allocation records; the independent reader
@@ -846,7 +995,7 @@ the host tests run.
 
   The independent reader in the tracer crate decrypts every record and reads the seed, legacy
   command, intent, typed intent, typed observation, terminal, job terminal, job observation,
-  disposition, seed-backup, setup approval/class/access, exposure and connection-refusal shapes,
+  disposition, seed-backup, setup approval/class/access, exposure, connection-refusal, mode-acceptance and signature-refusal shapes,
   with exact members on the new records.
   It checks a completion against the seed identifier it derives independently, and inspects reservations.
 - **`staging`**, the one staging name, which is never a record name or the envelope's.
@@ -1317,7 +1466,8 @@ browser holds:
 - **The replayed state.** It reads it in the worker's own context, through the module's
   `store_state`, which returns whether the store is locked, record numbers, calls and their
   states, job identities, terminal and job evidence, findings, disposition reports and standing
-  continuations, approved setup entries and their facts/cost/index/class/access, with command
+  continuations, approved setup entries and their facts/cost/index/class/access, live sets and
+  standing modes, installation history, acceptance history and signature refusals, with command
   bytes as hex and no seed identifier or key material.
 - **The stores' contents.** It reads them with an independent reader, `tracer/src/reader.rs`.
   The reader is written from the format's text and never calls the harness's store code. It
@@ -1327,7 +1477,7 @@ browser holds:
 In headless Chromium 154 a new tab hides the one before it, which then restarts its worker, as
 page hide must. The cases account for it.
 
-The full run has 106 cases.
+The full run has 108 cases.
 
 The cases:
 
@@ -1348,6 +1498,7 @@ The cases:
 | seed-backup re-display, each build | fresh passphrase is required; wrong passphrase shows no word; answering removes words; tracer relay and SSH connections end before display, held waits end, no stopped request resumes and the cut-off call stays unresolved |
 | 1. recorded, then sent (`CNF-30`, `ARC-8`) | exactly one relay connection; the sshd received exactly the wrapper recomposed from the journal entry, and its job record holds exactly the journal command; the replayed state holds the command intent after the setup approval and its following job terminal (exit status 7), and the output and exit status came back. With the append made to fail, the sshd received no `exec`, read only once that SSH connection has ended at the sshd |
 | a failed append is not applied (twr-ggw.5 AC2, `STA-3`) | that failed append failed at its `move()`, a real OPFS call; the replayed state has no record for it, and none appears after a reload and an unlock |
+| acceptable weaker modes, two cases (one per build) | installation history on fixture renders unpinned with its standing label and no artifact claim; two lowering forms commit one refusal each with no intent, relay connection or SSH connection; tracer controls run harmless commands, and a host-key halt adds no mode |
 | 2. a wrong host key halts (`CNF-21`, `SEC-11`) | no authentication attempt, no `exec`, no journal entry, and exactly one connection |
 | 3. no pin, no contact (`CNF-23`'s no-pin case, `CHN-R4`) | no TCP connection accepted at the relay, none at the sshd, no dial, and nothing pinned afterwards |
 | oversized launch (twr-ggw.71) | a 30000-byte command is refused with the composed size and limit before intent or contact: no journal entry, changed store state, relay connection or sshd exec. The same store then runs `echo ok; exit 7` and records its terminal |
@@ -1551,12 +1702,17 @@ rest of `CNF-88` has no code here yet.
 | `spec-checks` | `spec/bundle/cors-probe.sh` | `CNF-4` |
 | | `spec/prototypes/spec-checks/check-install-disks.py`, and `--baseline`, which must fail | evidence for `CNF-85` |
 | `build` (the job is `CNF-1`) | `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings` | `CNF-2`, at that strictness |
-| | `cargo test --locked` | runs `build.rs`, so the gates above run here, and the `[session]` fixtures (`CNF-88`'s build fixtures); the relay matrix, `CNF-87`'s fixture half; the seed's tests, `CNF-83`'s derivation tests and `CNF-13`'s tests; the local store's, `CNF-82`'s and `CNF-15`'s host half (below); dispatch and journal recovery for `CNF-29`'s box-plane case, including the unresolved-command hold before contact and at append, identical bytes and reads, no writes on refusal, replay, every holding call and other-machine independence, `CNF-30`, `CNF-39` and `STA-24` dispositions; job classification, channel deliveries, unresolved evidence, append failures, replay and all four dispositions, plus real-shell signals, high exit codes, missing and unreadable record files, NUL-corrupted scalars, exact scalar forms, the reader and replay exit ceiling, incomplete unreadable entries, owned-child cleanup, recycled PIDs, stale fixture groups, exact sentinel matching, drop, duplicate-id, boot, output and cross-store identity tests for `CNF-40`'s dropped command not re-run, waiting on its job record, `CNF-54`–`CNF-56` and `CNF-110`'s collection case; and allocation's, `CNF-72`'s tests and the companion comparison against the allocation witness file (ADR-0032), with `CNF-3`'s three breaks as its unit tests; atomic setup approval and indices, ceremony gates, unanswered classes, maintained access/profile, binding prerequisites and acts, exclusive live bindings, session credential inspection, durable exposure/refusal records, caller-bound adapter admission before approval, ceremony and Restore restrictions, independent sshd rejection of uninstalled and other-machine keys, provenance resolution and replay; typed fixture operations through the adapter's send path at every append kill boundary and a suspended record/send boundary, the resource barrier across both planes, all requester provenances through production command admission/append, disposition reach/end/replacement, exact collectable calls and committed job evidence in the 20-row matrix, unsupported typed-record replay refusals, and the dispatch companion's production-path stage1 comparison and complete vocabulary negative controls |
+| | `cargo test --locked` | runs `build.rs`, so the gates above run here, and the `[session]` fixtures (`CNF-88`'s build fixtures); the relay matrix, `CNF-87`'s fixture half; the seed's tests, `CNF-83`'s derivation tests and `CNF-13`'s tests; the local store's, `CNF-82`'s and `CNF-15`'s host half (below); dispatch and journal recovery for `CNF-29`'s box-plane case, including the unresolved-command hold before contact and at append, identical bytes and reads, no writes on refusal, replay, every holding call and other-machine independence, `CNF-30`, `CNF-39` and `STA-24` dispositions; job classification, channel deliveries, unresolved evidence, append failures, replay and all four dispositions, plus real-shell signals, high exit codes, missing and unreadable record files, NUL-corrupted scalars, exact scalar forms, the reader and replay exit ceiling, incomplete unreadable entries, owned-child cleanup, recycled PIDs, stale fixture groups, exact sentinel matching, drop, duplicate-id, boot, output and cross-store identity tests for `CNF-40`'s dropped command not re-run, waiting on its job record, `CNF-54`–`CNF-56` and `CNF-110`'s collection case; and allocation's, `CNF-72`'s tests and the companion comparison against the allocation witness file (ADR-0032), with `CNF-3`'s three breaks as its unit tests; atomic setup approval and indices, ceremony gates, unanswered classes, maintained access/profile, binding prerequisites and acts, exclusive live bindings, session credential inspection, durable exposure/refusal records, caller-bound adapter admission before approval, ceremony and Restore restrictions, independent sshd rejection of uninstalled and other-machine keys, provenance resolution and replay; typed fixture operations through the adapter's send path at every append kill boundary and a suspended record/send boundary, the resource barrier across both planes, all requester provenances through production command admission/append, disposition reach/end/replacement, exact collectable calls and committed job evidence in the 20-row matrix, unsupported typed-record replay refusals, and the dispatch companion's production-path stage1 comparison and complete vocabulary negative controls; acceptable weaker mode acceptance windows and atomicity, restatement through adapter and direct store admission, trust-display completeness, both lowering forms, durable refusal records, old shapes and independently parsed acceptance windows |
 | `web` (the job is `CNF-1` for the browser build) | `cargo clippy -D warnings` on wasm32, the served and the tracer build | `CNF-2`, on the new target |
 | | `scripts/check-adr-0024.sh` | spec ADR-0024's build check |
 | | `scripts/build-web.sh served`, then `tracer check-absence dist/served` | the served build (`ARC-32`) carries no fixture-derived key, pin source or test switch |
 | | `tracer check-csp dist/served` | `ARC-33`'s policy, exactly |
-| | `scripts/tracer.sh`, in headless Chrome | `CNF-30`, `CNF-21`, `CNF-23`'s no-pin case and `ARC-33`, as above, the relay refusals of `CNF-87` a correct client meets, and the local store's `CNF-82` and `CNF-15` in the browser; seed-backup display, hiding, full re-entry/skip, interruptions, re-display and custody in both builds (`CNF-44`, `CNF-82`), and integrated allocation refusals, completions and failed OPFS appends (`CNF-72`); `CNF-40`'s dropped command not re-run, waiting on its job record, `CNF-54`–`CNF-56`, `STA-20a` and `CNF-110`'s box-plane collection case; unresolved-command hold, concurrent admission and shared results, stopped waits with the writer free, unreachable answers and destructive replacement; typed reset confirmation and every continuation on the real pinned connection; setup batch costs and indices, unanswered class controls, Not sure and No, maintained access and non-operator boundaries in both builds; binding, derived client authentication, machine authorized_keys, ledger restart and re-display in both builds; these browser cases supply the pinned SSH attempt evidence, which has no host form |
+| | `scripts/tracer.sh`, in headless Chrome | `CNF-30`, `CNF-21`, `CNF-23`'s no-pin case and `ARC-33`, as above, the relay refusals of `CNF-87` a correct client meets, and the local store's `CNF-82` and `CNF-15` in the browser; seed-backup display, hiding, full re-entry/skip, interruptions, re-display and custody in both builds (`CNF-44`, `CNF-82`), and integrated allocation refusals, completions and failed OPFS appends (`CNF-72`); `CNF-40`'s dropped command not re-run, waiting on its job record, `CNF-54`–`CNF-56`, `STA-20a` and `CNF-110`'s box-plane collection case; unresolved-command hold, concurrent admission and shared results, stopped waits with the writer free, unreachable answers and destructive replacement; typed reset confirmation and every continuation on the real pinned connection; setup batch costs and indices, unanswered class controls, Not sure and No, maintained access and non-operator boundaries in both builds; binding, derived client authentication, machine authorized_keys, ledger restart and re-display in both builds; acceptable weaker mode display and two pre-contact lowering refusals in both builds, with completed controls and unchanged modes at a host-key halt; these browser cases supply the pinned SSH attempt evidence, which has no host form |
+
+The `build` job's `cargo test --locked` also gates mode acceptance windows and atomicity,
+restatement through both typed admission paths, trust-display completeness, durable lowering
+refusals, old shapes, and independently parsed acceptance windows. The `web` job runs the
+same pre-contact lowering path in both builds; host tests alone never compile that path.
 
 Every job checks out the submodule; `spec-checks` takes the full history, which
 `check-install-disks.py --baseline` reads to reconstruct the pre-fix brief. `web` installs
@@ -1634,7 +1790,381 @@ are included in `check-absence`.
 
 For focused setup checks, set `TAU_TRACER_SETUP_CASE=all`. The `existing` value runs the existing
 dispatch/job cases without seed-display-dependent custody controls. The full gate leaves
-`TAU_TRACER_SETUP_CASE`, `TAU_TRACER_SEED_CASE` and `TAU_TRACER_HOLD_CASE` unset and runs all 106 cases.
+`TAU_TRACER_SETUP_CASE`, `TAU_TRACER_SEED_CASE` and `TAU_TRACER_HOLD_CASE` unset and runs all 108 cases. `TAU_TRACER_MODE_CASE` must also be unset.
+
+The weaker-mode boundaries were mutation-checked on 2026-10-23 with Rust 1.97.1.
+M1–M7, M12 and M14 retain their evidence from that date. M8–M11 and M13 were rerun,
+and M15–M16 added, on 2026-10-23 with the current lowering regression cases.
+Each command ran in the foreground, with its output redirected to a log and its exit status
+checked. Only the named production change was present for each failing test. Before each
+identical passing rerun, the saved source bytes were restored and compared byte for byte.
+For the browser command, wasm-bindgen 0.2.127, Chromium 154 and the wasm32 clang/llvm-ar
+were configured as described above; `TMPDIR` was `/var/tmp`.
+
+**Weaker modes M1** — Disabled the earlier-exposure refusal in Store::check_binding_modes. File: `src/store.rs`. Exact command:
+
+```sh
+TMPDIR=/var/tmp nix shell nixpkgs#gcc -c env RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web mode_acceptance_windows_and_atomic_binding
+```
+
+Red exit: 101. Failing test, assertion location and panic output:
+
+```text
+thread 'store::mode_tests::mode_acceptance_windows_and_atomic_binding' (3292280) panicked at src/store/mode_tests.rs:129:9:
+late installation acceptance
+```
+
+Restored green rerun of the identical command: exit 0.
+
+```text
+test store::mode_tests::mode_acceptance_windows_and_atomic_binding ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 180 filtered out; finished in 0.46s
+```
+
+**Weaker modes M2** — Disabled the first-command window check in Store::check_acceptance. File: `src/store.rs`. Exact command:
+
+```sh
+TMPDIR=/var/tmp nix shell nixpkgs#gcc -c env RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web mode_acceptance_windows_and_atomic_binding
+```
+
+Red exit: 101. Failing test, assertion location and panic output:
+
+```text
+thread 'store::mode_tests::mode_acceptance_windows_and_atomic_binding' (3293827) panicked at src/store/mode_tests.rs:140:9:
+late conduct acceptance
+```
+
+Restored green rerun of the identical command: exit 0.
+
+```text
+test store::mode_tests::mode_acceptance_windows_and_atomic_binding ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 180 filtered out; finished in 0.45s
+```
+
+**Weaker modes M3** — Made the unbound refusal in Store::connection_session journal a conduct acceptance. File: `src/store.rs`. Exact command:
+
+```sh
+TMPDIR=/var/tmp nix shell nixpkgs#gcc -c env RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web modes_never_entered_by_failing
+```
+
+Red exit: 101. Failing test, assertion location and panic output:
+
+```text
+thread 'store::mode_tests::modes_never_entered_by_failing' (3295380) panicked at src/store/mode_tests.rs:581:9:
+assertion `left == right` failed: failure journaled a mode
+  left: [Object {"exposure": Object {"accepted_modes": Array [String("no_artifact_pin")], "bound_set": Array [Object {"identity": Object {"derivation_version": Number(1), "family": String("machines"), "index": Number(0), "seed": String("4db80813e20ec4f97c9d7afc330b5aee4bdab6c15c3d3ca9e28e6387bb9f6d9a")}, "machine": String("fixture")}], "session": String("session-5")}}, Object {"mode_acceptance": Object {"mode": String("no_brief"), "session": String("session-5")}}, Object {"mode_acceptance": Object {"mode": String("no_brief"), "session": String("session-5")}}]
+ right: [Object {"exposure": Object {"accepted_modes": Array [String("no_artifact_pin")], "bound_set": Array [Object {"identity": Object {"derivation_version": Number(1), "family": String("machines"), "index": Number(0), "seed": String("4db80813e20ec4f97c9d7afc330b5aee4bdab6c15c3d3ca9e28e6387bb9f6d9a")}, "machine": String("fixture")}], "session": String("session-5")}}, Object {"mode_acceptance": Object {"mode": String("no_brief"), "session": String("session-5")}}]
+```
+
+Restored green rerun of the identical command: exit 0.
+
+```text
+test store::mode_tests::modes_never_entered_by_failing ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 180 filtered out; finished in 0.21s
+```
+
+**Weaker modes M4** — Made Local::report claim the bundled bootstrap hash for an unpinned installation. File: `src/store.rs`. Exact command:
+
+```sh
+TMPDIR=/var/tmp nix shell nixpkgs#gcc -c env RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web mode_trust_display_lists_every_mode_without_artifact_claims
+```
+
+Red exit: 101. Failing test, assertion location and panic output:
+
+```text
+thread 'store::mode_tests::mode_trust_display_lists_every_mode_without_artifact_claims' (3296762) panicked at src/store/mode_tests.rs:202:9:
+assertion `left == right` failed
+  left: Array [Object {"installation": String("unpinned"), "machine": String("fixture"), "sha256": String("41f73e3cf5fa919b8aa5ca6b30dc48f0da2720776d7423e2a7748211456fe081")}]
+ right: Array [Object {"installation": String("unpinned"), "machine": String("fixture")}]
+```
+
+Restored green rerun of the identical command: exit 0.
+
+```text
+test store::mode_tests::mode_trust_display_lists_every_mode_without_artifact_claims ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 180 filtered out; finished in 0.16s
+```
+
+**Weaker modes M5** — Dropped the no-brief mode from Store::standing_modes. File: `src/store.rs`. Exact command:
+
+```sh
+TMPDIR=/var/tmp nix shell nixpkgs#gcc -c env RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web mode_restatement_uses_target_set_at_destroy_and_reinstall
+```
+
+Red exit: 101. Failing test, assertion location and panic output:
+
+```text
+thread 'store::mode_tests::mode_restatement_uses_target_set_at_destroy_and_reinstall' (3298243) panicked at src/store/mode_tests.rs:255:13:
+adapter bypassed restatement
+```
+
+Restored green rerun of the identical command: exit 0.
+
+```text
+test store::mode_tests::mode_restatement_uses_target_set_at_destroy_and_reinstall ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 180 filtered out; finished in 0.90s
+```
+
+**Weaker modes M6** — Bypassed the restatement hook for destroy in Store::check_operation. File: `src/store.rs`. Exact command:
+
+```sh
+TMPDIR=/var/tmp nix shell nixpkgs#gcc -c env RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web mode_restatement_uses_target_set_at_destroy_and_reinstall
+```
+
+Red exit: 101. Failing test, assertion location and panic output:
+
+```text
+thread 'store::mode_tests::mode_restatement_uses_target_set_at_destroy_and_reinstall' (3299683) panicked at src/store/mode_tests.rs:255:13:
+adapter bypassed restatement
+```
+
+Restored green rerun of the identical command: exit 0.
+
+```text
+test store::mode_tests::mode_restatement_uses_target_set_at_destroy_and_reinstall ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 180 filtered out; finished in 0.88s
+```
+
+**Weaker modes M7** — Omitted no-brief from the trust display in Store::sessions. File: `src/store.rs`. Exact command:
+
+```sh
+TMPDIR=/var/tmp nix shell nixpkgs#gcc -c env RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web mode_trust_display_lists_every_mode_without_artifact_claims
+```
+
+Red exit: 101. Failing test, assertion location and panic output:
+
+```text
+thread 'store::mode_tests::mode_trust_display_lists_every_mode_without_artifact_claims' (3301419) panicked at src/store/mode_tests.rs:198:9:
+assertion `left == right` failed: trust display completeness
+  left: Array [String("An installation with no artifact pin")]
+ right: Array [String("An installation with no artifact pin"), String("Acting on a goal with no brief")]
+```
+
+Restored green rerun of the identical command: exit 0.
+
+```text
+test store::mode_tests::mode_trust_display_lists_every_mode_without_artifact_claims ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 180 filtered out; finished in 0.18s
+```
+
+**Weaker modes M8** — Removed signature-lowering admission from the host `Journal::append`. File: `src/store.rs`. Exact command:
+
+```sh
+TMPDIR=/var/tmp nix shell nixpkgs#gcc -c env RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web mode_lowering_refuses_each_form_before_intent_and_records_it
+```
+
+Red exit: 101. Failing test, assertion location and panic output:
+
+```text
+thread 'store::mode_tests::mode_lowering_refuses_each_form_before_intent_and_records_it' (3467239) panicked at src/store/mode_tests.rs:562:9:
+assertion `left == right` failed: no intent was journaled
+  left: [(7, Entry { machine: "fixture", command: [101, 99, 104, 111, 32, 39, 83, 105, 103, 76, 101, 118, 101, 108, 32, 61, 32, 78, 101, 118, 101, 114, 39, 32, 62, 62, 32, 47, 101, 116, 99, 47, 112, 97, 99, 109, 97, 110, 46, 99, 111, 110, 102], provenance: Some(CommandProvenance { target: Entry("fixture"), session: Some("session-5"), requester: Session }) })]
+ right: []
+```
+
+Saved source bytes restored and compared byte for byte. Green rerun of the identical command:
+exit 0.
+
+```text
+test store::mode_tests::mode_lowering_refuses_each_form_before_intent_and_records_it ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 180 filtered out; finished in 4.08s
+```
+
+**Weaker modes M9** — Disabled the signature-level-of-never form in `lowering`. File: `src/modes.rs`. Exact command:
+
+```sh
+TMPDIR=/var/tmp nix shell nixpkgs#gcc -c env RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web mode_lowering_refuses_each_form_before_intent_and_records_it
+```
+
+Red exit: 101. Failing test, assertion location and panic output:
+
+```text
+thread 'store::mode_tests::mode_lowering_refuses_each_form_before_intent_and_records_it' (3469240) panicked at src/store/mode_tests.rs:562:9:
+assertion `left == right` failed: no intent was journaled
+  left: [(7, Entry { machine: "fixture", command: [101, 99, 104, 111, 32, 39, 83, 105, 103, 76, 101, 118, 101, 108, 32, 61, 32, 78, 101, 118, 101, 114, 39, 32, 62, 62, 32, 47, 101, 116, 99, 47, 112, 97, 99, 109, 97, 110, 46, 99, 111, 110, 102], provenance: Some(CommandProvenance { target: Entry("fixture"), session: Some("session-5"), requester: Session }) })]
+ right: []
+```
+
+Saved source bytes restored and compared byte for byte. Green rerun of the identical command:
+exit 0.
+
+```text
+test store::mode_tests::mode_lowering_refuses_each_form_before_intent_and_records_it ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 180 filtered out; finished in 4.27s
+```
+
+**Weaker modes M10** — Disabled the untrusted-repository form in `lowering`. File: `src/modes.rs`. Exact command:
+
+```sh
+TMPDIR=/var/tmp nix shell nixpkgs#gcc -c env RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web mode_lowering_refuses_each_form_before_intent_and_records_it
+```
+
+Red exit: 101. Failing test, assertion location and panic output:
+
+```text
+thread 'store::mode_tests::mode_lowering_refuses_each_form_before_intent_and_records_it' (3470818) panicked at src/store/mode_tests.rs:562:9:
+assertion `left == right` failed: no intent was journaled
+  left: [(12, Entry { machine: "fixture", command: [83, 105, 103, 76, 101, 118, 101, 108, 32, 61, 32, 79, 112, 116, 105, 111, 110, 97, 108, 32, 84, 114, 117, 115, 116, 65, 108, 108], provenance: Some(CommandProvenance { target: Entry("fixture"), session: Some("session-5"), requester: Session }) })]
+ right: []
+```
+
+Saved source bytes restored and compared byte for byte. Green rerun of the identical command:
+exit 0.
+
+```text
+test store::mode_tests::mode_lowering_refuses_each_form_before_intent_and_records_it ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 180 filtered out; finished in 4.21s
+```
+
+**Weaker modes M11** — Removed the refusal record commit in `Journal::check_signature`. File: `src/store.rs`. Exact command:
+
+```sh
+TMPDIR=/var/tmp nix shell nixpkgs#gcc -c env RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web mode_lowering_refuses_each_form_before_intent_and_records_it
+```
+
+Red exit: 101. Failing test, assertion location and panic output:
+
+```text
+thread 'store::mode_tests::mode_lowering_refuses_each_form_before_intent_and_records_it' (3472824) panicked at src/store/mode_tests.rs:573:9:
+assertion `left == right` failed: exactly one refusal record
+  left: 7
+ right: 8
+```
+
+Saved source bytes restored and compared byte for byte. Green rerun of the identical command:
+exit 0.
+
+```text
+test store::mode_tests::mode_lowering_refuses_each_form_before_intent_and_records_it ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 180 filtered out; finished in 4.15s
+```
+
+**Weaker modes M12** — Removed the pre-contact signature check from run_command; the append check remained. File: `src/harness/run.rs`. Exact command:
+
+```sh
+nix shell nixpkgs#gcc -c env RUSTUP_TOOLCHAIN=1.97.1 CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-Clinker-features=-lld CHROME=<chromium> TAU_TRACER_MODE_CASE=all bash scripts/tracer.sh
+```
+
+Red exit: 1. Both browser cases failed the assertion at
+`tracer/src/mode_cases.rs:120`; the served case also failed the record assertions at
+`tracer/src/mode_cases.rs:129` and `tracer/src/mode_cases.rs:143`. These are tracer assertions,
+not Rust panics. The append guard remained in place and prevented an intent in the tracer build.
+
+```text
+== acceptable weaker modes and pre-contact signature refusal: tracer
+   [FAILED] lowering refused before relay or SSH contact and exec
+   [FAILED] lowering refused before relay or SSH contact and exec
+== acceptable weaker modes and pre-contact signature refusal: served
+   [FAILED] lowering refused before relay or SSH contact and exec
+   [FAILED] exactly one refusal, no intent, unchanged modes
+   [FAILED] independent reader reads the exact refusal record
+   [FAILED] lowering refused before relay or SSH contact and exec
+   [FAILED] exactly one refusal, no intent, unchanged modes
+   [FAILED] independent reader reads the exact refusal record
+   FAIL acceptable weaker modes and pre-contact signature refusal: tracer: lowering refused before relay or SSH contact and exec; lowering refused before relay or SSH contact and exec
+   FAIL acceptable weaker modes and pre-contact signature refusal: served: lowering refused before relay or SSH contact and exec; exactly one refusal, no intent, unchanged modes; independent reader reads the exact refusal record; lowering refused before relay or SSH contact and exec; exactly one refusal, no intent, unchanged modes; independent reader reads the exact refusal record
+FAIL: tracer cases failed: acceptable weaker modes and pre-contact signature refusal: tracer, acceptable weaker modes and pre-contact signature refusal: served
+```
+
+Restored green rerun: exit 0, including both no-contact assertions:
+
+```text
+== acceptable weaker modes and pre-contact signature refusal: tracer
+   [ok] lowering refused before relay or SSH contact and exec
+   [ok] lowering refused before relay or SSH contact and exec
+== acceptable weaker modes and pre-contact signature refusal: served
+   [ok] lowering refused before relay or SSH contact and exec
+   [ok] lowering refused before relay or SSH contact and exec
+TRACER PASS
+```
+
+**Weaker modes M13** — Substituted the earlier matcher without quoted-token handling, keeping all current cases. File: `src/modes.rs`. Exact command:
+
+```sh
+TMPDIR=/var/tmp nix shell nixpkgs#gcc -c env RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web mode_lowering_refuses_each_form_before_intent_and_records_it
+```
+
+Red exit: 101. Failing test, assertion location and panic output:
+
+```text
+thread 'store::mode_tests::mode_lowering_refuses_each_form_before_intent_and_records_it' (3474409) panicked at src/store/mode_tests.rs:562:9:
+assertion `left == right` failed: no intent was journaled
+  left: [(16, Entry { machine: "fixture", command: [101, 99, 104, 111, 32, 83, 105, 103, 76, 101, 118, 101, 108, 32, 61, 32, 39, 78, 101, 118, 101, 114, 39, 32, 62, 32, 47, 101, 116, 99, 47, 112, 97, 99, 109, 97, 110, 46, 99, 111, 110, 102], provenance: Some(CommandProvenance { target: Entry("fixture"), session: Some("session-5"), requester: Session }) })]
+ right: []
+```
+
+Saved source bytes restored and compared byte for byte. Green rerun of the identical command:
+exit 0.
+
+```text
+test store::mode_tests::mode_lowering_refuses_each_form_before_intent_and_records_it ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 180 filtered out; finished in 4.25s
+```
+
+**Weaker modes M14** — Disabled the later-exposure acceptance check in ModeHistory::check_and_apply. File: `tracer/src/reader.rs`. Exact command:
+
+```sh
+TMPDIR=/var/tmp nix shell nixpkgs#gcc -c env RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tracer weaker_mode_records_and_windows_are_independently_checked
+```
+
+Red exit: 101. Failing test, assertion location and panic output:
+
+```text
+thread 'reader::tests::weaker_mode_records_and_windows_are_independently_checked' (3310490) panicked at tracer/src/reader.rs:1200:18:
+independent reader must refuse
+```
+
+Restored green rerun of the identical command: exit 0.
+
+```text
+test reader::tests::weaker_mode_records_and_windows_are_independently_checked ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 60 filtered out; finished in 86.96s
+```
+
+**Weaker modes M15** — Made `check_signature` refuse whenever any machine has the installation mode, irrespective of the target. File: `src/store.rs`. The `fixture-other` control runs while `fixture` has both modes standing. Exact command:
+
+```sh
+TMPDIR=/var/tmp nix shell nixpkgs#gcc -c env RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web mode_lowering_refuses_each_form_before_intent_and_records_it
+```
+
+Red exit: 101. Failing test, assertion location and panic output:
+
+```text
+thread 'store::mode_tests::mode_lowering_refuses_each_form_before_intent_and_records_it' (3476557) panicked at src/store/mode_tests.rs:633:9:
+assertion failed: block_on(store.append(&command("fixture-other", None, bytes),
+            &approval())).is_ok()
+```
+
+Saved source bytes restored and compared byte for byte. Green rerun of the identical command:
+exit 0.
+
+```text
+test store::mode_tests::mode_lowering_refuses_each_form_before_intent_and_records_it ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 180 filtered out; finished in 4.19s
+```
+
+**Weaker modes M16** — Substituted the matcher that stops its value scan at punctuation and consumes later directives, keeping the new repeated-assignment and shell-syntax cases. File: `src/modes.rs`. Exact command:
+
+```sh
+TMPDIR=/var/tmp nix shell nixpkgs#gcc -c env RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web mode_lowering_refuses_each_form_before_intent_and_records_it
+```
+
+Red exit: 101. Failing test, assertion location and panic output:
+
+```text
+thread 'store::mode_tests::mode_lowering_refuses_each_form_before_intent_and_records_it' (3478461) panicked at src/store/mode_tests.rs:562:9:
+assertion `left == right` failed: no intent was journaled
+  left: [(25, Entry { machine: "fixture", command: [112, 114, 105, 110, 116, 102, 32, 39, 37, 115, 92, 110, 39, 32, 39, 83, 105, 103, 76, 101, 118, 101, 108, 32, 61, 32, 82, 101, 113, 117, 105, 114, 101, 100, 39, 32, 39, 83, 105, 103, 76, 101, 118, 101, 108, 32, 61, 32, 78, 101, 118, 101, 114, 39], provenance: Some(CommandProvenance { target: Entry("fixture"), session: Some("session-5"), requester: Session }) })]
+ right: []
+```
+
+Saved source bytes restored and compared byte for byte. Green rerun of the identical command:
+exit 0.
+
+```text
+test store::mode_tests::mode_lowering_refuses_each_form_before_intent_and_records_it ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 180 filtered out; finished in 3.79s
+```
 
 Binding admission and fixture authentication were mutation-checked on 2026-10-23 with Rust
 1.97.1. Each command below ran in the foreground, first with only the stated production

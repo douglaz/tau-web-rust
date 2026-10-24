@@ -50,3 +50,12 @@ exercise fixed text such as `icon`, `state`, `call` and `machine`, and the adjac
 The fourth also holds `approve never` and `improve never`: concatenated list-item text carries
 `proven` across those word boundaries. The language check omits only the displayed word list
 and still reports a planted hidden reserved claim elsewhere in the page.
+
+- `pacman-c8ccc368.conf` is Arch Linux's `pacman.conf` from its pacman packaging project,
+  copied byte for byte from
+  `https://gitlab.archlinux.org/archlinux/packaging/packages/pacman/-/raw/c8ccc3684e28c419ebd709e666eef15e1479acdf/pacman.conf`,
+  commit `c8ccc3684e28c419ebd709e666eef15e1479acdf` (`c8ccc368`). The upstream project is
+  pacman, https://www.archlinux.org/pacman/, licensed GPL-2.0-or-later (the packaging
+  project's `PKGBUILD` at that same commit declares the licence). The signature-lowering
+  tests admit this stock configuration, including its commented TrustAll example; they
+  execute no package manager and claim no observed unsigned-package refusal.

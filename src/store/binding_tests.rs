@@ -236,6 +236,7 @@ fn adapter_refuses_outside_bound_set_before_any_approval() {
         Err(OperationError::Policy(RequestRefusal::Facts))
     );
     request.approved = Some(OperationApproval {
+        restated_modes: Vec::new(),
         resource: Resource::Entry("fixture".into()),
         target: request.target.clone(),
         operation: request.operation,
@@ -258,6 +259,7 @@ fn adapter_refuses_caller_present_requester_relabelling() {
         request.session = caller.clone();
         request.requester = requester;
         request.approved = Some(OperationApproval {
+            restated_modes: Vec::new(),
             resource: Resource::Entry("fixture-other".into()),
             target: request.target.clone(),
             operation: request.operation,
@@ -309,6 +311,7 @@ fn replay_refuses_exposure_for_an_unlisted_identity() {
         .identity
         .clone();
     let exposure = Exposure {
+        accepted_modes: Vec::new(),
         session: format!("session-{number}"),
         bound_set: vec![BoundMachine {
             machine: "fixture".into(),

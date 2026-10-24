@@ -116,8 +116,13 @@ const renderSetup = (store) => {
     }
     const access = machine.access;
     if (access) paragraph(section, `Access model: ${access.model}; profile ${access.profile}, revision ${access.revision}.`);
+    const installation = (store.installations ?? []).find(i => i.machine === machine.entry.machine);
+    if (installation) paragraph(section, `Installation: ${installation.installation}.`);
     const session = (store.sessions ?? []).find(s => s.bound_set.includes(machine.entry.machine));
-    if (session) paragraph(section, `Session ${session.identity}: bound set ${session.bound_set.join(', ')}.`);
+    if (session) {
+      paragraph(section, `Session ${session.identity}: bound set ${session.bound_set.join(', ')}.`);
+      for (const label of session.standing_modes ?? []) paragraph(section, `Standing mode: ${label}.`);
+    }
     else if (machine.class !== null && access) {
       const button = document.createElement('button');
       button.type = 'button';

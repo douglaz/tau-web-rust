@@ -96,6 +96,8 @@ pub struct BoundMachine {
 pub struct Exposure {
     pub session: String,
     pub bound_set: Vec<BoundMachine>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accepted_modes: Vec<crate::modes::Mode>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

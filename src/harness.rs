@@ -27,6 +27,9 @@ pub use wait::stop_waits;
     reason = "used generically and only on one thread: the browser's worker, or a host test"
 )]
 pub trait Journal {
+    /// Refuse literal signature lowering before contact, then repeat under the append writer.
+    async fn check_signature(&mut self, machine: &str, command: &[u8])
+    -> Result<(), AppendRefusal>;
     /// Check the unresolved-command hold and disposition before contact; repeat atomically
     /// at append.
     async fn check(&self, machine: &str) -> Result<(), AppendRefusal>;
@@ -80,6 +83,7 @@ pub struct Entry {
 /// A policy refusal does not trip the store's failed-append latch.
 #[derive(Debug, PartialEq, Eq)]
 pub enum AppendRefusal {
+    SignatureLowering(crate::modes::SignatureRefusal),
     Storage(String),
     Policy(crate::dispatch::DispatchRefusal),
 }
@@ -87,6 +91,7 @@ pub enum AppendRefusal {
 impl std::fmt::Display for AppendRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::SignatureLowering(record) => write!(f, "signature-lowering: {record:?}"),
             Self::Storage(why) => f.write_str(why),
             Self::Policy(record) => write!(f, "dispatch: {record:?}"),
         }

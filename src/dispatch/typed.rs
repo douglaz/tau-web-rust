@@ -62,6 +62,8 @@ pub struct Facts {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OperationApproval {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub restated_modes: Vec<crate::modes::Mode>,
     pub resource: Resource,
     pub target: Target,
     pub operation: Operation,
@@ -100,6 +102,8 @@ pub struct Request {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OperationIntent {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub restated_modes: Vec<crate::modes::Mode>,
     pub call: u64,
     pub resource: Resource,
     pub target: Target,
@@ -154,6 +158,7 @@ pub struct Assumption {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "reason", rename_all = "snake_case")]
 pub enum RequestRefusal {
+    Modes,
     BoundSet,
     Unmapped,
     Facts,
@@ -277,6 +282,11 @@ impl Dispatch {
             return Err(RequestRefusal::Facts);
         }
         let expected = OperationApproval {
+            restated_modes: request
+                .approved
+                .as_ref()
+                .map(|a| a.restated_modes.clone())
+                .unwrap_or_default(),
             resource: resource.clone(),
             target: request.target.clone(),
             operation: request.operation,
@@ -344,6 +354,12 @@ impl Dispatch {
     ) -> Result<OperationIntent, RequestRefusal> {
         let resource = self.check_request(request)?;
         Ok(OperationIntent {
+            restated_modes: request
+                .approved
+                .as_ref()
+                .expect("checked approval")
+                .restated_modes
+                .clone(),
             call: number,
             resource,
             target: request.target.clone(),
@@ -362,8 +378,19 @@ impl Dispatch {
         if number != intent.call || self.call_state(number).is_some() {
             return Err("intent identity is not its unique record number".into());
         }
+        if intent
+            .restated_modes
+            .iter()
+            .enumerate()
+            .any(|(i, mode)| intent.restated_modes[..i].contains(mode))
+            || (!matches!(intent.operation, Operation::Destroy | Operation::Reinstall)
+                && !intent.restated_modes.is_empty())
+        {
+            return Err("invalid restated modes".into());
+        }
         if intent.approved
             != (OperationApproval {
+                restated_modes: intent.restated_modes.clone(),
                 resource: intent.resource.clone(),
                 target: intent.target.clone(),
                 operation: intent.operation,
