@@ -57,20 +57,21 @@ impl Redacted {
         credentials: &[&[u8]],
     ) -> bool {
         use serde_json::Value;
-        let exact = |bytes: &[u8]| {
-            Self::for_inference(store, bytes, credentials)
-                .is_ok_and(|safe| safe.as_bytes() == bytes)
+        let Ok(mut held) = store.held_credentials() else {
+            return false;
         };
-        match value {
-            Value::String(s) => exact(s.as_bytes()),
-            Value::Array(a) => a
-                .iter()
-                .all(|v| Self::inference_value_is_safe(store, v, credentials)),
-            Value::Object(o) => o.iter().all(|(k, v)| {
-                exact(k.as_bytes()) && Self::inference_value_is_safe(store, v, credentials)
-            }),
-            _ => exact(value.to_string().as_bytes()),
+        held.borrowed.extend_from_slice(credentials);
+        fn safe(value: &Value, held: &Held<'_>) -> bool {
+            let exact =
+                |bytes: &[u8]| redact(bytes, &[], held).is_ok_and(|r| r.as_bytes() == bytes);
+            match value {
+                Value::String(s) => exact(s.as_bytes()),
+                Value::Array(a) => a.iter().all(|v| safe(v, held)),
+                Value::Object(o) => o.iter().all(|(k, v)| exact(k.as_bytes()) && safe(v, held)),
+                _ => exact(value.to_string().as_bytes()),
+            }
         }
+        safe(value, &held)
     }
 
     pub(crate) fn for_store<S: Storage>(

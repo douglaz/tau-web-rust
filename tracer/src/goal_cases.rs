@@ -673,6 +673,44 @@ pub(super) async fn run(
                 }),
             );
         }
+        // A different session's ordinary report must not erase the first session's result.
+        run.browser.evaluate(&tab.session, "(()=>{const c=document.querySelector('[data-machine=fixture-other]');c.querySelector('[data-goal-text]').value='End this session goal';c.querySelector('[data-goal-enter]').click();return true;})()").await?;
+        for _ in 0..200 {
+            if run
+                .browser
+                .evaluate(
+                    &tab.session,
+                    "!!document.querySelector('[data-machine=fixture-other] [data-goal-accept]')",
+                )
+                .await?
+                == true
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        case.check(
+            "another session's goal entry preserves the terminal label",
+            run.browser.evaluate(&tab.session, "document.querySelector('[data-machine=fixture] [data-goal-outcome]')?.textContent ?? null").await? == label,
+        );
+        {
+            let mut state = run.aggregator.state.lock().unwrap();
+            state.fail = false;
+            state.top_up = false;
+            state.script = vec![call("done", json!({"machine":"fixture-other"}))].into();
+        }
+        setup_cases::click(run, tab, "[data-machine=fixture-other] [data-goal-accept]").await?;
+        for _ in 0..200 {
+            if run.browser.evaluate(&tab.session, "document.querySelector('[data-machine=fixture-other] [data-goal-outcome]')?.textContent === 'Goal loop ended: done.'").await? == true {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        case.check(
+            "each session retains its own terminal label",
+            run.browser.evaluate(&tab.session, "document.querySelector('[data-machine=fixture] [data-goal-outcome]')?.textContent ?? null").await? == label
+                && run.browser.evaluate(&tab.session, "document.querySelector('[data-machine=fixture-other] [data-goal-outcome]')?.textContent === 'Goal loop ended: done.'").await? == true,
+        );
         cases.push(case);
     }
     run.aggregator.state.lock().unwrap().top_up = false;

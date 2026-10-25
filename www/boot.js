@@ -17,6 +17,7 @@ const texts = {
 };
 const clearWords = () => $('seed-backup-words-slot').replaceChildren();
 let redisplay = false;
+const goalOutcomes = new Map();
 const render = (store) => {
   const { state } = store;
   renderSetup(store);
@@ -161,8 +162,8 @@ const renderSetup = (store) => {
         });
         card.append(words, source, enter);
       }
-      if (store.goal_outcome?.session === session.identity) {
-        const outcome = store.goal_outcome.outcome;
+      const outcome = goalOutcomes.get(session.identity);
+      if (outcome) {
         const status = document.createElement('p');
         status.dataset.goalOutcome = session.identity;
         status.textContent = outcome.done === true ? 'Goal loop ended: done.'
@@ -194,6 +195,7 @@ const renderSetup = (store) => {
 
 let worker;
 const start = () => {
+  goalOutcomes.clear();
   show('starting', 'Starting the harness…');
   render({ state: 'starting' });
   worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
@@ -203,6 +205,7 @@ const start = () => {
     if (data.harness_ready) show('ready', `Harness ready (spec ${data.harness_ready}).`);
     else if (data.store) {
       const { store_state: state, store_error: error, store_reason: reason, ...rest } = data.store;
+      if (rest.goal_outcome) goalOutcomes.set(rest.goal_outcome.session, rest.goal_outcome.outcome);
       render({ state, error, reason, ...rest });
     }
     else if (Object.keys(data).length === 1 && typeof data.seed_backup_display === 'string') {
