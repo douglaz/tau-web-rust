@@ -111,6 +111,12 @@ fn main() {
         let value: toml::Table = text.parse().unwrap_or_else(|e| panic!("spec/{path}: {e}"));
         if name == "inference.toml" {
             session_gate::session_gate(&value).unwrap_or_else(|refusal| panic!("{refusal}"));
+            println!(
+                "cargo::rustc-env=TAU_INFERENCE_ORIGIN={}",
+                value["aggregator"]["base_url"]
+                    .as_str()
+                    .expect("aggregator origin")
+            );
         }
         bundle.push((name, path));
     }

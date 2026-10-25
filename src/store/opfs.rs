@@ -110,6 +110,8 @@ impl Storage for Opfs {
         } else {
             to
         };
+        #[cfg(feature = "tracer")]
+        crate::testonly::hold_move().await?;
         let file = self.file(from, false).await?;
         let move_to: Function = Reflect::get(&file, &"move".into())
             .map_err(why("move"))?

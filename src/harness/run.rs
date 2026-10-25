@@ -167,6 +167,21 @@ struct PinCheck {
 impl client::Handler for PinCheck {
     type Error = russh::Error;
 
+    #[cfg(feature = "tracer")]
+    async fn auth_banner(
+        &mut self,
+        _banner: &str,
+        session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        if let Some(released) = crate::testonly::session_point_receiver("session_authentication") {
+            released.await.expect("fixture authentication release");
+        }
+        if crate::testonly::rekey_session("session_authentication") {
+            session.initiate_rekey()?;
+        }
+        Ok(())
+    }
+
     async fn check_server_key(
         &mut self,
         key: &PublicKeyOrCertificate,
@@ -214,18 +229,23 @@ pub async fn run_command(
     if !jobs::launch_fits(bytes) {
         return Err(Refusal::LaunchTooLong { bytes });
     }
-    let (ssh, pinned, host_key) = connect(
-        pins,
-        journal,
-        &session,
-        target,
-        #[cfg(feature = "tracer")]
-        tamper_auth,
-    )
-    .await?;
-    let mut channel = ssh
-        .channel_open_session()
+    let stop = wait::Stop::collection();
+    let (ssh, pinned, host_key, _socket) = stop
+        .until(connect(
+            pins,
+            journal,
+            &session,
+            target,
+            &stop,
+            #[cfg(feature = "tracer")]
+            tamper_auth,
+        ))
         .await
+        .ok_or_else(|| Refusal::Journal("sessions ended".into()))??;
+    let mut channel = stop
+        .until(ssh.channel_open_session())
+        .await
+        .ok_or_else(|| Refusal::Journal("sessions ended".into()))?
         .map_err(|e| Refusal::Failed(format!("session channel: {e}")))?;
 
     // ARC-8, STA-4: the record is appended immediately before the bytes leave, and a failed
@@ -261,6 +281,13 @@ pub async fn run_command(
             .await);
         }
     };
+    if super::inference::ending() {
+        return Err(Refusal::Unresolved {
+            call: seq,
+            why: "sessions ended after intent committed".into(),
+            evidence: None,
+        });
+    }
     // No await separates committed intent from registration in this single-threaded worker.
     let own = wait::DispatchResult::new(seq);
     let outcome = async {
@@ -273,11 +300,33 @@ pub async fn run_command(
                 evidence: None,
             })?;
         let job = intent.job.as_deref().expect("new intent has job identity");
+        if super::inference::ending() {
+            return Err(Refusal::Unresolved {
+                call: seq,
+                why: "sessions ended before command transmission".into(),
+                evidence: None,
+            });
+        }
         let sent = jobs::launch(job, &entry.machine, &entry.command).into_bytes();
-        let result = exec_record(&mut channel, &sent).await;
-        let _ = ssh
-            .disconnect(russh::Disconnect::ByApplication, "", "en")
-            .await;
+        let progress = super::job_read::Read::default();
+        let result = stop
+            .until(exec_record(&mut channel, &sent, Some(&progress)))
+            .await
+            .unwrap_or_else(|| {
+                Err(if progress.sent() {
+                    "sessions ended while awaiting job record"
+                } else {
+                    "sessions ended before command transmission"
+                }
+                .into())
+            });
+        #[cfg(feature = "tracer")]
+        ssh_point(&ssh, "session_evidence").await;
+        if !stop.stopped() {
+            let _ = stop
+                .until(ssh.disconnect(russh::Disconnect::ByApplication, "", "en"))
+                .await;
+        }
         // CNF-30: the journal determines the wrapper's exact transmitted bytes.
         let recorded = journal.read(seq).await;
         let replayed = journal.intent(seq).await;
@@ -317,19 +366,19 @@ pub async fn run_command(
             job: job.into(),
             record,
         };
-        let evidence =
-            journal
-                .job_evidence(&received)
-                .await
-                .map_err(|why| Refusal::Unresolved {
-                    call: seq,
-                    why: format!("job evidence append: {why}"),
-                    evidence: Some(Box::new(jobs::uncommitted(
-                        &received,
-                        &entry.machine,
-                        &hex::encode(&entry.command),
-                    ))),
-                })?;
+        let evidence = journal
+            .job_evidence_unless_stopped(&received, &stop)
+            .await
+            .unwrap_or_else(|| Err("sessions ended before journaling job evidence".into()))
+            .map_err(|why| Refusal::Unresolved {
+                call: seq,
+                why: format!("job evidence append: {why}"),
+                evidence: Some(Box::new(jobs::uncommitted(
+                    &received,
+                    &entry.machine,
+                    &hex::encode(&entry.command),
+                ))),
+            })?;
         if evidence.state != jobs::State::Finished {
             return Err(Refusal::Unresolved {
                 call: seq,
@@ -397,8 +446,19 @@ async fn held(
         .iter()
         .map(|intent| (intent, wait::result(intent.call)))
         .collect();
+    let stopped_why = |why: &str| {
+        json!(if super::inference::ending() {
+            "sessions ended before record was read"
+        } else {
+            why
+        })
+    };
     for (intent, own) in calls {
         let not_read = |why: Value| json!({"call":intent.call,"not_read":true,"why":why});
+        if super::inference::ending() {
+            reports.push(not_read(stopped_why("stopped before record was read")));
+            continue;
+        }
         let Some(job) = intent.job.as_deref() else {
             reports.push(not_read(json!(
                 "no job identity; only a disposition can release this call"
@@ -406,14 +466,14 @@ async fn held(
             continue;
         };
         if stop.stopped() {
-            reports.push(not_read(json!("stopped before record was read")));
+            reports.push(not_read(stopped_why("stopped before record was read")));
             continue;
         }
         if let Some(own) = own {
             let result = stop.until(own.get()).await;
             reports.push(match result {
                 Some(result) => json!({"call":intent.call,"dispatch_result":result}),
-                None => not_read(json!("stopped while awaiting own dispatch's result")),
+                None => not_read(stopped_why("stopped while awaiting own dispatch's result")),
             });
             continue;
         }
@@ -428,12 +488,13 @@ async fn held(
                     journal,
                     session,
                     target,
+                    &stop,
                     #[cfg(feature = "tracer")]
                     tamper_auth,
                 ))
                 .await
             {
-                Some(Ok((ssh, _, _))) => connection = Some(ssh),
+                Some(Ok((ssh, _, _, socket))) => connection = Some((ssh, socket)),
                 Some(Err(why)) => {
                     let reason = match why {
                         Refusal::Failed(why) => json!({"connection":"unavailable","why":why}),
@@ -445,30 +506,36 @@ async fn held(
                     continue;
                 }
                 None => {
-                    reports.push(not_read(json!("stopped before record was read")));
+                    reports.push(not_read(stopped_why("stopped before record was read")));
                     continue;
                 }
             }
         }
-        let ssh = connection.as_ref().expect("connected for collection");
+        let (ssh, _socket) = connection.as_ref().expect("connected for collection");
+        let progress = super::job_read::Read::default();
         let read = async {
             let mut channel = ssh
                 .channel_open_session()
                 .await
                 .map_err(|e| format!("session channel: {e}"))?;
-            exec_record(&mut channel, jobs::collect(job).as_bytes()).await
+            read_job_record(&mut channel, job, &progress).await
         };
         let record = match stop.until(read).await {
             Some(Ok(record)) => record,
             Some(Err(why)) => {
-                reports.push(not_read(json!(why)));
+                reports.push(progress.failure(intent.call, None, super::inference::ending(), &why));
                 if ssh.is_closed() {
                     unreachable = Some(json!("connection lost"));
                 }
                 continue;
             }
             None => {
-                reports.push(not_read(json!("stopped while reading record")));
+                reports.push(progress.failure(
+                    intent.call,
+                    None,
+                    super::inference::ending(),
+                    "stopped while reading record",
+                ));
                 continue;
             }
         };
@@ -479,6 +546,8 @@ async fn held(
         };
         #[cfg(feature = "tracer")]
         crate::testonly::completed_read();
+        #[cfg(feature = "tracer")]
+        ssh_point(ssh, "session_evidence").await;
         match journal.job_evidence_unless_stopped(&received, &stop).await {
             Some(Ok(report)) => {
                 reports.push(serde_json::to_value(report).expect("report serialization"))
@@ -512,6 +581,7 @@ pub async fn collect_jobs(
     target: &Target,
     #[cfg(feature = "tracer")] tamper_auth: bool,
 ) -> Result<Vec<Value>, Refusal> {
+    let stop = wait::Stop::collection();
     let session = resolve(journal, &target.machine).await?;
     let calls = journal
         .collectable(&target.machine)
@@ -534,31 +604,66 @@ pub async fn collect_jobs(
     if had_calls && calls.is_empty() {
         return Ok(reports);
     }
-    let (ssh, _, _) = connect(
-        pins,
-        journal,
-        &session,
-        target,
-        #[cfg(feature = "tracer")]
-        tamper_auth,
-    )
-    .await?;
+    let connection = stop
+        .until(connect(
+            pins,
+            journal,
+            &session,
+            target,
+            &stop,
+            #[cfg(feature = "tracer")]
+            tamper_auth,
+        ))
+        .await;
+    let (ssh, _, _, _socket) = match connection {
+        Some(result) => result?,
+        None => {
+            reports.extend(calls.into_iter().map(|intent| {
+                json!({"call":intent.call,"job":intent.job,"not_read":true,
+                    "why":"sessions ended before record was read"})
+            }));
+            return Ok(reports);
+        }
+    };
     for intent in calls {
         let job = intent.job.expect("collectable has job identity");
+        if super::inference::ending() {
+            reports.push(json!({"call":intent.call,"job":job,"not_read":true,
+                "why":"sessions ended before record was read"}));
+            continue;
+        }
         if ssh.is_closed() {
             reports.push(
                 json!({"call":intent.call,"job":job,"not_read":true,"why":"connection lost"}),
             );
             continue;
         }
-        let result = match ssh.channel_open_session().await {
-            Ok(mut channel) => exec_record(&mut channel, jobs::collect(&job).as_bytes()).await,
-            Err(e) => Err(format!("session channel: {e}")),
+        let progress = super::job_read::Read::default();
+        let read = async {
+            let mut channel = ssh
+                .channel_open_session()
+                .await
+                .map_err(|e| format!("session channel: {e}"))?;
+            read_job_record(&mut channel, &job, &progress).await
         };
-        let record = match result {
-            Ok(record) => record,
-            Err(why) => {
-                reports.push(json!({"call":intent.call,"job":job,"failed":true,"why":why}));
+        let record = match stop.until(read).await {
+            Some(Ok(record)) => record,
+            Some(Err(why)) => {
+                reports.push(progress.failure(
+                    intent.call,
+                    Some(&job),
+                    super::inference::ending(),
+                    &why,
+                ));
+                continue;
+            }
+            None => {
+                reports.push(progress.failure(
+                    intent.call,
+                    Some(&job),
+                    super::inference::ending(),
+                    "stopped while reading record",
+                ));
                 continue;
             }
         };
@@ -567,19 +672,42 @@ pub async fn collect_jobs(
             job,
             record,
         };
-        match journal.job_evidence(&received).await {
-            Ok(report) => reports.push(serde_json::to_value(report).expect("report serialization")),
-            Err(why) => reports.push(json!({
+        #[cfg(feature = "tracer")]
+        ssh_point(&ssh, "session_evidence").await;
+        match journal.job_evidence_unless_stopped(&received, &stop).await {
+            Some(Ok(report)) => {
+                reports.push(serde_json::to_value(report).expect("report serialization"))
+            }
+            result => reports.push(json!({
                 "call":intent.call,"job":received.job,"failed":true,
-                "why":format!("job evidence append: {why}"),
+                "why":match result {
+                    Some(Err(why)) => format!("job evidence append: {why}"),
+                    None => "wait stopped before journaling job evidence".into(),
+                    Some(Ok(_)) => unreachable!(),
+                },
                 "job_record":jobs::uncommitted(&received, &intent.machine, &intent.command)
             })),
         }
     }
-    let _ = ssh
-        .disconnect(russh::Disconnect::ByApplication, "", "en")
-        .await;
+    if !stop.stopped() {
+        let _ = stop
+            .until(ssh.disconnect(russh::Disconnect::ByApplication, "", "en"))
+            .await;
+    }
     Ok(reports)
+}
+
+async fn read_job_record(
+    channel: &mut russh::Channel<client::Msg>,
+    job: &str,
+    progress: &super::job_read::Read,
+) -> Result<Record, String> {
+    #[cfg(feature = "tracer")]
+    crate::testonly::hold_job_read().await?;
+    if super::inference::ending() {
+        return Err("sessions ended before record was read".into());
+    }
+    exec_record(channel, jobs::collect(job).as_bytes(), Some(progress)).await
 }
 
 /// The SSH exit status belongs to the wrapper, never to the command. Only a complete,
@@ -587,11 +715,15 @@ pub async fn collect_jobs(
 async fn exec_record(
     channel: &mut russh::Channel<client::Msg>,
     bytes: &[u8],
+    progress: Option<&super::job_read::Read>,
 ) -> Result<Record, String> {
     channel
         .exec(true, bytes)
         .await
         .map_err(|e| format!("exec: {e}"))?;
+    if let Some(progress) = progress {
+        progress.mark_sent();
+    }
     let mut delivered = jobs::ReadDelivery::default();
     while let Some(message) = channel.wait().await {
         match message {
@@ -613,30 +745,42 @@ async fn connect(
     journal: &impl BoundJournal,
     session: &Session,
     target: &Target,
+    stop: &std::rc::Rc<wait::Stop>,
     #[cfg(feature = "tracer")] tamper_auth: bool,
-) -> Result<(client::Handle<PinCheck>, String, String), Refusal> {
+) -> Result<
+    (
+        client::Handle<PinCheck>,
+        String,
+        String,
+        wait::SocketRegistration,
+    ),
+    Refusal,
+> {
     // CHN-R4: with no pin there is nothing to check a key against, so nothing is contacted.
     let pinned = pins.pin(&target.machine).ok_or(Refusal::NoPin)?.0;
     if !journal.credentials_available() {
         return Err(Refusal::NoCredentials);
     }
-    let (Some(ssh_key), Some(relay_key)) = (
-        session.client_key(&target.machine),
-        journal.relay_key().await,
-    ) else {
+    let Some(relay_key) = journal.relay_key().await else {
         return Err(Refusal::NoCredentials);
     };
-    // Role 0's child secret is an RFC 8032 Ed25519 seed (credential format v1).
-    let ssh_key = PrivateKey::new(
-        KeypairData::Ed25519(Ed25519Keypair::from_seed(&ssh_key.0)),
-        "",
-    )
-    .map_err(|e| Refusal::Failed(format!("ssh client key: {e}")))?;
+    // Borrow the holding only while deriving the transport key, before any network wait.
+    let ssh_key = {
+        let ssh_key = session
+            .client_key(&target.machine)
+            .ok_or(Refusal::NoCredentials)?;
+        PrivateKey::new(
+            KeypairData::Ed25519(Ed25519Keypair::from_seed(&ssh_key.0)),
+            "",
+        )
+        .map_err(|e| Refusal::Failed(format!("ssh client key: {e}")))?
+    };
 
     let url = format!("{}v1/tcp/{}/{}", target.relay, target.host, target.port);
     let (mut meta, mut ws) = WsMeta::connect(&url, None)
         .await
         .map_err(|e| Refusal::Failed(format!("relay websocket: {e}")))?;
+    let socket = stop.socket(meta.wrapped().clone());
     let mut events = meta
         .observe(ObserveConfig::default())
         .await
@@ -726,7 +870,16 @@ async fn connect(
     if !auth.success() {
         return Err(Refusal::Failed(format!("authentication refused: {auth:?}")));
     }
-    Ok((ssh, pinned, host_key))
+    #[cfg(feature = "tracer")]
+    {
+        crate::testonly::session_point("session_connected").await;
+        if crate::testonly::rekey_session("session_connected") {
+            ssh.rekey_soon()
+                .await
+                .map_err(|e| Refusal::Failed(format!("rekey: {e}")))?;
+        }
+    }
+    Ok((ssh, pinned, host_key, socket))
 }
 
 /// The next frame, which the handshake requires to be a JSON text frame.
@@ -752,4 +905,12 @@ async fn resolve(
             AdmissionRefusal::Unbound => Refusal::Unbound(machine.into()),
             AdmissionRefusal::Journal(why) => Refusal::Journal(why),
         })
+}
+
+#[cfg(feature = "tracer")]
+async fn ssh_point(ssh: &client::Handle<PinCheck>, point: &str) {
+    crate::testonly::session_point(point).await;
+    if crate::testonly::rekey_session(point) {
+        ssh.rekey_soon().await.expect("fixture rekey request");
+    }
 }

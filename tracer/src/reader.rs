@@ -102,6 +102,9 @@ fn check_event(number: u64, event: &Value) -> Result<(), String> {
             .as_str()
             .ok_or_else(|| format!("{kind}: {name} is not text"))
     };
+    if kind.starts_with("inference_") {
+        return crate::inference_reader::shape(number, event);
+    }
     match kind.as_str() {
         "exposure" => {
             exact_optional(body, &["session", "bound_set"], "accepted_modes")?;
@@ -739,6 +742,7 @@ pub fn read(files: &Files, passphrase: &str) -> Result<Opened, String> {
     let mut previous = "0".repeat(64);
     let mut records = Vec::new();
     let mut mode_history = ModeHistory::default();
+    let mut inference_history = crate::inference_reader::History::default();
     for (expected, number) in (0..).zip(numbers) {
         if number != expected {
             return Err(format!("record {expected} missing"));
@@ -764,6 +768,9 @@ pub fn read(files: &Files, passphrase: &str) -> Result<Opened, String> {
         let event: Value =
             serde_json::from_slice(&plaintext).map_err(|e| format!("record {number}: {e}"))?;
         check_event(number, &event).map_err(|e| format!("record {number}: {e}"))?;
+        inference_history
+            .apply(number, &event)
+            .map_err(|e| format!("record {number}: {e}"))?;
         mode_history
             .check_and_apply(&event)
             .map_err(|e| format!("record {number}: {e}"))?;
@@ -1017,6 +1024,22 @@ pub fn record_findings<'a>(
     seed_id: &str,
 ) -> Vec<&'a str> {
     let mut event: Value = serde_json::from_slice(bytes).expect("reader checked JSON");
+    let mut credential_findings = Vec::new();
+    if event.as_object().is_some_and(|o| o.len() == 1)
+        && let Some(account) = event.get_mut("inference_account")
+        && account
+            .as_object()
+            .is_some_and(|o| o.len() == 1 && o.contains_key("credential"))
+    {
+        if let Some(value) = account["credential"].as_str() {
+            credential_findings.extend(
+                found(needles, value.as_bytes())
+                    .into_iter()
+                    .filter(|name| !name.starts_with("inference account credential, ")),
+            );
+        }
+        account["credential"] = Value::Null;
+    }
     for path in [
         "/allocation/seed_backup/seed",
         "/allocation/reserve/seed",
@@ -1068,7 +1091,10 @@ pub fn record_findings<'a>(
             }
         }
     }
-    found(needles, event.to_string().as_bytes())
+    credential_findings.extend(found(needles, event.to_string().as_bytes()));
+    credential_findings.sort_unstable();
+    credential_findings.dedup();
+    credential_findings
 }
 
 /// `CNF-82` and `CNF-15`'s host half, against the harness's store on its in-memory storage.
@@ -1077,6 +1103,80 @@ mod tests {
     use super::*;
     use tau_web::harness::{Entry, Journal};
     use tau_web::store::{MemoryStorage, Pbkdf2, block_on, create, unlock};
+
+    #[test]
+    fn empty_completion_text_commits_as_absent_and_independent_reader_accepts() {
+        use tau_web::credential::{InferenceAccountCredential, LocalPassphrase};
+        use tau_web::inference::{self, Candidate, Request, Response, Transport};
+        struct Replies(&'static str);
+        impl Transport for Replies {
+            async fn exchange(&mut self, r: &Request) -> Option<Response> {
+                let body = match r.path {
+                    "/account" => r#"{"automatic_top_up":false}"#,
+                    "/keys" => r#"{"key_id":"fixture-key","key":"fixture-private-key"}"#,
+                    "/completion" => self.0,
+                    _ => "{}",
+                };
+                Some(Response {
+                    status: 200,
+                    body: body.as_bytes().to_vec().into(),
+                })
+            }
+        }
+        let storage = MemoryStorage::default();
+        let mut store = block_on(create(
+            storage.clone(),
+            &Pbkdf2,
+            LocalPassphrase::new(PASS.as_bytes().to_vec()),
+        ))
+        .unwrap();
+        block_on(store.seed_backup(tau_web::allocation::Completion::Skipped)).unwrap();
+        block_on(store.approve_setup(tau_web::dispatch::fixture_setup())).unwrap();
+        block_on(store.answer_class("fixture".into(), tau_web::dispatch::ClassAnswer::No)).unwrap();
+        block_on(store.bind("fixture")).unwrap();
+        block_on(
+            store.set_inference_account(InferenceAccountCredential::new(
+                b"fixture-account".to_vec(),
+            )),
+        )
+        .unwrap();
+        for (body, absent, present, expected) in [
+            (
+                r#"{"provider":"","id":"valid-id"}"#,
+                "reported_provider",
+                "request_id",
+                "valid-id",
+            ),
+            (
+                r#"{"provider":"valid-provider","id":""}"#,
+                "request_id",
+                "reported_provider",
+                "valid-provider",
+            ),
+        ] {
+            let result = block_on(inference::infer(
+                &mut store,
+                &mut Replies(body),
+                "https://127.0.0.1:1",
+                Some(&Candidate {
+                    slug: "fixture-model".into(),
+                    maker: "fixture-maker".into(),
+                    provider: "fixture-provider".into(),
+                }),
+                &json!({"machine":"fixture","messages":[{"role":"user","content":"fixture prompt"}]}),
+                || 100,
+            ));
+            assert_eq!(result["finished"], true, "{result}");
+            let opened = read(&storage.files(), PASS).unwrap();
+            let terminal: Value =
+                serde_json::from_slice(&opened.records.last().unwrap().1).unwrap();
+            assert!(
+                terminal["inference_terminal"].get(absent).is_none(),
+                "{terminal}"
+            );
+            assert_eq!(terminal["inference_terminal"][present], expected);
+        }
+    }
 
     #[test]
     fn weaker_mode_records_and_windows_are_independently_checked() {
@@ -1955,6 +2055,24 @@ mod tests {
         assert_eq!(
             refused,
             "record 1: its event is not one this version reads; replay stopped"
+        );
+    }
+}
+
+#[cfg(test)]
+mod inference_secret_tests {
+    use super::*;
+    #[test]
+    fn account_field_never_exempts_session_inference_key() {
+        let mut needles = encodings("inference account credential", b"account-private");
+        needles.extend(encodings("session inference key", b"session-private"));
+        let account = json!({"inference_account":{"credential":"account-private"}});
+        assert!(record_findings(&needles, account.to_string().as_bytes(), "").is_empty());
+        let leak = json!({"inference_account":{"credential":"session-private"}});
+        assert!(
+            record_findings(&needles, leak.to_string().as_bytes(), "")
+                .iter()
+                .any(|name| name.starts_with("session inference key"))
         );
     }
 }

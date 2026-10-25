@@ -158,6 +158,7 @@ pub struct Assumption {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "reason", rename_all = "snake_case")]
 pub enum RequestRefusal {
+    SessionsEnded,
     Modes,
     BoundSet,
     Unmapped,

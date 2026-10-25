@@ -113,3 +113,119 @@ pub(crate) fn completed_read() {
 pub(crate) fn completed_reads() -> u32 {
     COMPLETED_READS.with(std::cell::Cell::get)
 }
+
+/// Fixed test selection; session-start selection supplies the production seam later.
+pub fn inference_candidate() -> crate::inference::Candidate {
+    crate::inference::Candidate {
+        slug: "fixture-model".into(),
+        maker: "fixture-maker".into(),
+        provider: "fixture-provider".into(),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+std::thread_local! {
+    static HELD_MOVE: std::cell::RefCell<Option<(js_sys::Promise, js_sys::Function)>> = const { std::cell::RefCell::new(None) };
+    static HELD_JOB_READ: std::cell::RefCell<Option<(js_sys::Promise, js_sys::Function)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Suspend one job-record read after opening its SSH channel, before sending its exec.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub fn test_hold_job_read(release: js_sys::Promise, acquired: js_sys::Function) {
+    HELD_JOB_READ.with_borrow_mut(|held| *held = Some((release, acquired)));
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) async fn hold_job_read() -> Result<(), String> {
+    let held = HELD_JOB_READ.with_borrow_mut(Option::take);
+    if let Some((release, acquired)) = held {
+        acquired
+            .call0(&wasm_bindgen::JsValue::NULL)
+            .map_err(|_| "job read acquired callback")?;
+        wasm_bindgen_futures::JsFuture::from(release)
+            .await
+            .map_err(|_| "job read release promise")?;
+    }
+    Ok(())
+}
+
+/// Suspend the next OPFS move while its append still holds the store writer.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub fn test_hold_move(release: js_sys::Promise, acquired: js_sys::Function) {
+    HELD_MOVE.with_borrow_mut(|held| *held = Some((release, acquired)));
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) async fn hold_move() -> Result<(), String> {
+    let held = HELD_MOVE.with_borrow_mut(Option::take);
+    if let Some((release, acquired)) = held {
+        acquired
+            .call0(&wasm_bindgen::JsValue::NULL)
+            .map_err(|_| "move acquired callback")?;
+        wasm_bindgen_futures::JsFuture::from(release)
+            .await
+            .map_err(|_| "move release promise")?;
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+std::thread_local! {
+    static SESSION_POINTS: std::cell::RefCell<std::collections::BTreeMap<String, (js_sys::Promise, js_sys::Function)>> = const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+    static REKEY_SESSION: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Park exactly one visit to a writer or SSH boundary, without taking the writer.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub fn test_hold_session_point(
+    point: String,
+    release: js_sys::Promise,
+    acquired: js_sys::Function,
+) {
+    SESSION_POINTS.with_borrow_mut(|points| points.insert(point, (release, acquired)));
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) async fn session_point(point: &str) {
+    let held = SESSION_POINTS.with_borrow_mut(|points| points.remove(point));
+    if let Some((release, acquired)) = held {
+        acquired
+            .call0(&wasm_bindgen::JsValue::NULL)
+            .expect("session point callback");
+        wasm_bindgen_futures::JsFuture::from(release)
+            .await
+            .expect("session point release");
+    }
+}
+
+/// Ask the real SSH driver to start one rekey at the selected boundary.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub fn test_rekey_session(point: String) {
+    REKEY_SESSION.with_borrow_mut(|value| *value = Some(point));
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn rekey_session(point: &str) -> bool {
+    REKEY_SESSION.with_borrow_mut(|value| value.take_if(|value| value == point).is_some())
+}
+
+/// Bridge a tracer promise to a Send receiver for the SSH handler's authentication wait.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn session_point_receiver(point: &str) -> Option<tokio::sync::oneshot::Receiver<()>> {
+    let (release, acquired) = SESSION_POINTS.with_borrow_mut(|points| points.remove(point))?;
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    acquired
+        .call0(&wasm_bindgen::JsValue::NULL)
+        .expect("session point callback");
+    wasm_bindgen_futures::spawn_local(async move {
+        wasm_bindgen_futures::JsFuture::from(release)
+            .await
+            .expect("session point release");
+        let _ = sender.send(());
+    });
+    Some(receiver)
+}

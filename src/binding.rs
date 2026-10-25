@@ -38,7 +38,9 @@ impl<T: Credential + 'static> Given for T {
             crate::credential::PostHarnessCredential,
             crate::credential::DataKey,
             crate::credential::WrappingKey,
-            crate::credential::LocalPassphrase
+            crate::credential::LocalPassphrase,
+            crate::credential::InferenceAccountCredential,
+            crate::credential::SessionInferenceKey
         );
         value
             .downcast_ref::<crate::seed::Seed>()
@@ -54,7 +56,7 @@ pub(crate) struct Holding {
 pub struct Session {
     pub identity: String,
     pub bound_set: Vec<String>,
-    pub(crate) given: Vec<Holding>,
+    pub(crate) given: std::cell::RefCell<Vec<Holding>>,
 }
 
 impl Session {
@@ -62,25 +64,28 @@ impl Session {
         Self {
             identity,
             bound_set: vec![machine.clone()],
-            given: vec![Holding {
+            given: std::cell::RefCell::new(vec![Holding {
                 machine,
                 credential: Box::new(key),
-            }],
+            }]),
         }
     }
 
-    pub fn client_key(&self, machine: &str) -> Option<&SshClientKey> {
-        self.given
-            .iter()
-            .find(|holding| holding.machine == machine)?
-            .credential
-            .value()
-            .downcast_ref()
+    pub fn client_key(&self, machine: &str) -> Option<std::cell::Ref<'_, SshClientKey>> {
+        std::cell::Ref::filter_map(self.given.borrow(), |given| {
+            given
+                .iter()
+                .find(|h| h.machine == machine)?
+                .credential
+                .value()
+                .downcast_ref()
+        })
+        .ok()
     }
 
     pub fn inspect(&self) -> Value {
         json!({"identity":self.identity,"bound_set":self.bound_set,
-            "given":self.given.iter().map(|h| json!({"row":h.credential.row(),"machine":h.machine})).collect::<Vec<_>>()})
+            "given":self.given.borrow().iter().map(|h| json!({"row":h.credential.row(),"machine":if h.machine.is_empty() {Value::Null} else {json!(h.machine)}})).collect::<Vec<_>>()})
     }
 }
 

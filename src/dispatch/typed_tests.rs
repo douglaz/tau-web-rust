@@ -522,6 +522,28 @@ fn disposition_matrix_reads_and_commands_in_core_store_and_replay() {
                     Reports::Unknown,
                 ))
                 .unwrap();
+                // Exercise the real inference journal and transport in every matrix row.
+                {
+                    use crate::store::inference::tests::{Fake, infer};
+                    if !store.sessions().iter().any(|s| {
+                        s["bound_set"]
+                            .as_array()
+                            .unwrap()
+                            .contains(&serde_json::json!("fixture"))
+                    }) {
+                        block_on(store.bind("fixture")).unwrap();
+                    }
+                    block_on(store.set_inference_account(
+                        crate::credential::InferenceAccountCredential::new(
+                            b"matrix-account-private".to_vec(),
+                        ),
+                    ))
+                    .unwrap();
+                    let mut transport = Fake::default();
+                    let reply = infer(store, &mut transport);
+                    assert_eq!(reply["finished"], true, "{reply}");
+                    assert!(transport.seen.iter().any(|r| r.0 == "/completion"));
+                }
                 assert_eq!(store.dispatch().standing["fixture"], standing);
                 command_refused(
                     store,

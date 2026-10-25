@@ -55,6 +55,8 @@ use zeroize::{Zeroize, Zeroizing};
 #[cfg(target_arch = "wasm32")]
 pub mod opfs;
 
+pub(crate) mod inference;
+
 /// The directory the store owns in the origin-private file system.
 pub const DIRECTORY: &str = "tau-web-store";
 /// The envelope's file name.
@@ -196,12 +198,19 @@ pub(crate) enum Event {
     ModeAcceptance(Acceptance),
     SignatureRefusal(SignatureRefusal),
     ConnectionRefusal(ConnectionRefusal),
+    InferenceAccount {
+        credential: String,
+    },
+    InferenceIntent(crate::inference::Intent),
+    InferenceTerminal(crate::inference::Terminal),
 }
 
 impl Drop for Event {
     fn drop(&mut self) {
-        if let Event::Seed { mnemonic } = self {
-            mnemonic.zeroize();
+        match self {
+            Event::Seed { mnemonic } => mnemonic.zeroize(),
+            Event::InferenceAccount { credential } => credential.zeroize(),
+            _ => {}
         }
     }
 }
@@ -333,6 +342,7 @@ pub struct Store<S> {
     commands: Vec<(u64, Entry)>,
     dispatch: Dispatch,
     sessions: Vec<Rc<Session>>,
+    inference: inference::State,
     response_calls: std::collections::BTreeSet<u64>,
     exposure_ledger: Vec<Exposure>,
     conduct_acceptances: Vec<Acceptance>,
@@ -441,6 +451,7 @@ pub async fn unlock<S: Storage>(
     key.0.copy_from_slice(&unwrapped);
     let mut store = Store::new(storage, key, envelope.id);
     store.replay().await?;
+    store.inference.recovered = store.inference_revocations().into_iter().collect();
     if store.next == FIRST {
         store.finish_creation().await?;
     }
@@ -460,6 +471,7 @@ impl<S: Storage> Store<S> {
             commands: Vec::new(),
             dispatch: Dispatch::default(),
             sessions: Vec::new(),
+            inference: inference::State::default(),
             response_calls: std::collections::BTreeSet::new(),
             exposure_ledger: Vec::new(),
             conduct_acceptances: Vec::new(),
@@ -619,6 +631,9 @@ impl<S: Storage> Store<S> {
         machine: &str,
         modes: &[Mode],
     ) -> Result<String, String> {
+        if self.inference.ended {
+            return Err("sessions ended".into());
+        }
         self.check_binding_modes(machine, modes)?;
         self.dispatch
             .check_binding(machine)
@@ -669,6 +684,7 @@ impl<S: Storage> Store<S> {
             .iter()
             .map(|s| {
                 let mut view = s.inspect();
+                view["unaccounted_spend"] = self.unaccounted_spend(&s.identity);
                 view["standing_modes"] = self
                     .standing_modes(&s.bound_set[0])
                     .iter()
@@ -807,6 +823,9 @@ impl<S: Storage> Store<S> {
         &mut self,
         machine: &str,
     ) -> Result<Rc<Session>, AdmissionRefusal> {
+        if self.inference.ended {
+            return Err(AdmissionRefusal::Journal("sessions ended".into()));
+        }
         if !self.dispatch.approved_entries.contains_key(machine) {
             return Err(AdmissionRefusal::NoEntry);
         }
@@ -963,6 +982,9 @@ impl<S: Storage> Store<S> {
         request: &crate::dispatch::Request,
     ) -> Result<(), crate::dispatch::RequestRefusal> {
         use crate::dispatch::{Operation, RequestRefusal, Resource};
+        if self.inference.ended {
+            return Err(RequestRefusal::SessionsEnded);
+        }
         let resource = self.dispatch.check_request(request)?;
         let expected = match (&resource, request.operation) {
             (Resource::Entry(machine), Operation::Destroy | Operation::Reinstall) => {
@@ -1058,16 +1080,19 @@ impl<S: Storage> Store<S> {
             borrowed: vec![seed.bytes(), &self.key.0],
             mnemonic: seed.phrase(),
             derived: Vec::new(),
+            bindings: Vec::new(),
         };
+        if let Some(account) = &self.inference.account {
+            held.borrowed.push(&account.0);
+        }
         for session in &self.sessions {
-            for holding in &session.given {
-                held.borrowed.push(
-                    holding
-                        .credential
-                        .response_bytes()
-                        .ok_or("session credential has no response scan representation")?,
-                );
+            let bindings = session.given.borrow();
+            for holding in bindings.iter() {
+                if holding.credential.response_bytes().is_none() {
+                    return Err("session credential has no response scan representation".into());
+                }
             }
+            held.bindings.push(bindings);
         }
         for entry in self.allocation().entries() {
             let identity = &entry.identity;
@@ -1180,6 +1205,15 @@ impl<S: Storage> Store<S> {
                     self.seed = Some(seed);
                 }
                 (FIRST, _) => return Err("the first record is not the seed; replay stopped".into()),
+                (
+                    _,
+                    Event::InferenceAccount { .. }
+                    | Event::InferenceIntent(_)
+                    | Event::InferenceTerminal(_),
+                ) => {
+                    self.apply_inference(number, &event)
+                        .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
+                }
                 (_, Event::Exposure(exposure)) => {
                     self.replay_exposure(number, exposure)
                         .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
@@ -1397,6 +1431,35 @@ impl<S: Storage> Store<S> {
                 return Err("invalid connection refusal shape".into());
             }
         }
+        if matches!(
+            event,
+            Event::InferenceAccount { .. }
+                | Event::InferenceIntent(_)
+                | Event::InferenceTerminal(_)
+        ) {
+            struct ClearedValue(Value);
+            impl Drop for ClearedValue {
+                fn drop(&mut self) {
+                    fn clear(v: &mut Value) {
+                        match v {
+                            Value::String(s) => s.zeroize(),
+                            Value::Array(a) => a.iter_mut().for_each(clear),
+                            Value::Object(o) => o.values_mut().for_each(clear),
+                            _ => {}
+                        }
+                    }
+                    clear(&mut self.0);
+                }
+            }
+            let original = ClearedValue(
+                serde_json::from_slice(&plaintext).map_err(|_| "invalid inference shape")?,
+            );
+            let encoded =
+                ClearedValue(serde_json::to_value(&event).map_err(|_| "invalid inference shape")?);
+            if encoded.0 != original.0 {
+                return Err("invalid inference record shape".into());
+            }
+        }
         Ok(event)
     }
 
@@ -1458,6 +1521,9 @@ impl<S: Storage> Journal for Store<S> {
         machine: &str,
         command: &[u8],
     ) -> Result<(), AppendRefusal> {
+        if self.inference.ended {
+            return Err(AppendRefusal::Storage("sessions ended".into()));
+        }
         if self.installation_unpinned(machine)
             && let Some(form) = crate::modes::lowering(command)
         {
@@ -1475,6 +1541,9 @@ impl<S: Storage> Journal for Store<S> {
     }
 
     async fn check(&self, machine: &str) -> Result<(), AppendRefusal> {
+        if self.inference.ended {
+            return Err(AppendRefusal::Storage("sessions ended".into()));
+        }
         self.dispatch
             .check_command(machine)
             .map_err(AppendRefusal::Policy)
@@ -1835,6 +1904,7 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
         let mut report = self.report(None);
         report["locked"] = (!matches!(self.state, State::Unlocked(_))).into();
         if let State::Unlocked(store) = &self.state {
+            report["inference_calls"] = store.inference_calls();
             report["records"] = store.records().collect::<Vec<_>>().into();
             report["calls"] =
                 serde_json::to_value(store.dispatch.calls.values().collect::<Vec<_>>())

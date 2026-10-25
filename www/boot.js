@@ -121,6 +121,8 @@ const renderSetup = (store) => {
     const session = (store.sessions ?? []).find(s => s.bound_set.includes(machine.entry.machine));
     if (session) {
       paragraph(section, `Session ${session.identity}: bound set ${session.bound_set.join(', ')}.`);
+      const spend = session.unaccounted_spend;
+      if (spend?.count) paragraph(section, `${spend.count} unresolved inference requests: unaccounted spend against cap ${spend.cap}.`);
       for (const label of session.standing_modes ?? []) paragraph(section, `Standing mode: ${label}.`);
     }
     else if (machine.class !== null && access) {
@@ -172,12 +174,24 @@ const start = () => {
   };
 };
 
-// STA-23: explicit lock, page hide and a back/forward-cache restore each end the harness worker,
-// and with it everything inside it: its keys, its channels and any work in flight. A fresh one
-// starts locked. No grace timer, and nothing is journaled here. Text typed but not submitted goes
-// too (SEC-5 row 18: the passphrase is in the input UI briefly).
+// Stop dispatch and clear the page at once. The worker drops session holdings, records each
+// revoke and answers; termination follows that answer or this implementation bound. Expiry
+// and the next-unlock sweep cover a killed worker without relying on an unload append.
+const END_SESSIONS_BOUND_MS = 5000;
+const endingWorkers = new WeakSet();
 const lock = () => {
-  worker.terminate();
+  const previous = worker;
+  if (!endingWorkers.has(previous)) {
+    endingWorkers.add(previous);
+    const timer = setTimeout(() => previous.terminate(), END_SESSIONS_BOUND_MS);
+    previous.addEventListener('message', ({ data }) => {
+      if (data?.sessions_ended === true && Object.keys(data).length === 1) {
+        clearTimeout(timer);
+        previous.terminate();
+      }
+    });
+    previous.postMessage({ end_sessions: true });
+  }
   clearWords();
   $('seed-backup-input').value = '';
   redisplay = false;
