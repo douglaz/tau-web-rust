@@ -17,6 +17,70 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 
+// Read the README's authority grammar independently of the harness predicate.
+fn document_url(source: &str) -> bool {
+    if !source.starts_with("https://")
+        || source
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || c == '\\')
+    {
+        return false;
+    }
+    let end = source[8..]
+        .bytes()
+        .position(|b| matches!(b, b'/' | b'?' | b'#'))
+        .map_or(source.len(), |offset| offset + 8);
+    let mut parts = source[8..end].split(':');
+    let host = parts.next().unwrap_or_default();
+    if let Some(port) = parts.next() {
+        let mut number = 0u32;
+        if port.is_empty() {
+            return false;
+        }
+        for digit in port.bytes() {
+            if !digit.is_ascii_digit() {
+                return false;
+            }
+            number = number * 10 + u32::from(digit - b'0');
+            if number > 65535 {
+                return false;
+            }
+        }
+        if number == 0 || parts.next().is_some() {
+            return false;
+        }
+    }
+    if host.is_empty() || host.len() > 253 || !host.is_ascii() {
+        return false;
+    }
+    let mut count = 0;
+    let mut ipv4 = true;
+    let mut last_starts_with_letter = false;
+    for label in host.as_bytes().split(|b| *b == b'.') {
+        count += 1;
+        if label.is_empty() || label.len() > 63 {
+            return false;
+        }
+        if !label[0].is_ascii_alphanumeric()
+            || !label[label.len() - 1].is_ascii_alphanumeric()
+            || label
+                .iter()
+                .any(|b| !b.is_ascii_alphanumeric() && *b != b'-')
+            || label
+                .get(..4)
+                .is_some_and(|p| p.eq_ignore_ascii_case(b"xn--"))
+        {
+            return false;
+        }
+        last_starts_with_letter = label[0].is_ascii_alphabetic();
+        ipv4 &= label.len() <= 3
+            && (label.len() == 1 || label[0] != b'0')
+            && label.iter().all(u8::is_ascii_digit)
+            && label.iter().fold(0u32, |n, b| n * 10 + u32::from(b - b'0')) <= 255;
+    }
+    last_starts_with_letter || (count == 4 && ipv4)
+}
+
 pub type Files = BTreeMap<String, Vec<u8>>;
 
 const ITERATIONS: u32 = 600_000;
@@ -136,6 +200,17 @@ fn check_event(number: u64, event: &Value) -> Result<(), String> {
                 {
                     return Err("invalid bound identity".into());
                 }
+            }
+        }
+        "goal" => {
+            exact(body, &["session", "text", "source", "document_source"])?;
+            if text("session")?.is_empty()
+                || text("text")?.trim().is_empty()
+                || text("source")? != "operator_session_goal_card"
+                || !(body["document_source"].is_null()
+                    || body["document_source"].as_str().is_some_and(document_url))
+            {
+                return Err("invalid session goal".into());
             }
         }
         "mode_acceptance" => {
@@ -597,6 +672,7 @@ fn mode_list(value: &Value) -> Result<(), String> {
 struct ModeHistory {
     exposed_machines: BTreeSet<String>,
     exposed_sessions: BTreeSet<String>,
+    goals: BTreeSet<String>,
     closed_conduct_windows: BTreeSet<String>,
     unpinned_installations: BTreeSet<String>,
 }
@@ -622,6 +698,12 @@ impl ModeHistory {
             );
             if accepted {
                 self.unpinned_installations.insert(machine.into());
+            }
+        }
+        if let Some(goal) = event.get("goal") {
+            let session = goal["session"].as_str().expect("checked goal");
+            if !self.exposed_sessions.contains(session) || !self.goals.insert(session.into()) {
+                return Err("goal names no exposure or repeats a session".into());
             }
         }
         if let Some(acceptance) = event.get("mode_acceptance") {
@@ -2074,5 +2156,118 @@ mod inference_secret_tests {
                 .iter()
                 .any(|name| name.starts_with("session inference key"))
         );
+    }
+    #[test]
+    fn goal_document_url_requires_a_valid_host_and_port() {
+        let mut examples = vec![
+            ("https://127.0.0.1:443/document".to_string(), true),
+            ("https://docs.example:65535/path?q=1#part".into(), true),
+            ("https://localhost".into(), true),
+            ("https://0.0.0.0:1".into(), true),
+            ("https://255.255.255.255".into(), true),
+            ("https://a-b.example:000443/é".into(), true),
+        ];
+        for source in [
+            "http://docs.example/",
+            "HTTPS://docs.example/",
+            "https://127.0.0.1:invalid/document",
+            "https://127.0.0.1:65536/document",
+            "https://:443/document",
+            "https://",
+            "https:///path",
+            "https://docs.example:/",
+            "https://docs.example:0/",
+            "https://docs.example:+443/",
+            "https://docs.example:443:1/",
+            "https://user:pass@docs.example/",
+            "https://[::1]/",
+            "https://xn--a/",
+            "https://XN--a.example/",
+            "https://docs.example./",
+            "https://-a.example/",
+            "https://a-.example/",
+            "https://a..example/",
+            "https://é.example/",
+            "https://docs%2eexample/",
+            "https://127.1/",
+            "https://0177.0.0.1/",
+            "https://0x7f000001/",
+            "https://2130706433/",
+            "https://256.1.1.1/",
+            "https://docs.123/",
+            "https://docs.example/path with space",
+            "https://docs.example/\n",
+            "https://docs.example/\u{7f}",
+            "https://docs.example/\u{a0}",
+            "https://docs.example/\\path",
+        ] {
+            examples.push((source.into(), false));
+        }
+        examples.extend([
+            (format!("https://{}.example/", "a".repeat(63)), true),
+            (format!("https://{}.example/", "a".repeat(64)), false),
+            (
+                format!(
+                    "https://{}.{}.{}.{}",
+                    "a".repeat(63),
+                    "b".repeat(63),
+                    "c".repeat(63),
+                    "d".repeat(61)
+                ),
+                true,
+            ),
+            (
+                format!(
+                    "https://{}.{}.{}.{}",
+                    "a".repeat(63),
+                    "b".repeat(63),
+                    "c".repeat(63),
+                    "d".repeat(62)
+                ),
+                false,
+            ),
+        ]);
+        for (source, expected) in examples {
+            let goal = json!({"goal":{"session":"session-4","text":"text","source":"operator_session_goal_card","document_source":source}});
+            let read = check_event(5, &goal);
+            assert_eq!(read.is_ok(), expected, "reader grammar: {source}: {read:?}");
+            assert_eq!(
+                document_url(&source),
+                expected,
+                "reader predicate: {source}"
+            );
+            if tau_web::goals::document_url(&source) {
+                assert!(read.is_ok(), "reader rejects harness-admitted URL {source}");
+            } else {
+                assert!(!expected, "harness refused valid URL {source}");
+            }
+        }
+    }
+
+    #[test]
+    fn session_goal_shape_is_exact_and_requires_its_own_exposure_once() {
+        let goal = json!({"goal":{"session":"session-4","text":"one session","source":"operator_session_goal_card","document_source":null}});
+        assert!(check_event(5, &goal).is_ok());
+        for field in ["session", "text", "source", "document_source"] {
+            let mut missing = goal.clone();
+            missing["goal"].as_object_mut().unwrap().remove(field);
+            assert!(check_event(5, &missing).is_err(), "{field}");
+        }
+        let mut extra = goal.clone();
+        extra["goal"]["brief"] = json!("runtime");
+        assert!(check_event(5, &extra).is_err());
+        let mut history = ModeHistory::default();
+        assert!(history.check_and_apply(&goal).is_err());
+        history.exposed_sessions.insert("session-4".into());
+        assert!(history.check_and_apply(&goal).is_ok());
+        assert!(history.check_and_apply(&goal).is_err());
+        let mut array = goal.clone();
+        array["goal"] = json!([
+            "session-4",
+            "one session",
+            "operator_session_goal_card",
+            null
+        ]);
+        assert!(check_event(5, &array).is_err());
     }
 }

@@ -276,18 +276,48 @@ pub async fn infer(
     request: &Value,
     now: impl Fn() -> u64,
 ) -> Value {
-    match run(journal, transport, origin, candidate, request, now).await {
+    match run(journal, transport, origin, candidate, request, None, now).await {
         Ok(v) => v,
         Err(why) => json!({"refused":why}),
     }
 }
 
+/// Harness-owned tools share the same mint, route, redaction and journal driver.
+pub async fn infer_tools(
+    journal: &mut impl Journal,
+    transport: &mut impl Transport,
+    origin: &str,
+    candidate: Option<&Candidate>,
+    request: &Value,
+    now: impl Fn() -> u64,
+) -> Value {
+    match run(
+        journal,
+        transport,
+        origin,
+        candidate,
+        request,
+        Some(crate::goals::definitions()),
+        now,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(why) => json!({"refused":why}),
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "shared inference admission and send driver"
+)]
 async fn run(
     journal: &mut impl Journal,
     transport: &mut impl Transport,
     origin: &str,
     candidate: Option<&Candidate>,
     request: &Value,
+    tools: Option<Value>,
     now: impl Fn() -> u64,
 ) -> Result<Value, String> {
     if !valid_request(request) {
@@ -368,6 +398,10 @@ async fn run(
     }
     drop(mint_guard);
     probe(journal, transport, origin, false).await?;
+    let mut body = compose(candidate, request);
+    if let Some(tools) = tools {
+        body["tools"] = tools;
+    }
     send(
         journal,
         transport,
@@ -381,7 +415,7 @@ async fn run(
             zdr: true,
         },
         origin,
-        compose(candidate, request),
+        body,
     )
     .await
 }

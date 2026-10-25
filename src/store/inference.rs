@@ -456,7 +456,28 @@ impl<S: Storage> Store<S> {
         let boundary =
             |bytes: &[u8]| crate::redaction::Redacted::for_inference(self, bytes, &credentials);
         let redacted = boundary(&response.body);
-        let mut v: Value = serde_json::from_slice(&response.body).unwrap_or(Value::Null);
+        let mut v: Value = if matches!(intent, InferenceIntent::Completion { .. }) {
+            // Scan the original values the loop's lossy text decoder can recover, before
+            // the byte boundary replaces any credential with executable marker text.
+            serde_json::from_str(&String::from_utf8_lossy(&response.body)).unwrap_or(Value::Null)
+        } else {
+            serde_json::from_slice(&response.body).unwrap_or(Value::Null)
+        };
+        // Inspect decoded tool values with the same holdings and transient request keys.
+        // Refuse the whole call rather than turn a redacted command into executable text.
+        let tool_refused = matches!(intent, InferenceIntent::Completion { .. })
+            && (v
+                .pointer("/choices/0/message/tool_calls")
+                .is_some_and(|calls| {
+                    !crate::redaction::Redacted::inference_value_is_safe(self, calls, &credentials)
+                })
+                || redacted.as_ref().is_ok_and(|safe| {
+                    serde_json::from_str::<Value>(&String::from_utf8_lossy(safe.as_bytes()))
+                        .ok()
+                        .and_then(|body| body.pointer("/choices/0/message/tool_calls").cloned())
+                        .as_ref()
+                        != v.pointer("/choices/0/message/tool_calls")
+                }));
         let mut t = InferenceTerminal::new(call, response.status);
         let mut key = None;
         match &intent {
@@ -583,6 +604,8 @@ impl<S: Storage> Store<S> {
             Ok(safe) if matches!(intent, InferenceIntent::Completion { .. }) => {
                 if self.inference.ended {
                     report["refused"] = "sessions ended".into();
+                } else if tool_refused {
+                    report["tool_refusal"] = "tool credential boundary".into();
                 } else {
                     report["body"] = String::from_utf8_lossy(safe.as_bytes()).into_owned().into();
                 }

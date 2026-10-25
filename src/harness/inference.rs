@@ -23,7 +23,7 @@ thread_local! {
 pub(crate) fn ending() -> bool {
     ENDING.get()
 }
-fn origin() -> String {
+pub(super) fn origin() -> String {
     #[cfg(feature = "tracer")]
     {
         ORIGIN.with_borrow(|o| o.clone()).unwrap_or_default()
@@ -33,7 +33,7 @@ fn origin() -> String {
         env!("TAU_INFERENCE_ORIGIN").to_string()
     } // No selection exists, so this build refuses before any contact.
 }
-fn candidate() -> Option<Candidate> {
+pub(super) fn candidate() -> Option<Candidate> {
     #[cfg(feature = "tracer")]
     {
         Some(crate::testonly::inference_candidate())
@@ -96,7 +96,7 @@ impl Transport for Fetch {
     }
 }
 
-struct Writer(LocalStore);
+pub(super) struct Writer(pub(super) LocalStore);
 impl Journal for Writer {
     type MintGuard = tokio::sync::OwnedMutexGuard<()>;
     async fn mint_guard(&mut self, session: &str) -> Self::MintGuard {
@@ -249,6 +249,7 @@ pub async fn sweep_inference() {
 #[wasm_bindgen]
 pub async fn end_sessions() {
     ENDING.set(true);
+    super::goals::end();
     super::wait::stop_all();
     let local = crate::worker::local();
     let ids = {

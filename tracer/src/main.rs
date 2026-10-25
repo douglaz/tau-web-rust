@@ -19,6 +19,7 @@ mod binding_cases;
 mod cdp;
 mod checks;
 mod fixtures;
+mod goal_cases;
 mod hold_cases;
 mod inference_cases;
 mod inference_reader;
@@ -823,6 +824,11 @@ async fn run_cases(
     requests: &[&fixtures::Requests],
     cases: &mut Vec<Case>,
 ) -> Result<(), String> {
+    if std::env::var_os("TAU_TRACER_GOALS").is_some() {
+        let (tab, mut worker) = run.open(tracer_origin, false).await?;
+        goal_cases::run(run, &tab, &mut worker, cases).await?;
+        return Ok(());
+    }
     if std::env::var_os("TAU_TRACER_INFERENCE").is_some() {
         let (mut tab, mut worker) = run.open(tracer_origin, false).await?;
         let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
@@ -1027,7 +1033,7 @@ async fn run_cases(
     case.check(
         "the worker's replayed state is record 0 alone",
         run.inspect(&worker).await?
-            == json!({ "state": "unlocked", "seed_backup_owed": true, "seed_backup_completion": null, "seed_backup_stage": "showing_words", "locked": false, "records": [0], "commands": [], "calls": [], "terminals": [], "dispositions": [], "standing": {}, "jobs": [], "typed_calls": [], "inference_calls": [], "observations": [], "current_installations": {}, "setup": [], "setup_offer": tau_web::dispatch::fixture_setup(), "sessions":[],"exposure_ledger":[],"connection_refusals":[],"mode_acceptances":[],"signature_refusals":[],"installations":[] }),
+            == json!({ "state": "unlocked", "seed_backup_owed": true, "seed_backup_completion": null, "seed_backup_stage": "showing_words", "locked": false, "records": [0], "commands": [], "calls": [], "terminals": [], "dispositions": [], "standing": {}, "jobs": [], "typed_calls": [], "inference_calls": [], "observations": [], "current_installations": {}, "setup": [], "setup_offer": tau_web::dispatch::fixture_setup(), "sessions":[],"goals":[],"exposure_ledger":[],"connection_refusals":[],"mode_acceptances":[],"signature_refusals":[],"installations":[] }),
     );
     let host = reader::build(
         HOST_PASSPHRASE,
@@ -2283,6 +2289,7 @@ async fn run_cases(
     worker = run.worker(&tab, None, false).await?;
     inference_cases::run(run, &mut tab, &mut worker, cases).await?;
     inference_cases::no_plaintext(run, &tab, &worker, cases).await?;
+    goal_cases::run(run, &tab, &mut worker, cases).await?;
     // twr-ggw.5 AC4, AC5: no plaintext secret in any storage, message, request or log, in both builds.
     run.collect(&tab).await?;
     run.collect(&served_tab).await?;
@@ -2528,7 +2535,7 @@ async fn run_cases(
             }
         }
         // The same guarded serializer and check handle control mnemonics and the final seed.
-        // Sessions end with the harness worker; goals, tools and session workers are twr-ggw.14's.
+        // Sessions end with the harness worker; goals and tools run in it.
         for mnemonic in std::iter::once(opened.mnemonic()?).chain(
             include_str!("../../tests/vectors/seed-backup-collisions.txt")
                 .lines()

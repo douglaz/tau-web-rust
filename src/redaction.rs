@@ -50,6 +50,29 @@ impl Redacted {
         redact(body, &[], &held)
     }
 
+    /// Refuse decoded values rather than execute a command altered by redaction.
+    pub(crate) fn inference_value_is_safe<S: Storage>(
+        store: &Store<S>,
+        value: &serde_json::Value,
+        credentials: &[&[u8]],
+    ) -> bool {
+        use serde_json::Value;
+        let exact = |bytes: &[u8]| {
+            Self::for_inference(store, bytes, credentials)
+                .is_ok_and(|safe| safe.as_bytes() == bytes)
+        };
+        match value {
+            Value::String(s) => exact(s.as_bytes()),
+            Value::Array(a) => a
+                .iter()
+                .all(|v| Self::inference_value_is_safe(store, v, credentials)),
+            Value::Object(o) => o.iter().all(|(k, v)| {
+                exact(k.as_bytes()) && Self::inference_value_is_safe(store, v, credentials)
+            }),
+            _ => exact(value.to_string().as_bytes()),
+        }
+    }
+
     pub(crate) fn for_store<S: Storage>(
         store: &Store<S>,
         body: &[u8],

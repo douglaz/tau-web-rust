@@ -121,6 +121,58 @@ const renderSetup = (store) => {
     const session = (store.sessions ?? []).find(s => s.bound_set.includes(machine.entry.machine));
     if (session) {
       paragraph(section, `Session ${session.identity}: bound set ${session.bound_set.join(', ')}.`);
+      const card = document.createElement('section');
+      card.dataset.goalCard = session.identity;
+      paragraph(card, 'Goal for this session');
+      if (session.goal) {
+        paragraph(card, session.goal.text);
+        paragraph(card, `Source: ${session.goal.source}.`);
+        if (session.goal.document_source) paragraph(card, `Document source: ${session.goal.document_source}.`);
+        if (!(session.standing_modes ?? []).includes('Acting on a goal with no brief')) {
+          paragraph(card, 'No brief is available.');
+          const accept = document.createElement('button');
+          accept.type = 'button';
+          accept.dataset.goalAccept = session.identity;
+          accept.textContent = 'Acting on a goal with no brief';
+          accept.addEventListener('click', () => {
+            accept.disabled = true;
+            worker.postMessage({ goal_accept: { session: session.identity } });
+          });
+          card.append(accept);
+        }
+      } else {
+        const words = document.createElement('textarea');
+        words.dataset.goalText = '';
+        words.setAttribute('aria-label', 'Your goal in your own words');
+        const source = document.createElement('input');
+        source.type = 'url';
+        source.dataset.documentSource = '';
+        source.setAttribute('aria-label', 'Optional document source (https URL)');
+        const enter = document.createElement('button');
+        enter.type = 'button';
+        enter.dataset.goalEnter = session.identity;
+        enter.textContent = 'Set goal';
+        enter.addEventListener('click', () => {
+          const text = words.value;
+          const document_source = source.value || null;
+          words.value = source.value = '';
+          enter.disabled = true;
+          worker.postMessage({ goal: { session: session.identity, text, document_source } });
+        });
+        card.append(words, source, enter);
+      }
+      if (store.goal_outcome?.session === session.identity) {
+        const outcome = store.goal_outcome.outcome;
+        const status = document.createElement('p');
+        status.dataset.goalOutcome = session.identity;
+        status.textContent = outcome.done === true ? 'Goal loop ended: done.'
+          : outcome.unresolved === true ? 'Goal loop ended: inference request unresolved.'
+          : outcome.refused ? `Goal loop ended: ${outcome.refused}.`
+          : outcome.finished === true ? `Goal loop ended: inference request finished with status ${outcome.status}.`
+          : 'Goal loop ended.';
+        card.append(status);
+      }
+      section.append(card);
       const spend = session.unaccounted_spend;
       if (spend?.count) paragraph(section, `${spend.count} unresolved inference requests: unaccounted spend against cap ${spend.cap}.`);
       for (const label of session.standing_modes ?? []) paragraph(section, `Standing mode: ${label}.`);
