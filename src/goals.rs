@@ -215,7 +215,7 @@ pub async fn run(
     machine: &str,
     document: Option<String>,
 ) -> Value {
-    let mut context = json!({"goal":{"type":"operator_goal","text":goal.text},"history":[]});
+    let mut context = json!({"bound_set":[machine],"goal":{"type":"operator_goal","text":goal.text},"history":[]});
     if let Some(text) = document {
         context["document"] = untrusted("fetched_document", json!(text));
     }

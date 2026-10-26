@@ -521,6 +521,13 @@ pub(super) async fn run(
         })
         .collect::<Vec<_>>();
     case.check(
+        "every model turn receives only this session's bound machine",
+        contexts.len() == 2
+            && contexts
+                .iter()
+                .all(|c| c["bound_set"] == json!(["fixture"])),
+    );
+    case.check(
         "fetched text and tool output are explicitly untrusted",
         contexts.len() == 2
             && contexts.iter().all(|c| {
@@ -699,6 +706,7 @@ pub(super) async fn run(
             state.top_up = false;
             state.script = vec![call("done", json!({"machine":"fixture-other"}))].into();
         }
+        let other_from = run.aggregator.requests.lock().unwrap().len();
         setup_cases::click(run, tab, "[data-machine=fixture-other] [data-goal-accept]").await?;
         for _ in 0..200 {
             if run.browser.evaluate(&tab.session, "document.querySelector('[data-machine=fixture-other] [data-goal-outcome]')?.textContent === 'Goal loop ended: done.'").await? == true {
@@ -706,6 +714,12 @@ pub(super) async fn run(
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
+        let other_requests = bodies(run, other_from);
+        case.check(
+            "the other session's first turn receives only its own bound machine",
+            other_requests.len() == 1
+                && context(&other_requests[0])["bound_set"] == json!(["fixture-other"]),
+        );
         case.check(
             "each session retains its own terminal label",
             run.browser.evaluate(&tab.session, "document.querySelector('[data-machine=fixture] [data-goal-outcome]')?.textContent ?? null").await? == label

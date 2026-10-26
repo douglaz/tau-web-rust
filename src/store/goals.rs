@@ -536,6 +536,42 @@ mod tests {
     }
 
     #[test]
+    fn identical_goals_disclose_only_their_own_bound_machine_on_the_first_turn() {
+        let mut contexts = Vec::new();
+        for machine in ["fixture", "fixture-other"] {
+            let mut store = ready();
+            let identity = if machine == "fixture" {
+                session(&store)
+            } else {
+                block_on(store.bind(machine)).unwrap()
+            };
+            block_on(store.enter_goal(&identity, "Report this machine's status".into(), None))
+                .unwrap();
+            block_on(store.accept_mode(&identity, Mode::NoBrief)).unwrap();
+            let goal = store.goal(&identity).unwrap().clone();
+            let mut h = harness(
+                store,
+                vec![json!({"name":"done","arguments":{"machine":machine}})],
+            );
+            h.session = identity;
+            assert_eq!(
+                block_on(crate::goals::run(&mut h, &goal, machine, None)),
+                json!({"done":true})
+            );
+            assert_eq!(h.script.bodies.len(), 1);
+            let context = context(&h.script.bodies[0]);
+            assert_eq!(
+                context["bound_set"],
+                json!([machine]),
+                "the first outbound completion must disclose this session's bound machine"
+            );
+            contexts.push(context);
+        }
+        assert_eq!(contexts[0]["goal"], contexts[1]["goal"]);
+        assert_ne!(contexts[0], contexts[1]);
+    }
+
+    #[test]
     fn scripted_turns_use_inference_redaction_fixed_tools_and_untrusted_content() {
         let mut store = ready();
         let goal = enter(&mut store);
@@ -581,6 +617,11 @@ mod tests {
             }));
             let context: Value =
                 serde_json::from_str(body["messages"][0]["content"].as_str().unwrap()).unwrap();
+            assert_eq!(
+                context["bound_set"],
+                json!(["fixture"]),
+                "every outbound completion must disclose this session's bound machine"
+            );
             assert_eq!(context["document"]["type"], "untrusted");
             assert_eq!(context["document"]["source"], "fetched_document");
             let bytes = body.to_string().into_bytes();
