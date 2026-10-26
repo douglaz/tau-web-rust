@@ -22,6 +22,9 @@ pub(crate) fn fresh() -> (MemoryStorage, Store<MemoryStorage>, u32) {
     entries[1].machine = "other".into();
     // Index 0 belongs to fixture; the extra attempt uses the returned third index.
     block_on(store.approve_setup(entries)).unwrap();
+    for machine in ["fixture", "other"] {
+        store.fixture_requirements(machine);
+    }
     let extra = block_on(store.allocate(crate::allocation::Family::Machines)).unwrap();
     store
         .associate(Association {
@@ -204,10 +207,10 @@ fn typed_record_before_send_survives_every_kill_boundary() {
         assert_eq!(result.is_ok(), at == 4);
         drop(store);
         let replayed = bound_reopen(&active, extra_index);
-        assert_eq!(replayed.records(), 0..if at == 4 { 13 } else { 12 });
+        assert_eq!(replayed.records(), 0..if at == 4 { 15 } else { 14 });
         assert_eq!(replayed.dispatch().typed_calls.len(), usize::from(at == 4));
         if at == 4 {
-            let recorded = &replayed.dispatch().typed_calls[&10];
+            let recorded = &replayed.dispatch().typed_calls[&12];
             assert_eq!(recorded.state, CallState::Unresolved);
             assert_eq!(recorded.intent.approved, request.approved.unwrap());
             assert_eq!(
@@ -241,11 +244,11 @@ fn typed_record_before_send_survives_every_kill_boundary() {
     drop(store);
     let replayed = bound_reopen(&active, extra_index);
     assert_eq!(
-        replayed.dispatch().typed_calls[&8].state,
+        replayed.dispatch().typed_calls[&10].state,
         CallState::Unresolved
     );
     assert_eq!(
-        replayed.dispatch().typed_calls[&8].intent.approved,
+        replayed.dispatch().typed_calls[&10].intent.approved,
         request.approved.unwrap()
     );
     assert!(
@@ -1046,7 +1049,7 @@ fn inspection_reports_typed_records_drops_assumptions_and_refused_replay() {
     assert_eq!(report["dispositions"][2]["report"]["decision"], "refused");
     assert_eq!(
         report["dispositions"][2]["report"]["issues"][0]["settled_by"],
-        6
+        10
     );
     assert_eq!(
         report["observations"][0]["observation"]["reports"],

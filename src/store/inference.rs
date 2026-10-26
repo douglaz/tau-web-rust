@@ -258,6 +258,7 @@ impl<S: Storage> Store<S> {
     /// Stops dispatch before any await. Dropping the row-2 holdings zeroizes their buffers.
     pub fn end_inference_sessions(&mut self) -> Vec<String> {
         self.inference.ended = true;
+        self.pending_requirements.clear();
         for s in &self.sessions {
             s.given.borrow_mut().clear();
         }
@@ -296,6 +297,9 @@ impl<S: Storage> Store<S> {
         let is_revoke = matches!(intent, InferenceIntent::Revoke { .. });
         if !is_revoke {
             self.live(session)?;
+            if self.pending_requirements.contains_key(session) {
+                return Err("proposal approval pending".into());
+            }
         }
         let account = self
             .inference
@@ -463,21 +467,25 @@ impl<S: Storage> Store<S> {
         } else {
             serde_json::from_slice(&response.body).unwrap_or(Value::Null)
         };
-        // Inspect decoded tool values with the same holdings and transient request keys.
+        // Inspect decoded action values with the same holdings and transient request keys.
         // Refuse the whole call rather than turn a redacted command into executable text.
         let tool_refused = matches!(intent, InferenceIntent::Completion { .. })
-            && (v
-                .pointer("/choices/0/message/tool_calls")
-                .is_some_and(|calls| {
-                    !crate::redaction::Redacted::inference_value_is_safe(self, calls, &credentials)
-                })
-                || redacted.as_ref().is_ok_and(|safe| {
+            && [
+                "/choices/0/message/tool_calls",
+                "/choices/0/message/proposal",
+            ]
+            .iter()
+            .any(|path| {
+                v.pointer(path).is_some_and(|value| {
+                    !crate::redaction::Redacted::inference_value_is_safe(self, value, &credentials)
+                }) || redacted.as_ref().is_ok_and(|safe| {
                     serde_json::from_str::<Value>(&String::from_utf8_lossy(safe.as_bytes()))
                         .ok()
-                        .and_then(|body| body.pointer("/choices/0/message/tool_calls").cloned())
+                        .and_then(|body| body.pointer(path).cloned())
                         .as_ref()
-                        != v.pointer("/choices/0/message/tool_calls")
-                }));
+                        != v.pointer(path)
+                })
+            });
         let mut t = InferenceTerminal::new(call, response.status);
         let mut key = None;
         match &intent {

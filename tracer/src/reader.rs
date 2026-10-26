@@ -572,6 +572,10 @@ fn check_setup(value: &Value) -> Result<(), String> {
                 return Err("class differs from answer".into());
             }
         }
+        "requirements" => {
+            crate::declaration_reader::shape(body)?;
+            access(&body["access"])?;
+        }
         "access" => {
             exact(body, &["machine", "access"])?;
             if !body["machine"].is_string() {
@@ -824,6 +828,7 @@ pub fn read(files: &Files, passphrase: &str) -> Result<Opened, String> {
     let mut previous = "0".repeat(64);
     let mut records = Vec::new();
     let mut mode_history = ModeHistory::default();
+    let mut requirements_history = crate::declaration_reader::History::default();
     let mut inference_history = crate::inference_reader::History::default();
     for (expected, number) in (0..).zip(numbers) {
         if number != expected {
@@ -855,6 +860,9 @@ pub fn read(files: &Files, passphrase: &str) -> Result<Opened, String> {
             .map_err(|e| format!("record {number}: {e}"))?;
         mode_history
             .check_and_apply(&event)
+            .map_err(|e| format!("record {number}: {e}"))?;
+        requirements_history
+            .apply(&event)
             .map_err(|e| format!("record {number}: {e}"))?;
         records.push((number, plaintext));
         previous = address(bytes);
@@ -1177,6 +1185,44 @@ pub fn record_findings<'a>(
     credential_findings.sort_unstable();
     credential_findings.dedup();
     credential_findings
+}
+
+/// Later-boundary host fixtures explicitly approve their contract through public store acts.
+#[cfg(test)]
+pub(crate) async fn approve_fixture_contract<S: tau_web::store::Storage>(
+    store: &mut tau_web::store::Store<S>,
+    machine: &str,
+) {
+    use tau_web::{declaration::Proposal, dispatch::ClassAnswer, goals::Tool, modes::Mode};
+    if store.dispatch().approved_entries[machine].class.is_none() {
+        store
+            .answer_class(machine.into(), ClassAnswer::No)
+            .await
+            .unwrap();
+    }
+    let session = store.bind(machine).await.unwrap();
+    store
+        .enter_goal(&session, "fixture contract".into(), None)
+        .await
+        .unwrap();
+    store.accept_mode(&session, Mode::NoBrief).await.unwrap();
+    store
+        .propose_requirements(
+            &session,
+            0,
+            Proposal::Declaration {
+                machine: machine.into(),
+                declaration: tau_web::declaration::ad_hoc_minimum(),
+            },
+            &Tool::Done {
+                machine: machine.into(),
+            },
+        )
+        .unwrap();
+    store
+        .approve_requirements(&session, machine, 0)
+        .await
+        .unwrap();
 }
 
 /// `CNF-82` and `CNF-15`'s host half, against the harness's store on its in-memory storage.
@@ -1684,6 +1730,7 @@ mod tests {
         block_on(store.seed_backup(tau_web::allocation::Completion::Skipped)).unwrap();
         let approval = block_on(store.approve_setup(tau_web::dispatch::fixture_setup())).unwrap();
         let index = approval.entries[0].identity.index;
+        block_on(approve_fixture_contract(&mut store, "fixture"));
         let entry = Entry {
             machine: "fixture".into(),
             command: b"true".to_vec(),
@@ -1700,7 +1747,7 @@ mod tests {
         assert_eq!(block_on(store.check("fixture")), Ok(()));
         let call = block_on(store.append(&entry, &admission)).unwrap();
         let opened = read(&storage.files(), PASS).unwrap();
-        let intent: Value = serde_json::from_slice(&opened.records[3].1).unwrap();
+        let intent: Value = serde_json::from_slice(&opened.records[call as usize].1).unwrap();
         assert_eq!(
             intent["intent"]["provenance"],
             json!({"target":{"allocation_index":index},
@@ -1741,7 +1788,8 @@ mod tests {
         block_on(store.job_evidence(&evidence)).unwrap();
         let opened = read(&store.storage().files(), PASS).unwrap();
         assert_eq!(
-            serde_json::from_slice::<Value>(&opened.records[4].1).unwrap()["job_terminal"]["call"],
+            serde_json::from_slice::<Value>(&opened.records.last().unwrap().1).unwrap()["job_terminal"]
+                ["call"],
             call
         );
     }
@@ -1929,12 +1977,16 @@ mod tests {
         let mut entries = tau_web::dispatch::fixture_setup();
         entries[1].machine = "other".into();
         block_on(store.approve_setup(entries)).unwrap();
+        for machine in ["fixture", "other"] {
+            block_on(approve_fixture_contract(&mut store, machine));
+        }
+        let mut calls = Vec::new();
         for n in 1..=2 {
             let mut entry = command(n);
             if n == 2 {
                 entry.machine = "other".into();
             }
-            block_on(store.append(
+            let call = block_on(store.append(
                 &entry,
                 &tau_web::dispatch::Approval::HarnessPin {
                     machine: entry.machine.clone(),
@@ -1942,15 +1994,16 @@ mod tests {
                 },
             ))
             .unwrap();
+            calls.push(call);
         }
         block_on(store.terminal(&tau_web::dispatch::Terminal {
-            call: 3,
+            call: calls[0],
             exit_status: 7,
         }))
         .unwrap();
         block_on(store.dispose(tau_web::dispatch::Disposition {
             machine: "other".into(),
-            calls: vec![4],
+            calls: vec![calls[1]],
             continuation: tau_web::dispatch::Continuation::AsIfNotDone,
             uncertainty: "the command outcome is unknown".into(),
         }))
@@ -1959,21 +2012,21 @@ mod tests {
         let opened = read(&files, PASS).unwrap();
         assert_eq!(
             opened.records.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
-            [0, 1, 2, 3, 4, 5, 6]
+            (0..17).collect::<Vec<_>>()
         );
         assert_eq!(
             opened.commands(),
             [
-                (3, "fixture".to_string(), b"echo 1".to_vec()),
-                (4, "other".to_string(), b"echo 2".to_vec())
+                (calls[0], "fixture".to_string(), b"echo 1".to_vec()),
+                (calls[1], "other".to_string(), b"echo 2".to_vec())
             ]
         );
         assert_eq!(
-            serde_json::from_slice::<Value>(&opened.records[5].1).unwrap(),
-            json!({"terminal":{"call":3,"exit_status":7}})
+            serde_json::from_slice::<Value>(&opened.records[15].1).unwrap(),
+            json!({"terminal":{"call":calls[0],"exit_status":7}})
         );
         assert_eq!(
-            serde_json::from_slice::<Value>(&opened.records[6].1).unwrap()["disposition"]["continuation"],
+            serde_json::from_slice::<Value>(&opened.records[16].1).unwrap()["disposition"]["continuation"],
             "as_if_not_done"
         );
         let mnemonic = opened.mnemonic().unwrap();
@@ -2270,4 +2323,66 @@ mod inference_secret_tests {
         ]);
         assert!(check_event(5, &array).is_err());
     }
+}
+
+/// Add independently approved declaration history to a dispatch fixture. Existing record
+/// numbers and command history stay intact; tests of proposal entry use the original files.
+pub fn with_contracts(mut files: Files, passphrase: &str) -> Result<Files, String> {
+    let opened = read(&files, passphrase)?;
+    let events: Vec<Value> = opened
+        .records
+        .iter()
+        .map(|(_, bytes)| serde_json::from_slice(bytes).unwrap())
+        .collect();
+    let mut access = BTreeMap::new();
+    let mut declared = BTreeSet::new();
+    let mut classes = BTreeSet::new();
+    for event in &events {
+        if let Some(entries) = event
+            .pointer("/setup/approval/entries")
+            .and_then(Value::as_array)
+        {
+            for e in entries {
+                access.insert(
+                    e["entry"]["machine"].as_str().unwrap().to_owned(),
+                    e["access"].clone(),
+                );
+            }
+        }
+        if let Some(c) = event
+            .pointer("/setup/class/machine")
+            .and_then(Value::as_str)
+        {
+            classes.insert(c.to_owned());
+        }
+        if let Some(p) = event.pointer("/setup/requirements/proposal")
+            && p["kind"] == "declaration"
+        {
+            declared.insert(p["machine"].as_str().unwrap().to_owned());
+        }
+    }
+    let envelope: Value = serde_json::from_slice(&files["envelope.json"]).unwrap();
+    let id = envelope["id"].as_str().unwrap();
+    let mut number = opened.records.len() as u64;
+    let mut previous = address(&files[&(number - 1).to_string()]);
+    for machine in classes.difference(&declared) {
+        let Some(access) = access.get(machine).filter(|a| !a.is_null()) else {
+            continue;
+        };
+        let declaration = json!({"version":2,"listeners":{"inbound":[{"proto":"tcp","port":22,"from":"any"}],"outbound":[]},"services":[],"key_material":{"spendable":false,"permitted":[]},"drift_checks":[],"required":[],"default_credentials":"none"});
+        let event = json!({"setup":{"requirements":{"session":format!("fixture-contract-{machine}"),"candidate":0,"access":access,"proposal":{"kind":"declaration","machine":machine,"declaration":declaration}}}});
+        let mut nonce = [0x6d; 12];
+        nonce[4..].copy_from_slice(&number.to_be_bytes());
+        let ciphertext = seal(
+            &opened.data_key,
+            &nonce,
+            &format!("tau-web/local/v1/{id}/event/{number}/{previous}"),
+            &serde_json::to_vec(&event).unwrap(),
+        );
+        let bytes = format!("{{\"id\":{},\"type\":\"event\",\"number\":{number},\"previous\":{},\"nonce\":{},\"ciphertext\":{}}}", json!(id), json!(previous), json!(URL_SAFE_NO_PAD.encode(nonce)), json!(URL_SAFE_NO_PAD.encode(ciphertext))).into_bytes();
+        previous = address(&bytes);
+        files.insert(number.to_string(), bytes);
+        number += 1;
+    }
+    Ok(files)
 }

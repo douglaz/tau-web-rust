@@ -987,6 +987,7 @@ mod tests {
                 .approve_setup(tau_web::dispatch::fixture_setup())
                 .await
                 .unwrap();
+            crate::reader::approve_fixture_contract(&mut store, "fixture").await;
             let call = store
                 .append(
                     &Entry {
@@ -1001,7 +1002,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(call, 3);
+            assert_eq!(call, 8);
             let id = store.intent(call).await.unwrap().job.unwrap();
             let (child, _guard) =
                 start(&machine, &jobs::launch(&id, "fixture", command.as_bytes()));

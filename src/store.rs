@@ -349,6 +349,7 @@ pub struct Store<S> {
     exposure_ledger: Vec<Exposure>,
     conduct_acceptances: Vec<Acceptance>,
     goals: Vec<crate::goals::Goal>,
+    pending_requirements: std::collections::BTreeMap<String, goals::Pending>,
     signature_refusals: Vec<SignatureRefusal>,
     connection_refusals: Vec<ConnectionRefusal>,
     /// Set by a failed append, whose move may have landed: no append follows in this worker.
@@ -479,6 +480,7 @@ impl<S: Storage> Store<S> {
             exposure_ledger: Vec::new(),
             conduct_acceptances: Vec::new(),
             goals: Vec::new(),
+            pending_requirements: Default::default(),
             signature_refusals: Vec::new(),
             connection_refusals: Vec::new(),
             failed: None,
@@ -691,6 +693,7 @@ impl<S: Storage> Store<S> {
                 view["goal"] =
                     serde_json::to_value(self.goals.iter().find(|g| g.session == s.identity))
                         .expect("goal serializes");
+                view["pending_requirements"] = self.pending_requirements_view(&s.identity);
                 view["unaccounted_spend"] = self.unaccounted_spend(&s.identity);
                 view["standing_modes"] = self
                     .standing_modes(&s.bound_set[0])
@@ -951,6 +954,33 @@ impl<S: Storage> Store<S> {
         &mut self.dispatch
     }
 
+    /// Authenticated preapproved fixture history for tests of later dispatch boundaries.
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub(crate) fn fixture_requirements(&mut self, machine: &str) {
+        if self.dispatch.approved_entries[machine].class.is_none() {
+            block_on(self.answer_class(machine.into(), crate::dispatch::ClassAnswer::No)).unwrap();
+        }
+        block_on(
+            self.setup_record(crate::dispatch::SetupRecord::Requirements(
+                crate::declaration::ApprovalRecord {
+                    session: format!("fixture-contract-{machine}"),
+                    candidate: 0,
+                    access: self.dispatch.approved_entries[machine]
+                        .approved
+                        .access
+                        .clone()
+                        .unwrap(),
+                    proposal: crate::declaration::Proposal::Declaration {
+                        machine: machine.into(),
+                        declaration: crate::declaration::ad_hoc_minimum(),
+                    },
+                }
+                .into(),
+            )),
+        )
+        .unwrap();
+    }
+
     /// Historical invalid dispositions cannot be produced by the live writer, which
     /// refuses them without a record. Fixtures commit them to exercise replay's reports.
     #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -993,6 +1023,17 @@ impl<S: Storage> Store<S> {
             return Err(RequestRefusal::SessionsEnded);
         }
         let resource = self.dispatch.check_request(request)?;
+        if !matches!(request.operation, Operation::Read | Operation::Inference)
+            && let Resource::Entry(machine) = &resource
+            && self
+                .pending_requirements
+                .values()
+                .any(|p| p.proposal.machine() == machine)
+        {
+            return Err(RequestRefusal::InstallationFacts {
+                why: "proposal approval pending".into(),
+            });
+        }
         let expected = match (&resource, request.operation) {
             (Resource::Entry(machine), Operation::Destroy | Operation::Reinstall) => {
                 self.standing_modes(machine)
@@ -1401,6 +1442,15 @@ impl<S: Storage> Store<S> {
         // duplicate members are rejected and mnemonic buffers retain Event's zeroization.
         let event: Event = serde_json::from_slice(&plaintext)
             .map_err(|_| "its event is not one this version reads".to_string())?;
+        if let Event::Setup(crate::dispatch::SetupRecord::Requirements(_)) = &event {
+            let value: Value =
+                serde_json::from_slice(&plaintext).map_err(|_| "requirements record shape")?;
+            let record = &value["setup"]["requirements"];
+            if !record.is_object() || !record["access"].is_object() {
+                return Err("requirements record shape".into());
+            }
+            crate::declaration::Proposal::parse(&record["proposal"])?;
+        }
         if matches!(
             event,
             Event::Exposure(_)
@@ -1565,7 +1615,18 @@ impl<S: Storage> Journal for Store<S> {
         }
         self.dispatch
             .check_command(machine)
-            .map_err(AppendRefusal::Policy)
+            .map_err(AppendRefusal::Policy)?;
+        self.dispatch
+            .check_installation(machine)
+            .map_err(AppendRefusal::Storage)?;
+        if self
+            .pending_requirements
+            .values()
+            .any(|p| p.proposal.machine() == machine)
+        {
+            return Err(AppendRefusal::Storage("proposal approval pending".into()));
+        }
+        Ok(())
     }
 
     async fn append(&mut self, entry: &Entry, approval: &Approval) -> Result<u64, AppendRefusal> {
@@ -2285,6 +2346,9 @@ mod tests {
             })
             .collect();
         block_on(store.approve_setup(entries)).unwrap();
+        for machine in ["fixture", "fixture-2", "fixture-3", "other"] {
+            store.fixture_requirements(machine);
+        }
         (storage, store)
     }
 
@@ -2653,7 +2717,7 @@ mod tests {
             );
             assert_eq!(recorded(&store), [command(1)], "op {at}: nothing applied");
             assert_eq!(block_on(store.read(2)), None);
-            assert_eq!(store.records(), 0..4);
+            assert_eq!(store.records(), 0..12);
             let reopened = reopen(&storage.files(), PASS).unwrap();
             assert_eq!(
                 recorded(&reopened),
@@ -2673,15 +2737,19 @@ mod tests {
         ));
         assert_eq!(storage.memory().log, ["create", "close", "move"]);
         assert_eq!(recorded(&store), [command(1)], "not applied");
-        let landed = storage.files()["4"].clone();
+        let landed = storage.files()["12"].clone();
         let refused =
             block_on(store.append(&independent_command(3), &independent_approval(3))).unwrap_err();
         assert!(
             refused.to_string().contains("until the worker restarts"),
             "{refused}"
         );
-        assert_eq!(storage.files()["4"], landed, "record 4 is not overwritten");
-        assert!(!storage.files().contains_key("5"));
+        assert_eq!(
+            storage.files()["12"],
+            landed,
+            "record 12 is not overwritten"
+        );
+        assert!(!storage.files().contains_key("13"));
         // After a restart the directory is read again: the landed record is replayed, and the
         // next append takes the next number.
         let files = storage.files();
@@ -2690,9 +2758,9 @@ mod tests {
         assert_eq!(recorded(&reopened), [command(1), independent_command(2)]);
         assert_eq!(
             block_on(reopened.append(&independent_command(3), &independent_approval(3))),
-            Ok(5)
+            Ok(13)
         );
-        assert_eq!(storage.files()["4"], landed);
+        assert_eq!(storage.files()["12"], landed);
     }
 
     #[test]
@@ -3885,9 +3953,9 @@ mod tests {
             assert_eq!(block_on(store.collectable("fixture")).unwrap().len(), 1);
             let evidence = job_evidence(&store, 1, Some(7));
             let mut core = store.dispatch.clone();
-            core.job_evidence(5, evidence.clone(), true).unwrap();
+            core.job_evidence(13, evidence.clone(), true).unwrap();
             let report = block_on(store.job_evidence(&evidence)).unwrap();
-            assert_eq!(report.number, Some(5));
+            assert_eq!(report.number, Some(13));
             assert_eq!(store.commands.len(), 1, "collection appended an intent");
             for projection in [
                 &core,
@@ -4069,9 +4137,9 @@ mod tests {
         let (storage, mut store) = admitted_store(PASS, 0);
         storage.memory().log.clear();
         let id = block_on(store.append(&command(1), &approval())).unwrap();
-        assert_eq!(id, 3);
+        assert_eq!(id, 11);
         assert_eq!(storage.memory().log, ["create", "close", "move"]);
-        assert!(storage.files().contains_key("3"));
+        assert!(storage.files().contains_key("11"));
         assert_eq!(store.dispatch.calls[&id].intent.approval, Some(approval()));
         for at in 1..=3 {
             let (storage, mut store) = self::admitted_store(PASS, 0);
@@ -4206,7 +4274,7 @@ mod tests {
                 machine: "other".into(),
                 fingerprint: "SHA256:other".into(),
             };
-            assert_eq!(block_on(store.append(&entry, &other)), Ok(5));
+            assert_eq!(block_on(store.append(&entry, &other)), Ok(13));
             assert!(store.failed.is_none());
             assert_eq!(
                 store.dispatch.check_command("fixture"),
@@ -4241,9 +4309,9 @@ mod tests {
                 store.dispatch.standing["fixture"].disposition.continuation,
                 continuation
             );
-            assert_eq!(block_on(store.append(&command(2), &approval())), Ok(5));
-            assert_eq!(block_on(store.terminal(&terminal(5))), Ok(6));
-            assert_eq!(block_on(store.append(&command(1), &approval())), Ok(7));
+            assert_eq!(block_on(store.append(&command(2), &approval())), Ok(13));
+            assert_eq!(block_on(store.terminal(&terminal(13))), Ok(14));
+            assert_eq!(block_on(store.append(&command(1), &approval())), Ok(15));
             assert_eq!(
                 state(&reopen(&storage.files(), PASS).unwrap(), 1),
                 state(&store, 1)
@@ -4344,7 +4412,7 @@ mod tests {
         assert_eq!(
             replacement,
             DispositionReport::Accepted {
-                number: 6,
+                number: 14,
                 replaces: Some(first),
                 dropped: vec![],
                 assumption: Some(crate::dispatch::Assumption {
@@ -4362,28 +4430,28 @@ mod tests {
             ),
             "criterion 3: unnamed unresolved command retains its hold after replacement"
         );
-        assert_eq!(block_on(store.terminal(&terminal(2))), Ok(7));
-        assert_eq!(block_on(store.append(&command(1), &approval())), Ok(8));
+        assert_eq!(block_on(store.terminal(&terminal(2))), Ok(15));
+        assert_eq!(block_on(store.append(&command(1), &approval())), Ok(16));
         let current = accepted(&mut store, AsIfDone, &[1]);
         let last = block_on(store.dispose(disposition(Abandonment, &[1]))).unwrap();
         assert_eq!(
             last,
             DispositionReport::Accepted {
-                number: 10,
+                number: 18,
                 replaces: Some(current),
                 dropped: vec![],
                 assumption: None,
             }
         );
         for s in [&mut store, &mut reopen(&storage.files(), PASS).unwrap()] {
-            assert_eq!(s.dispatch.standing["fixture"].number, 10);
+            assert_eq!(s.dispatch.standing["fixture"].number, 18);
             let Err(AppendRefusal::Policy(crate::dispatch::DispatchRefusal::Held(hold))) =
                 block_on(s.append(&command(2), &approval()))
             else {
                 panic!("criterion 3: unnamed call still holds under destructive replacement")
             };
-            assert_eq!(hold.calls.iter().map(|c| c.call).collect::<Vec<_>>(), [8]);
-            assert_eq!(hold.disposition.unwrap().disposition, 10);
+            assert_eq!(hold.calls.iter().map(|c| c.call).collect::<Vec<_>>(), [16]);
+            assert_eq!(hold.disposition.unwrap().disposition, 18);
         }
     }
 
@@ -4394,7 +4462,7 @@ mod tests {
             let (storage, mut store) = admitted_store(PASS, 1);
             let number = accepted(&mut store, continuation, &[1]);
             let disposed = state(&store, 1);
-            assert_eq!(block_on(store.terminal(&terminal(1))), Ok(5));
+            assert_eq!(block_on(store.terminal(&terminal(1))), Ok(13));
             assert_eq!(state(&store, 1), disposed);
             assert_eq!(store.dispatch.terminals[0].terminal, terminal(1));
             assert_eq!(store.dispatch.standing["fixture"].number, number);
@@ -4495,7 +4563,7 @@ mod tests {
             }
             assert!(reopened.dispatch.check_command("other").is_ok());
             if case == 3 {
-                assert_eq!(reopened.dispatch.standing["fixture"].number, 6);
+                assert_eq!(reopened.dispatch.standing["fixture"].number, 14);
                 assert_eq!(state(reopened, 1), state(&store, 1));
             } else {
                 assert!(reopened.dispatch.standing.is_empty());
@@ -4584,7 +4652,7 @@ mod tests {
                         state(reopened, 1),
                         if committed {
                             CallState::Finished {
-                                terminal: 4,
+                                terminal: 12,
                                 exit_status: 7,
                             }
                         } else {
@@ -4596,7 +4664,7 @@ mod tests {
                         if committed { "finished" } else { "unresolved" }
                     );
                 } else if committed {
-                    assert_eq!(state(reopened, 3), CallState::Unresolved);
+                    assert_eq!(state(reopened, 11), CallState::Unresolved);
                     assert_eq!(calls[0]["state"], "unresolved");
                 } else {
                     assert!(calls.is_empty());
@@ -4745,3 +4813,6 @@ mod redaction_tests;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod mode_tests;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod declaration_tests;

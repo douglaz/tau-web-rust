@@ -163,6 +163,7 @@ pub enum RequestRefusal {
     BoundSet,
     Unmapped,
     Facts,
+    InstallationFacts { why: String },
     UnsupportedOperation { operation: Operation },
     Barrier { calls: Vec<u64> },
     Continuation { in_force: DestructiveDisposition },
@@ -281,6 +282,12 @@ impl Dispatch {
                 || value == "sealed"
         }) {
             return Err(RequestRefusal::Facts);
+        }
+        if matches!(request.operation, Operation::Create | Operation::Reinstall)
+            && let Resource::Entry(machine) = &resource
+        {
+            self.check_installation(machine)
+                .map_err(|why| RequestRefusal::InstallationFacts { why })?;
         }
         let expected = OperationApproval {
             restated_modes: request

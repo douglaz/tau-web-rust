@@ -4,7 +4,7 @@ use super::*;
 pub(super) async fn prepare(
     run: &Run<'_>,
     tab: &Tab,
-    worker: &Worker,
+    worker: &mut Worker,
     pass: &str,
 ) -> Result<(), String> {
     prepare_with_enrolment(run, tab, worker, pass, true).await
@@ -13,7 +13,7 @@ pub(super) async fn prepare(
 pub(super) async fn prepare_without_enrolment(
     run: &Run<'_>,
     tab: &Tab,
-    worker: &Worker,
+    worker: &mut Worker,
     pass: &str,
 ) -> Result<(), String> {
     prepare_with_enrolment(run, tab, worker, pass, false).await
@@ -22,7 +22,7 @@ pub(super) async fn prepare_without_enrolment(
 async fn prepare_with_enrolment(
     run: &Run<'_>,
     tab: &Tab,
-    worker: &Worker,
+    worker: &mut Worker,
     pass: &str,
     enrol: bool,
 ) -> Result<(), String> {
@@ -50,6 +50,14 @@ async fn prepare_with_enrolment(
             })
             .await?;
         }
+    }
+    let files = store_files(&run.dump(tab).await?);
+    let approved = reader::with_contracts(files.clone(), pass)?;
+    if approved != files {
+        run.put(tab, &approved).await?;
+        *worker = run.reload(tab, worker).await?;
+        run.browser.evaluate(&worker.session, &format!("(async()=>{{const m=await import(new URL('./pkg/tau_web.js',self.location.href).href);if(m.test_inference_origin)await m.test_inference_origin({});return true;}})()", json!(run.aggregator.origin))).await?;
+        run.submit(tab, "unlock", pass).await?;
     }
     if machines.is_empty() {
         return Ok(());
@@ -203,7 +211,7 @@ pub(super) async fn run(
         "independent reader reads the journaled unbound refusal",
         refusal == json!({"connection_refusal":{"machine":"fixture","reason":"unbound"}}),
     );
-    prepare(run, tab, &worker, pass).await?;
+    prepare(run, tab, &mut worker, pass).await?;
     let state = run.inspect(&worker).await?;
     case.check(
         "page binding gives each session only its machine client credential",
@@ -346,7 +354,7 @@ pub(super) async fn run(
             && seen.relay_accepted == 0
             && seen.ssh_connections == 0,
     );
-    prepare(run, tab, &worker, pass).await?;
+    prepare(run, tab, &mut worker, pass).await?;
     case.check(
         "re-entry creates new session identities and ledger entries",
         run.inspect(&worker).await?["exposure_ledger"]
@@ -373,7 +381,7 @@ pub(super) async fn run(
             && seen.relay_accepted == 0
             && seen.ssh_connections == 0,
     );
-    prepare(run, tab, &worker, pass).await?;
+    prepare(run, tab, &mut worker, pass).await?;
     case.check(
         "the page can bind again",
         run.inspect(&worker).await?["sessions"]

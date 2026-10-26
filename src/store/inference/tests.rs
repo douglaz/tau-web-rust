@@ -99,7 +99,7 @@ impl Transport for Fake {
             "/revoke" => "{}".into(),
             _ if self.no_report => "\n \n{\"id\":\"chatcmpl-fixture\",\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":5,\"total_tokens\":8}}".into(),
             _ if self.echo_metadata => json!({"provider":r.authorization.as_deref().and_then(|s|s.strip_prefix("Bearer ")).unwrap(),"id":"fixture-account-private-value"}).to_string(),
-            _ if self.echo => "{\"content\":\"fixture-session-private-value fixture-account-private-value\"}".into(),
+            _ if self.echo => json!({"choices":[{"message":{"content":"fixture-session-private-value fixture-account-private-value"}}]}).to_string(),
             _ => "\n \n{\"id\":\"gen-fixture\",\"provider\":\"Fixture Provider\",\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":5,\"total_tokens\":8,\"cost\":0.000000123456789012345678901234567890}}".into(),
         };
         Some(Response {
@@ -206,11 +206,26 @@ fn session_inspection_and_terminal_metadata_and_no_prompt_or_session_inference_k
     .unwrap();
     assert!(record.get("reported_provider").is_none());
     assert!(record.get("spend").is_none());
-    f.no_report = false;
-    f.echo = true;
-    let result = infer(&mut s, &mut f);
-    assert_eq!(result["body"], "{\"content\":\"<redacted> <redacted>\"}");
     assert!(reopen(&s).inference.account.is_some());
+}
+
+#[test]
+fn completion_content_keeps_redacted_body_without_tool_refusal() {
+    let mut s = ready();
+    let mut f = Fake {
+        echo: true,
+        ..Fake::default()
+    };
+    let result = infer(&mut s, &mut f);
+    assert!(
+        result.get("tool_refusal").is_none(),
+        "ordinary completion content must remain available after redaction: {result}"
+    );
+    let body: Value = serde_json::from_str(result["body"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        body.pointer("/choices/0/message/content"),
+        Some(&json!("<redacted> <redacted>"))
+    );
 }
 
 #[test]

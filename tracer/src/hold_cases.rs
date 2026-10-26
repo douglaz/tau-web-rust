@@ -20,9 +20,9 @@ async fn restore(
     files: &Files,
 ) -> Result<Worker, String> {
     run.put(tab, files).await?;
-    let worker = run.reload(tab, &worker).await?;
+    let mut worker = run.reload(tab, &worker).await?;
     run.submit(tab, "unlock", PASSPHRASE).await?;
-    binding_cases::prepare(run, tab, &worker, PASSPHRASE).await?;
+    binding_cases::prepare(run, tab, &mut worker, PASSPHRASE).await?;
     Ok(worker)
 }
 
@@ -211,12 +211,14 @@ pub(super) async fn run(
             .unwrap()
             .len();
         worker = settle_unresolved(run, tab, worker).await?;
+        // Declaration preparation and journal restores must not race a timed command.
+        // The fixture reboot below ends this detached job after the stop assertions.
         let (new, call, id) = job_cases::drop_command(
             run,
             tab,
             worker,
             args("fixture"),
-            "sleep 20; echo stopped-job",
+            "while :; do sleep 1; done",
         )
         .await?;
         worker = new;
@@ -390,7 +392,7 @@ pub(super) async fn run(
             // A storage error latches dispatch off until the worker reopens the journal.
             worker = run.reload(tab, &worker).await?;
             run.submit(tab, "unlock", PASSPHRASE).await?;
-            binding_cases::prepare(run, tab, &worker, PASSPHRASE).await?;
+            binding_cases::prepare(run, tab, &mut worker, PASSPHRASE).await?;
         }
         take(run.seen);
         fresh_pace(run.relay);

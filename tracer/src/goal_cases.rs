@@ -286,6 +286,9 @@ pub(super) async fn run(
     worker: &mut Worker,
     cases: &mut Vec<Case>,
 ) -> Result<(), String> {
+    if focused("declaration") {
+        return declaration_cases::run(run, tab, worker, cases).await;
+    }
     let original = store_files(&run.dump(tab).await?);
     let initial = base();
     let session = reset(run, tab, worker, &initial).await?;
@@ -1109,6 +1112,7 @@ pub(super) async fn run(
     }
     run.aggregator.state.lock().unwrap().document_status = 200;
     cases.push(case);
+    declaration_cases::run(run, tab, worker, cases).await?;
     finish(run, tab, worker, &original).await
 }
 

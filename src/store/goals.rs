@@ -1,7 +1,144 @@
 use super::*;
 use crate::goals::{Goal, Tool};
 
+#[derive(Clone, Debug)]
+pub(super) struct Pending {
+    pub candidate: u64,
+    pub proposal: crate::declaration::Proposal,
+}
+
 impl<S: Storage> Store<S> {
+    pub fn check_goal_start(&self, session: &str) -> Result<(), String> {
+        self.live_goal_session(session)?;
+        self.goal(session).ok_or("missing goal")?;
+        if self.pending_requirements.contains_key(session) {
+            return Err("proposal approval pending".into());
+        }
+        if !self
+            .conduct_acceptances
+            .iter()
+            .any(|a| a.session == session && a.mode == Mode::NoBrief)
+        {
+            return Err("Acting on a goal with no brief requires acceptance".into());
+        }
+        Ok(())
+    }
+
+    fn check_candidate(
+        &self,
+        session: &str,
+        proposal: &crate::declaration::Proposal,
+    ) -> Result<(), String> {
+        let live = self.live_goal_session(session)?;
+        if live.bound_set != [proposal.machine()] {
+            return Err("bound set".into());
+        }
+        if !crate::redaction::Redacted::inference_value_is_safe(
+            self,
+            &serde_json::to_value(proposal).expect("proposal serializes"),
+            &[],
+        ) {
+            return Err("proposal credential boundary".into());
+        }
+        self.dispatch.check_proposal(proposal)
+    }
+
+    pub fn propose_requirements(
+        &mut self,
+        session: &str,
+        candidate: u64,
+        proposal: crate::declaration::Proposal,
+        tool: &Tool,
+    ) -> Result<(), String> {
+        self.check_goal_start(session)?;
+        // Validate the companion without requiring the declaration it is proposing.
+        self.check_tool_context(session, tool)?;
+        if proposal.machine() != tool.machine() {
+            return Err("proposal target".into());
+        }
+        self.check_candidate(session, &proposal)?;
+        self.pending_requirements.insert(
+            session.into(),
+            Pending {
+                candidate,
+                proposal,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn pending_requirements_view(&self, session: &str) -> Value {
+        self.pending_requirements
+            .get(session)
+            .filter(|p| self.check_candidate(session, &p.proposal).is_ok())
+            .map(|p| json!({"session":session,"candidate":p.candidate,"proposal":p.proposal}))
+            .unwrap_or(Value::Null)
+    }
+
+    pub fn pending_requirements_matches(
+        &self,
+        session: &str,
+        machine: &str,
+        candidate: u64,
+    ) -> bool {
+        self.match_pending(session, machine, candidate).is_ok()
+    }
+    pub fn reject_requirements(
+        &mut self,
+        session: &str,
+        machine: &str,
+        candidate: u64,
+    ) -> Result<(), String> {
+        self.match_pending(session, machine, candidate)?;
+        self.pending_requirements.remove(session);
+        Ok(())
+    }
+    fn match_pending(
+        &self,
+        session: &str,
+        machine: &str,
+        candidate: u64,
+    ) -> Result<Pending, String> {
+        self.live_goal_session(session)?;
+        let p = self
+            .pending_requirements
+            .get(session)
+            .ok_or("no pending proposal")?;
+        if p.candidate != candidate || p.proposal.machine() != machine {
+            return Err("stale proposal approval".into());
+        }
+        Ok(p.clone())
+    }
+    pub async fn approve_requirements(
+        &mut self,
+        session: &str,
+        machine: &str,
+        candidate: u64,
+    ) -> Result<(), String> {
+        let pending = self.match_pending(session, machine, candidate)?;
+        let result = async {
+            self.check_candidate(session, &pending.proposal)?;
+            let access = self.dispatch.approved_entries[machine]
+                .approved
+                .access
+                .clone()
+                .ok_or("missing access")?;
+            self.setup_record(crate::dispatch::SetupRecord::Requirements(
+                crate::declaration::ApprovalRecord {
+                    session: session.into(),
+                    candidate,
+                    access,
+                    proposal: pending.proposal,
+                }
+                .into(),
+            ))
+            .await
+        }
+        .await;
+        self.pending_requirements.remove(session);
+        result
+    }
+
     pub(super) fn check_goal(&self, goal: &Goal) -> Result<(), String> {
         if !goal.valid()
             || !self
@@ -51,6 +188,25 @@ impl<S: Storage> Store<S> {
 
     /// Model admission is write-free, including an out-of-set target.
     pub fn check_tool(&self, session: &str, tool: &Tool) -> Result<(), String> {
+        self.check_tool_context(session, tool)?;
+        if self.pending_requirements.contains_key(session) {
+            return Err("proposal approval pending".into());
+        }
+        if matches!(
+            tool,
+            Tool::Exec { .. }
+                | Tool::Job { .. }
+                | Tool::Typed {
+                    operation: crate::dispatch::Operation::Create
+                        | crate::dispatch::Operation::Reinstall,
+                    ..
+                }
+        ) {
+            self.dispatch.check_installation(tool.machine())?;
+        }
+        Ok(())
+    }
+    fn check_tool_context(&self, session: &str, tool: &Tool) -> Result<(), String> {
         if !crate::redaction::Redacted::inference_value_is_safe(
             self,
             &serde_json::to_value(tool).expect("tool serializes"),
@@ -117,8 +273,14 @@ mod tests {
     use crate::dispatch::{self, CommandProvenance, Operation, Requester, Target};
     use crate::goals::{Driver, Job};
     use crate::inference::{self, Response, Transport};
-    use crate::store::inference::tests::{Fake, Fixed, candidate, ready};
+    use crate::store::inference::tests::{Fake, Fixed, candidate};
 
+    fn ready() -> Store<MemoryStorage> {
+        let mut store = crate::store::inference::tests::ready();
+        store.fixture_requirements("fixture");
+        store.fixture_requirements("fixture-other");
+        store
+    }
     fn session(s: &Store<MemoryStorage>) -> String {
         s.sessions[0].identity.clone()
     }
@@ -1072,5 +1234,172 @@ mod tests {
             assert_eq!(result.report["tool_refusal"], "tool credential boundary");
             assert!(result.report.get("body").is_none());
         }
+    }
+    #[test]
+    fn proposal_boundary_scans_decoded_names_values_and_transient_credentials_lossily() {
+        for (key_name, escaped, invalid_utf8, transient) in [
+            (false, false, false, false),
+            (true, false, false, false),
+            (false, true, false, false),
+            (true, true, true, false),
+            (false, false, true, true),
+            (false, true, true, true),
+        ] {
+            let mut store = ready();
+            let goal = enter(&mut store);
+            accept(&mut store);
+            let mut h = harness(store, vec![done()]);
+            assert_eq!(
+                block_on(crate::goals::run(&mut h, &goal, "fixture", None))["done"],
+                true
+            );
+            let identity = session(&h.store);
+            let (call, request) = block_on(h.store.inference_prepare(
+                &identity,
+                inference::Intent::Completion {
+                    call: 0,
+                    session: identity.clone(),
+                    model: candidate().slug,
+                    key_id: "fixture-key-id".into(),
+                    zdr: true,
+                    requested_provider: candidate().provider,
+                },
+                "https://127.0.0.1",
+                json!({}),
+            ))
+            .unwrap();
+            let secret = if transient {
+                "fixture-session-private-value"
+            } else {
+                "fixture-account-private-value"
+            };
+            if transient {
+                h.store.sessions[0]
+                    .given
+                    .borrow_mut()
+                    .retain(|g| g.credential.row() != 2);
+            }
+            let mut d = serde_json::to_value(crate::declaration::ad_hoc_minimum()).unwrap();
+            d["services"] = json!([{"name":secret,"scope":{"kind":"system"},"lifecycle":"running-at-delivery"}]);
+            let mut p = json!({"kind":"declaration","machine":"fixture","declaration":d});
+            if key_name {
+                p[secret] = json!("value");
+            }
+            let mut body =
+                json!({"choices":[{"message":{"tool_calls":[done()],"proposal":p}}]}).to_string();
+            if escaped {
+                body = body.replace(
+                    secret,
+                    &secret
+                        .chars()
+                        .map(|c| format!("\\u{:04x}", c as u32))
+                        .collect::<String>(),
+                );
+            }
+            let mut body = body.into_bytes();
+            if invalid_utf8 {
+                body.pop();
+                body.extend_from_slice(b",\"note\":\"\xff\"}");
+            }
+            let response = Response {
+                status: 200,
+                body: Zeroizing::new(body),
+            };
+            let result = block_on(h.store.inference_finish(call, &response, &request)).unwrap();
+            assert_eq!(result.report["tool_refusal"], "tool credential boundary");
+            assert!(result.report.get("body").is_none());
+        }
+    }
+
+    #[test]
+    fn malformed_proposals_and_zero_call_sidecars_refuse_the_whole_turn_before_dispatch() {
+        let valid = json!({"kind":"declaration","machine":"fixture","declaration":crate::declaration::ad_hoc_minimum()});
+        let mut invalids = vec![
+            json!(null),
+            json!({"kind":"unknown","machine":"fixture"}),
+            json!({"kind":"tighten_class","machine":"fixture","class":"single_purpose"}),
+        ];
+        let mut bad = valid.clone();
+        bad["machine"] = json!("outside");
+        invalids.push(bad);
+        let mut bad = valid.clone();
+        bad["question"] = json!("approve me");
+        invalids.push(bad);
+        let mut bad = valid.clone();
+        bad["declaration"]["version"] = json!(1);
+        invalids.push(bad);
+        for p in invalids {
+            let mut store = ready();
+            let goal = enter(&mut store);
+            accept(&mut store);
+            let mut h = harness(store, vec![done()]);
+            h.script.raw_completion = Some(
+                json!({"choices":[{"message":{"tool_calls":[done()],"proposal":p}}]})
+                    .to_string()
+                    .into_bytes(),
+            );
+            let before = h.store.dispatch.setup_view();
+            assert!(
+                block_on(crate::goals::run(&mut h, &goal, "fixture", None))
+                    .get("refused")
+                    .is_some()
+            );
+            assert!(h.dispatched.is_empty());
+            assert_eq!(h.store.dispatch.setup_view(), before);
+        }
+        let mut store = ready();
+        let goal = enter(&mut store);
+        accept(&mut store);
+        let mut h = harness(store, vec![done()]);
+        h.script.raw_completion = Some(
+            json!({"choices":[{"message":{"tool_calls":[],"proposal":valid}}]})
+                .to_string()
+                .into_bytes(),
+        );
+        assert_eq!(
+            block_on(crate::goals::run(&mut h, &goal, "fixture", None))["refused"],
+            "one tool call required"
+        );
+        assert!(h.dispatched.is_empty());
+    }
+
+    #[test]
+    fn proposal_redaction_cannot_repair_an_original_completion_into_approval() {
+        let mut store = ready();
+        let goal = enter(&mut store);
+        accept(&mut store);
+        let mut h = harness(store, vec![done(), done()]);
+        h.script.fake.key = Some("bad\"key");
+        let mut proposal = json!({"kind":"declaration","machine":"fixture","declaration":crate::declaration::ad_hoc_minimum()});
+        proposal["declaration"]["services"] = json!([{"name":"RAW_SLOT","scope":{"kind":"system"},"lifecycle":"running-at-delivery"}]);
+        let raw = json!({"choices":[{"message":{"tool_calls":[done()],"proposal":proposal}}]})
+            .to_string()
+            .replace("RAW_SLOT", "bad\"key")
+            .into_bytes();
+        assert!(serde_json::from_slice::<Value>(&raw).is_err());
+        // Inspect the production inference boundary directly before the loop's proposal
+        // handler can supply an unrelated refusal for repaired replacement text.
+        let mut boundary_store = ready();
+        enter(&mut boundary_store);
+        accept(&mut boundary_store);
+        let mut boundary = harness(boundary_store, vec![done()]);
+        boundary.script.fake.key = Some("bad\"key");
+        boundary.script.raw_completion = Some(raw.clone());
+        let response = block_on(boundary.turn(&json!({
+            "machine":"fixture", "messages":[{"role":"user","content":"proposal boundary check"}]
+        })));
+        assert_eq!(response["tool_refusal"], "tool credential boundary");
+        assert!(response.get("body").is_none());
+        assert!(boundary.dispatched.is_empty());
+        h.script.raw_completion = Some(raw);
+        assert_eq!(
+            block_on(crate::goals::run(&mut h, &goal, "fixture", None))["done"],
+            true
+        );
+        assert_eq!(h.dispatched, vec![Tool::parse(&done()).unwrap()]);
+        assert_eq!(
+            context(&h.script.bodies[1])["history"][0]["call"],
+            json!({"withheld":"credential boundary"})
+        );
     }
 }

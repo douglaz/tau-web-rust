@@ -61,6 +61,23 @@ const paragraph = (parent, text) => {
   p.textContent = text;
   parent.append(p);
 };
+const renderDeclaration = (parent, d) => {
+  paragraph(parent, `Delivery declaration version ${d.version}.`);
+  const list = (label, value, empty, entry) => {
+    if (value === 'unspecified') paragraph(parent, `${label}: unspecified (not stated).`);
+    else if (!value.length) paragraph(parent, `${label}: explicit empty set; ${empty}.`);
+    else for (const e of value) paragraph(parent, `${label}: ${entry(e)}.`);
+  };
+  list('Inbound listeners', d.listeners.inbound, 'no listener may be present', e => `${e.proto} port ${e.port} from ${e.from}`);
+  list('Outbound restrictions', d.listeners.outbound, 'no restriction declared', e => `${e.proto} host ${e.host} port ${e.port}`);
+  list('Services', d.services, 'no service obligation declared', e => `${e.name}, ${e.scope.kind}${e.scope.kind === 'user' ? ` account ${e.scope.account}` : ' (no account)'}, ${e.lifecycle === 'running-at-delivery' ? 'running at delivery' : 'enabled and survives reboot'}`);
+  paragraph(parent, `Spendable tenant material: ${d.key_material.spendable === 'unspecified' ? 'unspecified (not stated)' : d.key_material.spendable ? 'permitted' : 'forbidden'}.`);
+  list('Permitted tenant material', d.key_material.permitted, 'no tenant material may be present; application secrets are classified separately', e => `${e.kind} at ${e.where}`);
+  list('Drift checks on re-entry', d.drift_checks, 'no re-entry checks declared', e => JSON.stringify(e));
+  list('Required checks', d.required, 'no delivery checks declared', e => JSON.stringify(e));
+  if (d.default_credentials === 'none') paragraph(parent, 'Default credentials: none.');
+  else list('Default credentials to change', d.default_credentials, 'none declared', e => e);
+};
 const renderSetup = (store) => {
   const slot = $('setup');
   slot.replaceChildren();
@@ -117,6 +134,10 @@ const renderSetup = (store) => {
     }
     const access = machine.access;
     if (access) paragraph(section, `Access model: ${access.model}; profile ${access.profile}, revision ${access.revision}.`);
+    if (machine.declaration) renderDeclaration(section, machine.declaration);
+    for (const approval of machine.requirements ?? []) {
+      if (approval.proposal.kind === 'tighten_class') paragraph(section, 'Approved tightening: single-purpose to multi-tenant. The original class answer is retained.');
+    }
     const installation = (store.installations ?? []).find(i => i.machine === machine.entry.machine);
     if (installation) paragraph(section, `Installation: ${installation.installation}.`);
     const session = (store.sessions ?? []).find(s => s.bound_set.includes(machine.entry.machine));
@@ -162,6 +183,26 @@ const renderSetup = (store) => {
         });
         card.append(words, source, enter);
       }
+      const pending = session.pending_requirements;
+      if (pending) {
+        const approval = document.createElement('section');
+        approval.dataset.requirementsCard = session.identity;
+        paragraph(approval, `Approve intended requirements for ${pending.proposal.machine}. These are proposed requirements, not measured results.`);
+        if (pending.proposal.kind === 'declaration') renderDeclaration(approval, pending.proposal.declaration);
+        else paragraph(approval, 'Tighten this machine from single-purpose to multi-tenant. It must remain bound alone and cannot hold spendable or private tenant material.');
+        for (const [decision, text] of [['approve', 'Approve these requirements'], ['reject', 'Reject these requirements']]) {
+          const button = document.createElement('button');
+          button.type = 'button';
+          button.dataset.requirementsDecision = decision;
+          button.textContent = text;
+          button.addEventListener('click', () => {
+            for (const b of approval.querySelectorAll('button')) b.disabled = true;
+            worker.postMessage({ requirements_answer: { session: session.identity, machine: pending.proposal.machine, candidate: pending.candidate, decision } });
+          });
+          approval.append(button);
+        }
+        card.append(approval);
+      }
       const outcome = goalOutcomes.get(session.identity);
       if (outcome) {
         const status = document.createElement('p');
@@ -201,6 +242,10 @@ const start = () => {
   worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
   const current = worker;
   worker.onmessage = ({ data }) => {
+    if (data.requirements_store) {
+      const { state, error, reason, ...rest } = JSON.parse(data.requirements_store);
+      data = { store: { store_state: state, ...(error ? { store_error: error } : {}), ...(reason ? { store_reason: reason } : {}), ...rest } };
+    }
     if (worker !== current) return;
     if (data.harness_ready) show('ready', `Harness ready (spec ${data.harness_ready}).`);
     else if (data.store) {

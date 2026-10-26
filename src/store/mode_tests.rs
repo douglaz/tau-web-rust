@@ -17,6 +17,7 @@ fn approved() -> Store<MemoryStorage> {
     block_on(store.approve_setup(fixture_setup())).unwrap();
     for machine in ["fixture", "fixture-other"] {
         block_on(store.answer_class(machine.into(), ClassAnswer::No)).unwrap();
+        store.fixture_requirements(machine);
     }
     store
 }
