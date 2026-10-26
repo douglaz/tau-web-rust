@@ -119,6 +119,7 @@ fn batch_indices_precede_any_create_and_match_the_card() {
             .collect::<Vec<_>>()
     );
     block_on(store.answer_class("fixture".into(), ClassAnswer::No)).unwrap();
+    store.fixture_requirements("fixture");
     let caller = block_on(store.bind("fixture")).unwrap();
     let mut request = request;
     request.session = caller.clone();
@@ -134,8 +135,8 @@ fn batch_indices_precede_any_create_and_match_the_card() {
             .iter()
             .all(|e| e.get("setup").is_none() && e.pointer("/allocation/reserve").is_none())
     );
-    assert_eq!(call, 5);
-    assert!(records[5].get("operation_intent").is_some());
+    assert_eq!(call, 6);
+    assert!(records[6].get("operation_intent").is_some());
     assert_eq!(store.allocation().next_unused().machines, 2);
 }
 
@@ -544,6 +545,7 @@ fn commands_require_an_approved_entry_and_matching_provenance_without_latching()
     assert!(store.failed.is_none());
     block_on(store.approve_setup(fixture_setup())).unwrap();
     let extra = block_on(store.allocate(Family::Machines)).unwrap();
+    store.fixture_requirements("fixture");
     for target in [Target::Entry("fixture".into()), Target::Inference] {
         assert!(
             store

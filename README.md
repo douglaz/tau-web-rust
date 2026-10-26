@@ -134,9 +134,9 @@ The card labels acceptance **Acting on a goal with no brief**, through the exist
 `Store::accept_mode` act and encrypted `mode_acceptance`. `goal_accept` takes exactly
 `{session}` and requires that live session's goal. Accepting starts its model loop in the
 harness worker. **Implementation reading: admission.** A turn waits for acceptance; each
-acting tool also checks acceptance before any contact or intent. Existing operator commands
-and collection remain unchanged. No session worker was added. No model-requested operator
-approval act or approval screen was added.
+acting tool also checks acceptance before any contact or intent. Collection keeps its existing admission. Install-capable commands additionally require the
+journaled machine facts described below. No session worker was added. Typed proposals wait for
+the operator on the declaration card before their companion tool is dispatched.
 
 **Implementation reading: fixture protocol.** Each turn is a real request through the shared
 inference driver, including its mint, route, intent, terminal and redaction boundaries. A
@@ -159,7 +159,7 @@ before contact.
 |---|---|
 | `exec` | `{machine,command}`; live bound-set and no-brief checks, then the existing command path: session admission, signature lowering, command hold/disposition/barrier, launch size, connect, append and exec. Its intent records requester `session` and the live identity. |
 | `request_harness_job` | `{machine,job,arguments}`; schema, bound set and no-brief checks, then the shared box-plane hold/disposition/barrier check before job availability. Held work collects its holding calls, records no intent and never runs afterwards. Unheld requests refuse as unavailable, naming the job's owner. |
-| `request_typed_operation` | `{machine,operation,arguments}`; harness-resolved approved entry, caller-bound admission, no-brief gate and shared barrier/continuation check before approval. A request passing these checks refuses awaiting operator approval, with no intent or contact. The existing typed `check_request` and companion witnesses are unchanged. |
+| `request_typed_operation` | `{machine,operation,arguments}`; harness-resolved approved entry, caller-bound admission, no-brief gate and shared barrier/continuation check before approval. A request passing these checks refuses awaiting operator approval, with no intent or contact. The typed `check_request` also enforces the installation-facts guard; pinned companion witnesses and their recorded outcomes are unchanged. |
 | `done` | `{machine}`; bound-set resolution, no checked value and no contact. Ends the loop. |
 
 Unknown tools, missing/extra/ill-typed arguments, out-of-set targets and harness-only job names
@@ -185,14 +185,14 @@ optional `document:{type:"untrusted",source:"fetched_document",content}`, and `h
 calls beside `result:{type:"untrusted",source:"tool_output",content}`. Command results contain
 stdout, stderr and exit status. Composed bodies pass the existing credential boundary;
 bodies are never journaled. **Implementation reading: unsafe decoded calls.** The inference
-response boundary scans decoded tool-call values and member names with every held credential
+response boundary scans decoded completion-message values and member names, including proposals, with every held credential
 and the request's transient credentials before releasing a call. Admission rechecks current
 holdings under the writer. **Implementation reading: admission scan.** Both scans remain.
 **Implementation reading: original completion text.** The response boundary decodes the
-original completion body lossily, exactly as the loop does, before inspecting tool calls.
+original completion body lossily, exactly as the loop does, before inspecting tool calls and proposals.
 An invalid UTF-8 byte outside a call therefore cannot hide a literal or escaped credential
 inside it. Before release, the boundary also requires the original and redacted bodies to
-decode to identical tool-call values, including when the original has no parseable call.
+decode to identical completion messages, including proposal presence and when the original has no parseable message.
 Neither byte-level escaping nor redaction that repairs malformed JSON can produce executable
 marker text in place of a call. Both held
 credentials and the request's transient credentials are checked; admission still independently
@@ -651,7 +651,8 @@ starting at `bound.start`. A truncated enumeration fails.
 
 It runs stage1 only: 31 witnesses and 286 enumerated traces. The dedicated bucket, 54/184,
 belongs to twr-i6k.3; reboot, 12/0, belongs to twr-i6k.11. Together they cover 97/470. Each start
-journals a seed-backup completion, one batch approval with one index per entry, its calls and
+journals a seed-backup completion, one batch approval with one index per entry, explicit fixture
+class/declaration prerequisites, its calls and
 dispositions, including the invalid historical disposition. Only the extra index and vendor-id
 associations remain supplied in memory, including after reopen, until twr-ggw.21 journals them.
 Every outcome and projection member is compared at every step. Oldest-first
@@ -936,7 +937,7 @@ then does a live session receive the key. A failed append creates no session.
   `no-entry` and other pre-contact policy refusals remain write-free.
 - A command intent retains `harness_pin` approval and puts the bound session identity in
   `provenance.session`; older `null` values remain readable.
-- No approval screen exists yet. The adapter's caller-bound admission runs before any approval
+- No typed-operation approval screen exists yet. The adapter's caller-bound admission runs before any approval
   is composed or compared, including requests with no approval. It checks the harness-supplied
   caller identity, the request's session identity and the resolved resource against that live
   session's bound set. A caller-present request must have requester `session`; relabelling
@@ -1350,7 +1351,7 @@ the host tests run.
 
   The independent reader in the tracer crate decrypts every record and reads the seed, legacy
   command, intent, typed intent, typed observation, terminal, job terminal, job observation,
-  disposition, seed-backup, setup approval/class/access, exposure, connection-refusal, mode-acceptance and signature-refusal shapes,
+  disposition, seed-backup, setup approval/class/access/requirements, exposure, connection-refusal, mode-acceptance and signature-refusal shapes,
   with exact members on the new records. It also independently parses and validates the
   inference account, intent and metadata-terminal shapes described above.
   It checks a completion against the seed identifier it derives independently, and inspects reservations.
@@ -1681,8 +1682,7 @@ and a revision above `4294967295` or of any other JSON type are refused.
 Its distinct refusals are `NoEntry`, `ClassMissing` and `AccessMissing`; both recorded facts
 admit the entry, also after reopen. `Store::bind` calls this check before deriving or journaling
 anything. The page offers a binding control after the class answer and shows each live session
-and bound set. Session tools run in the harness worker; create/payment and delivery declarations
-remain twr-ggw.21's and twr-ggw.15's.
+and bound set. Session tools run in the harness worker; create/payment remains twr-ggw.21's. Declaration approval follows the flow below.
 
 **Implementation readings.** The compiled two-entry setup (`fixture`, `fixture-other`), its
 vendor/product/region labels and 1000/2000 sat per month prices are fixture data, not a vendor's
@@ -1691,13 +1691,286 @@ indices in the operator's store; they are never reused. The question wording is 
 compile-time fixture until twr-ggw.34 supplies the bundle's wording; no page message changes it.
 Connection attempts require a live binding; names with no approved entry keep the write-free
 `no-entry` refusal. Access is checked at binding as an implementation reading of ARC-44's
-installation boundary. One answer per entry is an implementation reading; tightening waits for twr-ggw.15.
+installation boundary. One original answer per entry is an implementation reading; an approved tightening preserves
+that answer and records the new class separately.
 The one-approval-per-store reading and remaining in-memory associations are described under
 Dispatch above.
 
 The same-origin limit also applies to these acts: the harness cannot distinguish an operator's
 click from an identical message posted by another same-origin script. Page messages have exact
 members; unknown fields or values are refused or ignored with no journal entry.
+
+### Delivery declaration proposals and approval
+
+`src/declaration.rs` carries the pinned declaration v2 schema. Every field and nested member is
+required; input never acquires an implicit default. Concrete values, explicit empty lists and
+`"unspecified"` retain their schema meanings and, where the profile permits them, survive
+approval and replay distinctly. The ad-hoc minimum is parsed from the
+complete JSON example compiled from the pinned normative companion, which the compiled ad-hoc
+profile links. Each goal's inference context includes that complete minimum alongside the goal;
+the fixture proposes its typed additions while retaining the minimum's other facts. This uses
+"signed bundle" in the glossary's compile-time sense and makes no signature claim in the page.
+Ad-hoc proposal admission requires the exact signed TCP/22/from-any entry to remain in the
+inbound list. Empty or unspecified inbound, an application-port replacement, or a changed
+protocol/source refuses before retaining a card or writing approval; the same semantic check
+runs again at approval, append and replay of new canonical requirements records. The candidate
+is never filled or repaired. Generic schema parsing still distinguishes valid empty and
+unspecified inbound from a missing field; this guard constrains ad-hoc proposals without
+implementing a delivery verdict.
+
+**Implementation reading: local proposal envelope.** The existing loopback completion message
+still requires exactly one valid tool call. Beside `tool_calls` it may contain `proposal`, one
+of these exact objects:
+
+```json
+{"kind":"declaration","machine":"fixture","declaration":{"version":2,"listeners":{"inbound":[{"proto":"tcp","port":22,"from":"any"}],"outbound":[]},"services":[],"key_material":{"spendable":false,"permitted":[]},"drift_checks":[],"required":[],"default_credentials":"none"}}
+{"kind":"tighten_class","machine":"fixture","class":"multi_tenant"}
+```
+
+The four tools, their arguments and meanings are unchanged. A proposal-only response is
+refused. The whole response is validated before dispatch; both targets must match the live
+bound machine. Unknown kinds, extra fields, malformed entries and relaxation refuse the turn.
+This is a local fixture protocol, with no claim about a live provider's wire format.
+
+**Implementation reading: approval identity and lifetime.** Under the writer, the worker checks
+the current bound session, proposal, class and credentials, then retains one transient candidate
+identified by that completion's journal call number. It publishes a harness-written card through
+the ordinary worker/page path, releases the writer and waits. The card displays every proposed
+fact as text, including emptiness versus unspecified. Its wording is fixture wording until
+twr-ggw.34 supplies bundle wording. No answer is selected. Approval and rejection are exact
+`requirements_answer` messages containing `session`, `machine`, `candidate` and `decision`
+(`approve` or `reject`); they carry no replacement values or model-written approval text.
+Wrong, stale, malformed, duplicate and ended-session acts make no canonical transition.
+
+Approval rechecks the stored candidate, live binding, current class/declaration and current
+credential holdings under the writer. It appends one encrypted `setup.requirements` record
+before applying the fact or waking the loop. That record has exactly `session`, `candidate`,
+`access` (the journaled maintained ad-hoc profile and revision) and `proposal`. A declaration
+records the complete resolved values, rather than a profile lookup for later replay. A class
+tightening requires an existing single-purpose answer and validates the existing declaration
+against multi-tenant constraints before recording the new class. Inspection's `setup` retains
+`answer`, the effective `class`, `declaration` and the `requirements` history. Both the original
+answer and every approved tightening remain visible after unlock. No intermediate incompatible
+state is applied. The existing one-machine binding path remains; larger-set tightening policy
+is outside this change.
+
+Pending approval blocks common model-tool admission and further inference preparation. The
+companion tool waits, including plain `done`, and then passes its ordinary admission again.
+Subsequent turns carry the accepted proposals as operator-approved intended requirements,
+separately from untrusted tool output and from measured observations.
+Approval grants no operation approval and clears no hold, barrier, disposition or no-brief
+requirement. Rejection, session end and failed append release no deferred call. End cancels the
+wait immediately, checks liveness under the approval writer and after append, and prevents a
+late act from restarting work. An append whose move landed but reported failure may replay as
+approved, under the existing failure latch; its current-session continuation stays stopped.
+Replay restores only committed machine facts, without a card, binding, running goal or tool
+continuation. Historical intents still replay without a new declaration prerequisite.
+
+**Implementation reading: typed values.** Ports are integers 1–65535; protocols are `tcp` or
+`udp`; inbound sources are `any`, `peers` or `none`. Outbound hosts admit `any`, ASCII DNS labels
+(up to 63 bytes each and 253 total, alphanumeric ends, interior hyphens), or parsed IP CIDR
+blocks with bounded prefix lengths. Service names follow the pinned stage-1 grammar and
+247-byte bound, refusing instances and unit suffixes. System scope has no account; user scope
+requires the pinned account grammar and 32-byte bound. Lifecycle values are exactly
+`running-at-delivery` and `enabled-survives-reboot`. No lifecycle read or command composition
+is performed here. For the companion's otherwise unenumerated material labels, the supported
+typed kinds are `public`, `watch-only` and `private-non-spendable`; locations are absolute paths
+containing ASCII letters, digits, slash, dot, underscore or hyphen. Default-credential lists
+contain nonempty identifiers using letters, digits, underscore, dot, colon or hyphen. These are
+narrow supported input grammars, not new measuring procedures. Multi-tenant declarations must
+state spendable false and permit no private tenant material. Empty permitted tenant material
+does not prohibit the separately classified application-secret path.
+
+There is no signed check library at this pin: `required` and `drift_checks` admit only explicit
+empty lists or the schema's unspecified marker. Nonempty entries, commands and claimed bundle
+provenance are refused. No historical exec is scheduled as a declaration check. The response
+boundary scans the original lossy-decoded message, its names and values, with held and transient
+request credentials, and compares the original and redacted messages including proposal
+presence. Unsafe messages withhold proposal and call together; redaction creates no replacement
+candidate. Current holdings are checked again at retention, rendering and approval commit.
+Raw completion bodies never enter approval records or the page's goal outcome.
+
+**Implementation reading: conservative installation and create admission.** Arbitrary exec
+can install software, so every new raw command requires journaled class, access and approved
+declaration. All three requestable jobs also require those facts before their existing
+availability boundary. The check runs before command contact/intent and again at command
+append. Typed create and reinstall check the same prerequisites through resolved approved
+entries, including all existing target aliases and requester routes, before contact and again
+at durable append. Refusing create is a conservative implementation reading of
+the catalogue-image ambiguity, which the specification has not settled. Missing facts do not
+prevent binding, goal entry, inference, typed reads or record collection. Goal-loop preflight
+uses its own acceptance/context check, so obtaining a declaration never requires one already.
+A pending proposal also blocks command append and typed mutation append for that machine.
+Complete facts permit progress only to the existing truthful boundary: unavailable job,
+missing pin or operation approval still awaited. This supplies no install/create/payment or
+Delivered implementation.
+
+Host checks cover schema and grammar, current credential safety, exact approval identity,
+append failures and landed errors, replay validation, tightening and the installation/create
+boundaries. Browser cases observe the actual inference request, card, buttons, paused loop,
+approval/rejection, encrypted records and unlock, with end races at writer, move and companion
+boundaries. The encrypted reader validates new record shapes and class/material constraints
+independently in `tracer/src/declaration_reader.rs`. Inherited dispatch fixtures explicitly add
+preapproved declaration history through independent encrypted records before testing later
+boundaries; these fixture records are not an alternate production approval path. The dispatch
+companion comparison retains its pinned witnesses and outcomes, with explicit prerequisite
+history in its driver. Declaration verdicts remain twr-ggw.19's, observation evaluation
+.20's, lifecycle evaluation .36/.73's, converging install .16's and real create/payment .21's.
+The specification pin is retained; this change does not complete T42.
+
+### Declaration mutation evidence (D01–D27, B01–B06)
+
+On 2026-10-26 the host controls D01–D27 below changed one production property, compiled,
+reached their named assertions, restored the original file byte for byte and passed the same
+selected check, with red/green exits **101/0**. Their exact source, patch and selected host-test
+coverage are unchanged by the browser correction below. Browser controls B01–B06 are rerun
+against that correction, with red/green exits **1/0** and mutated/restored builds exiting **0**.
+Every restored browser check passes all ten declaration cases, including the actual page
+approval click, encrypted append and unlock. No compiler error, polling exhaustion, timeout
+result or unexecuted assertion counts as a successful control.
+
+An earlier B01 run stopped with “declaration card did not appear” and zero cases; it was
+invalid evidence and is superseded here. The earlier B05 waiter failure depended on a timeout
+sentinel; its replacement reads the real loop's published outcome after the end step returns.
+The equality control D21 now asserts the inference boundary's refusal directly before any
+proposal handler, so a later handler refusal cannot supply its negative evidence.
+The earlier claim of thirty valid declaration controls is withdrawn. The Round 2 claim that
+all 33 controls were valid is also withdrawn: B06's combined assertion short-circuited on a
+timeout sentinel and never read the late-publication counter. That B06 result is invalid and
+is superseded by the direct publication/state observations below. The original logs remain
+historical. The tables combine 27 unchanged host controls with six rerun browser controls;
+the three minimum controls remain included.
+
+Criterion keys: **C1** goal-derived typed proposal, signed minimum and explicit approval;
+**C2** signed-check provenance and measuring-command refusal; **C3** presence, emptiness and
+unspecified; **C4** version, service/scope/account grammar; **C5** one-way tightening;
+**C6** installation admission and append; **C7** conservative create admission;
+**C8** durable authority, exact identity, credentials, replay and session end.
+The schema, approval, failure/replay and requester/alias tests in `src/store/declaration_tests.rs`
+exercise the corresponding positive and refusal paths, including unchanged journal bytes.
+Empty/unspecified inbound remain schema values but refuse ad-hoc approval because they omit
+the signed TCP/22/from-any entry. Other permitted empty/unspecified values retain their
+representation through approval and replay. The independent encrypted reader has its own
+minimum and grammar checks; it calls no production validator.
+
+Exact command templates (the selector in each row is the literal test substring):
+
+```sh
+# H(selector), for D01–D26:
+nix shell nixpkgs#gcc -c env RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web --lib SELECTOR -- --nocapture
+# R(selector), for D27:
+nix shell nixpkgs#gcc -c env RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tracer --bin tracer SELECTOR -- --nocapture
+# B, for each browser control, with all other TAU_TRACER_* variables absent:
+WEB=/var/tmp/tau-web-manager/ggw14/tools/web-env.sh
+export TAU_TRACER_GOALS=1 TAU_TRACER_GOAL_CASE=declaration
+bash "$WEB" bash scripts/build-web.sh tracer
+bash "$WEB" cargo +1.97.1 run --locked -p tracer -- run dist/served dist/tracer
+```
+
+The web wrapper and compiler/browser versions are recorded under “Session goals and tools
+mutation evidence (G1–G44)”. Commands ran serially in the foreground, without pipes, using an isolated `TMPDIR`.
+For each B control, restoration was followed by rebuilding the fixed tracer and rerunning B.
+A served build was already present; the final full gate rebuilt both builds without selectors.
+
+The following are full SHA-256 values. Each S row is both the **before** and **after
+restoration** hash of that file, measured separately for every listed control. Each control
+also records its distinct mutated-file hash. These hashes describe these executions; they
+are not reconstructed hashes for the earlier logs.
+
+| Source | File | Before = restored SHA-256 |
+|---|---|---|
+| S1 | `src/declaration.rs` | `0419236ac5064b6f97cf6be5505f48d7e70c2377852356c0f10cf3c5e0ae75a3` |
+| S2 | `src/dispatch/setup.rs` | `b9d9301e86723f12339e84953b2ffed61d1fab68d84d6a25500e5e892077b084` |
+| S3 | `src/dispatch/typed.rs` | `6bb5f16b86f2ef1879c52d47f2bb2755fe3c89184a6fe2deff5265ac49042006` |
+| S4 | `src/goals.rs` | `408d89f802cdfc8b06448c10b131fb193fb115cf8b1ba013e04c297ac4719517` |
+| S5 | `src/harness/goals.rs` | `27810874fc872aeab73bdf3c83389081652a07c5bfdbe432abed3dbd2e2704b6` |
+| S6 | `src/store.rs` | `b051c9d81c3040ccbad34e1276f7797bc4b2f8f407095c2742c43d8fcade752b` |
+| S7 | `src/store/goals.rs` | `10696040335ac7d3d8dd824367c38a2962a789f0c8dce4ee7ff630c06ed5f285` |
+| S8 | `src/store/inference.rs` | `e2211216088531bf746eb5ee21a83be76f41898feb5d730bb842494f6a3fb5ea` |
+| S9 | `tracer/src/declaration_reader.rs` | `3ac23ac5fa2d8a2656b99a8d8698e45d51091eb3af704c31e31f559795614aac` |
+
+The host controls are carried forward only after checking their source and selected-test
+hashes against the exact earlier source receipt, reconstructing each mutant from its patch in
+memory and matching its recorded mutant hash, and inspecting its intended panic plus red/green
+logs. The source receipt covers all 95 implementation inputs. The selected test files below
+are unchanged for D01–D27; the revised browser fixture is fixed for every rerun B control.
+Each B mutation changes only its named production property, leaving that fixture untouched.
+
+| Check input | SHA-256 |
+|---|---|
+| `src/store/declaration_tests.rs` | `c6290ae48b622487955d509967c7573791b1d16bb24182276d099924ca3a1e43` |
+| `src/store/goals.rs` | `10696040335ac7d3d8dd824367c38a2962a789f0c8dce4ee7ff630c06ed5f285` |
+| `tracer/src/declaration_reader.rs` | `3ac23ac5fa2d8a2656b99a8d8698e45d51091eb3af704c31e31f559795614aac` |
+| `tracer/src/declaration_cases.rs` | `b3472b236253d20ab8e99bcf02dbb83723ca5efe0a1bf2558732790cc68ec4ea` |
+
+| Control / criterion | Source; one-property mutation | Command selector | Expected and actual red assertion | Mutated SHA-256 | Red / restored green exit |
+|---|---|---|---|---|---|
+| D01 · C4: version | S1; Disable `version != 2` refusal | H(`declaration_requires_every_field`) | `/version: … "version":1` at the version rejection assertion | `7e8b11745e0cbdc81fc3eb86cc1e0bfd7b173df8fb525bb3ba096845ce91fd0c` | 101 / 0 |
+| D02 · C2: provenance | S1; Disable nonempty required/drift refusal | H(`declaration_checks_cannot_claim`) | `Declaration::parse(&d).is_err()` fails for an invented check | `c45fa4affb7dbf6d6abc10659dc83de176451e8dc87495daf8567c6806d3da2b` | 101 / 0 |
+| D03 · C4: service | S1; Disable `service_name` refusal | H(`declaration_service_scope`) | `""` at the invalid service-name assertion | `9c9136a9c6020e1fb2ad0399978087789ab325a44f185455b1750e860009f4f3` | 101 / 0 |
+| D04 · C4: account | S1; Disable `user_account` refusal | H(`declaration_service_scope`) | `""` at the invalid user-account assertion | `a4a798bd1d16163cf1f22707c47c877382fe9181fa25c7e82ea96e70aa9f3d67` | 101 / 0 |
+| D05 · C3: presence | S1; Insert missing services as `[]` before parsing | H(`declaration_requires_every_field`) | `missing /services` | `c71b6f520f6ad80963b39c7a4c1178010cf9371e5b0690d9abec6817d1850fdc` | 101 / 0 |
+| D06 · C4: scope | S1; Drop system scope account before parsing | H(`declaration_service_scope`) | `parse(service("hermes", scope)).is_err()` | `1dc297dd5a6d7c22fe929055df9ac95be14fa9f718e3973ce8061bff96566d1b` | 101 / 0 |
+| D07 · C5: tightening | S2; Disable current/resulting class direction guard | H(`declaration_tightening_is_operator`) | `propose_requirements(identity,43,…).is_err()` fails on relaxation | `33e231abc42d83fb68f093d040a925cea859741f2f900cfbc89c18826e6d1fb6` | 101 / 0 |
+| D08 · C5: material | S1; Disable multi-tenant material guard | H(`declaration_tightening_refuses_incompatible`) | `propose_requirements(session,43,tightening,…).is_err()` | `9e22a623a95a74dd9d04bd77834b761f50446572ff7ff26e526f3321f0f73339` | 101 / 0 |
+| D09 · C8: identity | S7; Disable machine/candidate match in `match_pending` | H(`declaration_pending_is_not_authority`) | `approve_requirements(identity,"fixture-other",42).is_err()` | `0e5465006549ead23e7b55273c2948d3e74f291bc2db7e99d872eb88a16d5b7a` | 101 / 0 |
+| D10 · C8: durability | S6; Apply cloned dispatch before propagating failed commit | H(`declaration_failures_and_landed_errors`) | `approved_entries["fixture"].declaration.is_none()` | `72e804e4b80765e8428cd179f0c8b6da8811cff9ae0117ed02d248c1c7ab5a14` | 101 / 0 |
+| D11 · C8: retention scan | S7; Disable credential scan in `check_candidate` | H(`declaration_current_credentials`) | `propose_requirements(identity,42,proposal(d),…).is_err()` | `47f4f3908d980aedf2156065abfdfd965648f8a6bccd79dcd6e90572dfd6b2a8` | 101 / 0 |
+| D12 · C8: approval scan | S7; Replace approval `check_candidate` with `check_proposal` | H(`declaration_current_credentials`) | `approve_requirements(identity,"fixture",42).is_err()` | `b3cfd942d05c0889a3fa9ab214f31591eefd2aeef3856a71e3b49f7c403646d3` | 101 / 0 |
+| D13 · C6: admission | S6; Drop `Journal::check` installation-facts guard | H(`declaration_exec_and_job_admission`) | `block_on(s.check("fixture")).is_err()` | `e8ce313f5fb7689d932e83f5c46a16b8cb558a010482804851dc2b7f33ec29ba` | 101 / 0 |
+| D14 · C6: append | S6; Drop `Journal::append` current `self.check` | H(`declaration_exec_and_job_admission`) | `block_on(s.append(&entry,&approval)).is_err()` | `5a5e00757a24a2b8e953ffb44d3dc5e563e167e58d7dd6f3a9d671035de560c6` | 101 / 0 |
+| D15 · C7: create | S3; Replace typed installation check with `Ok(())` | H(`declaration_create_refuses_each_missing`) | `class Session` at adapter InstallationFacts refusal assertion | `c85aa2cd5e1b17e31b714290122f18815ce4acfec051b06a72ea5cf1f4f5d892` | 101 / 0 |
+| D16 · C8: replay class | S2; Skip requirements `apply_setup` proposal validation | H(`declaration_replay_rechecks_material`) | `reopen(&s).is_err()` fails on tightened-class material | `af77c1f217819f9879f137d04afec3f9475eb58df9d23df2f2c6eaa88f359420` | 101 / 0 |
+| D17 · C6: pending tool | S7; Disable pending guard in `check_tool` | H(`declaration_pending_is_not_authority`) | `s.check_tool(&identity,&done()).is_err()` | `627c494f18613d414518bf4b098d4ac656fb36b76803fe736f25085d44782052` | 101 / 0 |
+| D18 · C6: pending inference | S8; Disable pending guard in `inference_prepare` | H(`declaration_pending_blocks_new_inference`) | `block_on(s.inference_prepare(…)).is_err()` | `4bfc813d6549668a66ca63974f8cf42f5e7e18411a019aca3e50168d0d89d5ba` | 101 / 0 |
+| D19 · C8: companion end | S4; Remove loop ending check immediately before `driver.tool` | H(`declaration_loop_checks_end`) | equality fails: actual `Null`, expected `"sessions ended"` | `207084ac895cdb2f5a43d388ec689bdbe6ca02d79a72f5dfe81d8200aa5d91fb` | 101 / 0 |
+| D20 · C8: decoded scan | S8; Disable decoded completion-message scan | H(`proposal_boundary_scans_decoded`) | equality fails: actual `Null`, expected `"tool credential boundary"` | `c8b92114a0374a909826dcc38a41354aa4e4fb5f65dbbd1075faea36051ace2a` | 101 / 0 |
+| D21 · C8: redaction equality | S8; Disable original/redacted completion-message equality | H(`proposal_redaction_cannot_repair`) | equality fails: actual `Null`, expected `"tool credential boundary"` | `a8384932c6747ae2880b2a8e2733577ec7ec89ccd156a48babed36ea9d964d95` | 101 / 0 |
+| D22 · C8: lossy decoding | S8; Use strict `from_slice` for both original and redacted decoders | H(`proposal_boundary_scans_decoded`) | equality fails: actual `Null`, expected `"tool credential boundary"` | `daf7fb6a50eec0da0d4c06a9cf920c1ca1124477a6c8d327938dcea81b0f73cd` | 101 / 0 |
+| D23 · C1: approval | S7; Apply declaration before inserting pending candidate | H(`declaration_pending_is_not_authority`) | `s.dispatch.check_installation("fixture").is_err()` | `a39b88951df79c0a28037b23bf457d4403c1016e55a76adf37ac5a1cf54f6259` | 101 / 0 |
+| D24 · C5: approval | S7; Apply class before inserting pending candidate | H(`declaration_tightening_is_operator`) | equality fails: actual `Some(MultiTenant)`, expected `Some(SinglePurpose)` | `36885718d81263c6d5c6a25de6876a45c7126dff6bcf2bd937606d616e5470f4` | 101 / 0 |
+| D25 · C1: minimum | S2; Skip `validate_ad_hoc_minimum` in `check_proposal` | H(`declaration_ad_hoc_minimum_is_preserved`) | `proposal must retain TCP/22/from-any`; actual `Ok(())`, expected minimum refusal | `fc5cf3c12c3cf7b4ed687a9bdd872f59ca03bdba40fdc3c74576bcbf675cf995` | 101 / 0 |
+| D26 · C8: replay minimum | S2; Skip requirements `apply_setup` proposal validation | H(`declaration_replay_refuses_ad_hoc_minimum`) | `approval dropping minimum must refuse replay` | `39463871ce97b2107f9aa2b58e31e1173df799db3e1eb6ea492f2c1ef092b71d` | 101 / 0 |
+| D27 · C8: independent reader | S9; Disable independent inbound-baseline check in reader history | R(`independent_reader_refuses_approval`) | `invalid ad-hoc approval` | `d2a9a73dc3d14622e3e6595141ee57986b542694fed7362812879d284584da12` | 101 / 0 |
+
+| Browser control / criterion | Source; one-property mutation | Expected and actual failing assertion (command B) | Mutated SHA-256 | Red / restored green exit |
+|---|---|---|---|---|
+| B01 · C1: proposal pause | S4; Lookup `ignored_proposal` instead of `proposal` | `before approval the exact candidate is pending, with no companion or subsequent inference continuation` | `715d8f9530f3db5a4d97784b421a90b604da357105a74e98e578dfffafb61d82` | 1 / 0 |
+| B02 · C1/C8: approval result | S5; Discard receiver rejection/error and return `Ok(())` | `rejection ends loop` | `af7068732df6785c23f66750ffa65259f607742ab61daad2fcc0a3966085f01a` | 1 / 0 |
+| B03 · C8: approval writer | S5; Disable `requirements_answer` ending check after writer acquisition | `only a completed durable append restores facts` | `1050aad9c60cd3299b425ffa6e0da31da2748ea35169c7b17b5d07346b0a246c` | 1 / 0 |
+| B04 · C8: post-append | S5; Disable `requirements_answer` post-append ending check | `operator act also refuses ending after its awaited append` | `be4e93e502b0be21c1607d3d707f030d60eeb80769771dcd20749166fdd4aec3` | 1 / 0 |
+| B05 · C8: waiter cancellation | S5; Remove the approval-sender cancellation block from session end | `session end settles the approval wait with a stopped loop outcome` | `07909271ff17e4d8c6d999a80fd3b324b2e06120c04c725146f1d7c758a44532` | 1 / 0 |
+| B06 · C8: proposal writer | S5; Disable `SessionDriver::proposal` ending check after writer acquisition | `proposal writer publishes no approval card after end begins`; independently, `proposal writer settles the loop with the sessions ended outcome` | `23850f5e6bed7ceb3b9ec0cd8dca5d36d27db59b51d27bc42018f409da0446c7` | 1 / 0 |
+
+B01's red observation was `pending=false, approved=false, completions=2`, with page outcome
+`"Goal loop ended: done."`; its safety assertion executed and the summary contained one failed
+case. The restored observation was an exact pending candidate, no approval, one completion
+and no loop outcome before the click. B05's red observation was `end-step loop outcome: null`;
+restoration produced the explicit `sessions ended` outcome without a timeout race. B02 also
+failed the companion-dispatch assertion after a failed append; rejection and failed durability
+both reach their intended checks. B06 unconditionally reads both worker observations after
+the controlled proposal/end writer queue drains. Its red observation is
+`{"outcome":null,"publications":1}`: a real late card publication and no published loop outcome.
+Both named boundary assertions execute and fail within ten evaluated cases. After byte-identical
+restoration and rebuild the observation is
+`{"outcome":{"refused":"sessions ended"},"publications":0}` and both assertions pass.
+The publication assertion is independent of the outcome assertion; no unresolved promise,
+timeout sentinel, polling error or deadline is used for this boundary. The B06 success predicate
+requires exit 1, ten evaluated cases, that exact red observation and both exact `[FAILED]`
+assertion lines, followed by restored exit 0 and the exact green observation.
+The remaining browser controls print their named safety failures within the ten-case summary.
+
+| New wait or continuation boundary | Cancellation and post-await checks | Discriminating controls |
+|---|---|---|
+| Proposal waits to acquire writer | Check ending under writer before retaining/publishing; no card after end begins | B06 queues the proposal behind a held writer, starts end and releases it; reads publication count and actual loop outcome unconditionally after end returns, asserting zero publications and the named stopped outcome separately |
+| Operator approval wait | End cancels sender and clears transient store candidate; rejection/failed append propagates an error | B05 directly reads stopped loop result after end; B02 removes result enforcement; D17/D18 protect concurrent tool/inference admission |
+| Approval waits to acquire writer | Ending check precedes candidate revalidation and any append | B03 queues approval behind the writer; no canonical approval may appear |
+| Begun approval append and committed result | A begun append completes whole; after append check ending before returning success or releasing continuation; facts alone replay | B04 suspends the real OPFS move and the committed-result point; D10 tests failed/landed moves |
+| Companion dispatch after approval | Waiter and loop recheck ending; companion then passes ordinary admission and existing send stops | D19 removes the loop check; browser `requirements_dispatch` suspends immediately before it and asserts no late done; pending/replay retains no continuation |
+
+All existing holds, no-brief acceptance, credential, caller-bound, signature and session-end
+rules remain in the full suite. The declaration checks assert intended facts and admission;
+they make no delivery verdict, lifecycle, installation or real create/payment claim.
 
 ### The tracer
 
@@ -1829,7 +2102,7 @@ browser holds:
 In headless Chromium 154 a new tab hides the one before it, which then restarts its worker, as
 page hide must. The cases account for it.
 
-The full run defines 184 cases.
+The full run defines 194 cases.
 
 The cases:
 
@@ -2167,7 +2440,7 @@ are included in `check-absence`.
 
 For focused setup checks, set `TAU_TRACER_SETUP_CASE=all`. The `existing` value runs the existing
 dispatch/job cases without seed-display-dependent custody controls. The full gate leaves
-`TAU_TRACER_SETUP_CASE`, `TAU_TRACER_SEED_CASE` and `TAU_TRACER_HOLD_CASE` unset and runs all 184 cases. `TAU_TRACER_GOALS`, `TAU_TRACER_GOAL_CASE`, `TAU_TRACER_MODE_CASE`, `TAU_TRACER_INFERENCE`, `TAU_TRACER_INFERENCE_PHASE`,
+`TAU_TRACER_SETUP_CASE`, `TAU_TRACER_SEED_CASE` and `TAU_TRACER_HOLD_CASE` unset and runs all 194 cases. `TAU_TRACER_GOALS`, `TAU_TRACER_GOAL_CASE`, `TAU_TRACER_MODE_CASE`, `TAU_TRACER_INFERENCE`, `TAU_TRACER_INFERENCE_PHASE`,
 `TAU_TRACER_INFERENCE_END` and `TAU_TRACER_SESSION_END` must also be unset. The focused
 `session-end`, `sent-reads` and `command-intent` inference phases exercise the corresponding
 session-end boundaries. `TAU_TRACER_SESSION_END` selects comma-separated case-name fragments

@@ -18,6 +18,8 @@ mod aggregator;
 mod binding_cases;
 mod cdp;
 mod checks;
+mod declaration_cases;
+mod declaration_reader;
 mod fixtures;
 mod goal_cases;
 mod hold_cases;
@@ -959,7 +961,7 @@ async fn run_cases(
             && run.inspect(&served_worker).await? == before_approval,
     );
     setup_cases::approve(run, &served_tab, &served_worker).await?;
-    binding_cases::prepare(run, &served_tab, &served_worker, SERVED_PASSPHRASE).await?;
+    binding_cases::prepare(run, &served_tab, &mut served_worker, SERVED_PASSPHRASE).await?;
     let report = run
         .harness_run(&served_worker, served_args("fixture"))
         .await?;
@@ -974,8 +976,8 @@ async fn run_cases(
         observed.relay_accepted == 0 && observed.ssh_connections == 0,
     );
     case.check(
-        "only the seed, completion, setup approval, two class answers and two exposure entries were appended",
-        run.inspect(&served_worker).await?["records"] == json!([0, 1, 2, 3, 4, 5, 6]),
+        "only the seed, completion, setup approval, two class answers, two approved fixture declarations and two exposure entries were appended",
+        run.inspect(&served_worker).await?["records"] == json!([0, 1, 2, 3, 4, 5, 6, 7, 8]),
     );
     let report = run
         .harness_collect(&served_worker, served_args("fixture"))
@@ -986,7 +988,7 @@ async fn run_cases(
         report == json!({"outcome":{"refused":"no-pin"}})
             && observed.relay_accepted == 0
             && observed.ssh_connections == 0
-            && run.inspect(&served_worker).await?["records"] == json!([0, 1, 2, 3, 4, 5, 6]),
+            && run.inspect(&served_worker).await?["records"] == json!([0, 1, 2, 3, 4, 5, 6, 7, 8]),
     );
     cases.push(case);
 
@@ -1142,7 +1144,7 @@ async fn run_cases(
         run.submit(&tab, "unlock", PASSPHRASE).await?;
     }
     setup_cases::approve(run, &tab, &worker).await?;
-    binding_cases::prepare(run, &tab, &worker, PASSPHRASE).await?;
+    binding_cases::prepare(run, &tab, &mut worker, PASSPHRASE).await?;
     // A focused fixture run for reproducible unresolved-command mutation checks.
     if std::env::var_os("TAU_TRACER_HOLD_CASE").is_some() {
         hold_cases::run(run, &tab, worker, &args, cases).await?;
@@ -1249,7 +1251,7 @@ async fn run_cases(
         .await?;
     worker = run.reload(&tab, &worker).await?;
     run.submit(&tab, "unlock", PASSPHRASE).await?;
-    binding_cases::prepare(run, &tab, &worker, PASSPHRASE).await?;
+    binding_cases::prepare(run, &tab, &mut worker, PASSPHRASE).await?;
     take(seen);
     let report = run.harness_run(&worker, args("unpinned")).await?;
     let observed = take(seen);
@@ -1281,7 +1283,7 @@ async fn run_cases(
     run.put(&tab, &prior_no_pin).await?;
     worker = run.reload(&tab, &worker).await?;
     run.submit(&tab, "unlock", PASSPHRASE).await?;
-    binding_cases::prepare(run, &tab, &worker, PASSPHRASE).await?;
+    binding_cases::prepare(run, &tab, &mut worker, PASSPHRASE).await?;
     cases.push(case);
 
     let mut case = Case::new("oversized launch refuses before intent and contact (twr-ggw.71)");
@@ -1343,7 +1345,7 @@ async fn run_cases(
     run.put(&tab, &original).await?;
     worker = run.reload(&tab, &worker).await?;
     run.submit(&tab, "unlock", PASSPHRASE).await?;
-    binding_cases::prepare(run, &tab, &worker, PASSPHRASE).await?;
+    binding_cases::prepare(run, &tab, &mut worker, PASSPHRASE).await?;
     take(seen);
     cases.push(case);
 
@@ -1391,8 +1393,8 @@ async fn run_cases(
         &journal
             .records
             .iter()
-            .find(|(n, _)| *n == 12)
-            .ok_or("missing intent 12")?
+            .find(|(n, _)| Some(*n) == report["outcome"]["call"].as_u64())
+            .ok_or("missing command intent")?
             .1,
     )
     .map_err(|e| e.to_string())?;
@@ -1454,17 +1456,17 @@ async fn run_cases(
     );
     let replayed = run.inspect(&worker).await?;
     case.check(
-        "the store's replayed state holds it as record 12 after binding",
-        replayed["records"] == json!([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13])
+        "the store holds the command and terminal under their journal identities",
+        replayed["records"] == json!((0..=outcome["terminal"].as_u64().unwrap()).collect::<Vec<_>>())
             && replayed["commands"]
-                == json!([{ "number": 12, "machine": "fixture", "command": hex::encode(COMMAND) }])
-            && outcome["seq"] == 12
-            && outcome["terminal"] == 13
+                == json!([{ "number": outcome["call"], "machine": "fixture", "command": hex::encode(COMMAND) }])
+            && outcome["seq"] == outcome["call"]
+            && outcome["terminal"].as_u64() == outcome["call"].as_u64().map(|n|n+1)
             && replayed["calls"][0]["approval"]["harness_pin"]["machine"] == "fixture"
             && replayed["calls"][0]["approval"]["harness_pin"]["fingerprint"] == pinned.as_str()
             && replayed["calls"][0]["state"] == "finished"
             && replayed["terminals"]
-                == json!([{ "number": 13, "call": 12, "exit_status": EXIT_STATUS }]),
+                == json!([{ "number": outcome["terminal"], "call": outcome["call"], "exit_status": EXIT_STATUS }]),
     );
     case.check(
         "the output and exit status came back",
@@ -1538,8 +1540,7 @@ async fn run_cases(
     );
     case.check(
         "the replayed state has no record for it",
-        after_failure == before_failure
-            && after_failure["records"] == json!([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]),
+        after_failure == before_failure && after_failure["records"] == replayed["records"],
     );
     worker = run.reload(&tab, &worker).await?;
     run.submit(&tab, "unlock", PASSPHRASE).await?;
@@ -1547,7 +1548,7 @@ async fn run_cases(
         "after a reload and an unlock, none appears",
         run.inspect(&worker).await? == binding_cases::replayed(&before_failure),
     );
-    binding_cases::prepare(run, &tab, &worker, PASSPHRASE).await?;
+    binding_cases::prepare(run, &tab, &mut worker, PASSPHRASE).await?;
     cases.push(case);
 
     let mut case = Case::new("close without exit status stays unresolved (twr-ggw.7, STA-8)");
@@ -1587,7 +1588,7 @@ async fn run_cases(
             && observed.ssh_exec.is_empty()
             && observed.relay_accepted == 0,
     );
-    binding_cases::prepare(run, &tab, &worker, PASSPHRASE).await?;
+    binding_cases::prepare(run, &tab, &mut worker, PASSPHRASE).await?;
     fresh_pace(relay);
     let commands = before["commands"].clone();
     let held = run.harness_run(&worker, args("fixture")).await?;
@@ -1617,7 +1618,7 @@ async fn run_cases(
     run.put(&tab, &reader::build(PASSPHRASE, &events)).await?;
     worker = run.reload(&tab, &worker).await?;
     run.submit(&tab, "unlock", PASSPHRASE).await?;
-    binding_cases::prepare(run, &tab, &worker, PASSPHRASE).await?;
+    binding_cases::prepare(run, &tab, &mut worker, PASSPHRASE).await?;
     take(seen);
     fresh_pace(relay);
     let before = run.inspect(&worker).await?;
@@ -1638,7 +1639,7 @@ async fn run_cases(
     run.put(&tab, &reader::build(PASSPHRASE, &events)).await?;
     worker = run.reload(&tab, &worker).await?;
     run.submit(&tab, "unlock", PASSPHRASE).await?;
-    binding_cases::prepare(run, &tab, &worker, PASSPHRASE).await?;
+    binding_cases::prepare(run, &tab, &mut worker, PASSPHRASE).await?;
     fresh_pace(relay);
     let report = run.harness_run(&worker, args("fixture")).await?;
     let observed = take(seen);
@@ -1668,7 +1669,7 @@ async fn run_cases(
     run.put(&tab, &original).await?;
     worker = run.reload(&tab, &worker).await?;
     run.submit(&tab, "unlock", PASSPHRASE).await?;
-    binding_cases::prepare(run, &tab, &worker, PASSPHRASE).await?;
+    binding_cases::prepare(run, &tab, &mut worker, PASSPHRASE).await?;
     take(seen);
     cases.push(case);
 
@@ -1745,7 +1746,7 @@ async fn run_cases(
     run.put(&tab, &reader::build(PASSPHRASE, &no_pass)).await?;
     worker = run.reload(&tab, &worker).await?;
     run.submit(&tab, "unlock", PASSPHRASE).await?;
-    binding_cases::prepare_without_enrolment(run, &tab, &worker, PASSPHRASE).await?;
+    binding_cases::prepare_without_enrolment(run, &tab, &mut worker, PASSPHRASE).await?;
     take(seen);
     let failed = run.harness_run(&worker, args("fixture")).await?;
     let observed = take(seen);
@@ -1758,7 +1759,7 @@ async fn run_cases(
     run.put(&tab, &saved_pass_store).await?;
     worker = run.reload(&tab, &worker).await?;
     run.submit(&tab, "unlock", PASSPHRASE).await?;
-    binding_cases::prepare(run, &tab, &worker, PASSPHRASE).await?;
+    binding_cases::prepare(run, &tab, &mut worker, PASSPHRASE).await?;
     let enrolled_passes = std::mem::take(&mut *relay.passes.lock().expect("passes lock"));
     let without = args("fixture");
     fresh_pace(relay);
@@ -1907,7 +1908,7 @@ async fn run_cases(
         "the store put back unlocks",
         run.inspect(&worker).await? == binding_cases::replayed(&baseline_state),
     );
-    binding_cases::prepare(run, &tab, &worker, PASSPHRASE).await?;
+    binding_cases::prepare(run, &tab, &mut worker, PASSPHRASE).await?;
     cases.push(case);
 
     // twr-ggw.5 AC3: reload, explicit lock, page hide and a killed worker each require unlock again.
@@ -1920,7 +1921,7 @@ async fn run_cases(
         &mut case,
         &tab,
         &old,
-        &worker,
+        &mut worker,
         &before,
         &args("fixture"),
     )
@@ -2068,7 +2069,7 @@ async fn run_cases(
         &mut case,
         &tab,
         &old,
-        &worker,
+        &mut worker,
         &before,
         &args("fixture"),
     )
@@ -2899,7 +2900,7 @@ async fn relocked(
     case: &mut Case,
     tab: &Tab,
     old: &Worker,
-    worker: &Worker,
+    worker: &mut Worker,
     before: &Value,
     request: &Value,
 ) -> Result<(), String> {
@@ -2975,9 +2976,9 @@ async fn settle_unresolved(run: &Run<'_>, tab: &Tab, worker: Worker) -> Result<W
     events.push(json!({"disposition":{"machine":"fixture","calls":calls,
         "continuation":"as_if_not_done","uncertainty":"the command outcome is unknown"}}));
     run.put(tab, &reader::build(PASSPHRASE, &events)).await?;
-    let worker = run.reload(tab, &worker).await?;
+    let mut worker = run.reload(tab, &worker).await?;
     run.submit(tab, "unlock", PASSPHRASE).await?;
-    binding_cases::prepare(run, tab, &worker, PASSPHRASE).await?;
+    binding_cases::prepare(run, tab, &mut worker, PASSPHRASE).await?;
     Ok(worker)
 }
 
@@ -3017,7 +3018,7 @@ async fn lock_during_command(
                 .is_some_and(|c| c["state"] == "unresolved"),
     );
     lock.await?;
-    let new = match run.worker(tab, Some(&worker), false).await {
+    let mut new = match run.worker(tab, Some(&worker), false).await {
         Ok(new) => new,
         Err(e) => {
             case.check(
@@ -3040,7 +3041,7 @@ async fn lock_during_command(
         &format!("{how}: the relay fixture saw the client's WebSocket close, and the sshd its connection end"),
         gone && ended,
     );
-    relocked(run, case, tab, &worker, &new, &before, &args("fixture")).await?;
+    relocked(run, case, tab, &worker, &mut new, &before, &args("fixture")).await?;
     tokio::time::sleep(Duration::from_secs(1)).await;
     let observed = take(run.seen);
     case.check(

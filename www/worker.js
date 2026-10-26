@@ -1,6 +1,6 @@
 // The harness worker alone holds the seed and keys. Only the dedicated seed-backup display
 // carries words to the page; re-entry and passphrase buffers are zero-filled by the module.
-import init, { spec_commit, open, create, unlock, seed_backup_display, seed_backup_answer, seed_backup_reentry, seed_backup_skip, seed_backup_redisplay, setup_approve, setup_answer, bind, goal_request, goal_accept, run_goal, end_sessions, sweep_inference } from './pkg/tau_web.js';
+import init, { spec_commit, open, create, unlock, seed_backup_display, seed_backup_answer, seed_backup_reentry, seed_backup_skip, seed_backup_redisplay, setup_approve, setup_answer, bind, goal_request, goal_accept, run_goal, requirements_answer, end_sessions, sweep_inference } from './pkg/tau_web.js';
 
 try {
   await init();
@@ -45,6 +45,7 @@ onmessage = async ({ data }) => {
   else if (data.setup_answer && typeof data.setup_answer === 'object') report = await setup_answer(JSON.stringify(data.setup_answer));
   else if (data.bind && typeof data.bind === 'object') report = await bind(JSON.stringify(data.bind));
   else if (data.goal && typeof data.goal === 'object') report = await goal_request(JSON.stringify(data.goal));
+  else if (data.requirements_answer && typeof data.requirements_answer === 'object') report = await requirements_answer(JSON.stringify(data.requirements_answer));
   else if (data.goal_accept && typeof data.goal_accept === 'object') {
     report = await goal_accept(JSON.stringify(data.goal_accept));
     reportStore(report);

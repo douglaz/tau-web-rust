@@ -31,7 +31,7 @@ async fn origin(run: &Run<'_>, worker: &Worker) -> Result<(), String> {
 async fn infer(run: &Run<'_>, worker: &Worker) -> Result<Value, String> {
     module(run,worker,&format!("return JSON.parse(await m.inference_request({}));",json!(json!({"machine":"fixture","messages":[{"role":"user","content":"browser prompt never journaled"}]}).to_string()))).await
 }
-async fn resume(run: &Run<'_>, tab: &Tab, worker: &Worker) -> Result<(), String> {
+async fn resume(run: &Run<'_>, tab: &Tab, worker: &mut Worker) -> Result<(), String> {
     origin(run, worker).await?;
     run.submit(tab, "unlock", PASSPHRASE).await?;
     let state = run.inspect(worker).await?;

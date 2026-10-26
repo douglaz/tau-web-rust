@@ -490,6 +490,9 @@ impl Driver {
         entries[0].machine = "entry-2".into();
         entries[1].machine = "entry-1".into();
         let approval = block_on(driver.store.approve_setup(entries))?;
+        for entry in &approval.entries {
+            driver.store.fixture_requirements(&entry.entry.machine);
+        }
         driver.indices.insert(2, approval.entries[0].identity.index);
         driver.indices.insert(0, approval.entries[1].identity.index);
         let extra = block_on(driver.store.allocate(crate::allocation::Family::Machines))?;

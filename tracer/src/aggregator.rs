@@ -176,8 +176,10 @@ impl State {
                         call = json!({"name":"exec","arguments":{"machine":"fixture","command":format!("printf '%s' '{}'",key.value)}});
                         escaped_key = Some(key.value.clone());
                     }
-                    reply["choices"][0]["message"] =
-                        json!({"role":"assistant","tool_calls":[call]});
+                    reply["choices"][0]["message"] = call
+                        .get("fixture_message")
+                        .cloned()
+                        .unwrap_or_else(|| json!({"role":"assistant","tool_calls":[call]}));
                 }
                 if !self.no_report {
                     reply["provider"] = "Fixture Provider".into();

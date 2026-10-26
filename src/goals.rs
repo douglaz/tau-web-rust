@@ -207,6 +207,14 @@ pub trait Driver {
     fn ending(&self) -> bool;
     async fn turn(&mut self, request: &Value) -> Value;
     async fn tool(&mut self, tool: &Tool) -> Value;
+    async fn proposal(
+        &mut self,
+        _candidate: u64,
+        _proposal: crate::declaration::Proposal,
+        _tool: &Tool,
+    ) -> Result<(), String> {
+        Err("proposal approval unavailable".into())
+    }
 }
 
 pub async fn run(
@@ -215,10 +223,12 @@ pub async fn run(
     machine: &str,
     document: Option<String>,
 ) -> Value {
-    let mut context = json!({"bound_set":[machine],"goal":{"type":"operator_goal","text":goal.text},"history":[]});
+    let mut context = json!({"bound_set":[machine],"goal":{"type":"operator_goal","text":goal.text},"history":[],"approved_requirements":[]});
     if let Some(text) = document {
         context["document"] = untrusted("fetched_document", json!(text));
     }
+    context["declaration_minimum"] =
+        serde_json::to_value(crate::declaration::ad_hoc_minimum()).expect("minimum serializes");
     for _ in 0..TURN_BOUND {
         if driver.ending() {
             return json!({"refused":"sessions ended"});
@@ -280,6 +290,31 @@ pub async fn run(
         };
         if tool.machine() != machine {
             return json!({"refused":"bound set"});
+        }
+        if let Some(value) = body.pointer("/choices/0/message/proposal") {
+            let proposal = match crate::declaration::Proposal::parse(value) {
+                Ok(p) => p,
+                Err(why) => return json!({"refused":why}),
+            };
+            if proposal.machine() != machine {
+                return json!({"refused":"proposal target"});
+            }
+            let Some(candidate) = response["call"].as_u64() else {
+                return json!({"refused":"proposal identity"});
+            };
+            let approved = serde_json::to_value(&proposal).expect("proposal serializes");
+            if let Err(why) = driver.proposal(candidate, proposal, &tool).await {
+                return json!({"refused":why});
+            }
+            context["approved_requirements"]
+                .as_array_mut()
+                .expect("requirements array")
+                .push(json!({"type":"operator_approved_intended_requirements","value":approved}));
+        }
+        #[cfg(all(target_arch = "wasm32", feature = "tracer"))]
+        crate::testonly::session_point("requirements_dispatch").await;
+        if driver.ending() {
+            return json!({"refused":"sessions ended"});
         }
         let result = driver.tool(&tool).await;
         if matches!(tool, Tool::Done { .. }) && result["done"] == true {

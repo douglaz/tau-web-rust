@@ -163,12 +163,15 @@ pub enum SetupRecord {
     Approval(SetupApproval),
     Class(ClassRecord),
     Access(AccessRecord),
+    Requirements(Box<crate::declaration::ApprovalRecord>),
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApprovedMachine {
     pub approved: ApprovedEntry,
     pub answer: Option<ClassAnswer>,
     pub class: Option<MachineClass>,
+    pub declaration: Option<crate::declaration::Declaration>,
+    pub requirements: Vec<crate::declaration::ApprovalRecord>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -193,6 +196,41 @@ impl Dispatch {
             return Err(BindingRefusal::AccessMissing);
         }
         Ok(())
+    }
+
+    pub fn check_installation(&self, entry: &str) -> Result<(), String> {
+        self.check_binding(entry)
+            .map_err(|e| format!("installation facts: {e:?}"))?;
+        let m = &self.approved_entries[entry];
+        let d = m
+            .declaration
+            .as_ref()
+            .ok_or("installation facts: approved declaration missing")?;
+        d.validate(m.class.expect("checked class"))
+    }
+
+    pub fn check_proposal(&self, proposal: &crate::declaration::Proposal) -> Result<(), String> {
+        use crate::declaration::Proposal;
+        self.check_binding(proposal.machine())
+            .map_err(|e| format!("proposal facts: {e:?}"))?;
+        let m = &self.approved_entries[proposal.machine()];
+        match proposal {
+            Proposal::Declaration { declaration, .. } => {
+                declaration.validate(m.class.expect("checked class"))?;
+                declaration.validate_ad_hoc_minimum()
+            }
+            Proposal::TightenClass { class, .. } => {
+                if m.class != Some(MachineClass::SinglePurpose)
+                    || *class != MachineClass::MultiTenant
+                {
+                    return Err("class tightening only".into());
+                }
+                if let Some(d) = &m.declaration {
+                    d.validate(*class)?;
+                }
+                Ok(())
+            }
+        }
     }
 
     pub(crate) fn apply_setup(
@@ -236,6 +274,8 @@ impl Dispatch {
                             approved: approved.clone(),
                             answer: None,
                             class: None,
+                            declaration: None,
+                            requirements: Vec::new(),
                         },
                     );
                     self.associations.push(Association {
@@ -259,6 +299,34 @@ impl Dispatch {
                 machine.answer = Some(record.answer);
                 machine.class = Some(record.class);
             }
+            SetupRecord::Requirements(record) => {
+                self.check_proposal(&record.proposal)?;
+                if self.approved_entries.values().any(|m| {
+                    m.requirements
+                        .iter()
+                        .any(|r| r.session == record.session && r.candidate == record.candidate)
+                }) {
+                    return Err("repeated requirements approval".into());
+                }
+                let machine = self
+                    .approved_entries
+                    .get_mut(record.proposal.machine())
+                    .expect("checked machine");
+                if machine.approved.access.as_ref() != Some(&record.access)
+                    || record.session.is_empty()
+                {
+                    return Err("requirements profile provenance".into());
+                }
+                match &record.proposal {
+                    crate::declaration::Proposal::Declaration { declaration, .. } => {
+                        machine.declaration = Some(declaration.clone())
+                    }
+                    crate::declaration::Proposal::TightenClass { class, .. } => {
+                        machine.class = Some(*class)
+                    }
+                }
+                machine.requirements.push(record.as_ref().clone());
+            }
             SetupRecord::Access(record) => {
                 record.access.validate()?;
                 let machine = self
@@ -279,6 +347,7 @@ impl Dispatch {
         let machines: Vec<_> = self.approved_entries.values().map(|m| serde_json::json!({
             "entry": m.approved.entry, "family": m.approved.identity.family, "index": m.approved.identity.index,
             "answer": m.answer, "class": m.class, "access": m.approved.access,
+            "declaration": m.declaration, "requirements": m.requirements,
         })).collect();
         serde_json::Value::Array(machines)
     }

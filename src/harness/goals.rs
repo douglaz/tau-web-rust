@@ -9,6 +9,7 @@ use wasm_bindgen::{JsCast, prelude::*};
 use wasm_bindgen_futures::JsFuture;
 
 thread_local! {
+    static APPROVALS: RefCell<BTreeMap<String, tokio::sync::oneshot::Sender<Result<(), String>>>> = const { RefCell::new(BTreeMap::new()) };
     static DOCUMENTS: RefCell<BTreeMap<String, String>> = const { RefCell::new(BTreeMap::new()) };
     static PENDING: RefCell<BTreeSet<String>> = const { RefCell::new(BTreeSet::new()) };
     static STARTED: RefCell<BTreeSet<String>> = const { RefCell::new(BTreeSet::new()) };
@@ -17,6 +18,11 @@ thread_local! {
     static TARGETS: RefCell<BTreeMap<String, Value>> = const { RefCell::new(BTreeMap::new()) };
 }
 pub(super) fn end() {
+    APPROVALS.with_borrow_mut(|pending| {
+        for (_, sender) in std::mem::take(pending) {
+            let _ = sender.send(Err("sessions ended".into()));
+        }
+    });
     FETCHES.with_borrow_mut(|fetches| {
         for f in fetches.drain(..) {
             f.abort();
@@ -168,6 +174,83 @@ pub async fn goal_accept(request: String) -> String {
         .to_string()
 }
 
+fn publish(report: Value) {
+    let worker: web_sys::DedicatedWorkerGlobalScope = js_sys::global().unchecked_into();
+    let message = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(
+        &message,
+        &JsValue::from_str("requirements_store"),
+        &JsValue::from_str(&report.to_string()),
+    );
+    let _ = worker.post_message(&message);
+}
+
+#[wasm_bindgen]
+pub async fn requirements_answer(request: String) -> String {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Answer {
+        session: String,
+        machine: String,
+        candidate: u64,
+        decision: Decision,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum Decision {
+        Approve,
+        Reject,
+    }
+    let result = async {
+        if !serde_json::from_str::<Value>(&request).is_ok_and(|v| v.is_object()) {
+            return Err("proposal answer schema".into());
+        }
+        let a: Answer = serde_json::from_str(&request).map_err(|_| "proposal answer schema")?;
+        #[cfg(feature = "tracer")]
+        crate::testonly::session_point("requirements_writer").await;
+        let local = local();
+        let mut local = local.lock().await;
+        if super::inference::ending() {
+            return Err("sessions ended".into());
+        }
+        if let Some(why) = local.dispatch_refusal() {
+            return Err(why.into());
+        }
+        let store = local.store().ok_or("locked")?;
+        // A stale/malformed act must not consume a different candidate's waiter.
+        if !store.pending_requirements_matches(&a.session, &a.machine, a.candidate) {
+            return Err("stale proposal approval".into());
+        }
+        let result = match a.decision {
+            Decision::Approve => {
+                store
+                    .approve_requirements(&a.session, &a.machine, a.candidate)
+                    .await
+            }
+            Decision::Reject => store
+                .reject_requirements(&a.session, &a.machine, a.candidate)
+                .and(Err("proposal rejected".into())),
+        };
+        #[cfg(feature = "tracer")]
+        crate::testonly::session_point("requirements_committed").await;
+        let result = if super::inference::ending() {
+            Err("sessions ended".into())
+        } else {
+            result
+        };
+        if let Some(sender) = APPROVALS.with_borrow_mut(|pending| pending.remove(&a.session)) {
+            let _ = sender.send(result.clone());
+        }
+        result
+    }
+    .await;
+    local()
+        .lock()
+        .await
+        .report(result.as_ref().err().map(String::as_str))
+        .to_string()
+}
+
 struct SessionDriver {
     session: String,
 }
@@ -185,6 +268,42 @@ impl Driver for SessionDriver {
             || (js_sys::Date::now() / 1000.) as u64,
         )
         .await
+    }
+    async fn proposal(
+        &mut self,
+        candidate: u64,
+        proposal: crate::declaration::Proposal,
+        tool: &Tool,
+    ) -> Result<(), String> {
+        #[cfg(feature = "tracer")]
+        crate::testonly::session_point("proposal_writer").await;
+        let receiver = {
+            let local = local();
+            let mut local = local.lock().await;
+            if super::inference::ending() {
+                return Err("sessions ended".into());
+            }
+            if let Some(why) = local.dispatch_refusal() {
+                return Err(why.into());
+            }
+            local.store().ok_or("locked")?.propose_requirements(
+                &self.session,
+                candidate,
+                proposal,
+                tool,
+            )?;
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            APPROVALS.with_borrow_mut(|pending| pending.insert(self.session.clone(), sender));
+            publish(local.report(None));
+            receiver
+        };
+        let result = receiver
+            .await
+            .map_err(|_| "proposal approval cancelled".to_string())?;
+        if super::inference::ending() {
+            return Err("sessions ended".into());
+        }
+        result
     }
     async fn tool(&mut self, tool: &Tool) -> Value {
         dispatch(&self.session, tool).await
@@ -207,13 +326,7 @@ pub async fn run_goal(session: String) -> String {
             .live_goal_session(&session)
             .map_err(|_| "not a live session")?;
         let goal = store.goal(&session).cloned().ok_or("missing goal")?;
-        store.check_tool(
-            &session,
-            &Tool::Exec {
-                machine: live.bound_set[0].clone(),
-                command: String::new(),
-            },
-        )?;
+        store.check_goal_start(&session)?;
         if PENDING.with_borrow(|p| p.contains(&session)) {
             return Err("document fetch pending".into());
         }
