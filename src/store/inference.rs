@@ -467,18 +467,25 @@ impl<S: Storage> Store<S> {
         } else {
             serde_json::from_slice(&response.body).unwrap_or(Value::Null)
         };
-        // Inspect decoded tool values with the same holdings and transient request keys.
+        // Inspect decoded action values with the same holdings and transient request keys.
         // Refuse the whole call rather than turn a redacted command into executable text.
         let tool_refused = matches!(intent, InferenceIntent::Completion { .. })
-            && (v.pointer("/choices/0/message").is_some_and(|message| {
-                !crate::redaction::Redacted::inference_value_is_safe(self, message, &credentials)
-            }) || redacted.as_ref().is_ok_and(|safe| {
-                serde_json::from_str::<Value>(&String::from_utf8_lossy(safe.as_bytes()))
-                    .ok()
-                    .and_then(|body| body.pointer("/choices/0/message").cloned())
-                    .as_ref()
-                    != v.pointer("/choices/0/message")
-            }));
+            && [
+                "/choices/0/message/tool_calls",
+                "/choices/0/message/proposal",
+            ]
+            .iter()
+            .any(|path| {
+                v.pointer(path).is_some_and(|value| {
+                    !crate::redaction::Redacted::inference_value_is_safe(self, value, &credentials)
+                }) || redacted.as_ref().is_ok_and(|safe| {
+                    serde_json::from_str::<Value>(&String::from_utf8_lossy(safe.as_bytes()))
+                        .ok()
+                        .and_then(|body| body.pointer(path).cloned())
+                        .as_ref()
+                        != v.pointer(path)
+                })
+            });
         let mut t = InferenceTerminal::new(call, response.status);
         let mut key = None;
         match &intent {
