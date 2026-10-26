@@ -546,9 +546,27 @@ pub(super) async fn run(
         "lost completion reports unresolved, never failed",
         lost["unresolved"] == true && lost.get("failed").is_none(),
     );
+    let from = run.browser.event_count();
+    let next = infer(run, worker).await?;
+    if next["finished"] != true {
+        // Keep response bodies and request credentials out of failure diagnostics.
+        let failures: Vec<_> = run.browser.events.lock().unwrap()[from..]
+            .iter()
+            .filter(|e| {
+                e["sessionId"] == worker.session && e["method"] == "Network.loadingFailed"
+            })
+            .map(|e| {
+                json!({"error":e["params"]["errorText"],"blocked":e["params"]["blockedReason"],"cors":e["params"]["corsErrorStatus"]})
+            })
+            .collect();
+        println!(
+            "   next inference failure: {}",
+            json!({"call":next["call"],"finished":next["finished"],"status":next["status"],"unresolved":next["unresolved"],"refused":next["refused"],"why":next["why"],"network_failures":failures})
+        );
+    }
     case.check(
         "next inference request dispatches",
-        infer(run, worker).await?["finished"] == true,
+        next["finished"] == true,
     );
     let state = run.inspect(worker).await?;
     case.check(

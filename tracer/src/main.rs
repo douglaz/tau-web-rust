@@ -522,6 +522,7 @@ impl Run<'_> {
         old: Option<&Worker>,
         in_use: bool,
     ) -> Result<Worker, String> {
+        let from = self.browser.event_count();
         for _ in 0..300 {
             if let [worker] = self.live_workers(tab).as_slice()
                 && Some(worker) != old
@@ -552,10 +553,52 @@ impl Run<'_> {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        let live = self.live_workers(tab);
+        // Only lifecycle metadata: no console arguments, exception bodies or request data.
+        let events: Vec<_> = self.browser.events.lock().unwrap()[from..]
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e["method"].as_str(),
+                    Some(
+                        "Target.attachedToTarget"
+                            | "Target.detachedFromTarget"
+                            | "Target.targetCrashed"
+                            | "Inspector.targetCrashed"
+                            | "Inspector.detached"
+                            | "Runtime.exceptionThrown"
+                            | "Page.frameStartedLoading"
+                            | "Page.frameStoppedLoading"
+                    )
+                )
+            })
+            .map(|e| {
+                json!({"method":e["method"],"session":e["sessionId"],"child_session":e["params"]["sessionId"],"target":e["params"]["targetId"],"attached_target":e["params"]["targetInfo"]["targetId"],"type":e["params"]["targetInfo"]["type"],"reason":e["params"]["reason"],"status":e["params"]["status"],"error_code":e["params"]["errorCode"],"exception_id":e["params"]["exceptionDetails"]["exceptionId"]})
+            })
+            .collect();
+        println!(
+            "   worker timeout: page={:?}, old={old:?}, live={live:?}, events={}",
+            tab.session,
+            json!(events)
+        );
+        // These best-effort observations happen after the wait has already failed.
+        let view = match tokio::time::timeout(Duration::from_secs(2), self.view(tab)).await {
+            Ok(Ok(view)) => json!({"status":view["status"],"store":view["store"]}),
+            Ok(Err(_)) => json!({"query":"failed"}),
+            Err(_) => json!({"query":"timed_out"}),
+        };
+        let targets =
+            match tokio::time::timeout(Duration::from_secs(2), self.harness_targets(&tab.origin))
+                .await
+            {
+                Ok(Ok(targets)) => json!({"workers":targets}),
+                Ok(Err(_)) => json!({"query":"failed"}),
+                Err(_) => json!({"query":"timed_out"}),
+            };
+        println!("   worker timeout observations: view={view}, targets={targets}");
         Err(format!(
             "{}: no new harness worker in 30 s ({:?})",
-            tab.origin,
-            self.live_workers(tab)
+            tab.origin, live
         ))
     }
 
