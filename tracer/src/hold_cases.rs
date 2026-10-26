@@ -211,12 +211,14 @@ pub(super) async fn run(
             .unwrap()
             .len();
         worker = settle_unresolved(run, tab, worker).await?;
+        // Declaration preparation and journal restores must not race a timed command.
+        // The fixture reboot below ends this detached job after the stop assertions.
         let (new, call, id) = job_cases::drop_command(
             run,
             tab,
             worker,
             args("fixture"),
-            "sleep 20; echo stopped-job",
+            "while :; do sleep 1; done",
         )
         .await?;
         worker = new;
