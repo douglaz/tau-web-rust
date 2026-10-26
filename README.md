@@ -50,14 +50,15 @@ still under construction.
 `src/` is the harness worker's wasm module, built for `wasm32-unknown-unknown` on spec ADR-0024's
 configuration, beside the pinned inputs above. It runs in a dedicated worker the page starts,
 because spec `STA-1` says "A single **harness worker** MUST be the only writer of durable state".
-What it does so far is the tracer bullet of twr-ggw.2, one command over a pinned SSH connection
-through the relay, recorded in the encrypted local store of twr-ggw.5 (below). The module exports
+The command path began with twr-ggw.2's tracer: one command over a pinned SSH connection
+through the relay, recorded in twr-ggw.5's encrypted local store (below). Goals and tools now
+drive that same recorded path through the session loop described below. The module exports
 `run_command` and `collect_jobs`, the same entry points in both builds below. The page defines no global and holds
-no reference to the worker's instance of the module. It sends passphrase, seed-backup, setup-approval, per-entry class-answer
-and binding messages to the worker, with no dispatch request; today only the tracer calls
-`run_command` there (below). Another same-origin script could still load its own copy of the
+no reference to the worker's instance of the module. It sends passphrase, seed-backup, setup-approval, per-entry class-answer,
+binding, goal and no-brief acceptance messages to the worker. Goal acceptance starts the
+model loop there; only the tracer directly calls the `run_command` export (below). Another same-origin script could still load its own copy of the
 module and call it; that copy has no unlocked store, so it refuses every request before any
-contact. For approval, class answers and binding, the harness cannot distinguish an operator's
+contact. For approval, class answers, binding and goal entry, the harness cannot distinguish an operator's
 click from an identical message another same-origin script posts. While locked or running the
 seed-backup ceremony, every request is refused before contact. The pins, keys and journal never
 come from the request. Both builds use the bound machine's derived client key and the
@@ -109,6 +110,167 @@ There are two builds of the same page, both release builds:
     `test_no_credentials`, which withholds the machine client key and relay key.
   The writer, allocator, seed-backup append and completed-read exports remain tracer-only.
   Neither build contains a compiled client key or relay key.
+
+### Goals and the model's tools
+
+For each live bound session, the page offers a goal card containing the operator's own words
+and one optional https document source. `goal_request` accepts the exact object
+`{session,text,document_source}` (the optional source may be omitted). Only an unlocked store
+outside the seed-backup ceremony accepts it. A missing live session, unknown member, wrong
+type, empty text, non-https source, second goal or ended session changes nothing. The worker
+journals an encrypted `goal` event before applying it. `store_state.goals` shows history;
+`sessions[].goal` and the page show that live session's text and provenance without keys.
+There is no import, export, sharing, stored-goal selector or reuse control. Fresh bindings have
+no goal and empty input fields, even after replay of earlier goals.
+
+**Implementation reading: provenance and lifetime.** The source is the fixed
+`operator_session_goal_card` marker; a session accepts exactly one goal. `document_source` is
+always present in the record, null when absent. There is no document metadata record. A goal
+is never a configurable brief or feed list. Unknown brief/feed members are rejected at the
+goal, tool and inference boundaries or ignored by the exact-member page protocol. The bundle
+still contains no promoted brief and no runtime brief/feed configuration exists.
+
+The card labels acceptance **Acting on a goal with no brief**, through the existing
+`Store::accept_mode` act and encrypted `mode_acceptance`. `goal_accept` takes exactly
+`{session}` and requires that live session's goal. Accepting starts its model loop in the
+harness worker. **Implementation reading: admission.** A turn waits for acceptance; each
+acting tool also checks acceptance before any contact or intent. Existing operator commands
+and collection remain unchanged. No session worker was added. No model-requested operator
+approval act or approval screen was added.
+
+**Implementation reading: fixture protocol.** Each turn is a real request through the shared
+inference driver, including its mint, route, intent, terminal and redaction boundaries. A
+harness-owned `tools` array contains exactly these four definitions, each requiring a machine
+string. The fixture returns one `{name,arguments}` call in
+`choices[0].message.tool_calls`. This is a loopback fixture protocol, with no claim about a
+live service's tool-call format. The loop accepts one call per turn and at most ten turns,
+starts at most once for a goal, and ends on bound `done`, session end, a refused, lost or
+unresolved inference request, a finished non-2xx turn, or the turn bound. Every dispatched
+result, including a hold,
+dispatch refusal or unresolved command, is the call's untrusted tool output in the next turn;
+the model then decides again. Delivering a result arms no dispatch or retry. **Implementation
+reading: invalid calls.** An unknown tool, invalid arguments or an out-of-set machine ends
+the loop before dispatch or any tool record. A 2xx turn also ends the loop when its body
+does not parse, has zero tool calls or has more than one tool call. No turn is retried and
+replay resumes nothing. The served build has no session-start selection and refuses its turn
+before contact.
+
+| Tool | Arguments and dispatch |
+|---|---|
+| `exec` | `{machine,command}`; live bound-set and no-brief checks, then the existing command path: session admission, signature lowering, command hold/disposition/barrier, launch size, connect, append and exec. Its intent records requester `session` and the live identity. |
+| `request_harness_job` | `{machine,job,arguments}`; schema, bound set and no-brief checks, then the shared box-plane hold/disposition/barrier check before job availability. Held work collects its holding calls, records no intent and never runs afterwards. Unheld requests refuse as unavailable, naming the job's owner. |
+| `request_typed_operation` | `{machine,operation,arguments}`; harness-resolved approved entry, caller-bound admission, no-brief gate and shared barrier/continuation check before approval. A request passing these checks refuses awaiting operator approval, with no intent or contact. The existing typed `check_request` and companion witnesses are unchanged. |
+| `done` | `{machine}`; bound-set resolution, no checked value and no contact. Ends the loop. |
+
+Unknown tools, missing/extra/ill-typed arguments, out-of-set targets and harness-only job names
+are refused without command intent or contact. The model supplies no address, pin, user,
+approval, cost bound or bundle commit. Tracer-only `test_model_target` supplies exact loopback
+connection targets, and `test_model_tool` exercises dispatch admission directly; both names
+are in the served absence needles. The served build has no target source, so a directly
+requested model exec reaches its existing missing-pin refusal. **Implementation reading: unavailable jobs and facts.**
+`fetch_artifact` (twr-i6k.5) and `ready_to_reset` (twr-i6k.3) admit empty argument objects.
+`place_secret` (twr-ggw.23) admits exactly text fields `application,path,owner,mode,secret_name,purpose`,
+never a value. Typed arguments are a text map; the harness supplies cost bound zero and its
+compiled spec commit while awaiting approval. Browser builds contain no typed adapter.
+The lost-create per-tool test now reaches the shared barrier before approval. Held and
+barrier-refused tool-result content remains twr-ggw.67's; these cases claim only dispatch,
+recording, contact behavior and delivery of each call's untrusted result to the next turn.
+**Implementation reading: job-only admission.** `check_job` admits jobs only. Exec hold
+evidence is the shared `Journal::check` host tests
+and the scripted browser case, through production `run_command`.
+
+**Implementation reading: context typing.** There is no fixed system instruction or fetched
+instruction text. A user message contains a JSON context: `goal:{type:"operator_goal",text}`,
+optional `document:{type:"untrusted",source:"fetched_document",content}`, and `history` of
+calls beside `result:{type:"untrusted",source:"tool_output",content}`. Command results contain
+stdout, stderr and exit status. Composed bodies pass the existing credential boundary;
+bodies are never journaled. **Implementation reading: unsafe decoded calls.** The inference
+response boundary scans decoded tool-call values and member names with every held credential
+and the request's transient credentials before releasing a call. Admission rechecks current
+holdings under the writer. **Implementation reading: admission scan.** Both scans remain.
+**Implementation reading: original completion text.** The response boundary decodes the
+original completion body lossily, exactly as the loop does, before inspecting tool calls.
+An invalid UTF-8 byte outside a call therefore cannot hide a literal or escaped credential
+inside it. Before release, the boundary also requires the original and redacted bodies to
+decode to identical tool-call values, including when the original has no parseable call.
+Neither byte-level escaping nor redaction that repairs malformed JSON can produce executable
+marker text in place of a call. Both held
+credentials and the request's transient credentials are checked; admission still independently
+checks current holdings. A credential-bearing call is refused whole, sends nothing and
+records no tool intent; its next-turn history withholds the call and carries only the
+credential-boundary refusal as untrusted tool output. A JSON escape cannot bypass these checks.
+Tool output and documents change no acceptance, approval,
+binding, disposition, hold, barrier or capability, including when claiming policy authority.
+No vendor credential is held by this build (SEC-5 row 1); the hostile-goal/document tests search
+all credentials the store enumerates, including both inference tiers, with the existing raw,
+hex, HEX, base64 and base64url needles and embedded alignments. **Implementation reading:
+credential attempt.** The scripted attempt writes
+hex of the actual received completion body to the machine. Planting a held credential into
+that context therefore fails all three scans: completion bodies, SSH commands and machine files.
+The SSH scan includes octal forms of every needle, because the job wrapper sends command
+bytes as printf octal operands; scanning only the literal wire would miss the hex attempt.
+
+**Implementation reading: document URL grammar.** Entry and replay share a conservative
+HTTPS predicate; the independent reader applies the same grammar. Hosts are ASCII DNS labels
+of 1–63 letters, digits or hyphens, starting and ending with a letter or digit, with at most
+253 host bytes, or canonical dotted-decimal IPv4. The last DNS label starts with a letter. Encoded internationalized labels (`xn--`), IPv6, user information, trailing dots and alternative
+numeric hosts are excluded. An optional port contains decimal digits and is in 1–65535.
+An optional path, query or fragment contains no whitespace, control character or backslash.
+The browser request parser also checks entry. Malformed ports and empty hosts refuse replay
+with the record number. Accepted examples include `https://localhost`,
+`https://127.0.0.1:443/document`, `https://docs.example:65535/path?q=1#part` and
+`https://a-b.example:000443/é`. Refused examples include `https://:443/document`,
+`https://127.0.0.1:65536/document`, `https://docs.example:0/`, `https://xn--a/`,
+`https://user:pass@docs.example/`, `https://[::1]/`, `https://docs.example./`,
+`https://0177.0.0.1/` and `https://docs.example/path with space`. The reader checks these
+examples, label and host byte bounds, port bounds and the excluded forms using its own
+byte-oriented authority and decimal-number parser. A comparison also requires every
+harness-admitted example to pass the independent record reader.
+
+The operator-named document source commits with the goal before one credential-less GET:
+CORS, manual redirects, no-store caching, no Authorization/account headers or browser
+credentials. No other path fetches documents into model context. **Implementation reading:
+failed document fetch.** An unreadable, redirected or non-2xx response retains the journaled
+goal and source and supplies no document text. **Implementation reading: pending document.**
+Acceptance refuses until the fetch has settled, including reading its body. Since each
+session accepts one goal, the loop-start pending guard is defence in depth: ordinary accepted
+entry cannot reach it. Loop-start admission passes through the actual tool-check refusal.
+The pending marker is installed under the source-append writer before any other report can
+expose that goal. The fetch and its settlement hold no writer, and the end step never waits
+for them. Document text remains transient. Session end
+aborts active document requests, clears retained text, and is checked after source append and
+immediately before send. The new browser case suspends the real source append, begins end,
+releases append and observes no GET. The TLS fixture reuses the tracer's certificate.
+
+| Send path | Session-end stop | Browser evidence |
+|---|---|---|
+| Model turn | Shared inference `can_send`, post-append check, response boundary and loop ending check; pending documents refuse start | `session end withholds completion body at finish_writer`; shared inference intent stop cases; pending-document acceptance case |
+| Model exec | Decoded credential boundary, current-holding admission, existing command stops and post-append check | `session end during box-plane intent commit prevents exec`; existing command/evidence stop cases |
+| Requested harness job | Shared command check and held-read stops; unheld jobs send nothing | `session end stops held read before acquiring writer`; `model exec and every admitted job collect holding calls and never launch` |
+| Requested typed operation | Ending checked under writer; browser has no adapter or send | `model typed create reaches the shared barrier before operator approval` |
+| Document GET | Post-source-append and immediate pre-send ending checks; AbortController; pending-fetch guard never delays end | `document source commits before fetch and session end prevents a late send`; `session end aborts an active document request without waiting for it` |
+| `done` | Bound-set check, no send | `scripted exec and done preserve untrusted typing and keep credentials off the machine` |
+
+The focused browser selector is `TAU_TRACER_GOALS=1`; optional `TAU_TRACER_GOAL_CASE`
+ends that focused run after `card`, `context`, `outcome`, `hold`, `barrier`, `credential`,
+`document_pending` or `document_end`. Leave both unset
+for the full gate. **Implementation reading: loop outcome.** When the page starts a loop,
+the worker reports its outcome in a fresh
+store report after it ends; the goal card shows the outcome. **Implementation reading:
+outcome members.** An inference stop reports only numeric `call` and `status`, boolean
+`finished` and `unresolved`, and the fixed `refused: "inference request refused"` when a
+refusal exists, omitting absent or ill-typed members. Bound completion reports only
+`done: true`; other loop refusals contain fixed harness text. No response body or aggregator
+text leaves the loop. **Implementation reading: outcome labels.** An unresolved outcome
+is labelled only as unresolved. Otherwise a refusal takes precedence over a finished status;
+a finished outcome without refusal is labelled by its HTTP status, including non-2xx turns.
+An outcome with none of these members has the neutral label `Goal loop ended.`.
+The two-completion check waits
+for that terminal report before counting. The tracer-only `goal_turn` suspension point lets
+the authority case snapshot all policy state after acceptance and before the first turn;
+it is included in the served absence needles. Its inference key is prepared before that
+snapshot, so sessions compare exactly across the hostile content. Only the command's intent
+and job terminal and the two inference intent/terminal pairs may be added.
 
 ### Procured inference
 
@@ -290,7 +452,7 @@ The following are **implementation readings**, with deliberately limited claims:
   the call stays unresolved and the existing failed-append latch applies. Older journals
   without responses replay unchanged. No response body appears in `store_state` or page reports.
 - **Model context:** the boundary's returned `Redacted` bytes are the stand-in for model
-  context, the only response form an adapter hands on. Model tools are twr-ggw.14's. The inference adapter composes model request bodies; the fixture inspects every received body and the tracer searches them for credential needles under STG-10.
+  context, the only response form an adapter hands on. Session tools now compose their bodies through the same boundary. The inference adapter composes model request bodies; the fixture inspects every received body and the tracer searches them for credential needles under STG-10.
 - **Two mechanisms:** the typed adapter declares root-password fields as RFC 6901 JSON
   Pointers; the fixture declares `/root_password`. Declared fields require JSON: malformed
   JSON refuses with no response record or output, leaving the call unresolved. Only the
@@ -556,10 +718,10 @@ dispatch companion comparison: passed
 
 This comparison is evidence about harness knowledge alone; the storage and browser fault tests
 carry ordering and contact evidence. Approved entries and their approval-time indices are
-journaled here. Live bindings are enforced above this core; actual session tools/routes wait for twr-ggw.14. The
-per-tool create case waits there; no extra route is invented here. Creating/paying and learning
+journaled here. Live bindings are enforced above this core. The model's typed-operation tool now
+reaches the create barrier before approval. Creating/paying and learning
 the vendor id are twr-ggw.21's; inference records now use their own store path; session-start
-selection is twr-ggw.18's, the disposition screen twr-ggw.66's and the model twr-ggw.14's;
+selection is twr-ggw.18's and the disposition screen twr-ggw.66's;
 account-credential sheet export is twr-ggw.27's and Replace's statement about it twr-ggw.29's;
 the real account checks and CNF-78's override measurement remain twr-ggw.51's; the abandonment flow and its
 authorization twr-ggw.31's; LNVPS fixture and criterion 23's LNVPS half twr-ggw.32's; stop and
@@ -802,8 +964,9 @@ variants; the standing-mode hook and rendering iterate the modes present.
 
 The acceptance surfaces and windows are **implementation readings**:
 
-- Acceptance is a store act, following the dispositions precedent. Neither build exports an
-  acceptance function or adds a page message or control. The binding message retains exactly
+- Acceptance is a store act, following the dispositions precedent. Both builds now expose
+  no-brief acceptance on the goal card through `goal_accept`; installation acceptance stays
+  store-only. The binding message retains exactly
   `{"bind":{"machine":"fixture"}}`.
 - `Store::bind_with_modes(machine, &[Mode::NoArtifactPin])` accepts the installation mode only
   on the machine's first binding, before any exposure record names it. The binding act stands
@@ -812,11 +975,11 @@ The acceptance surfaces and windows are **implementation readings**:
   a move that lands and reports failure restores the exposure and mode on replay, with no
   live session. Asking for an invalid mode refuses the entire binding without a record.
 - `Store::accept_mode(session, Mode::NoBrief)` requires a live session and precedes its first
-  journaled command intent, identified by `provenance.session`. That intent stands in for the
-  model's first command until goals and tools exist. A duplicate, unknown or ended session,
+  journaled command intent, identified by `provenance.session`. The model tool path requires
+  this acceptance for its goal before acting. A duplicate, unknown or ended session,
   the installation mode through this act, and a no-brief acceptance inside binding all refuse
-  without writing. This ticket does not require an acceptance for existing operator commands;
-  that requirement belongs to twr-ggw.14.
+  without writing. **Implementation reading:** this gate applies to the model's acting tools;
+  existing operator `run_command` and `collect_jobs` requests remain unchanged.
 
 Installation history stands for the life of this store, through restarts, later sessions,
 fixture destroy and fixture reinstall. A later binding shows it and refuses to accept it
@@ -856,10 +1019,9 @@ session and bound-set view plus `store_state` inspection. Both report and inspec
 The page renders `Installation: unpinned.` in that machine's section, and every standing label
 as `Standing mode: <label>.` alongside its existing session and bound-set line, generically.
 The unpinned installation names no bootstrap URL, hash or signer, including nothing from the
-compiled Alpine artifact policy. History remains visible with no live session. **Implementation
-reading: the no-brief browser gap** is deliberate: there is no acceptance export, and replay
-restores no session. Host tests cover both labels on report and inspection; browser cases
-cover only installation history. Trust layers and Delivered labels remain with their owners.
+compiled Alpine artifact policy. History remains visible with no live session. The goal card
+now offers no-brief acceptance and browser cases cover its standing label too. Replay restores
+no session or active conduct. Trust layers and Delivered labels remain with their owners.
 
 **Implementation readings: signature lowering.** On a machine with installation history, two
 literal pacman assignment forms are refused (ARC-25a, CNF-67). `SigLevel`, `LocalFileSigLevel`
@@ -1046,8 +1208,8 @@ word elements changes the document and is reported; phrase, array and binary lea
 
 The Replace flow and a second store seed belong to twr-ggw.29; the core already clears the
 record for a fresh seed and gates its allocations, while store replay refuses Replace today.
-Sheet import belongs to twr-ggw.27. Sessions exist and end with the harness worker; session
-workers, goals and tools are twr-ggw.14's. Seed-backup re-display ends sessions, waits and
+Sheet import belongs to twr-ggw.27. Sessions, goals and tools run in the harness worker.
+Seed-backup re-display ends sessions, waits and
 connections, and requires a fresh binding after the ceremony completes.
 
 ### The local store
@@ -1093,6 +1255,13 @@ the host tests run.
     `run_command` supplies its directly named entry, the bound session identity, and requester `session`.
     No command carries typed operation facts or an `OperationApproval`. A new-format intent with `approval:null`
     (or an absent approval member) means never dispatched. No path in this build writes one.
+  - `{"goal":{"session":"session-5","text":"…","source":"operator_session_goal_card","document_source":null}}`:
+    the operator's text for that one live session, committed before it applies or its optional
+    source is fetched. All four members are required; `document_source` is null or one https
+    URL. The source marker is fixed by the harness. Extra members, arrays, missing session or
+    source, an unknown exposure or a repeated goal for that session refuse replay. The
+    independent reader checks the same documented shape without calling store code. The
+    document text is never recorded. Replayed goals are history and start no work.
   - inference account, intent and terminal events use the exact shapes under "Procured
     inference" above, separately from typed operations.
   - a typed intent under `operation_intent`: `call` (its record number), `resource`
@@ -1263,7 +1432,7 @@ the host tests run.
     store: another tab, or this page's previous harness worker, still holds it."
   - Chromium releases a terminated worker's lock asynchronously, so a fresh worker queues
     behind it.
-- **Session workers.** None exists yet; they are twr-ggw.14's.
+- **Session workers.** None exists yet.
   - A session worker must be started by the harness worker, never by the page, so terminating
     the harness worker ends it.
   - The ticket that adds session workers must show, by a test, that they have ended after a
@@ -1512,8 +1681,8 @@ and a revision above `4294967295` or of any other JSON type are refused.
 Its distinct refusals are `NoEntry`, `ClassMissing` and `AccessMissing`; both recorded facts
 admit the entry, also after reopen. `Store::bind` calls this check before deriving or journaling
 anything. The page offers a binding control after the class answer and shows each live session
-and bound set. Session tools, create/payment and delivery declarations remain twr-ggw.14's,
-twr-ggw.21's and twr-ggw.15's.
+and bound set. Session tools run in the harness worker; create/payment and delivery declarations
+remain twr-ggw.21's and twr-ggw.15's.
 
 **Implementation readings.** The compiled two-entry setup (`fixture`, `fixture-other`), its
 vendor/product/region labels and 1000/2000 sat per month prices are fixture data, not a vendor's
@@ -1660,7 +1829,7 @@ browser holds:
 In headless Chromium 154 a new tab hides the one before it, which then restarts its worker, as
 page hide must. The cases account for it.
 
-The full run defines 171 cases.
+The full run defines 184 cases.
 
 The cases:
 
@@ -1717,6 +1886,19 @@ The cases:
 | background stdout (`STA-20a`) | `sleep 30 & echo hi` returns promptly with output and exit 0; the fixture saw the command launch and end |
 | received-command finding (`CNF-56`) | the fixture changes the recorded command during a live job; the result still settles with its exit and output, and the advisory finding survives reload and unlock; the reader reads every new shape |
 | disposition collection (`CNF-110`, box-plane case) | all four continuations over a real dropped job: collection reaches the relay and sshd, launches nothing, appends evidence and no intent; disposition and disposed state stay unchanged; destructive continuations refuse commands before contact both before and after collection, continuing ones admit them |
+| goal card records one session source and refuses runtime briefs and feeds | independent decryption, exact messages, the actual loop-start admission reason, no-brief refusal for all acting tools, second-goal refusal and hostile document text |
+| scripted exec and done preserve untrusted typing and keep credentials off the machine | waits for the page's terminal outcome before counting; compares `setup`, `exposure_ledger`, `connection_refusals`, `dispositions`, `standing`, `typed_calls`, `mode_acceptances`, `sessions`, `installations`, `signature_refusals` and `setup_offer` after acceptance; only its six named records may be added; writes received context hex and scans bodies, SSH commands and files |
+| finished error turn reports metadata without a response body | a 503 completion carries non-empty untrusted fixture text; every page message lacks both a `body` member and that text, the outcome carries only safe terminal metadata and the card labels the finished status |
+| finished refused turn displays its refusal | automatic top-up on produces a finished 200 account-read refusal; the page shows the fixed refusal, no finished-status label, no unresolved marker and no response body |
+| scripted schema and bound set refusals and direct harness-only job refusals | unknown tool, missing machine, out-of-set target and harness-only jobs produce no command intent or contact |
+| model exec and every admitted job collect holding calls and never launch | different/identical exec bytes and every admitted job cause exactly one holding-call read each, with fixture dial spacing temporarily removed so it cannot mask a duplicate dispatch; each untrusted result reaches the next turn, which chooses done, with no new command intent or retry |
+| model typed create reaches the shared barrier before operator approval | independent lost create refuses model create; the call's untrusted result reaches the next turn and done, with no new typed intent or contact |
+| hostile document cannot clear a destructive disposition | the destructive stop refuses exec; the next turn receives that refusal and chooses done |
+| escaped session credential in a scripted exec is refused before dispatch | minted session key returned as JSON escapes produces no SSH exec or command intent; credential-boundary refusal reaches the next turn without the unsafe call |
+| pending document fetch refuses acceptance until its response settles | holds the fixture response, asserts the exact pending acceptance refusal with no records or completions, releases it, and observes the document in the first turn |
+| document source commits before fetch and session end prevents a late send | suspend source append, begin end, release it, observe no GET and historical provenance |
+| session end aborts an active document request without waiting for it | a withheld document response is aborted; the fixture observes its connection close and session end answers independently |
+| goals stay historical after replay and failed documents supply no context | old-session refusal, fresh empty fields, redirect/non-2xx sources retained without document context |
 | live signal | a self-killed command returns unresolved with ended evidence, partial output and advisory agreement; no terminal is journaled |
 | collection after a bad record (crafted older journal) | a malformed first record reports its failure; the later finished job still returns its output and exit 23 and receives a terminal record |
 | held request after replay (`CNF-40`) | reads only its holding call to finished, names release, records no intent and never runs afterwards; only a new request runs |
@@ -1985,7 +2167,7 @@ are included in `check-absence`.
 
 For focused setup checks, set `TAU_TRACER_SETUP_CASE=all`. The `existing` value runs the existing
 dispatch/job cases without seed-display-dependent custody controls. The full gate leaves
-`TAU_TRACER_SETUP_CASE`, `TAU_TRACER_SEED_CASE` and `TAU_TRACER_HOLD_CASE` unset and runs all 171 cases. `TAU_TRACER_MODE_CASE`, `TAU_TRACER_INFERENCE`, `TAU_TRACER_INFERENCE_PHASE`,
+`TAU_TRACER_SETUP_CASE`, `TAU_TRACER_SEED_CASE` and `TAU_TRACER_HOLD_CASE` unset and runs all 184 cases. `TAU_TRACER_GOALS`, `TAU_TRACER_GOAL_CASE`, `TAU_TRACER_MODE_CASE`, `TAU_TRACER_INFERENCE`, `TAU_TRACER_INFERENCE_PHASE`,
 `TAU_TRACER_INFERENCE_END` and `TAU_TRACER_SESSION_END` must also be unset. The focused
 `session-end`, `sent-reads` and `command-intent` inference phases exercise the corresponding
 session-end boundaries. `TAU_TRACER_SESSION_END` selects comma-separated case-name fragments
@@ -4425,3 +4607,1151 @@ AssertionError: stale progress wording remains
 ```
 
 Each control restored and compared the README bytes exactly. Restored checker exit: 0.
+
+### Session goals and tools mutation evidence (G1–G44)
+
+The original G1–G22 commands ran in the foreground, unpiped, redirecting stdout/stderr to
+`/var/tmp/tau-ggw14-implementation/G<n>-red.log` and then `G<n>-green.log`. Each production
+file was saved before its mutation, restored in a `finally` block, and compared byte for byte
+before the identical command ran green. G10 was rerun with the job first so its typed host
+outcome explicitly distinguishes held from job-unavailable. Every pair went red and green.
+
+The browser command file `/var/tmp/tau-ggw14-implementation/browser` contains exactly:
+
+```sh
+#!/usr/bin/env bash
+set -euo pipefail
+export TMPDIR=/var/tmp
+cd /home/user/p/tau-web-rust
+bash /var/tmp/tau-web-manager/ggw14/tools/web-env.sh bash scripts/build-web.sh tracer
+exec bash /var/tmp/tau-web-manager/ggw14/tools/web-env.sh env -u TAU_TRACER_HOLD_CASE -u TAU_TRACER_INFERENCE -u TAU_TRACER_INFERENCE_END -u TAU_TRACER_INFERENCE_PHASE -u TAU_TRACER_MODE_CASE -u TAU_TRACER_SEED_CASE -u TAU_TRACER_SESSION_END -u TAU_TRACER_SETUP_CASE TAU_TRACER_GOALS=1 cargo run --locked -p tracer -- run dist/served dist/tracer
+```
+
+It uses the provided web environment, whose exact contents are:
+
+```sh
+#!/usr/bin/env bash
+# The web job's tool environment, rooted under /var/tmp/tau-web-manager/ggw14/tools (nix out-links + CI's pinned wasm-bindgen 0.2.127).
+T=/var/tmp/tau-web-manager/ggw14/tools
+export TMPDIR=${TMPDIR:-/var/tmp}
+export WB=$T/wbg CLANG=$T/clang LLVM=$T/llvm CHR=$T/chromium
+exec nix shell nixpkgs#gcc -c sh -c 'PATH="$WB/bin:$PATH" CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-Clinker-features=-lld CC_wasm32_unknown_unknown=$CLANG/bin/clang AR_wasm32_unknown_unknown=$LLVM/bin/llvm-ar RUSTUP_TOOLCHAIN=1.97.1 CHROME=$CHR/bin/chromium "$@"' sh "$@"
+```
+
+G1–G3 and G12 cover record provenance and reuse; G4–G5 cover the four machine-naming tools;
+G6 covers dispatch-level no-brief admission; G7–G8 and G19 cover untrusted typing and claimed
+authority; G13–G18 independently plant brief/feed substitution, configuration and fetched
+authority; G9 covers the credential absence claim; G10 and G20 cover model-tool holds; G11
+covers the typed pre-approval barrier; G21–G22 cover both document session-end boundaries.
+Held-result content is not asserted by G10 or G20. G9, G10, G19 and G20 were
+rerun below with the current checks and the new scratch directory.
+
+**G1 — omit goal session.** Files: `src/goals.rs`. Exact command:
+
+```sh
+nix shell 'nixpkgs#gcc' -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web goal_commits_session_source_once_and_replay_never_reuses_it -- --nocapture
+```
+
+Red exit 101. Failing assertion:
+
+```text
+called `Result::unwrap()` on an `Err` value: "its event is not one this version reads"
+```
+
+Restored bytes identical; same command green exit 0.
+
+**G2 — omit goal source.** Files: `src/goals.rs`. Exact command:
+
+```sh
+nix shell 'nixpkgs#gcc' -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web goal_commits_session_source_once_and_replay_never_reuses_it -- --nocapture
+```
+
+Red exit 101. Failing assertion:
+
+```text
+called `Result::unwrap()` on an `Err` value: "its event is not one this version reads"
+```
+
+Restored bytes identical; same command green exit 0.
+
+**G3 — reuse historical goal in a fresh session.** Files: `src/store/goals.rs`. Exact command:
+
+```sh
+nix shell 'nixpkgs#gcc' -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web goal_commits_session_source_once_and_replay_never_reuses_it -- --nocapture
+```
+
+Red exit 101. Failing assertion:
+
+```text
+assertion failed: reopened.goal(&fresh).is_none()
+```
+
+Restored bytes identical; same command green exit 0.
+
+**G4 — add fifth tool.** Files: `src/goals.rs`. Exact command:
+
+```sh
+nix shell 'nixpkgs#gcc' -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web scripted_turns_use_inference_redaction_fixed_tools_and_untrusted_content -- --nocapture
+```
+
+Red exit 101. Failing assertion:
+
+```text
+assertion `left == right` failed
+```
+
+Restored bytes identical; same command green exit 0.
+
+**G5 — remove required machine.** Files: `src/goals.rs`. Exact command:
+
+```sh
+nix shell 'nixpkgs#gcc' -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web scripted_turns_use_inference_redaction_fixed_tools_and_untrusted_content -- --nocapture
+```
+
+Red exit 101. Failing assertion:
+
+```text
+assertion failed: body["tools"].as_array().unwrap().iter().all(|t|
+```
+
+Restored bytes identical; same command green exit 0.
+
+**G6 — remove acting-tool no-brief gate.** Files: `src/store/goals.rs`. Exact command:
+
+```sh
+nix shell 'nixpkgs#gcc' -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web all_acting_tools_require_no_brief_acceptance_and_a_bound_machine -- --nocapture
+```
+
+Red exit 101. Failing assertion:
+
+```text
+called `Result::unwrap_err()` on an `Ok` value: ()
+```
+
+Restored bytes identical; same command green exit 0.
+
+**G7 — remove document untrusted typing.** Files: `src/goals.rs`. Exact command:
+
+```sh
+nix shell 'nixpkgs#gcc' -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web scripted_turns_use_inference_redaction_fixed_tools_and_untrusted_content -- --nocapture
+```
+
+Red exit 101. Failing assertion:
+
+```text
+assertion `left == right` failed
+```
+
+Restored bytes identical; same command green exit 0.
+
+**G8 — remove tool-output untrusted typing.** Files: `src/goals.rs`. Exact command:
+
+```sh
+nix shell 'nixpkgs#gcc' -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web scripted_turns_use_inference_redaction_fixed_tools_and_untrusted_content -- --nocapture
+```
+
+Red exit 101. Failing assertion:
+
+```text
+assertion `left == right` failed
+```
+
+Restored bytes identical; same command green exit 0.
+
+**G9 — compose held account credential into context after its boundary.** Files: `src/store/inference.rs`. Exact command:
+
+```sh
+nix shell nixpkgs#gcc -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web scripted_turns_use_inference_redaction_fixed_tools_and_untrusted_content -- --nocapture
+```
+
+Red exit 101. Failing assertion:
+
+```text
+assertion `left == right` failed
+```
+
+Restored bytes identical; same command green exit 0. This round's logs are
+`/var/tmp/tau-ggw14-round2-20261025/G9-{red,green}.log`.
+
+**G10 — remove job admission hold (rerun with job-only production admission).** Files: `src/goals.rs`. Exact command:
+
+```sh
+nix shell nixpkgs#gcc -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web new_model_jobs_keep_the_command_hold -- --nocapture
+```
+
+Red exit 101. Failing assertion:
+
+```text
+expected held tool, got JobUnavailable("twr-i6k.5")
+```
+
+Restored bytes identical; same command green exit 0. This round's logs are
+`/var/tmp/tau-ggw14-round2-20261025/G10-{red,green}.log`.
+
+**G11 — remove typed pre-approval barrier.** Files: `src/store/goals.rs`. Exact command:
+
+```sh
+nix shell 'nixpkgs#gcc' -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web lost_create_reaches_model_typed_barrier_before_approval -- --nocapture
+```
+
+Red exit 101. Failing assertion:
+
+```text
+called `Result::unwrap_err()` on an `Ok` value: Request { target: Entry("fixture"), operation: Create, session: "session-5", requester: Session, facts: Facts { arguments: {}, cost_bound: 0, bundle_commit: "d029ebd9f632696bb027a22559d774d165685947" }, approved: None }
+```
+
+Restored bytes identical; same command green exit 0.
+
+**G12 — prefill a fresh goal from history.** Files: `www/boot.js`. Exact command:
+
+```sh
+env -u TAU_TRACER_GOAL_CASE /var/tmp/tau-ggw14-implementation/browser
+```
+
+Red exit 1. Failing assertion:
+
+```text
+[FAILED] fresh bindings have no goal and no prefilled goal input
+```
+
+Restored bytes identical; same command green exit 0.
+
+**G13 — accept a runtime brief substitute.** Files: `src/harness/goals.rs`. Exact command:
+
+```sh
+env TAU_TRACER_GOAL_CASE=card /var/tmp/tau-ggw14-implementation/browser
+```
+
+Red exit 1. Failing assertion:
+
+```text
+[FAILED] goal refuses runtime brief substitute/configure
+```
+
+Restored bytes identical; same command green exit 0.
+
+**G14 — accept a runtime feed-list substitute.** Files: `src/harness/goals.rs`. Exact command:
+
+```sh
+env TAU_TRACER_GOAL_CASE=card /var/tmp/tau-ggw14-implementation/browser
+```
+
+Red exit 1. Failing assertion:
+
+```text
+[FAILED] goal refuses runtime feeds substitute/configure
+```
+
+Restored bytes identical; same command green exit 0.
+
+**G15 — persist runtime brief configuration.** Files: `www/worker.js`. Exact command:
+
+```sh
+env TAU_TRACER_GOAL_CASE=card /var/tmp/tau-ggw14-implementation/browser
+```
+
+Red exit 1. Failing assertion:
+
+```text
+[FAILED] page ignores runtime brief configuration
+```
+
+Restored bytes identical; same command green exit 0.
+
+**G16 — persist runtime feed-list configuration.** Files: `www/worker.js`. Exact command:
+
+```sh
+env TAU_TRACER_GOAL_CASE=card /var/tmp/tau-ggw14-implementation/browser
+```
+
+Red exit 1. Failing assertion:
+
+```text
+[FAILED] page ignores runtime feed_list configuration
+```
+
+Restored bytes identical; same command green exit 0.
+
+**G17 — fetched brief text waives no-brief acceptance.** Files: `src/harness/goals.rs`. Exact command:
+
+```sh
+env TAU_TRACER_GOAL_CASE=card /var/tmp/tau-ggw14-implementation/browser
+```
+
+Red exit 1. Failing assertion:
+
+```text
+[FAILED] each acting tool refuses without no-brief acceptance
+```
+
+Restored bytes identical; same command green exit 0.
+
+**G18 — fetched feed text waives no-brief acceptance.** Files: `src/harness/goals.rs`. Exact command:
+
+```sh
+env TAU_TRACER_GOAL_CASE=card /var/tmp/tau-ggw14-implementation/browser
+```
+
+Red exit 1. Failing assertion:
+
+```text
+[FAILED] each acting tool refuses without no-brief acceptance
+```
+
+Restored bytes identical; same command green exit 0.
+
+**G19 — tool output grants authority to the typed tool.** Files: `src/harness/goals.rs`. Exact command:
+
+```sh
+env TAU_TRACER_GOAL_CASE=context /var/tmp/tau-ggw14-round2-20261025/browser
+```
+
+Red exit 1. Failing assertion:
+
+```text
+[FAILED] claimed authority grants no typed approval
+```
+
+Restored bytes identical; same command green exit 0. This round's logs are
+`/var/tmp/tau-ggw14-round2-20261025/G19-{red,green}.log`.
+
+**G20 — remove the shared command hold from exec and jobs (rerun).** Files: `src/dispatch/typed.rs`. Exact command (with the scratch path expanded):
+
+```sh
+env TAU_TRACER_GOAL_CASE=hold "$ROUND3/browser"
+```
+
+Red exit 1. Failing assertions:
+
+```text
+[FAILED] each held request reads its holding job exactly once and never launches or records the requested work
+```
+
+Restored bytes identical; same command green exit 0.
+
+**G21 — remove both document post-append/pre-send end checks.** Files: `src/harness/goals.rs`. Exact command:
+
+```sh
+env TAU_TRACER_GOAL_CASE=document_end /var/tmp/tau-ggw14-implementation/browser
+```
+
+Red exit 1. Failing assertion:
+
+```text
+[FAILED] no document GET occurs after session end begins during source append
+```
+
+Restored bytes identical; same command green exit 0.
+
+**G22 — do not abort an active document request.** Files: `src/harness/goals.rs`. Exact command:
+
+```sh
+env -u TAU_TRACER_GOAL_CASE /var/tmp/tau-ggw14-implementation/browser
+```
+
+Red exit 1. Failing assertion:
+
+```text
+[FAILED] end aborts the document fetch and its loopback connection closes
+```
+
+Restored bytes identical; same command green exit 0.
+
+### Session goals and tools follow-up mutation evidence
+
+The following controls ran in the foreground, unpiped. Each production file was saved,
+restored in `finally`, and compared byte for byte before the identical command ran green.
+Logs, saved bytes and exact exits are in `/var/tmp/tau-ggw14-round2-20261025/`, named
+`G<n>-red.log`, `G<n>-green.log` and `G<n>-saved`; the index is `mutations.json`.
+The four `a`–`d` controls each independently plant `brief`, `briefs`, `feeds` and `feed_list`,
+respectively. The tool controls cover both the call object and its arguments.
+G10 is also the job-only admission control for the removed test-only exec path.
+
+The browser command file `/var/tmp/tau-ggw14-round2-20261025/browser` contains exactly:
+
+```sh
+#!/usr/bin/env bash
+set -euo pipefail
+export TMPDIR=/var/tmp
+cd /home/user/p/tau-web-rust
+bash /var/tmp/tau-web-manager/ggw14/tools/web-env.sh bash scripts/build-web.sh tracer
+exec bash /var/tmp/tau-web-manager/ggw14/tools/web-env.sh env -u TAU_TRACER_HOLD_CASE -u TAU_TRACER_INFERENCE -u TAU_TRACER_INFERENCE_END -u TAU_TRACER_INFERENCE_PHASE -u TAU_TRACER_MODE_CASE -u TAU_TRACER_SEED_CASE -u TAU_TRACER_SESSION_END -u TAU_TRACER_SETUP_CASE TAU_TRACER_GOALS=1 cargo run --locked -p tracer -- run dist/served dist/tracer
+```
+
+One preliminary G28 planting attempted to parse the plaintext key-preparation message as a
+goal context and stopped at the tracer's 120-second evaluation timeout. It is retained in
+`G28-initial-timeout.log` and counts as no evidence. The corrected planting then exposed a
+weak check: body and file scans failed, but the SSH scan stayed green because launch bytes
+are octal operands. That incomplete control is `G28-initial-incomplete-control.log`.
+The SSH scan was strengthened to include octal forms of every needle. G36 proves that scan
+against a real composed launch, and the final G28 below fails all three scans. No timed-out
+or incomplete control is claimed as a successful pair.
+
+**G23 — stop after dispatch refusal: host hold and typed barrier delivery (rerun).** Files: `src/goals.rs`. Exact command (with the scratch path expanded):
+
+```sh
+nix shell nixpkgs#gcc -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web held_and_barrier_refused_calls_reach_the_next_turn_then_done -- --nocapture
+```
+
+Red exit 101. Failing assertion:
+
+```text
+assertion `left == right` failed: dispatch refusal must reach another turn
+```
+
+Restored bytes identical; same command green exit 0.
+
+**G24 — stop after dispatch refusal: scripted exec, jobs and typed barrier delivery (rerun).** Files: `src/goals.rs`. Exact command (with the scratch path expanded):
+
+```sh
+env TAU_TRACER_GOAL_CASE=barrier "$ROUND3/browser"
+```
+
+Red exit 1. Failing assertions:
+
+```text
+[FAILED] dispatch result reaches the next turn as that call's untrusted tool output before done
+[FAILED] lost create's barrier refuses model create without a record or contact
+[FAILED] claimed authority leaves the destructive stop standing
+```
+
+Restored bytes identical; same command green exit 0.
+
+**G25 — disable decoded-value scanning: escaped session and account credentials.** Files: `src/redaction.rs`. Exact command:
+
+```sh
+nix shell nixpkgs#gcc -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web escaped_tool_credentials_are_refused_before_dispatch_and_never_enter_history -- --nocapture
+```
+
+Red exit 101. Failing assertion:
+
+```text
+decoded credential must never be dispatched
+```
+
+Restored bytes identical; same command green exit 0.
+
+**G26 — disable decoded-value scanning: escaped minted session key in browser exec.** Files: `src/redaction.rs`. Exact command:
+
+```sh
+env TAU_TRACER_GOAL_CASE=credential /var/tmp/tau-ggw14-round2-20261025/browser
+```
+
+Red exit 1. Failing assertion:
+
+```text
+[FAILED] escaped key sends no SSH exec and records no intent
+```
+
+Restored bytes identical; same command green exit 0.
+
+**G27 — remove pending-document acceptance and start guards (rerun).** Files: `src/harness/goals.rs`. Exact command (with the scratch path expanded):
+
+```sh
+env TAU_TRACER_GOAL_CASE=document_pending "$ROUND3/browser"
+```
+
+Red exit 1. Failing assertions:
+
+```text
+[FAILED] pending fetch refuses acceptance without a record or inference send
+[FAILED] settled fetch permits acceptance
+```
+
+Restored bytes identical; same command green exit 0.
+
+**G28 — plant a held account credential in goal context after the request boundary.** Files: `src/store/inference.rs`. Exact command:
+
+```sh
+env TAU_TRACER_GOAL_CASE=context /var/tmp/tau-ggw14-round2-20261025/browser
+```
+
+Red exit 1. Failing assertions:
+
+```text
+[FAILED] model context contains no held credential in any needle encoding
+[FAILED] every received SSH command excludes every held credential
+[FAILED] machine job files exclude every held credential
+```
+
+Restored bytes identical; same command green exit 0.
+
+**G29a — admit runtime brief on the tool path.** Files: `src/goals.rs`. Exact command:
+
+```sh
+nix shell nixpkgs#gcc -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web tool_refuses_every_runtime_brief_feed_member -- --nocapture
+```
+
+Red exit 101. Failing assertion:
+
+```text
+tool must refuse runtime brief in call
+```
+
+Restored bytes identical; same command green exit 0.
+
+**G29b — admit runtime briefs on the tool path.** Files: `src/goals.rs`. Exact command:
+
+```sh
+nix shell nixpkgs#gcc -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web tool_refuses_every_runtime_brief_feed_member -- --nocapture
+```
+
+Red exit 101. Failing assertion:
+
+```text
+tool must refuse runtime briefs in call
+```
+
+Restored bytes identical; same command green exit 0.
+
+**G29c — admit runtime feeds on the tool path.** Files: `src/goals.rs`. Exact command:
+
+```sh
+nix shell nixpkgs#gcc -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web tool_refuses_every_runtime_brief_feed_member -- --nocapture
+```
+
+Red exit 101. Failing assertion:
+
+```text
+tool must refuse runtime feeds in call
+```
+
+Restored bytes identical; same command green exit 0.
+
+**G29d — admit runtime feed_list on the tool path.** Files: `src/goals.rs`. Exact command:
+
+```sh
+nix shell nixpkgs#gcc -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web tool_refuses_every_runtime_brief_feed_member -- --nocapture
+```
+
+Red exit 101. Failing assertion:
+
+```text
+tool must refuse runtime feed_list in call
+```
+
+Restored bytes identical; same command green exit 0.
+
+**G30a — admit runtime brief on the inference path.** Files: `src/inference.rs`. Exact command:
+
+```sh
+nix shell nixpkgs#gcc -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web inference_refuses_every_runtime_brief_feed_member -- --nocapture
+```
+
+Red exit 101. Failing assertion:
+
+```text
+inference must refuse runtime brief
+```
+
+Restored bytes identical; same command green exit 0.
+
+**G30b — admit runtime briefs on the inference path.** Files: `src/inference.rs`. Exact command:
+
+```sh
+nix shell nixpkgs#gcc -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web inference_refuses_every_runtime_brief_feed_member -- --nocapture
+```
+
+Red exit 101. Failing assertion:
+
+```text
+inference must refuse runtime briefs
+```
+
+Restored bytes identical; same command green exit 0.
+
+**G30c — admit runtime feeds on the inference path.** Files: `src/inference.rs`. Exact command:
+
+```sh
+nix shell nixpkgs#gcc -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web inference_refuses_every_runtime_brief_feed_member -- --nocapture
+```
+
+Red exit 101. Failing assertion:
+
+```text
+inference must refuse runtime feeds
+```
+
+Restored bytes identical; same command green exit 0.
+
+**G30d — admit runtime feed_list on the inference path.** Files: `src/inference.rs`. Exact command:
+
+```sh
+nix shell nixpkgs#gcc -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web inference_refuses_every_runtime_brief_feed_member -- --nocapture
+```
+
+Red exit 101. Failing assertion:
+
+```text
+inference must refuse runtime feed_list
+```
+
+Restored bytes identical; same command green exit 0.
+
+**G31a — admit runtime brief on the goal path.** Files: `src/harness/goals.rs`. Exact command:
+
+```sh
+env TAU_TRACER_GOAL_CASE=card /var/tmp/tau-ggw14-round2-20261025/browser
+```
+
+Red exit 1. Failing assertion:
+
+```text
+[FAILED] goal refuses runtime brief substitute/configure
+```
+
+Restored bytes identical; same command green exit 0.
+
+**G31b — admit runtime briefs on the goal path.** Files: `src/harness/goals.rs`. Exact command:
+
+```sh
+env TAU_TRACER_GOAL_CASE=card /var/tmp/tau-ggw14-round2-20261025/browser
+```
+
+Red exit 1. Failing assertion:
+
+```text
+[FAILED] goal refuses runtime briefs substitute/configure
+```
+
+Restored bytes identical; same command green exit 0.
+
+**G31c — admit runtime feeds on the goal path.** Files: `src/harness/goals.rs`. Exact command:
+
+```sh
+env TAU_TRACER_GOAL_CASE=card /var/tmp/tau-ggw14-round2-20261025/browser
+```
+
+Red exit 1. Failing assertion:
+
+```text
+[FAILED] goal refuses runtime feeds substitute/configure
+```
+
+Restored bytes identical; same command green exit 0.
+
+**G31d — admit runtime feed_list on the goal path.** Files: `src/harness/goals.rs`. Exact command:
+
+```sh
+env TAU_TRACER_GOAL_CASE=card /var/tmp/tau-ggw14-round2-20261025/browser
+```
+
+Red exit 1. Failing assertion:
+
+```text
+[FAILED] goal refuses runtime feed_list substitute/configure
+```
+
+Restored bytes identical; same command green exit 0.
+
+**G32a — admit runtime brief on the page path.** Files: `www/worker.js`. Exact command:
+
+```sh
+env TAU_TRACER_GOAL_CASE=card /var/tmp/tau-ggw14-round2-20261025/browser
+```
+
+Red exit 1. Failing assertion:
+
+```text
+[FAILED] page ignores runtime brief configuration
+```
+
+Restored bytes identical; same command green exit 0.
+
+**G32b — admit runtime briefs on the page path.** Files: `www/worker.js`. Exact command:
+
+```sh
+env TAU_TRACER_GOAL_CASE=card /var/tmp/tau-ggw14-round2-20261025/browser
+```
+
+Red exit 1. Failing assertion:
+
+```text
+[FAILED] page ignores runtime briefs configuration
+```
+
+Restored bytes identical; same command green exit 0.
+
+**G32c — admit runtime feeds on the page path.** Files: `www/worker.js`. Exact command:
+
+```sh
+env TAU_TRACER_GOAL_CASE=card /var/tmp/tau-ggw14-round2-20261025/browser
+```
+
+Red exit 1. Failing assertion:
+
+```text
+[FAILED] page ignores runtime feeds configuration
+```
+
+Restored bytes identical; same command green exit 0.
+
+**G32d — admit runtime feed_list on the page path.** Files: `www/worker.js`. Exact command:
+
+```sh
+env TAU_TRACER_GOAL_CASE=card /var/tmp/tau-ggw14-round2-20261025/browser
+```
+
+Red exit 1. Failing assertion:
+
+```text
+[FAILED] page ignores runtime feed_list configuration
+```
+
+Restored bytes identical; same command green exit 0.
+
+**G33 — remove the goal record shape guard.** Files: `src/store.rs`. Exact command:
+
+```sh
+nix shell nixpkgs#gcc -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web goal_replay_refuses_positional_array -- --nocapture
+```
+
+Red exit 101. Failing assertion:
+
+```text
+malformed goal must refuse unlock
+```
+
+Restored bytes identical; same command green exit 0.
+
+**G34 — clear mode acceptance when the hostile command finishes.** Files: `src/store.rs`. Exact command:
+
+```sh
+env TAU_TRACER_GOAL_CASE=context /var/tmp/tau-ggw14-round2-20261025/browser
+```
+
+Red exit 1. Failing assertion:
+
+```text
+[FAILED] claimed authority leaves mode_acceptances unchanged
+```
+
+Restored bytes identical; same command green exit 0.
+
+**G35 — continue past bound done.** Files: `src/goals.rs`. Exact command:
+
+```sh
+env TAU_TRACER_GOAL_CASE=context /var/tmp/tau-ggw14-round2-20261025/browser
+```
+
+Red exit 1. Failing assertion:
+
+```text
+[FAILED] done ends the loop at two completions
+```
+
+Restored bytes identical; same command green exit 0.
+
+**G36 — omit octal credential needles for received SSH bytes.** Files: `tracer/src/goal_cases.rs`. Exact command:
+
+```sh
+nix shell nixpkgs#gcc -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tracer received_launch_scan_finds_context_hex_inside_printf_octal -- --nocapture
+```
+
+Red exit 101. Failing assertion:
+
+```text
+scan must detect the credential in received launch bytes
+```
+
+Restored bytes identical; same command green exit 0.
+
+### Session goals and tools mutation evidence (G37–G44)
+
+The original round-three controls ran in the foreground, unpiped, with output redirected to
+logs. Their saved bytes,
+`G<n>-red.log`, `G<n>-green.log` and `mutations.json` are under
+`/var/tmp/tau-ggw14-round3-20261025-evidence/`. Each source was restored and compared byte
+for byte before the same command ran green. G40–G41 below retain those commands and use
+the canonical scratch path:
+
+```sh
+ROUND3=$(realpath /var/tmp/tau-ggw14-round3-20261025-evidence)
+```
+
+`$ROUND3/browser` contains the exact browser command file printed in the follow-up evidence
+above: build the tracer directory through the provided web environment, then run the
+loopback tracer with `TAU_TRACER_GOALS=1` and the named focused selector. Every other
+selector is unset in that command file.
+
+The first G41 control stayed green because the fixture's dial-spacing refusal stopped the
+second dispatch before it could add a read. That run is retained as
+`G41-initial-masked.log` and counts as no successful mutation pair. The hold case now removes
+fixture dial spacing around each loop and restores it even when the loop returns an error.
+The corrected G41 below fails the exact read count for every held request. G40 and G41
+repeat only held or refused dispatches. G20, G23, G24 and G27 were rerun with their changed
+checks; their entries above now give this round's commands and failures.
+
+G37–G39 and G42–G44 below show round-four reruns under
+`/var/tmp/tau-ggw14-round4-M79FdJCU/`. G40–G41 retain their round-three evidence.
+After fixing the response scan, the lossy escaped-call case no longer isolates admission.
+G42 now primes the inference key and directly checks original credential-bearing calls at
+admission, independently of the response scan. The escaped valid-UTF-8 and lossy-UTF-8
+loop cases remain and now also require refusal before dispatch. G44 covers the expanded
+README grammar examples. Every rerun went red and restored green.
+
+**G37 — forward the entire error-turn report: host outcome.** Files: `src/goals.rs`. Exact command:
+
+```sh
+nix shell nixpkgs#gcc -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web finished_error_turn_reports_only_safe_metadata -- --nocapture
+```
+
+Red exit 101. Failing assertion:
+
+```text
+outcome contains only safe metadata: {"body":"{\"choices\":[{\"message\":{\"tool_calls\":[{\"untrusted\":\"response text\"}]}}]}","call":13,"finished":true,"status":500}
+```
+
+Restored bytes identical; same command green exit 0. Logs and saved bytes:
+`/var/tmp/tau-ggw14-round4-M79FdJCU/G37-red.log`, `/var/tmp/tau-ggw14-round4-M79FdJCU/G37-green.log` and
+`/var/tmp/tau-ggw14-round4-M79FdJCU/G37-source.bin`.
+
+**G38 — forward the entire error-turn report: page messages.** Files: `src/goals.rs`. Exact command:
+
+```sh
+env TAU_TRACER_GOAL_CASE=outcome /var/tmp/tau-ggw14-round4-M79FdJCU/browser
+```
+
+Red exit 1. Failing assertions:
+
+```text
+[FAILED] no page message carries a response body
+[FAILED] terminal page outcome contains only safe metadata
+[FAILED] finished refused turn is labelled by its refusal before its status
+```
+
+Restored bytes identical; same command green exit 0. Logs and saved bytes:
+`/var/tmp/tau-ggw14-round4-M79FdJCU/G38-red.log`, `/var/tmp/tau-ggw14-round4-M79FdJCU/G38-green.log` and
+`/var/tmp/tau-ggw14-round4-M79FdJCU/G38-source.bin`.
+
+**G39 — restore the unresolved page label for a finished error turn.** Files: `www/boot.js`. Exact command:
+
+```sh
+env TAU_TRACER_GOAL_CASE=outcome /var/tmp/tau-ggw14-round4-M79FdJCU/browser
+```
+
+Red exit 1. Failing assertion:
+
+```text
+[FAILED] finished non-2xx turn is labelled by its finished status
+```
+
+Restored bytes identical; same command green exit 0. Logs and saved bytes:
+`/var/tmp/tau-ggw14-round4-M79FdJCU/G39-red.log`, `/var/tmp/tau-ggw14-round4-M79FdJCU/G39-green.log` and
+`/var/tmp/tau-ggw14-round4-M79FdJCU/G39-source.bin`.
+
+**G40 — dispatch held or refused calls twice: host counter.** Files: `src/goals.rs`. Exact command (with the scratch path expanded):
+
+```sh
+nix shell nixpkgs#gcc -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web held_and_barrier_refused_calls_reach_the_next_turn_then_done -- --nocapture
+```
+
+Red exit 101. Failing assertion:
+
+```text
+assertion `left == right` failed: each scripted call dispatches exactly once
+```
+
+Restored bytes identical; same command green exit 0.
+
+**G41 — dispatch held or refused calls twice: exact browser read count.** Files: `src/goals.rs`. Exact command (with the scratch path expanded):
+
+```sh
+env TAU_TRACER_GOAL_CASE=hold "$ROUND3/browser"
+```
+
+Red exit 1. Failing assertions:
+
+```text
+[FAILED] each held request reads its holding job exactly once and never launches or records the requested work
+```
+
+Restored bytes identical; same command green exit 0.
+
+**G42 — remove the independent admission credential scan.** Files: `src/store/goals.rs`. Exact command:
+
+```sh
+nix shell nixpkgs#gcc -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web admission_scan_refuses_original_tool_credentials -- --nocapture
+```
+
+Red exit 101. Failing assertion:
+
+```text
+assertion `left == right` failed: admission must independently refuse a credential-bearing call
+  left: Ok(())
+ right: Err("tool credential boundary")
+```
+
+Restored bytes identical; same command green exit 0. Logs and saved bytes:
+`/var/tmp/tau-ggw14-round4-M79FdJCU/G42-red.log`, `/var/tmp/tau-ggw14-round4-M79FdJCU/G42-green.log` and
+`/var/tmp/tau-ggw14-round4-M79FdJCU/G42-source.bin`.
+
+**G43 — restore the permissive document URL predicate at replay.** Files: `src/goals.rs`. Exact command:
+
+```sh
+nix shell nixpkgs#gcc -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web goal_replay_refuses_invalid_source_and_document_url -- --nocapture
+```
+
+Red exit 101. Failing assertion:
+
+```text
+malformed goal must refuse unlock
+```
+
+Restored bytes identical; same command green exit 0. Logs and saved bytes:
+`/var/tmp/tau-ggw14-round4-M79FdJCU/G43-red.log`, `/var/tmp/tau-ggw14-round4-M79FdJCU/G43-green.log` and
+`/var/tmp/tau-ggw14-round4-M79FdJCU/G43-source.bin`.
+
+**G44 — make the independent reader accept every HTTPS authority.** Files: `tracer/src/reader.rs`. Exact command:
+
+```sh
+nix shell nixpkgs#gcc -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tracer goal_document_url_requires_a_valid_host_and_port -- --nocapture
+```
+
+Red exit 101. Failing assertion:
+
+```text
+assertion `left == right` failed: reader grammar: https://127.0.0.1:invalid/document: Ok(())
+  left: true
+ right: false
+```
+
+Restored bytes identical; same command green exit 0. Logs and saved bytes:
+`/var/tmp/tau-ggw14-round4-M79FdJCU/G44-red.log`, `/var/tmp/tau-ggw14-round4-M79FdJCU/G44-green.log` and
+`/var/tmp/tau-ggw14-round4-M79FdJCU/G44-source.bin`.
+
+### Session goals and tools round-four mutation evidence (G45–G48)
+
+Each command ran in the foreground, unpiped, with output redirected to the named scratch
+log; its exit was printed immediately afterwards. Every source was restored from its saved
+bytes and compared byte for byte before the same command ran green. The per-pair JSON
+files under `/var/tmp/tau-ggw14-round4-M79FdJCU/` record commands, exits, durations and
+source hashes. The `browser` command there builds the tracer directory through the supplied
+web environment and runs the loopback tracer with `TAU_TRACER_GOALS=1`; the named outcome
+selector remains set and all other selector families are explicitly unset. The browser
+request fence stays active. An initial G45 control restored strict JSON parsing alone and
+stayed green (exit 0), because the equality guard independently refused the call. Its logs,
+source and result are retained as `G45-initial-masked-red.log`,
+`G45-initial-masked-source.bin` and `G45-initial-masked-json` in the same scratch directory;
+it is not counted as a successful pair. The corrected G45 below also restores the old skip
+of comparison when the original body has no parseable calls. It fails the launch assertion;
+the check additionally requires no tool dispatch, no intent and withheld history.
+
+**G45 — restore strict UTF-8 parsing and the original skipping behavior.** Files: `src/store/inference.rs`. Exact command:
+
+```sh
+nix shell nixpkgs#gcc -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web literal_lossy_utf8_tool_credentials_are_refused_before_dispatch -- --nocapture
+```
+
+Red exit 101. Failing assertion:
+
+```text
+decoded credential must never be dispatched
+```
+
+Restored bytes identical; same command green exit 0. Logs and saved bytes:
+`/var/tmp/tau-ggw14-round4-M79FdJCU/G45-red.log`, `/var/tmp/tau-ggw14-round4-M79FdJCU/G45-green.log` and
+`/var/tmp/tau-ggw14-round4-M79FdJCU/G45-source.bin`.
+
+**G46 — restore finished-status precedence over a refusal.** Files: `www/boot.js`. Exact command:
+
+```sh
+env TAU_TRACER_GOAL_CASE=outcome /var/tmp/tau-ggw14-round4-M79FdJCU/browser
+```
+
+Red exit 1. Failing assertion:
+
+```text
+[FAILED] finished refused turn is labelled by its refusal before its status
+```
+
+Restored bytes identical; same command green exit 0. Logs and saved bytes:
+`/var/tmp/tau-ggw14-round4-M79FdJCU/G46-red.log`, `/var/tmp/tau-ggw14-round4-M79FdJCU/G46-green.log` and
+`/var/tmp/tau-ggw14-round4-M79FdJCU/G46-source.bin`.
+
+**G47 — allow a port above 65535 in the harness predicate.** Files: `src/goals.rs`. Exact command:
+
+```sh
+nix shell nixpkgs#gcc -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tracer goal_document_url_requires_a_valid_host_and_port -- --nocapture
+```
+
+Red exit 101. Failing assertion:
+
+```text
+reader rejects harness-admitted URL https://127.0.0.1:65536/document
+```
+
+Restored bytes identical; same command green exit 0. Logs and saved bytes:
+`/var/tmp/tau-ggw14-round4-M79FdJCU/G47-red.log`, `/var/tmp/tau-ggw14-round4-M79FdJCU/G47-green.log` and
+`/var/tmp/tau-ggw14-round4-M79FdJCU/G47-source.bin`.
+
+G48 covers both a quoted credential whose removal repairs malformed JSON and a two-backslash
+credential occurring in the wire encoding of one decoded character. Neither case may launch,
+record an intent or retain the altered call in history.
+
+**G48 — remove the comparison of original and released tool calls.** Files: `src/store/inference.rs`. Exact command:
+
+```sh
+nix shell nixpkgs#gcc -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked -p tau-web tool_calls_altered_by_byte_boundary_are_refused_whole -- --nocapture
+```
+
+Red exit 101. Failing assertion:
+
+```text
+a byte-altered call must never be dispatched
+```
+
+Restored bytes identical; same command green exit 0. Logs and saved bytes:
+`/var/tmp/tau-ggw14-round4-M79FdJCU/G48-red.log`, `/var/tmp/tau-ggw14-round4-M79FdJCU/G48-green.log` and
+`/var/tmp/tau-ggw14-round4-M79FdJCU/G48-source.bin`.
+
+### Session goals and tools round-three verification
+
+The round-three final implementation passed on 2026-10-25 with Rust 1.97.1,
+wasm-bindgen 0.2.127 and Chromium 154. Every command ran in the foreground, unpiped,
+with stdout/stderr redirected to its named log under
+`/var/tmp/tau-ggw14-round3-20261025-evidence/`; its exit was echoed immediately afterwards.
+`gates.json` records each exact command, exit and elapsed time.
+
+| Gate | Exact command | Exit |
+|---|---|---:|
+| Host format | `nix shell nixpkgs#gcc -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 fmt --check` | 0 |
+| Host clippy | `nix shell nixpkgs#gcc -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 clippy --locked --all-targets -- -D warnings` | 0 |
+| Host tests, pin and bundle | `nix shell nixpkgs#gcc -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked` | 0 |
+| Disk check | `python3 spec/prototypes/spec-checks/check-install-disks.py` | 0 |
+| Disk baseline negative control | `python3 spec/prototypes/spec-checks/check-install-disks.py --baseline` | 1 (required nonzero) |
+| Served wasm clippy | `bash /var/tmp/tau-web-manager/ggw14/tools/web-env.sh cargo clippy --locked -p tau-web --target wasm32-unknown-unknown --all-targets -- -D warnings` | 0 |
+| Tracer wasm clippy | `bash /var/tmp/tau-web-manager/ggw14/tools/web-env.sh cargo clippy --locked -p tau-web --target wasm32-unknown-unknown --all-targets --features tracer -- -D warnings` | 0 |
+| Dependency boundary | `bash /var/tmp/tau-web-manager/ggw14/tools/web-env.sh bash scripts/check-adr-0024.sh` | 0 |
+| Served build | `bash /var/tmp/tau-web-manager/ggw14/tools/web-env.sh bash scripts/build-web.sh served` | 0 |
+| Served absence | `bash /var/tmp/tau-web-manager/ggw14/tools/web-env.sh cargo run --locked -p tracer -- check-absence dist/served` | 0 |
+| Served CSP | `bash /var/tmp/tau-web-manager/ggw14/tools/web-env.sh cargo run --locked -p tracer -- check-csp dist/served` | 0 |
+| Full browser gate | `bash /var/tmp/tau-web-manager/ggw14/tools/web-env.sh env -u TAU_TRACER_HOLD_CASE -u TAU_TRACER_INFERENCE -u TAU_TRACER_INFERENCE_END -u TAU_TRACER_INFERENCE_PHASE -u TAU_TRACER_MODE_CASE -u TAU_TRACER_SEED_CASE -u TAU_TRACER_SESSION_END -u TAU_TRACER_SETUP_CASE -u TAU_TRACER_GOALS -u TAU_TRACER_GOAL_CASE bash scripts/tracer.sh` | 0 |
+
+The host suite passed 237 library tests, 4 bundle tests, 72 tracer tests and 3 doc tests.
+Both companion comparisons passed; the pinned specification and its witness files remain
+unchanged. Served absence checked 5 files against 248 needles. The full browser gate,
+with all ten `TAU_TRACER_*` selectors explicitly unset, printed `== summary (183 cases)`,
+183 PASS lines and `TRACER PASS`, exit 0, in 1199.6 seconds.
+No final gate timed out. The browser request fence remained active in both builds.
+`spec/bundle/cors-probe.sh` was **withheld by the no-live-vendor fence**.
+
+G37–G44 each passed red/restored-green. G20, G23, G24 and G27 were rerun and their entries
+updated: twelve pairs this round, all saved sources restored byte for byte. The initially
+masked G41 control is described above and is not counted as a successful pair.
+
+Files changed this round; all earlier work remains in place:
+
+- `README.md`
+- `src/goals.rs`
+- `src/store/goals.rs`
+- `tracer/src/goal_cases.rs`
+- `tracer/src/reader.rs`
+- `www/boot.js`
+
+`src/harness/goals.rs` and `src/dispatch/typed.rs` were changed only for controls and restored
+byte for byte. No dependency, session worker, approval act, new send path, commit, amend,
+push, pull request or tracker write was added. The protected session-end passages, stops,
+5000 ms bound and existing session-end report texts remain unchanged. No BLOCK was encountered.
+
+This round's implementation readings for the closing comment are:
+
+- Outcomes carry only the safe typed metadata members and fixed refusal text described above;
+  successful bound completion reports only `done: true`. Finished error turns display their
+  status and end without dispatch.
+- A 2xx body that does not parse, has zero tool calls or has more than one ends the loop
+  before dispatch, alongside the already documented invalid-call cases.
+- At round three both credential scans remained, with the admission scan covering escaped
+  credentials recovered from invalid UTF-8. Round four supersedes that reading: the response
+  scan now inspects original lossy completion text before any replacement.
+- Document entry and replay use the conservative HTTPS DNS/IPv4 and decimal-port grammar
+  above, also checked by the independent reader. Excluded forms include empty hosts,
+  malformed ports, user information, IPv6, encoded internationalized labels, trailing dots
+  and alternative numeric hosts.
+
+The previous implementation readings remain in the goals section. Final consistency command:
+
+```sh
+python3 /var/tmp/tau-ggw14-round3-20261025-evidence/consistency.py
+```
+
+It exits 0 only when protected text, tracker bytes, branch, pin, witness bytes, twelve
+mutation pairs, all gate exits and both case-count sites agree with the recorded evidence.
+
+### Session goals and tools final verification (round four)
+
+The final implementation passed on 2026-10-25 with Rust 1.97.1, wasm-bindgen 0.2.127 and
+Chromium 154. All commands ran after the last source edit and formatting, in the foreground,
+unpiped, with stdout/stderr redirected to `gate-<name>.log` under
+`/var/tmp/tau-ggw14-round4-M79FdJCU/`; each exit was echoed immediately afterwards.
+`gates.json` records every exact command, exit and elapsed time. `final-source.json` records
+the source hashes checked after the gates. An earlier sequence was stopped after its active
+host test command finished, before the final boundary refinement; its format, clippy and
+host-test logs are retained as `pre-final-*.log` and are superseded by the runs below.
+
+| Gate | Exact command | Exit |
+|---|---|---:|
+| Host format | `nix shell nixpkgs#gcc -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 fmt --check` | 0 |
+| Host clippy | `nix shell nixpkgs#gcc -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 clippy --locked --all-targets -- -D warnings` | 0 |
+| Host tests, pin and bundle | `nix shell nixpkgs#gcc -c env TMPDIR=/var/tmp RUSTFLAGS=-Clinker-features=-lld cargo +1.97.1 test --locked` | 0 |
+| Disk check | `python3 spec/prototypes/spec-checks/check-install-disks.py` | 0 |
+| Disk baseline negative control | `python3 spec/prototypes/spec-checks/check-install-disks.py --baseline` | 1 (required nonzero) |
+| Served wasm clippy | `bash /var/tmp/tau-web-manager/ggw14/tools/web-env.sh cargo clippy --locked -p tau-web --target wasm32-unknown-unknown --all-targets -- -D warnings` | 0 |
+| Tracer wasm clippy | `bash /var/tmp/tau-web-manager/ggw14/tools/web-env.sh cargo clippy --locked -p tau-web --target wasm32-unknown-unknown --all-targets --features tracer -- -D warnings` | 0 |
+| Dependency boundary | `bash /var/tmp/tau-web-manager/ggw14/tools/web-env.sh bash scripts/check-adr-0024.sh` | 0 |
+| Served build | `bash /var/tmp/tau-web-manager/ggw14/tools/web-env.sh bash scripts/build-web.sh served` | 0 |
+| Served absence | `bash /var/tmp/tau-web-manager/ggw14/tools/web-env.sh cargo run --locked -p tracer -- check-absence dist/served` | 0 |
+| Served CSP | `bash /var/tmp/tau-web-manager/ggw14/tools/web-env.sh cargo run --locked -p tracer -- check-csp dist/served` | 0 |
+| Full browser gate | `bash /var/tmp/tau-web-manager/ggw14/tools/web-env.sh env -u TAU_TRACER_HOLD_CASE -u TAU_TRACER_INFERENCE -u TAU_TRACER_INFERENCE_END -u TAU_TRACER_INFERENCE_PHASE -u TAU_TRACER_MODE_CASE -u TAU_TRACER_SEED_CASE -u TAU_TRACER_SESSION_END -u TAU_TRACER_SETUP_CASE -u TAU_TRACER_GOALS -u TAU_TRACER_GOAL_CASE bash scripts/tracer.sh` | 0 |
+
+The host suite passed 240 library tests, 4 bundle tests, 72 tracer tests and 3 doc tests.
+Both companion comparisons passed with the pinned specification and witness files unedited.
+The full browser gate explicitly unset all ten `TAU_TRACER_*` selectors and printed
+`== summary (184 cases)`, 184 PASS lines and `TRACER PASS`, exit 0, in
+1162.07 seconds. No final gate timed out. The request fence stayed
+active in both builds. `spec/bundle/cors-probe.sh` was **withheld by the no-live-vendor fence**.
+
+G45–G48 passed red/restored-green, as did the rerun G37–G39 and G42–G44: ten successful
+pairs this round. Every saved source matches the final bytes. The initial masked G45 is
+recorded separately above and is excluded. The response scan covers literal and escaped
+credentials in lossy completion text, including transient request credentials after holdings
+clear. The byte-comparison check additionally covers escaping and malformed-JSON repair.
+The reader checks the README grammar independently and rejects the harness port mutant.
+
+Files changed this round, preserving all earlier work:
+
+- `README.md`
+- `src/goals.rs`
+- `src/harness/goals.rs`
+- `src/store/goals.rs`
+- `src/store/inference.rs`
+- `tracer/src/aggregator.rs`
+- `tracer/src/goal_cases.rs`
+- `tracer/src/reader.rs`
+- `www/boot.js`
+
+This round's new implementation readings for the closing comment are:
+
+- Original completion text is decoded lossily before the response scan, exactly as in the
+  loop. Original and released tool-call values must agree, including the absence of a
+  parseable original call; redaction never creates executable marker text. Both credential
+  scans remain, and refusal withholds the whole call from later history.
+- An unresolved outcome is labelled only as unresolved. Otherwise refusal takes precedence
+  over finished status; finished outcomes without refusal use their status, and an outcome
+  without these members uses the neutral `Goal loop ended.` label.
+
+The existing document URL grammar has the same accepted set after removal of the dead `0x`
+test. Acceptance guards the pending fetch; the loop-start guard is defence in depth, and its
+admission errors retain their actual reason. The send-path coverage table remains accurate:
+no new send path, dependency, switch, approval act or session worker was added. The protected
+session-end sentences, stops, report texts and 5000 ms bound remain unchanged. No branch
+switch, commit, amend, push, pull request or tracker write occurred. No BLOCK was encountered.
+
+Final consistency command:
+
+```sh
+python3 /var/tmp/tau-ggw14-round4-M79FdJCU/consistency.py
+```
+
+It checks protected text, tracker bytes, branch, pin and witness cleanliness, the nine changed
+files, final source hashes, ten mutation pairs, all gate exits and both 184-case count sites.

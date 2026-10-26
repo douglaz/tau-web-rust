@@ -404,7 +404,7 @@ pub async fn run_command(
 }
 
 /// Admission's hold collects only its snapshot of holding calls; it never resumes dispatch.
-async fn admission_refusal(
+pub(crate) async fn admission_refusal(
     pins: &impl PinSource,
     journal: &mut impl BoundJournal,
     session: &Session,

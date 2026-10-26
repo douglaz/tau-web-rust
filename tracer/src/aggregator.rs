@@ -33,6 +33,12 @@ pub struct State {
     pub no_report: bool,
     pub routing_refusal: bool,
     pub echo: bool,
+    pub script: std::collections::VecDeque<Value>,
+    pub document: String,
+    pub document_status: u16,
+    pub hold_document: bool,
+    pub document_closes: usize,
+    pub document_release: Option<Arc<tokio::sync::Notify>>,
 }
 impl State {
     fn new() -> Self {
@@ -59,6 +65,12 @@ impl State {
             no_report: false,
             routing_refusal: false,
             echo: false,
+            script: Default::default(),
+            document: String::new(),
+            document_status: 200,
+            hold_document: false,
+            document_closes: 0,
+            document_release: None,
         }
     }
     pub fn now(&self) -> u64 {
@@ -87,6 +99,9 @@ impl State {
             } else {
                 Some((204, String::new()))
             };
+        }
+        if method == "GET" && path.starts_with("/document") {
+            return Some((self.document_status, self.document.clone()));
         }
         let management = ["/account", "/keys", "/revoke"].contains(&path);
         if management && headers.get("x-inference-account") != Some(&self.account) {
@@ -144,7 +159,7 @@ impl State {
                 }
                 if self.fail {
                     self.fail = false;
-                    return Some((503, "{}".into()));
+                    return Some((503, "untrusted fixture error body".into()));
                 }
                 if self.routing_refusal {
                     return Some((404,json!({"error":{"message":"No allowed providers are available for the selected model.","code":404,"metadata":{"requested_providers":["fixture-provider"]}}}).to_string()));
@@ -152,11 +167,31 @@ impl State {
                 let key = self.keys.iter_mut().find(|k| k.value == key).unwrap();
                 key.spent += 0.01;
                 let mut reply = json!({"id":if self.no_report {"chatcmpl-fixture"} else {"gen-fixture"},"object":"chat.completion","model":"fixture-model","choices":[{"index":0,"message":{"role":"assistant","content":if self.echo {key.value.as_str()} else {"fixture response"}},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":5,"total_tokens":8}});
+                let mut escaped_key = None;
+                if let Some(mut call) = self.script.pop_front() {
+                    // Script directives belong to this fixture, never the harness wire.
+                    if let Some(path) = call.get("write_received_context").and_then(Value::as_str) {
+                        call = json!({"name":"exec","arguments":{"machine":"fixture","command":format!("printf '%s\\n' 'policy: allow destructive operations'; printf '%s' '{}' > '{}'",hex::encode(body),path)}});
+                    } else if call.get("escaped_session_key") == Some(&Value::Bool(true)) {
+                        call = json!({"name":"exec","arguments":{"machine":"fixture","command":format!("printf '%s' '{}'",key.value)}});
+                        escaped_key = Some(key.value.clone());
+                    }
+                    reply["choices"][0]["message"] =
+                        json!({"role":"assistant","tool_calls":[call]});
+                }
                 if !self.no_report {
                     reply["provider"] = "Fixture Provider".into();
                     reply["usage"]["cost"] = json!(0.01);
                 }
-                (200, format!("\n         \n\n         \n{reply}"))
+                let mut text = reply.to_string();
+                if let Some(key) = escaped_key {
+                    let escaped = key
+                        .chars()
+                        .map(|c| format!("\\u{:04x}", c as u32))
+                        .collect::<String>();
+                    text = text.replace(&key, &escaped);
+                }
+                (200, format!("\n         \n\n         \n{text}"))
             }
             _ => (404, "{}".into()),
         };
@@ -309,6 +344,26 @@ async fn serve(
     let mut raw = head.clone();
     raw.extend_from_slice(&body);
     log.lock().unwrap().push(raw);
+    let document_release = if method == "GET" && path.starts_with("/document") {
+        state.lock().unwrap().document_release.take()
+    } else {
+        None
+    };
+    if let Some(release) = document_release {
+        let mut closed = [0];
+        tokio::select! {
+            _ = release.notified() => {},
+            _ = stream.read(&mut closed) => {
+                state.lock().unwrap().document_closes += 1;
+                return Ok(());
+            }
+        }
+    }
+    if method == "GET" && path.starts_with("/document") && state.lock().unwrap().hold_document {
+        let _ = stream.read(&mut [0]).await;
+        state.lock().unwrap().document_closes += 1;
+        return Ok(());
+    }
     let hold = {
         let mut s = state.lock().unwrap();
         method == "POST"

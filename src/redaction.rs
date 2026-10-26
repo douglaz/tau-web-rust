@@ -50,6 +50,30 @@ impl Redacted {
         redact(body, &[], &held)
     }
 
+    /// Refuse decoded values rather than execute a command altered by redaction.
+    pub(crate) fn inference_value_is_safe<S: Storage>(
+        store: &Store<S>,
+        value: &serde_json::Value,
+        credentials: &[&[u8]],
+    ) -> bool {
+        use serde_json::Value;
+        let Ok(mut held) = store.held_credentials() else {
+            return false;
+        };
+        held.borrowed.extend_from_slice(credentials);
+        fn safe(value: &Value, held: &Held<'_>) -> bool {
+            let exact =
+                |bytes: &[u8]| redact(bytes, &[], held).is_ok_and(|r| r.as_bytes() == bytes);
+            match value {
+                Value::String(s) => exact(s.as_bytes()),
+                Value::Array(a) => a.iter().all(|v| safe(v, held)),
+                Value::Object(o) => o.iter().all(|(k, v)| exact(k.as_bytes()) && safe(v, held)),
+                _ => exact(value.to_string().as_bytes()),
+            }
+        }
+        safe(value, &held)
+    }
+
     pub(crate) fn for_store<S: Storage>(
         store: &Store<S>,
         body: &[u8],

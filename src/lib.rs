@@ -10,6 +10,7 @@ pub mod allocation;
 pub mod binding;
 pub mod credential;
 pub mod dispatch;
+pub mod goals;
 pub mod harness;
 pub mod inference;
 pub mod jobs;
@@ -212,9 +213,9 @@ mod worker {
 
     /// The store's journal, which holds the store only inside an append or a read, so a command
     /// awaiting its record never holds it.
-    struct StoreJournal {
-        local: Rc<Mutex<Harness>>,
-        unavailable: bool,
+    pub(crate) struct StoreJournal {
+        pub(crate) local: Rc<Mutex<Harness>>,
+        pub(crate) unavailable: bool,
     }
 
     impl Journal for StoreJournal {
@@ -451,7 +452,7 @@ mod worker {
 
     /// The served build has no host-key pin source until twr-ggw.43.
     #[cfg(not(feature = "tracer"))]
-    struct NoPins;
+    pub(crate) struct NoPins;
 
     #[cfg(not(feature = "tracer"))]
     impl crate::harness::PinSource for NoPins {

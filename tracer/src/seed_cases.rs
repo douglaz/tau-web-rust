@@ -622,7 +622,7 @@ pub(super) async fn run(
                 cases.push(case);
             }
         }
-        // Sessions end with the harness worker; goals, tools and session workers are twr-ggw.14's.
+        // Sessions end with the harness worker; goals and tools run in it.
         let mut case = Case::new(if tracer {
             "seed-backup re-display ends dispatch connections and waits"
         } else {

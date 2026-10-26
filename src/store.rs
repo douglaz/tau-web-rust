@@ -55,6 +55,7 @@ use zeroize::{Zeroize, Zeroizing};
 #[cfg(target_arch = "wasm32")]
 pub mod opfs;
 
+mod goals;
 pub(crate) mod inference;
 
 /// The directory the store owns in the origin-private file system.
@@ -196,6 +197,7 @@ pub(crate) enum Event {
     Setup(crate::dispatch::SetupRecord),
     Exposure(Exposure),
     ModeAcceptance(Acceptance),
+    Goal(crate::goals::Goal),
     SignatureRefusal(SignatureRefusal),
     ConnectionRefusal(ConnectionRefusal),
     InferenceAccount {
@@ -346,6 +348,7 @@ pub struct Store<S> {
     response_calls: std::collections::BTreeSet<u64>,
     exposure_ledger: Vec<Exposure>,
     conduct_acceptances: Vec<Acceptance>,
+    goals: Vec<crate::goals::Goal>,
     signature_refusals: Vec<SignatureRefusal>,
     connection_refusals: Vec<ConnectionRefusal>,
     /// Set by a failed append, whose move may have landed: no append follows in this worker.
@@ -475,6 +478,7 @@ impl<S: Storage> Store<S> {
             response_calls: std::collections::BTreeSet::new(),
             exposure_ledger: Vec::new(),
             conduct_acceptances: Vec::new(),
+            goals: Vec::new(),
             signature_refusals: Vec::new(),
             connection_refusals: Vec::new(),
             failed: None,
@@ -684,6 +688,9 @@ impl<S: Storage> Store<S> {
             .iter()
             .map(|s| {
                 let mut view = s.inspect();
+                view["goal"] =
+                    serde_json::to_value(self.goals.iter().find(|g| g.session == s.identity))
+                        .expect("goal serializes");
                 view["unaccounted_spend"] = self.unaccounted_spend(&s.identity);
                 view["standing_modes"] = self
                     .standing_modes(&s.bound_set[0])
@@ -735,7 +742,7 @@ impl<S: Storage> Store<S> {
     }
 
     pub async fn accept_mode(&mut self, session: &str, mode: Mode) -> Result<(), String> {
-        if !self.sessions.iter().any(|s| s.identity == session) {
+        if self.inference.ended || !self.sessions.iter().any(|s| s.identity == session) {
             return Err("mode acceptance requires a live session".into());
         }
         let acceptance = Acceptance {
@@ -1218,6 +1225,11 @@ impl<S: Storage> Store<S> {
                     self.replay_exposure(number, exposure)
                         .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
                 }
+                (_, Event::Goal(goal)) => {
+                    self.check_goal(goal)
+                        .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
+                    self.goals.push(goal.clone());
+                }
                 (_, Event::ModeAcceptance(acceptance)) => {
                     self.check_acceptance(acceptance)
                         .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
@@ -1393,12 +1405,19 @@ impl<S: Storage> Store<S> {
             event,
             Event::Exposure(_)
                 | Event::ConnectionRefusal(_)
+                | Event::Goal(_)
                 | Event::ModeAcceptance(_)
                 | Event::SignatureRefusal(_)
                 | Event::OperationResponse { .. }
         ) {
             let value: Value = serde_json::from_slice(&plaintext)
                 .map_err(|_| "invalid binding record shape".to_string())?;
+            if value.get("goal").is_some_and(|g| {
+                g.as_object()
+                    .is_none_or(|o| o.len() != 4 || !o.contains_key("document_source"))
+            }) {
+                return Err("invalid goal record shape".into());
+            }
             for kind in ["mode_acceptance", "signature_refusal"] {
                 if value.get(kind).is_some_and(|body| !body.is_object()) {
                     return Err("invalid mode record shape".into());
@@ -1883,6 +1902,7 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
                 "seed_backup_stage": self.seed_backup,
                 "setup": store.dispatch.setup_view(),
                 "sessions": store.sessions(),
+                "goals": store.goals,
                 "mode_acceptances": store.mode_acceptances(),
                 "signature_refusals": store.signature_refusals(),
                 "installations": store.dispatch.approved_entries.keys().filter(|m| store.installation_unpinned(m)).map(|m| json!({"machine":m,"installation":"unpinned"})).collect::<Vec<_>>(),
