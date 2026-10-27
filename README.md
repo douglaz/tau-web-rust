@@ -1715,8 +1715,8 @@ inbound list. Empty or unspecified inbound, an application-port replacement, or 
 protocol/source refuses before retaining a card or writing approval; the same semantic check
 runs again at approval, append and replay of new canonical requirements records. The candidate
 is never filled or repaired. Generic schema parsing still distinguishes valid empty and
-unspecified inbound from a missing field; this guard constrains ad-hoc proposals without
-implementing a delivery verdict.
+unspecified inbound from a missing field; this guard constrains ad-hoc proposals before
+the delivery check.
 
 **Implementation reading: local proposal envelope.** The existing loopback completion message
 still requires exactly one valid tool call. Beside `tool_calls` it may contain `proposal`, one
@@ -1802,8 +1802,8 @@ prevent binding, goal entry, inference, typed reads or record collection. Goal-l
 uses its own acceptance/context check, so obtaining a declaration never requires one already.
 A pending proposal also blocks command append and typed mutation append for that machine.
 Complete facts permit progress only to the existing truthful boundary: unavailable job,
-missing pin or operation approval still awaited. This supplies no install/create/payment or
-Delivered implementation.
+missing pin or operation approval still awaited. This supplies no install/create/payment
+implementation; the fixture delivery check below consumes the journaled requirements.
 
 Host checks cover schema and grammar, current credential safety, exact approval identity,
 append failures and landed errors, replay validation, tightening and the installation/create
@@ -1814,8 +1814,8 @@ independently in `tracer/src/declaration_reader.rs`. Inherited dispatch fixtures
 preapproved declaration history through independent encrypted records before testing later
 boundaries; these fixture records are not an alternate production approval path. The dispatch
 companion comparison retains its pinned witnesses and outcomes, with explicit prerequisite
-history in its driver. Declaration verdicts remain twr-ggw.19's, observation evaluation
-.20's, lifecycle evaluation .36/.73's, converging install .16's and real create/payment .21's.
+history in its driver. The fixture delivery verdict is described below; observation evaluation
+remains .20's, lifecycle evaluation .36/.73's, converging install .16's and real create/payment .21's.
 The specification pin is retained; this change does not complete T42.
 
 ### Declaration mutation evidence (D01–D27, B01–B06)
@@ -1971,6 +1971,126 @@ The remaining browser controls print their named safety failures within the ten-
 All existing holds, no-brief acceptance, credential, caller-bound, signature and session-end
 rules remain in the full suite. The declaration checks assert intended facts and admission;
 they make no delivery verdict, lifecycle, installation or real create/payment claim.
+
+### Delivery verdict and operator card
+
+The ordinary worker/page path compares a machine with its **journaled declaration in force**.
+`src/delivery.rs` evaluates typed fields and aggregates their actual results; the encrypted
+store records the declaration identity, fixture observations, field results, findings and
+service-associated evidence notes before publishing the card. The fixture measurements and
+fixed default-credential/sshd-posture checks **do not read a live machine**. The page states
+this limit beside the claim. The served worker accepts no measurements or result overrides
+in an operator request; the tracer's observation injection is absent from the served build.
+Without a measurement producer, a served check records unavailable evidence, never a pass.
+
+Missing, invalid and unspecified fields prevent delivery. An observation of an empty set is
+distinct from a missing or failed read. Inbound and permitted tenant material constrain what
+may exist; outbound restrictions and required entries must be found. Drift checks are
+presence-only at delivery. The existing strict approval boundary still preserves TCP/22/from-any
+and admits no nonempty required/drift entry at this pin. The lower semantic view permits inert
+check identities for comparison without granting approval or execution capability.
+
+A standing finding says **handed over with findings**, including a lifecycle-only finding.
+Every finding remains visible; its class follows its field, with services producing lifecycle
+findings. Acceptance/waiver requests are refused. An approved amendment uses the existing
+proposal/approval history, retains findings and makes the prior check explicitly historical.
+Only a complete re-check can clear findings, after a fix or journaled amendment. Fixed lockdown
+findings remain independent. Incomplete checks preserve earlier findings and any newly observed
+difference still prevents Delivered. Failed appends apply
+nothing and latch further writes; a landed error is recovered only by replay. Restored/imported
+findings can be marked unknown through the small fixture seam and remain unknown until a complete
+re-check; this does not implement recovery or import.
+
+The check consumes lifecycle evidence, including **enabled, restart not demonstrated** and
+**stopped since a restart, as approved**, beside Delivered in the card and inspection projection.
+Neither note hides another finding. A restart note cannot clear a standing crash finding, and
+a placing session needs every running-at-delivery service running after its last placement.
+An incomplete attempt retains the last completed verdict and pending subsequent-placement
+evidence through session end and encrypted reopen. Inspection publishes the last completed
+check separately from the latest attempt; the card identifies the historical result, carries
+its evidence notes and shows the partial measurements, including missing versus failed reads.
+The historical result grants no fresh placement eligibility. Unknown findings, newly observed
+differences and changed declaration/class authority still prevent a current Delivered claim.
+Only a complete re-check retires the pending-placement evidence.
+These are typed fixture inputs, not boot-anchor or service-manager implementations.
+
+Application names are durably associated with the machine, unique there by exact equality,
+and substituted into both application-card sentences. Names, findings and historical reports
+are rendered as text and checked against current credential holdings. The card explains that
+Delivered covers the declared machine state and fixed lockdown checks. Historical commands and
+output carry **Checks the AI wrote — not part of Delivered**, with neutral rendering; their
+success or failure changes no verdict, finding or placement eligibility. A re-check never
+schedules a historical command.
+
+The runtime companion comparison reads `spec/docs/design/declaration-witnesses-v1.json` at
+specification `d029ebd9f632696bb027a22559d774d165685947`, bound `TauWeb.Declaration.bound`.
+It checks all 8 named witnesses, all 144 field/presence/observation/tenancy cases (including
+their multiplicities), and all 152 start projections plus 1,520 event/outcome steps through the same field
+evaluation and aggregation as the production path. The refused empty-inbound trace agrees;
+the admitted negative control independently asserts its inbound pass against the production
+finding, every carried inbound projection, and its final delivery true against production false.
+An earlier difference cannot mask a corrupted final outcome or a different recognized inbound
+outcome. No assumption changes the production rule. This is evidence
+about harness knowledge only, with no claim about external state, effect timing or concurrency.
+
+Remaining owners: **twr-ggw.20** supplies concrete observation evaluation/matching;
+**.34** supplies the bundle checklist/wording and concrete delivery reads; **.36** supplies
+service-state/enablement composition and lifecycle demonstration; **.50** supplies re-entry
+lifecycle/reboot-offer rules; **.73** supplies boot anchors and sticky lifecycle/re-anchor
+evaluation. **.23** retains real placement, placing-session tracking and provider/secret
+machinery. **.16/.21/.39** retain installation, create/payment and the later vendor-contract
+pin move. None of those production paths is demonstrated by the fixture card.
+
+**Implementation readings.** The local operator message is an exact-member `delivery`
+request: `check`, `application`, `accept_finding` or `waive_finding`, naming a live session
+and its bound machine. Application association records a name only; it installs nothing.
+Incomplete attempts retain earlier findings and the last completed result rather than clearing
+partly measured state; a retained verdict is explicitly historical where a demonstration is pending.
+The tracer-only unknown-findings and subsequent-placement inputs supply durable fixture
+metadata without implementing import, recovery or secret placement.
+
+Delivery evidence recorded on 2026-10-26, with corrected-state controls on 2026-10-27:
+
+| Property | Checks and deliberate controls |
+|---|---|
+| Presence, row semantics, required measurements, version/class guards | Shared-core host cases and all 152 companion traces; H01–H11, H27–H28, H31–H37, H41 |
+| Findings, incomplete re-checks, encrypted append/replay, unknown restored state | Store host cases and ordinary card; H19–H26, H46 |
+| Amendment approval/append/replay and bound-machine identity | Separate authority-boundary cases, real page approval and stale fixture refusal; H29–H30, H38–H40, H42, B01, B07 |
+| Both lifecycle labels, standing crash findings and placing-session evidence | Typed core/store cases and ordinary card/inspection; H12–H18, H26, B05 |
+| Exact application wording, identity and text rendering | Per-machine store cases, encrypted reader and ordinary card; H24, H43–H44, B02–B04 |
+| Finding acceptance, reports and actual rendered claims | Refused acceptance/waiver; real successful and failing model `exec`, replay with no command re-execution; H45, B08–B11 |
+| Session end and append publication | Stopped fixture read, actual queued writer and begun append; B06 and the existing declaration/session-end cases |
+| Incomplete attempt after placement, end and encrypted reopen | Failed/missing service reads after clean or finding-bearing complete checks; separate historical/partial evidence, unknown/new findings, changed declaration/class and later complete qualification; R01–R09, R12, RB01–RB04 |
+| Admitted-side individual outcomes | Unmodified corpus accepted; corrupted final delivery and blocked inbound rejected at their named step assertions; R10–R11 and separate scratch-input executions |
+
+H01–H46 originally compiled, reached their selected host assertion with exit **101**, restored the
+fixed source byte for byte and passed the same selected check with exit **0**. Browser controls
+rebuild both web variants and reach the intended assertion red (exit **1**), restore the source,
+rebuild and pass (exit **0**): the original B01–B10 covered all 15 delivery cases, and B11 covered the
+two real-command report cases. After correction, the 11 store controls and three comparator-dependent
+host controls are repeated against the corrected source; B02–B05 and B08–B10 are repeated with
+all 19 delivery cases. The other 36 control records retain explicitly checked unchanged guard
+sources and assertion coverage. R01–R12 independently invert the new host properties with exits
+**101/0**; RB01–RB04 rebuild and exercise all four new ordinary-card regressions with exits **1/0**.
+Compiler failures, empty
+runs and timeouts are excluded. Each control retains its exact command, patch, assertion,
+exit statuses and before/mutant/restored SHA-256 receipts.
+
+CNF-3's separate scratch-input breaks, repeated after the comparator correction, flip one expected outcome, remove the input file and
+introduce an unknown event. Each turns `declaration_companion_comparison` red at its intended
+diagnostic and passes after restoration, with exits **101/0**. Outcome/event diagnostics
+name `adhoc_delivered` and its step; the missing-file diagnostic names the `input-validation`
+case and its input. The pinned file is unchanged. The reader also refuses malformed headers,
+incomplete sweeps, extra/missing/unknown pair metadata and unknown or inconsistent admitted-side
+projections. Two further scratch controls coherently corrupt admitted final delivery and inbound
+outcome/projections; each is rejected at `empty_inbound_admitted` step 9 or 1 respectively and
+returns green on restoration, without changing the production evaluator's assumptions.
+
+The final serial gates cover formatting, host clippy/tests, the disk check and its failing
+baseline, both wasm clippy variants, ADR-0024, served build/absence/CSP, and the complete
+tracer with every selector unset. The tracer includes the existing 194 cases plus 19 delivery
+cases and both loopback assertions. Final logs are tied to an unchanged source/test/build-input
+receipt; the live CORS job is excluded locally. The source receipt is recorded with those logs.
 
 ### The tracer
 

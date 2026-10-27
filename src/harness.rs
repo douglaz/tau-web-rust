@@ -7,6 +7,10 @@
 //! A refusal ends the attempt: nothing here retries or reconnects (`ARC-41`).
 
 #[cfg(target_arch = "wasm32")]
+mod delivery;
+#[cfg(target_arch = "wasm32")]
+pub use delivery::*;
+#[cfg(target_arch = "wasm32")]
 mod goals;
 #[cfg(target_arch = "wasm32")]
 pub(crate) mod inference;
