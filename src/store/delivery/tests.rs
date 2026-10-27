@@ -221,6 +221,44 @@ fn delivery_unknown_restore_and_ended_session_do_not_manufacture_delivery() {
 }
 
 #[test]
+fn delivery_pending_placement_withholds_eligibility_until_complete_recheck() {
+    let (mut s, session) = ready();
+    approve(&mut s, &session, ad_hoc_minimum(), 1);
+    check(&mut s, &session, clean());
+    let completed = view(&s)["last_check"].clone();
+    assert_eq!(view(&s)["placement_eligible"], true);
+    block_on(s.fixture_delivery_record(Record::SubsequentPlacement {
+        machine: "fixture".into(),
+        session: session.clone(),
+    }))
+    .unwrap();
+    for partial in [false, true] {
+        if partial {
+            let mut m = clean();
+            m.fixed_default_credentials = Measured::Missing;
+            check(&mut s, &session, m);
+        }
+        for shown in [view(&s), view(&reopen(&s))] {
+            assert_eq!(shown["verdict"], "Delivered");
+            assert_eq!(shown["last_completed_check"], completed);
+            assert_eq!(shown["verdict_is_historical"], true);
+            assert_eq!(shown["subsequent_placement_sessions"], json!([session]));
+            assert_eq!(
+                shown["placement_eligible"], false,
+                "pending placement cannot borrow eligibility from the preceding check"
+            );
+        }
+    }
+    check(&mut s, &session, clean());
+    for shown in [view(&s), view(&reopen(&s))] {
+        assert_eq!(shown["verdict"], "Delivered");
+        assert_eq!(shown["subsequent_placement_sessions"], json!([]));
+        assert_eq!(shown["verdict_is_historical"], false);
+        assert_eq!(shown["placement_eligible"], true);
+    }
+}
+
+#[test]
 fn delivery_incomplete_attempt_retains_completed_verdict_and_placement_through_replay() {
     for unavailable in [Measured::Failed, Measured::Missing] {
         for finding in [false, true] {

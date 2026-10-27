@@ -236,7 +236,7 @@ impl<S: Storage> Store<S> {
                 "findings_unknown":m.unknown,"last_check":last,"current_declaration_checked":current,
                 "last_completed_check":completed,"completed_declaration_current":completed_current,
                 "verdict_is_historical":last.is_some_and(|c|!c.result.complete) || !completed_current || !m.placements_since_check.is_empty(),
-                "placement_eligible":!m.unknown && current && last.is_some_and(|c|c.result.placement_eligible),
+                "placement_eligible":!m.unknown && current && m.placements_since_check.is_empty() && last.is_some_and(|c|c.result.placement_eligible),
                 "applications":m.applications,"subsequent_placement_sessions":m.placements_since_check,
                 "report_label":delivery::REPORT_LABEL,"reports":reports});
             // Recheck current holdings at rendering, including names and historical output.
