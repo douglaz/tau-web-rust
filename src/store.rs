@@ -55,6 +55,7 @@ use zeroize::{Zeroize, Zeroizing};
 #[cfg(target_arch = "wasm32")]
 pub mod opfs;
 
+pub mod delivery;
 mod goals;
 pub(crate) mod inference;
 
@@ -195,6 +196,7 @@ pub(crate) enum Event {
     /// effect (`STA-22b`), with its seed identifier and derivation version (`STA-22a`).
     Allocation(allocation::Event),
     Setup(crate::dispatch::SetupRecord),
+    Delivery(delivery::Record),
     Exposure(Exposure),
     ModeAcceptance(Acceptance),
     Goal(crate::goals::Goal),
@@ -343,6 +345,7 @@ pub struct Store<S> {
     allocation: Option<Metadata>,
     commands: Vec<(u64, Entry)>,
     dispatch: Dispatch,
+    delivery: delivery::State,
     sessions: Vec<Rc<Session>>,
     inference: inference::State,
     response_calls: std::collections::BTreeSet<u64>,
@@ -474,6 +477,7 @@ impl<S: Storage> Store<S> {
             allocation: None,
             commands: Vec::new(),
             dispatch: Dispatch::default(),
+            delivery: delivery::State::default(),
             sessions: Vec::new(),
             inference: inference::State::default(),
             response_calls: std::collections::BTreeSet::new(),
@@ -1301,6 +1305,11 @@ impl<S: Storage> Store<S> {
                         .apply_setup(self.allocation.as_mut().expect("seed first"), record)
                         .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
                 }
+                (_, Event::Delivery(record)) => {
+                    self.delivery = self
+                        .validate_delivery(record)
+                        .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
+                }
                 (_, Event::Command { machine, command }) => {
                     self.apply_intent(
                         number,
@@ -1442,6 +1451,13 @@ impl<S: Storage> Store<S> {
         // duplicate members are rejected and mnemonic buffers retain Event's zeroization.
         let event: Event = serde_json::from_slice(&plaintext)
             .map_err(|_| "its event is not one this version reads".to_string())?;
+        if let Event::Delivery(_) = &event {
+            let value: Value =
+                serde_json::from_slice(&plaintext).map_err(|_| "delivery record shape")?;
+            if serde_json::to_value(&event).map_err(|_| "delivery record shape")? != value {
+                return Err("delivery record shape".into());
+            }
+        }
         if let Event::Setup(crate::dispatch::SetupRecord::Requirements(_)) = &event {
             let value: Value =
                 serde_json::from_slice(&plaintext).map_err(|_| "requirements record shape")?;
@@ -1962,6 +1978,7 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
                 "seed_backup_completion": store.allocation().seed_backup(),
                 "seed_backup_stage": self.seed_backup,
                 "setup": store.dispatch.setup_view(),
+                "delivery": store.delivery_view(),
                 "sessions": store.sessions(),
                 "goals": store.goals,
                 "mode_acceptances": store.mode_acceptances(),

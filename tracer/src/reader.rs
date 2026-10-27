@@ -461,6 +461,7 @@ fn check_event(number: u64, event: &Value) -> Result<(), String> {
             }
         }
         "setup" => check_setup(body)?,
+        "delivery" => crate::delivery_reader::shape(body)?,
         "allocation" => {
             if let Some(record) = body.get("seed_backup")
                 && (record.as_object().is_none_or(|o| o.len() != 2)
@@ -828,6 +829,7 @@ pub fn read(files: &Files, passphrase: &str) -> Result<Opened, String> {
     let mut previous = "0".repeat(64);
     let mut records = Vec::new();
     let mut mode_history = ModeHistory::default();
+    let mut delivery_history = crate::delivery_reader::History::default();
     let mut requirements_history = crate::declaration_reader::History::default();
     let mut inference_history = crate::inference_reader::History::default();
     for (expected, number) in (0..).zip(numbers) {
@@ -862,6 +864,9 @@ pub fn read(files: &Files, passphrase: &str) -> Result<Opened, String> {
             .check_and_apply(&event)
             .map_err(|e| format!("record {number}: {e}"))?;
         requirements_history
+            .apply(&event)
+            .map_err(|e| format!("record {number}: {e}"))?;
+        delivery_history
             .apply(&event)
             .map_err(|e| format!("record {number}: {e}"))?;
         records.push((number, plaintext));

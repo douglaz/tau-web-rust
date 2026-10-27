@@ -20,7 +20,7 @@ fn message(proposal: Value, tool: Value) -> Value {
 fn done() -> Value {
     json!({"name":"done","arguments":{"machine":"fixture"}})
 }
-async fn prepare(
+pub(super) async fn prepare(
     run: &Run<'_>,
     tab: &Tab,
     worker: &mut Worker,
@@ -90,11 +90,16 @@ async fn prepare(
     }
     Err("declaration goal card not accepted".into())
 }
-async fn start(run: &Run<'_>, tab: &Tab, session: &str, script: Vec<Value>) -> Result<(), String> {
+pub(super) async fn start(
+    run: &Run<'_>,
+    tab: &Tab,
+    session: &str,
+    script: Vec<Value>,
+) -> Result<(), String> {
     run.aggregator.state.lock().unwrap().script = script.into();
     setup_cases::click(run, tab, &format!("[data-goal-accept={session:?}]")).await
 }
-async fn wait_card(
+pub(super) async fn wait_card(
     run: &Run<'_>,
     tab: &Tab,
     worker: &Worker,
@@ -132,7 +137,7 @@ async fn wait_proposal_or_outcome(run: &Run<'_>, tab: &Tab, session: &str) -> Re
     }
     Err("neither pending proposal nor loop outcome observed".into())
 }
-async fn outcome(run: &Run<'_>, tab: &Tab, session: &str) -> Result<String, String> {
+pub(super) async fn outcome(run: &Run<'_>, tab: &Tab, session: &str) -> Result<String, String> {
     for _ in 0..300 {
         let value = run
             .browser

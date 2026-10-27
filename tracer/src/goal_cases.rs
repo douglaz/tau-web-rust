@@ -1113,6 +1113,7 @@ pub(super) async fn run(
     run.aggregator.state.lock().unwrap().document_status = 200;
     cases.push(case);
     declaration_cases::run(run, tab, worker, cases).await?;
+    delivery_cases::run(run, tab, worker, cases).await?;
     finish(run, tab, worker, &original).await
 }
 

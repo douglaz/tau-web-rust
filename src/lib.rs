@@ -10,6 +10,7 @@ pub mod allocation;
 pub mod binding;
 pub mod credential;
 pub mod declaration;
+pub mod delivery;
 pub mod dispatch;
 pub mod goals;
 pub mod harness;

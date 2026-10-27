@@ -135,6 +135,7 @@ const renderSetup = (store) => {
     const access = machine.access;
     if (access) paragraph(section, `Access model: ${access.model}; profile ${access.profile}, revision ${access.revision}.`);
     if (machine.declaration) renderDeclaration(section, machine.declaration);
+    renderDelivery(section, machine.entry.machine, store);
     for (const approval of machine.requirements ?? []) {
       if (approval.proposal.kind === 'tighten_class') paragraph(section, 'Approved tightening: single-purpose to multi-tenant. The original class answer is retained.');
     }
@@ -234,6 +235,61 @@ const renderSetup = (store) => {
   }
 };
 
+const renderDelivery = (section, machine, store) => {
+  const delivery = (store.delivery ?? []).find(d => d.machine === machine);
+  if (!delivery) return;
+  const card = document.createElement('section');
+  card.dataset.deliveryCard = machine;
+  paragraph(card, delivery.fixture_limit);
+  const verdict = document.createElement('p');
+  verdict.dataset.deliveryVerdict = machine;
+  verdict.textContent = delivery.verdict;
+  if (delivery.verdict_is_historical && delivery.last_completed_check) paragraph(card, 'The last completed result is historical; a final demonstration is still needed.');
+  card.append(verdict);
+  paragraph(card, 'Delivered covers the declared machine state and the fixed lockdown checks.');
+  if (delivery.last_completed_check) {
+    paragraph(card, 'Last recorded check against its journaled declaration:');
+    paragraph(card, delivery.verdict_is_historical ? 'Last completed check (historical result):' : 'Last completed check:');
+    paragraph(card, delivery.last_completed_check.result.delivered ? 'Delivered' : 'handed over with findings');
+    for (const note of delivery.last_completed_check.result.notes) paragraph(card, note.service.name + ': ' + note.text);
+    if (!delivery.completed_declaration_current) paragraph(card, 'The current declaration needs a re-check; the completed check used earlier values.');
+  }
+  if (delivery.last_check) {
+    if (!delivery.last_check.result.complete) paragraph(card, 'Latest attempt incomplete; no final demonstration recorded.');
+    for (const note of delivery.last_check.result.notes) {
+      if (!delivery.last_check.result.complete) paragraph(card, note.service.name + ': ' + note.text);
+    }
+    for (const result of delivery.last_check.result.fields) paragraph(card, result.field + ': ' + result.status);
+    if (!delivery.last_check.result.complete) paragraph(card, 'Latest attempt measurements: ' + JSON.stringify(delivery.last_check.measurements));
+  }
+  if (delivery.findings_unknown) paragraph(card, 'Findings unknown until a complete re-check.');
+  for (const finding of delivery.findings ?? []) paragraph(card, finding.class + ': ' + finding.detail);
+  for (const name of delivery.applications ?? []) {
+    const application = document.createElement('section');
+    application.dataset.deliveryApplication = '';
+    paragraph(application, `${name} is an AI that acts on this server by itself. tau-web's promises cover what tau-web's AI does, not what ${name} does.`);
+    paragraph(application, `It does not mean ${name} works`);
+    card.append(application);
+  }
+  for (const session of delivery.subsequent_placement_sessions ?? []) paragraph(card, 'Placement since the last check in session ' + session + '; final lifecycle demonstration not supplied.');
+  if (delivery.reports?.length) {
+    paragraph(card, delivery.report_label);
+    for (const report of delivery.reports) paragraph(card, JSON.stringify(report));
+  }
+  const session = (store.sessions ?? []).find(s => s.bound_set.includes(machine));
+  if (session) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.dataset.deliveryCheck = machine;
+    button.textContent = 'Check delivery (fixture evidence only)';
+    button.addEventListener('click', () => {
+      button.disabled = true;
+      worker.postMessage({ delivery: { action: 'check', session: session.identity, machine } });
+    });
+    card.append(button);
+  }
+  section.append(card);
+};
 let worker;
 const start = () => {
   goalOutcomes.clear();
