@@ -184,6 +184,8 @@ pub(crate) enum Event {
     Intent(Intent),
     OperationIntent(crate::dispatch::OperationIntent),
     OperationObservation(crate::dispatch::Observation),
+    OperationReceipt(crate::dispatch::Receipt),
+    Association(crate::dispatch::Association),
     OperationResponse {
         call: u64,
         body: String,
@@ -1005,7 +1007,7 @@ impl<S: Storage> Store<S> {
 
     /// An index is associated only once the allocation core holds it in the machine family
     /// (`STA-22b`), so no create can name an index that was never reserved.
-    pub fn associate(&mut self, association: crate::dispatch::Association) -> Result<(), String> {
+    fn check_association(&self, association: &crate::dispatch::Association) -> Result<(), String> {
         if let crate::dispatch::Target::AllocationIndex(index) = &association.target
             && !self
                 .allocation()
@@ -1015,7 +1017,19 @@ impl<S: Storage> Store<S> {
         {
             return Err("allocation index not reserved".into());
         }
-        self.dispatch.associate(association)
+        Ok(())
+    }
+
+    pub async fn associate(
+        &mut self,
+        association: crate::dispatch::Association,
+    ) -> Result<(), String> {
+        self.check_association(&association)?;
+        let mut next = self.dispatch.clone();
+        next.associate(self.next, association.clone())?;
+        self.commit(&Event::Association(association)).await?;
+        self.dispatch = next;
+        Ok(())
     }
 
     pub fn check_operation(
@@ -1181,6 +1195,18 @@ impl<S: Storage> Store<S> {
         let settled = next.observe(self.next, observation.clone())?;
         self.commit(&Event::OperationObservation(observation))
             .await?;
+        self.dispatch = next;
+        Ok(settled)
+    }
+
+    /// Receipt evidence is separate from arbitrary mutation response bytes and status reads.
+    pub async fn operation_receipt(
+        &mut self,
+        receipt: crate::dispatch::Receipt,
+    ) -> Result<Vec<u64>, String> {
+        let mut next = self.dispatch.clone();
+        let settled = next.receive(self.next, receipt.clone());
+        self.commit(&Event::OperationReceipt(receipt)).await?;
         self.dispatch = next;
         Ok(settled)
     }
@@ -1362,6 +1388,14 @@ impl<S: Storage> Store<S> {
                         .observe(number, observation.clone())
                         .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
                 }
+                (_, Event::OperationReceipt(receipt)) => {
+                    self.dispatch.receive(number, receipt.clone());
+                }
+                (_, Event::Association(association)) => {
+                    self.check_association(association)
+                        .and_then(|()| self.dispatch.associate(number, association.clone()))
+                        .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
+                }
                 (_, Event::Terminal(terminal)) => self
                     .dispatch
                     .terminal(number, terminal.clone())
@@ -1456,6 +1490,15 @@ impl<S: Storage> Store<S> {
                 serde_json::from_slice(&plaintext).map_err(|_| "delivery record shape")?;
             if serde_json::to_value(&event).map_err(|_| "delivery record shape")? != value {
                 return Err("delivery record shape".into());
+            }
+        }
+        if matches!(event, Event::OperationReceipt(_) | Event::Association(_)) {
+            let value: Value = serde_json::from_slice(&plaintext)
+                .map_err(|_| "invalid receipt or association shape")?;
+            if serde_json::to_value(&event).map_err(|_| "invalid receipt or association shape")?
+                != value
+            {
+                return Err("invalid receipt or association shape".into());
             }
         }
         if let Event::Setup(crate::dispatch::SetupRecord::Requirements(_)) = &event {
@@ -2020,6 +2063,11 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
                     .expect("typed calls serialize");
             report["observations"] =
                 serde_json::to_value(&store.dispatch.observations).expect("observations serialize");
+            report["receipts"] =
+                serde_json::to_value(&store.dispatch.receipts).expect("receipts serialize");
+            report["association_records"] =
+                serde_json::to_value(&store.dispatch.association_records)
+                    .expect("associations serialize");
             report["current_installations"] =
                 serde_json::to_value(&store.dispatch.current_installations)
                     .expect("installations serialize");
@@ -2274,6 +2322,7 @@ mod tests {
                 bundle_commit: crate::SPEC_COMMIT.into(),
             };
             let intent = OperationIntent {
+                receipt_binding: None,
                 restated_modes: Vec::new(),
                 call: 1,
                 resource: resource.clone(),
@@ -2283,6 +2332,7 @@ mod tests {
                 requester: Requester::Session,
                 facts: facts.clone(),
                 approved: OperationApproval {
+                    receipt_binding: None,
                     restated_modes: Vec::new(),
                     resource,
                     target,
@@ -4833,3 +4883,5 @@ mod mode_tests;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod declaration_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod receipt_tests;

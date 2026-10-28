@@ -25,6 +25,102 @@ pub struct Association {
     pub entry: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AssociationRecord {
+    pub number: u64,
+    pub association: Association,
+}
+
+/// Closed abstractions of the approved LNVPS request and externally validated result.
+/// These types do not perform TLS or vendor response validation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReceiptOperation {
+    Order,
+    Stop,
+    Restart,
+}
+
+impl ReceiptOperation {
+    pub fn operation(self) -> Operation {
+        match self {
+            Self::Order => Operation::Create,
+            Self::Stop => Operation::Destroy,
+            Self::Restart => Operation::Reset,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ReceiptBinding {
+    pub operation: ReceiptOperation,
+    pub account: u64,
+    pub signed_request: u64,
+}
+
+impl<'de> Deserialize<'de> for ReceiptBinding {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct BindingObject;
+        impl<'de> serde::de::Visitor<'de> for BindingObject {
+            type Value = ReceiptBinding;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a receipt binding object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<Self::Value, A::Error> {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Fields {
+                    operation: ReceiptOperation,
+                    account: u64,
+                    signed_request: u64,
+                }
+                let fields =
+                    Fields::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                Ok(ReceiptBinding {
+                    operation: fields.operation,
+                    account: fields.account,
+                    signed_request: fields.signed_request,
+                })
+            }
+        }
+        // deserialize_map refuses positional arrays while preserving duplicate-member checks.
+        deserializer.deserialize_map(BindingObject)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReceiptSource {
+    BrowserVendorTls,
+    ArbitraryResponse,
+    JobOutput,
+    NotifyEvent,
+    ProposedText,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Receipt {
+    pub source: ReceiptSource,
+    pub call: u64,
+    pub resource: Resource,
+    pub target: Target,
+    pub binding: ReceiptBinding,
+    pub validated: bool,
+    pub returned_vendor: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ReceiptRecord {
+    pub number: u64,
+    pub receipt: Receipt,
+    /// What this event settled when received, never rewritten by a later association.
+    pub settled: Vec<u64>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Operation {
@@ -62,6 +158,8 @@ pub struct Facts {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OperationApproval {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt_binding: Option<ReceiptBinding>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub restated_modes: Vec<crate::modes::Mode>,
     pub resource: Resource,
@@ -91,6 +189,7 @@ pub struct CommandProvenance {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Request {
+    pub receipt_binding: Option<ReceiptBinding>,
     pub target: Target,
     pub operation: Operation,
     pub session: String,
@@ -102,6 +201,8 @@ pub struct Request {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OperationIntent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt_binding: Option<ReceiptBinding>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub restated_modes: Vec<crate::modes::Mode>,
     pub call: u64,
@@ -170,10 +271,12 @@ pub enum RequestRefusal {
 }
 
 impl Dispatch {
-    /// In-memory harness knowledge for an already approved entry: a vendor machine id learned
-    /// at create, or a further index reserved for another create attempt. twr-ggw.21 will
-    /// journal these; until then the harness supplies them again after reopen.
-    pub fn associate(&mut self, association: Association) -> Result<(), String> {
+    /// Apply a committed extra association. Setup owns the initial allocation mappings.
+    pub(crate) fn associate(
+        &mut self,
+        number: u64,
+        association: Association,
+    ) -> Result<(), String> {
         if !matches!(
             association.target,
             Target::AllocationIndex(_) | Target::VendorMachine(_)
@@ -194,8 +297,74 @@ impl Dispatch {
                 Err("target already associated".into())
             };
         }
-        self.associations.push(association);
+        self.associations.push(association.clone());
+        self.association_records.push(AssociationRecord {
+            number,
+            association,
+        });
+        self.settle_receipts();
         Ok(())
+    }
+
+    fn receipt_matches(intent: &OperationIntent, receipt: &Receipt) -> bool {
+        receipt.source == ReceiptSource::BrowserVendorTls
+            && receipt.validated
+            && receipt.call == intent.call
+            && receipt.resource == intent.resource
+            && receipt.target == intent.target
+            && intent.receipt_binding.as_ref() == Some(&receipt.binding)
+            && receipt.binding.operation.operation() == intent.operation
+    }
+
+    /// Return the durable association constituent for an order; other receipts need none.
+    fn receipt_association(&self, receipt: &Receipt) -> Option<&AssociationRecord> {
+        self.association_records.iter().find(|record| {
+            receipt.returned_vendor.as_ref().is_some_and(|id| {
+                record.association.target == Target::VendorMachine(id.clone())
+                    && receipt.resource == Resource::Entry(record.association.entry.clone())
+            })
+        })
+    }
+
+    /// One derivation at both constituent arrivals, also used by journal replay.
+    fn settle_receipts(&mut self) -> Vec<u64> {
+        let mut settled = Vec::new();
+        for record in &self.receipts {
+            let receipt = &record.receipt;
+            let association = self.receipt_association(receipt).map(|r| r.number);
+            if receipt.binding.operation == ReceiptOperation::Order && association.is_none() {
+                continue;
+            }
+            for call in self.typed_calls.values_mut() {
+                if record.number <= call.intent.call
+                    || call.state != CallState::Unresolved
+                    || !Self::receipt_matches(&call.intent, receipt)
+                {
+                    continue;
+                }
+                call.state = CallState::ReceiptConfirmed {
+                    receipt: record.number,
+                    association: if receipt.binding.operation == ReceiptOperation::Order {
+                        association
+                    } else {
+                        None
+                    },
+                };
+                settled.push(call.intent.call);
+            }
+        }
+        settled
+    }
+
+    pub(crate) fn receive(&mut self, number: u64, receipt: Receipt) -> Vec<u64> {
+        self.receipts.push(ReceiptRecord {
+            number,
+            receipt,
+            settled: Vec::new(),
+        });
+        let settled = self.settle_receipts();
+        self.receipts.last_mut().expect("just received").settled = settled.clone();
+        settled
     }
 
     pub fn resolve(&self, target: &Target) -> Option<Resource> {
@@ -290,6 +459,7 @@ impl Dispatch {
                 .map_err(|why| RequestRefusal::InstallationFacts { why })?;
         }
         let expected = OperationApproval {
+            receipt_binding: request.receipt_binding.clone(),
             restated_modes: request
                 .approved
                 .as_ref()
@@ -362,6 +532,7 @@ impl Dispatch {
     ) -> Result<OperationIntent, RequestRefusal> {
         let resource = self.check_request(request)?;
         Ok(OperationIntent {
+            receipt_binding: request.receipt_binding.clone(),
             restated_modes: request
                 .approved
                 .as_ref()
@@ -398,6 +569,7 @@ impl Dispatch {
         }
         if intent.approved
             != (OperationApproval {
+                receipt_binding: intent.receipt_binding.clone(),
                 restated_modes: intent.restated_modes.clone(),
                 resource: intent.resource.clone(),
                 target: intent.target.clone(),

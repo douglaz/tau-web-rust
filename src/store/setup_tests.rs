@@ -548,60 +548,56 @@ fn commands_require_an_approved_entry_and_matching_provenance_without_latching()
     store.fixture_requirements("fixture");
     for target in [Target::Entry("fixture".into()), Target::Inference] {
         assert!(
-            store
-                .associate(Association {
-                    target,
-                    entry: "fixture".into()
-                })
-                .is_err()
+            block_on(store.associate(Association {
+                target,
+                entry: "fixture".into()
+            }))
+            .is_err()
         );
     }
     assert!(
-        store
-            .associate(Association {
-                target: Target::VendorMachine("stray".into()),
-                entry: "stray".into()
-            })
-            .is_err()
+        block_on(store.associate(Association {
+            target: Target::VendorMachine("stray".into()),
+            entry: "stray".into()
+        }))
+        .is_err()
     );
     assert!(
-        store
-            .associate(Association {
-                target: Target::AllocationIndex(0),
-                entry: "fixture-other".into()
-            })
-            .is_err()
+        block_on(store.associate(Association {
+            target: Target::AllocationIndex(0),
+            entry: "fixture-other".into()
+        }))
+        .is_err()
     );
     assert_eq!(
-        store.associate(Association {
+        block_on(store.associate(Association {
             target: Target::AllocationIndex(extra.index + 1),
             entry: "fixture".into()
-        }),
+        })),
         Err("allocation index not reserved".into())
     );
     for target in [
         Target::AllocationIndex(extra.index),
         Target::VendorMachine("vendor-id".into()),
     ] {
-        store
-            .associate(Association {
-                target,
-                entry: "fixture".into(),
-            })
-            .unwrap();
+        block_on(store.associate(Association {
+            target,
+            entry: "fixture".into(),
+        }))
+        .unwrap();
     }
     let replayed = reopen(&store);
     assert_eq!(
         replayed
             .dispatch
             .resolve(&Target::AllocationIndex(extra.index)),
-        None
+        Some(Resource::Entry("fixture".into()))
     );
     assert_eq!(
         replayed
             .dispatch
             .resolve(&Target::VendorMachine("vendor-id".into())),
-        None
+        Some(Resource::Entry("fixture".into()))
     );
     for target in [
         Target::Entry("fixture-other".into()),
