@@ -26,41 +26,26 @@ pub(crate) fn fresh() -> (MemoryStorage, Store<MemoryStorage>, u32) {
         store.fixture_requirements(machine);
     }
     let extra = block_on(store.allocate(crate::allocation::Family::Machines)).unwrap();
-    store
-        .associate(Association {
-            target: Target::AllocationIndex(extra.index),
-            entry: "fixture".into(),
-        })
-        .unwrap();
-    store
-        .associate(Association {
-            target: Target::VendorMachine("vendor-7".into()),
-            entry: "fixture".into(),
-        })
-        .unwrap();
+    block_on(store.associate(Association {
+        target: Target::AllocationIndex(extra.index),
+        entry: "fixture".into(),
+    }))
+    .unwrap();
+    block_on(store.associate(Association {
+        target: Target::VendorMachine("vendor-7".into()),
+        entry: "fixture".into(),
+    }))
+    .unwrap();
     (storage, store, extra.index)
 }
 
-pub(crate) fn reopen(storage: &MemoryStorage, extra_index: u32) -> Store<MemoryStorage> {
-    let mut store = block_on(store::unlock(
+pub(crate) fn reopen(storage: &MemoryStorage, _extra_index: u32) -> Store<MemoryStorage> {
+    block_on(store::unlock(
         MemoryStorage::with_files(storage.files()),
         &FixedKdf,
         pass(),
     ))
-    .unwrap();
-    store
-        .associate(Association {
-            target: Target::AllocationIndex(extra_index),
-            entry: "fixture".into(),
-        })
-        .unwrap();
-    store
-        .associate(Association {
-            target: Target::VendorMachine("vendor-7".into()),
-            entry: "fixture".into(),
-        })
-        .unwrap();
-    store
+    .unwrap()
 }
 
 fn bind_entries(store: &mut Store<MemoryStorage>) {
@@ -112,6 +97,7 @@ pub(crate) fn request(operation: Operation) -> Request {
     };
     let target = Target::Entry("fixture".into());
     let approved = OperationApproval {
+        receipt_binding: None,
         restated_modes: Vec::new(),
         resource: Resource::Entry("fixture".into()),
         target: target.clone(),
@@ -121,6 +107,7 @@ pub(crate) fn request(operation: Operation) -> Request {
         facts: facts.clone(),
     };
     Request {
+        receipt_binding: None,
         target,
         operation,
         session: "session-1".into(),
@@ -132,6 +119,7 @@ pub(crate) fn request(operation: Operation) -> Request {
 
 fn approve(request: &mut Request, resource: Resource) {
     request.approved = Some(OperationApproval {
+        receipt_binding: None,
         restated_modes: Vec::new(),
         resource,
         target: request.target.clone(),
@@ -196,6 +184,7 @@ fn typed_record_before_send_survives_every_kill_boundary() {
         let active = store.storage().clone();
         active.fault(Fault::Die(at));
         let mut vendor = fixture::Vendor::default();
+        let call = store.records().end;
         let request = bound_request(&store, Operation::Create, "fixture");
         let result = block_on(vendor.run(&mut store, Some(&request.session), &request));
         if at != 4 {
@@ -207,10 +196,10 @@ fn typed_record_before_send_survives_every_kill_boundary() {
         assert_eq!(result.is_ok(), at == 4);
         drop(store);
         let replayed = bound_reopen(&active, extra_index);
-        assert_eq!(replayed.records(), 0..if at == 4 { 15 } else { 14 });
+        assert_eq!(replayed.records(), 0..call + if at == 4 { 3 } else { 2 });
         assert_eq!(replayed.dispatch().typed_calls.len(), usize::from(at == 4));
         if at == 4 {
-            let recorded = &replayed.dispatch().typed_calls[&12];
+            let recorded = &replayed.dispatch().typed_calls[&call];
             assert_eq!(recorded.state, CallState::Unresolved);
             assert_eq!(recorded.intent.approved, request.approved.unwrap());
             assert_eq!(
@@ -231,6 +220,7 @@ fn typed_record_before_send_survives_every_kill_boundary() {
         pause_before_send: true,
         ..Default::default()
     };
+    let call = store.records().end;
     let request = bound_request(&store, Operation::Create, "fixture");
     {
         use std::future::Future;
@@ -244,11 +234,11 @@ fn typed_record_before_send_survives_every_kill_boundary() {
     drop(store);
     let replayed = bound_reopen(&active, extra_index);
     assert_eq!(
-        replayed.dispatch().typed_calls[&10].state,
+        replayed.dispatch().typed_calls[&call].state,
         CallState::Unresolved
     );
     assert_eq!(
-        replayed.dispatch().typed_calls[&10].intent.approved,
+        replayed.dispatch().typed_calls[&call].intent.approved,
         request.approved.unwrap()
     );
     assert!(
@@ -316,10 +306,10 @@ fn lost_create_new_call_session_route_and_index_are_refused_after_replay() {
 fn an_entry_target_associates_only_with_its_own_entry() {
     let (_, mut store, _) = fresh();
     assert_eq!(
-        store.associate(Association {
+        block_on(store.associate(Association {
             target: Target::Entry("stray".into()),
             entry: "fixture".into(),
-        }),
+        })),
         Err("only allocation indices and vendor ids can be associated".into())
     );
     assert_eq!(
@@ -1049,7 +1039,7 @@ fn inspection_reports_typed_records_drops_assumptions_and_refused_replay() {
     assert_eq!(report["dispositions"][2]["report"]["decision"], "refused");
     assert_eq!(
         report["dispositions"][2]["report"]["issues"][0]["settled_by"],
-        10
+        12
     );
     assert_eq!(
         report["observations"][0]["observation"]["reports"],
@@ -1059,9 +1049,9 @@ fn inspection_reports_typed_records_drops_assumptions_and_refused_replay() {
 }
 
 #[test]
-fn journal_assignment_keeps_the_running_system_barrier_without_transient_associations() {
+fn journal_assignment_and_extra_associations_survive_without_fixture_repair() {
     let (storage, mut store, extra) = fresh();
-    // Dispatched through the transient extra index, which the reopen below does not supply.
+    // Reopen uses files alone, including the explicit extra index association.
     let mut reset = request(Operation::Reset);
     reset.target = Target::AllocationIndex(extra);
     reset.approved.as_mut().unwrap().target = reset.target.clone();
@@ -1072,7 +1062,7 @@ fn journal_assignment_keeps_the_running_system_barrier_without_transient_associa
         pass(),
     ))
     .unwrap();
-    assert_eq!(replayed.dispatch().associations.len(), 2);
+    assert_eq!(replayed.dispatch().associations.len(), 4);
     assert_eq!(
         replayed
             .dispatch()

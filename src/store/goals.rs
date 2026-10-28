@@ -245,6 +245,7 @@ impl<S: Storage> Store<S> {
             return Err("typed tool required".into());
         };
         let request = Request {
+            receipt_binding: None,
             target: Target::Entry(machine.clone()),
             operation: *operation,
             session: session.into(),
@@ -534,6 +535,7 @@ mod tests {
         let identity = session(&s);
         let mut request = s.model_typed_request(&identity, &typed()).unwrap();
         request.approved = Some(dispatch::OperationApproval {
+            receipt_binding: None,
             restated_modes: vec![],
             resource: dispatch::Resource::Entry("fixture".into()),
             target: request.target.clone(),
@@ -863,6 +865,7 @@ mod tests {
                 let identity = session(&store);
                 let mut request = store.model_typed_request(&identity, &typed()).unwrap();
                 request.approved = Some(dispatch::OperationApproval {
+                    receipt_binding: None,
                     restated_modes: vec![],
                     resource: dispatch::Resource::Entry("fixture".into()),
                     target: request.target.clone(),

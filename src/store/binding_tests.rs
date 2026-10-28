@@ -185,12 +185,11 @@ fn adapter_refuses_outside_bound_set_before_any_approval() {
     let mut store = approved();
     let caller = block_on(store.bind("fixture")).unwrap();
     let other = block_on(store.bind("fixture-other")).unwrap();
-    store
-        .associate(Association {
-            target: Target::VendorMachine("other-id".into()),
-            entry: "fixture-other".into(),
-        })
-        .unwrap();
+    block_on(store.associate(Association {
+        target: Target::VendorMachine("other-id".into()),
+        entry: "fixture-other".into(),
+    }))
+    .unwrap();
     let mut request = crate::dispatch::typed_tests::request(Operation::Reset);
     request.requester = Requester::Session;
     request.session = caller.clone();
@@ -236,6 +235,7 @@ fn adapter_refuses_outside_bound_set_before_any_approval() {
         Err(OperationError::Policy(RequestRefusal::Facts))
     );
     request.approved = Some(OperationApproval {
+        receipt_binding: None,
         restated_modes: Vec::new(),
         resource: Resource::Entry("fixture".into()),
         target: request.target.clone(),
@@ -259,6 +259,7 @@ fn adapter_refuses_caller_present_requester_relabelling() {
         request.session = caller.clone();
         request.requester = requester;
         request.approved = Some(OperationApproval {
+            receipt_binding: None,
             restated_modes: Vec::new(),
             resource: Resource::Entry("fixture-other".into()),
             target: request.target.clone(),

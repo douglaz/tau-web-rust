@@ -59,12 +59,14 @@ fn request(operation: Operation, session: &str, modes: Vec<Mode>) -> Request {
         bundle_commit: crate::SPEC_COMMIT.into(),
     };
     Request {
+        receipt_binding: None,
         target: Target::Entry("fixture".into()),
         operation,
         session: session.into(),
         requester: Requester::Session,
         facts: facts.clone(),
         approved: Some(OperationApproval {
+            receipt_binding: None,
             resource: Resource::Entry("fixture".into()),
             target: Target::Entry("fixture".into()),
             operation,

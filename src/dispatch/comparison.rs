@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
 
-const FILE: &str = "spec/docs/design/dispatch-witnesses-v6.json";
+const FILE: &str = "spec/docs/design/dispatch-witnesses-v7.json";
 const GUARDS: &[&str] = &[
     "approvalResetRequiresRescue",
     "approvedReinstallBoundary",
@@ -20,6 +20,7 @@ const GUARDS: &[&str] = &[
     "failedPrerequisiteWithdraws",
     "lapse",
     "newestActivationRead",
+    "orderAssociation",
     "reach",
     "rebootBootChange",
     "reinstallWithdrawalEffective",
@@ -30,6 +31,11 @@ const GUARDS: &[&str] = &[
     "sessionDestroyRefused",
 ];
 const PAIRS: &[(&str, &str, &str)] = &[
+    (
+        "order_receipt_association_required",
+        "order_receipt_without_association_admitted",
+        "orderAssociation",
+    ),
     (
         "second_command_held",
         "second_command_without_hold",
@@ -117,8 +123,12 @@ fn members(value: &Value, keys: &[&str]) -> Result<(), String> {
         Err(format!("members: expected {expected:?}, actual {actual:?}"))
     }
 }
-fn parse<T: serde::de::DeserializeOwned>(value: &Value) -> Result<T, String> {
-    serde_json::from_value(value.clone()).map_err(|e| e.to_string())
+fn parse<T: serde::de::DeserializeOwned + Serialize>(value: &Value) -> Result<T, String> {
+    let parsed: T = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+    if serde_json::to_value(&parsed).map_err(|e| e.to_string())? != *value {
+        return Err("record must use its schema object shape".into());
+    }
+    Ok(parsed)
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -137,8 +147,30 @@ enum WTarget {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WApproval {
+    #[serde(deserialize_with = "required_option")]
+    receipt_binding: Option<ReceiptBinding>,
     session: u64,
     facts: u64,
+}
+// Journal compatibility defaults must not allow absent schema-7 witness fields.
+fn required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WReceipt {
+    source: ReceiptSource,
+    call: u64,
+    resource: WResource,
+    target: WTarget,
+    binding: ReceiptBinding,
+    validated: bool,
+    #[serde(deserialize_with = "required_option")]
+    returned_vendor: Option<u64>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -195,6 +227,7 @@ struct Knowledge {
     durable: bool,
     prerequisite_records: Vec<Value>,
     reboot_results: Vec<Value>,
+    receipts: Vec<WReceipt>,
     reinstall_approvals: Vec<Value>,
     reinstall_withdrawals: Vec<Value>,
     reset_offer: Vec<Value>,
@@ -227,6 +260,10 @@ impl Knowledge {
             }
             to_resource(&c.resource)?;
             to_target(&c.target)?;
+        }
+        for r in &self.receipts {
+            to_resource(&r.resource)?;
+            to_target(&r.target)?;
         }
         for a in &self.associations {
             to_target(&a.target)?;
@@ -262,23 +299,23 @@ impl Knowledge {
         Ok(())
     }
 }
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Trace {
     declarations: Vec<String>,
     assumptions: BTreeMap<String, Value>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pair: Option<Pair>,
     start: Value,
     steps: Vec<Value>,
 }
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Pair {
     side: String,
     with: String,
 }
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum Witnessed {
     Request {
@@ -288,8 +325,19 @@ enum Witnessed {
         operation: Operation,
         session: u64,
         facts: u64,
+        #[serde(deserialize_with = "required_option")]
         approved: Option<WApproval>,
         appended: bool,
+    },
+    Receive {
+        provenance: String,
+        receipt: WReceipt,
+        appended: bool,
+    },
+    Associate {
+        provenance: String,
+        target: WTarget,
+        entry: u64,
     },
     Read {
         provenance: String,
@@ -310,13 +358,13 @@ enum Witnessed {
         provenance: String,
     },
 }
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Source {
     AdapterRead,
     JobRecord,
 }
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Reading {
     Succeeded,
@@ -467,7 +515,6 @@ struct Driver {
     store: Store<MemoryStorage>,
     calls: BTreeMap<u64, u64>,
     indices: BTreeMap<u32, u32>,
-    transient_associations: Vec<Association>,
 }
 impl Driver {
     fn new(start: &Value) -> Result<Self, String> {
@@ -479,7 +526,6 @@ impl Driver {
             store,
             calls: BTreeMap::new(),
             indices: BTreeMap::new(),
-            transient_associations: Vec::new(),
         };
         block_on(
             driver
@@ -500,14 +546,13 @@ impl Driver {
         if driver.indices.values().collect::<BTreeSet<_>>().len() != driver.indices.len() {
             return Err("allocation map is not injective".into());
         }
-        // Only these two associations are supplied again after reopen.
+        // Extra mappings use the same committed association primitive as later order ids.
         for target in [WTarget::AllocationIndex(1), WTarget::VendorMachineId(10)] {
             let association = Association {
                 target: driver.to_target(&target)?,
                 entry: "entry-1".into(),
             };
-            driver.store.associate(association.clone())?;
-            driver.transient_associations.push(association);
+            block_on(driver.store.associate(association))?;
         }
         for c in &knowledge.calls {
             if c.state != "unresolved" {
@@ -550,15 +595,11 @@ impl Driver {
         Ok(driver)
     }
     fn replay(&mut self) -> Result<(), String> {
-        let associations = self.transient_associations.clone();
         self.store = block_on(store::unlock(
             MemoryStorage::with_files(self.store.storage().files()),
             &FixtureKdf,
             pass(),
         ))?;
-        for a in associations {
-            self.store.associate(a)?;
-        }
         Ok(())
     }
     fn to_target(&self, value: &WTarget) -> Result<Target, String> {
@@ -619,12 +660,14 @@ impl Driver {
             .resolve(&target)
             .unwrap_or(Resource::Entry("unmapped".into()));
         Ok(Request {
+            receipt_binding: approved.and_then(|a| a.receipt_binding.clone()),
             target: target.clone(),
             operation,
             session: format!("session-{session}"),
             requester: Requester::Session,
             facts: facts(fact),
             approved: approved.map(|a| OperationApproval {
+                receipt_binding: a.receipt_binding.clone(),
                 restated_modes: Vec::new(),
                 resource,
                 target,
@@ -677,12 +720,17 @@ impl Driver {
                     let (target, resource, operation, session, approved) =
                         if let Some(c) = d.typed_calls.get(id) {
                             let intent = &c.intent;
+                            assert_eq!(
+                                intent.receipt_binding, intent.approved.receipt_binding,
+                                "recorded call and approved receipt bindings differ"
+                            );
                             (
                                 self.witness_target(&intent.target),
                                 from_resource(&intent.resource),
                                 intent.operation,
                                 ordinal(&intent.session, "session-"),
                                 WApproval {
+                                    receipt_binding: intent.approved.receipt_binding.clone(),
                                     session: ordinal(&intent.approved.session, "session-"),
                                     facts: intent.approved.facts.arguments["fixture_fact"]
                                         .parse()
@@ -709,6 +757,7 @@ impl Driver {
                                 Operation::Exec,
                                 session,
                                 WApproval {
+                                    receipt_binding: None,
                                     session,
                                     facts: ordinal(fingerprint, "SHA256:comparison-fact-"),
                                 },
@@ -726,7 +775,8 @@ impl Driver {
                             CallState::NoEffect => "no_effect",
                             CallState::Disposed { .. }
                             | CallState::Finished { .. }
-                            | CallState::Confirmed { .. } => "terminal",
+                            | CallState::Confirmed { .. }
+                            | CallState::ReceiptConfirmed { .. } => "terminal",
                             CallState::Cancelled => "cancelled",
                         }
                         .into(),
@@ -785,6 +835,27 @@ impl Driver {
             reinstall_approvals: vec![],
             reinstall_withdrawals: vec![],
             reboot_results: vec![],
+            receipts: d
+                .receipts
+                .iter()
+                .map(|r| WReceipt {
+                    source: r.receipt.source,
+                    call: self
+                        .calls
+                        .iter()
+                        .find(|(_, id)| **id == r.receipt.call)
+                        .map_or(u64::MAX - r.receipt.call, |(symbol, _)| *symbol),
+                    resource: from_resource(&r.receipt.resource),
+                    target: self.witness_target(&r.receipt.target),
+                    binding: r.receipt.binding.clone(),
+                    validated: r.receipt.validated,
+                    returned_vendor: r
+                        .receipt
+                        .returned_vendor
+                        .as_ref()
+                        .map(|v| ordinal(v, "vendor-")),
+                })
+                .collect(),
         };
         projection.normalize();
         projection
@@ -1032,6 +1103,51 @@ impl Driver {
                     json!({"settled":before.into_iter().filter(|id| !after.contains(id)).map(|id| self.symbol(id)).collect::<Vec<_>>()}),
                 )
             }
+            Witnessed::Associate {
+                provenance,
+                target,
+                entry,
+            } => {
+                if provenance != "operator act" {
+                    return Err(format!("unknown association provenance {provenance}"));
+                }
+                let association = Association {
+                    target: self.to_target(&target)?,
+                    entry: format!("entry-{entry}"),
+                };
+                block_on(self.store.associate(association))?;
+                Ok(json!({}))
+            }
+            Witnessed::Receive {
+                provenance,
+                receipt,
+                appended,
+            } => {
+                if provenance != "adapter observation" {
+                    return Err(format!("unknown receipt provenance {provenance}"));
+                }
+                let receipt = Receipt {
+                    source: receipt.source,
+                    call: self.id(receipt.call),
+                    resource: to_resource(&receipt.resource)?,
+                    target: self.to_target(&receipt.target)?,
+                    binding: receipt.binding,
+                    validated: receipt.validated,
+                    returned_vendor: receipt.returned_vendor.map(|n| format!("vendor-{n}")),
+                };
+                if !appended {
+                    self.store.storage().fault(Fault::Fail(3));
+                }
+                let settled = match block_on(self.store.operation_receipt(receipt)) {
+                    Ok(settled) if appended => settled,
+                    Err(_) if !appended => Vec::new(),
+                    Ok(_) => return Err("receipt append unexpectedly succeeded".into()),
+                    Err(e) => return Err(e),
+                };
+                Ok(
+                    json!({"settled": settled.iter().map(|id| self.symbol(*id)).collect::<Vec<_>>()}),
+                )
+            }
             Witnessed::Replay { provenance } => {
                 if provenance != "replay" {
                     return Err(format!("unknown replay provenance {provenance}"));
@@ -1078,6 +1194,25 @@ fn validate_trace(trace: &Trace) -> Result<(), String> {
                     to_resource(&resource)?;
                     if provenance != "disposition" {
                         return Err(format!("unknown disposition provenance {provenance}"));
+                    }
+                }
+                Witnessed::Associate {
+                    provenance, target, ..
+                } => {
+                    to_target(&target)?;
+                    if provenance != "operator act" {
+                        return Err(format!("unknown association provenance {provenance}"));
+                    }
+                }
+                Witnessed::Receive {
+                    provenance,
+                    receipt,
+                    ..
+                } => {
+                    to_resource(&receipt.resource)?;
+                    to_target(&receipt.target)?;
+                    if provenance != "adapter observation" {
+                        return Err(format!("unknown receipt provenance {provenance}"));
                     }
                 }
                 Witnessed::Replay { provenance } => {
@@ -1246,7 +1381,7 @@ fn check(bytes: &[u8]) -> Result<String, String> {
             "enumeration",
         ],
     )?;
-    if root["schema"] != 6 || root["module"] != "dispatch" || root["namespace"] != "TauWeb.Dispatch"
+    if root["schema"] != 7 || root["module"] != "dispatch" || root["namespace"] != "TauWeb.Dispatch"
     {
         return Err(format!("{FILE}: unknown header"));
     }
@@ -1313,12 +1448,12 @@ fn check(bytes: &[u8]) -> Result<String, String> {
             seen.len()
         ));
     }
-    let names: BTreeMap<_, _> = traces
+    let names: Vec<_> = traces
         .iter()
         .filter(|(g, _, _, _)| *g == 0)
         .flat_map(|(_, _, b, t)| t.declarations.iter().map(move |n| (n.clone(), (*b, t))))
         .collect();
-    let mut pair_records = BTreeMap::new();
+    let mut pair_records = Vec::new();
     let mut actual_pairs = BTreeSet::new();
     let mut hold = [0; 2];
     for (group, _, route, trace) in &traces {
@@ -1327,8 +1462,17 @@ fn check(bytes: &[u8]) -> Result<String, String> {
             if !["refused", "admitted"].contains(&pair.side.as_str()) {
                 return Err(format!("{label}: unknown pair side {}", pair.side));
             }
-            let (other_bucket, other) = names
-                .get(&pair.with)
+            let (_, (other_bucket, other)) = names
+                .iter()
+                .find(|(n, (_, other))| {
+                    n == &pair.with
+                        && other.start == trace.start
+                        && other
+                            .steps
+                            .iter()
+                            .map(|s| &s["event"])
+                            .eq(trace.steps.iter().map(|s| &s["event"]))
+                })
                 .ok_or(format!("{label}: missing paired side {}", pair.with))?;
             if other_bucket != route
                 || other
@@ -1390,7 +1534,7 @@ fn check(bytes: &[u8]) -> Result<String, String> {
         if admitted {
             let (step, _) =
                 difference.ok_or(format!("{label}: admitted negative control never differed"))?;
-            pair_records.insert(trace.pair.as_ref().unwrap().with.clone(), (label, step));
+            pair_records.push((trace.pair.as_ref().unwrap().with.clone(), (label, step)));
         } else {
             if let Some((step, why)) = difference {
                 return Err(format!("{label}, step {step}: {why}"));
@@ -1402,20 +1546,36 @@ fn check(bytes: &[u8]) -> Result<String, String> {
     }
     let expected_pairs: BTreeSet<_> = PAIRS.iter().map(|(r, _, _)| name(r)).collect();
     if actual_pairs != expected_pairs
-        || pair_records.keys().cloned().collect::<BTreeSet<_>>() != expected_pairs
+        || pair_records
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect::<BTreeSet<_>>()
+            != expected_pairs
     {
         return Err("witnesses: stage1 pair inventory differs".into());
     }
-    if counts != [[31, 54, 12], [286, 184, 0]] {
+    for (refused, _, guard) in PAIRS {
+        let actual = pair_records
+            .iter()
+            .filter(|(r, _)| *r == name(refused))
+            .count();
+        let expected = if *guard == "orderAssociation" { 2 } else { 1 };
+        if actual != expected {
+            return Err(format!(
+                "{refused}: expected {expected} admitted traces, actual {actual}"
+            ));
+        }
+    }
+    if counts != [[44, 54, 12], [286, 184, 0]] {
         return Err(format!(
-            "routing: expected [[31,54,12],[286,184,0]], actual {counts:?}"
+            "routing: expected [[44,54,12],[286,184,0]], actual {counts:?}"
         ));
     }
     if hold != [4, 28] {
         return Err(format!("commandHold: expected [4,28], actual {hold:?}"));
     }
     let mut record = format!(
-        "dispatch companion comparison: passed\n  rule: ADR-0032, How the implementation is compared; ticket partition is an implementation reading\n  file: {FILE}\n  schema 6, module dispatch, namespace TauWeb.Dispatch, bound: 3 events over an alphabet of 8, distinct request call ids\n  stage1: 31 witnesses / 286 enumerated traces (twr-ggw.8)\n  dedicated: 54 witnesses / 184 enumerated traces (twr-i6k.3)\n  reboot: 12 witnesses / 0 enumerated traces (twr-i6k.11)\n  total: 97 witnesses / 470 enumerated traces\n  compared: start, every outcome and projection member at every stage1 step; keyed sets compared by key\n  commandHold: 4 named / 28 enumerated refusals\n"
+        "dispatch companion comparison: passed\n  rule: ADR-0032, How the implementation is compared; ticket partition is an implementation reading\n  file: {FILE}\n  schema 7, module dispatch, namespace TauWeb.Dispatch, bound: 3 events over an alphabet of 8, distinct request call ids\n  stage1: 44 witnesses / 286 enumerated traces (twr-ggw.8)\n  dedicated: 54 witnesses / 184 enumerated traces (twr-i6k.3)\n  reboot: 12 witnesses / 0 enumerated traces (twr-i6k.11)\n  total: 110 witnesses / 470 enumerated traces\n  compared: start, every outcome and projection member at every stage1 step; keyed sets compared by key\n  commandHold: 4 named / 28 enumerated refusals\n"
     );
     for (refused, (admitted, step)) in pair_records {
         record.push_str(&format!(
@@ -1497,7 +1657,18 @@ fn every_stage1_projection_and_outcome_rejects_unknown_vocabulary() {
 #[test]
 fn comparison_breaks_are_red_and_name_the_trace() {
     let bytes = std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join(FILE)).unwrap();
-    let original: Value = serde_json::from_slice(&bytes).unwrap();
+    let mut original: Value = serde_json::from_slice(&bytes).unwrap();
+    let witnesses = original["witnesses"].as_array_mut().unwrap();
+    let first = witnesses
+        .iter()
+        .position(|t| t["declarations"][0] == name("second_command_held"))
+        .unwrap();
+    witnesses.swap(0, first);
+    let second = witnesses
+        .iter()
+        .position(|t| t["declarations"][0] == name("second_command_without_hold"))
+        .unwrap();
+    witnesses.swap(1, second);
     let mut checks = Vec::new();
     let mut d = original.clone();
     d["witnesses"][0]["steps"][0]["dispatch"] = json!("refused");
@@ -1537,4 +1708,98 @@ fn comparison_breaks_are_red_and_name_the_trace() {
             .unwrap_err()
             .contains("absent-dispatch-witnesses.json")
     );
+}
+
+#[test]
+fn schema7_requires_all_binding_and_receipt_fields_and_rejects_unknown_vocabulary() {
+    let root: Value = serde_json::from_slice(
+        &std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join(FILE)).unwrap(),
+    )
+    .unwrap();
+    let witness = root["witnesses"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["declarations"][0] == name("lnvps_receipt_confirms"))
+        .unwrap();
+    let mutations = [
+        ("/steps/0/event/approved", "receipt_binding", None),
+        (
+            "/steps/0/knowledge/calls/0/approved",
+            "receipt_binding",
+            None,
+        ),
+        (
+            "/steps/0/event/approved",
+            "receipt_binding",
+            Some(json!(["restart", 41, 73])),
+        ),
+        (
+            "/steps/1/event/receipt",
+            "binding",
+            Some(json!(["restart", 41, 73])),
+        ),
+        (
+            "/steps/0/event",
+            "approved",
+            Some(json!([{"operation":"restart","account":41,"signed_request":73},1,1])),
+        ),
+        ("/start", "receipts", None),
+        ("/steps/1/event/receipt", "returned_vendor", None),
+        ("/steps/1/knowledge/receipts/0", "returned_vendor", None),
+        ("/steps/1/event/receipt", "binding", None),
+        ("/steps/1/event/receipt/binding", "operation", None),
+        ("/steps/1/event/receipt/binding", "account", None),
+        ("/steps/1/event/receipt/binding", "signed_request", None),
+        (
+            "/steps/1/event/receipt",
+            "source",
+            Some(json!("adapter_read")),
+        ),
+        (
+            "/steps/1/event/receipt/binding",
+            "operation",
+            Some(json!("reinstall")),
+        ),
+        (
+            "/steps/0/event/approved/receipt_binding",
+            "operation",
+            Some(json!("reset")),
+        ),
+        ("/steps/1/event/receipt", "unexpected", Some(json!(true))),
+        (
+            "/steps/1/knowledge/receipts/0",
+            "unexpected",
+            Some(json!(true)),
+        ),
+        (
+            "/steps/0/event/approved/receipt_binding",
+            "unexpected",
+            Some(json!(true)),
+        ),
+        (
+            "/steps/1/event/receipt",
+            "resource",
+            Some(json!({"inference":false})),
+        ),
+        (
+            "/steps/1/event/receipt",
+            "target",
+            Some(json!({"inference_cap":false})),
+        ),
+    ];
+    for (pointer, key, replacement) in mutations {
+        let mut trace = witness.clone();
+        let object = trace.pointer_mut(pointer).unwrap().as_object_mut().unwrap();
+        if let Some(value) = replacement {
+            object.insert(key.into(), value);
+        } else {
+            assert!(object.remove(key).is_some());
+        }
+        let why = validate_trace(&parse::<Trace>(&trace).unwrap()).unwrap_err();
+        assert!(
+            why.contains("lnvps_receipt_confirms"),
+            "{pointer}/{key}: {why}"
+        );
+    }
 }

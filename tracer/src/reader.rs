@@ -291,7 +291,7 @@ fn check_event(number: u64, event: &Value) -> Result<(), String> {
             }
         }
         "operation_intent" => {
-            exact_optional(
+            exact_optionals(
                 body,
                 &[
                     "call",
@@ -303,7 +303,7 @@ fn check_event(number: u64, event: &Value) -> Result<(), String> {
                     "facts",
                     "approved",
                 ],
-                "restated_modes",
+                &["restated_modes", "receipt_binding"],
             )?;
             if body["call"].as_u64() != Some(number) {
                 return Err("typed identity differs from record number".into());
@@ -320,7 +320,7 @@ fn check_event(number: u64, event: &Value) -> Result<(), String> {
             }
             text("session")?;
             facts(&body["facts"])?;
-            exact_optional(
+            exact_optionals(
                 &body["approved"],
                 &[
                     "resource",
@@ -330,7 +330,7 @@ fn check_event(number: u64, event: &Value) -> Result<(), String> {
                     "requester",
                     "facts",
                 ],
-                "restated_modes",
+                &["restated_modes", "receipt_binding"],
             )?;
             let list = body.get("restated_modes").cloned().unwrap_or(json!([]));
             mode_list(&list)?;
@@ -343,7 +343,11 @@ fn check_event(number: u64, event: &Value) -> Result<(), String> {
             {
                 return Err("invalid restated modes".into());
             }
+            if let Some(binding) = body.get("receipt_binding").filter(|v| !v.is_null()) {
+                receipt_binding(binding)?;
+            }
             for key in [
+                "receipt_binding",
                 "resource",
                 "target",
                 "operation",
@@ -354,6 +358,47 @@ fn check_event(number: u64, event: &Value) -> Result<(), String> {
                 if body[key] != body["approved"][key] {
                     return Err("typed intent differs from its approval".into());
                 }
+            }
+        }
+        "association" => {
+            exact(body, &["target", "entry"])?;
+            target(&body["target"])?;
+            text("entry")?;
+            if body["target"].get("allocation_index").is_none()
+                && body["target"].get("vendor_machine").is_none()
+            {
+                return Err("association target is not an allocation index or vendor id".into());
+            }
+        }
+        "operation_receipt" => {
+            exact(
+                body,
+                &[
+                    "source",
+                    "call",
+                    "resource",
+                    "target",
+                    "binding",
+                    "validated",
+                    "returned_vendor",
+                ],
+            )?;
+            resource(&body["resource"])?;
+            target(&body["target"])?;
+            receipt_binding(&body["binding"])?;
+            if ![
+                "browser_vendor_tls",
+                "arbitrary_response",
+                "job_output",
+                "notify_event",
+                "proposed_text",
+            ]
+            .contains(&text("source")?)
+                || body["call"].as_u64().is_none()
+                || !body["validated"].is_boolean()
+                || !(body["returned_vendor"].is_null() || body["returned_vendor"].is_string())
+            {
+                return Err("invalid receipt evidence".into());
             }
         }
         "operation_response" => {
@@ -650,6 +695,28 @@ fn facts(value: &Value) -> Result<(), String> {
         return Err("invalid typed facts".into());
     }
     Ok(())
+}
+
+fn receipt_binding(value: &Value) -> Result<(), String> {
+    exact(value, &["operation", "account", "signed_request"])?;
+    if ![json!("order"), json!("stop"), json!("restart")].contains(&value["operation"])
+        || value["account"].as_u64().is_none()
+        || value["signed_request"].as_u64().is_none()
+    {
+        return Err("invalid receipt binding".into());
+    }
+    Ok(())
+}
+
+fn exact_optionals(value: &Value, required: &[&str], optional: &[&str]) -> Result<(), String> {
+    let mut fields = required.to_vec();
+    fields.extend(
+        optional
+            .iter()
+            .copied()
+            .filter(|key| value.get(*key).is_some()),
+    );
+    exact(value, &fields)
 }
 
 fn exact_optional(value: &Value, required: &[&str], optional: &str) -> Result<(), String> {
@@ -1348,6 +1415,7 @@ mod tests {
             bundle_commit: tau_web::SPEC_COMMIT.into(),
         };
         let approved = OperationApproval {
+            receipt_binding: None,
             resource: Resource::Entry("fixture".into()),
             target: Target::Entry("fixture".into()),
             operation: Operation::Destroy,
@@ -1357,6 +1425,7 @@ mod tests {
             restated_modes: vec![Mode::NoArtifactPin, Mode::NoBrief],
         };
         block_on(store.operation(&Request {
+            receipt_binding: None,
             target: approved.target.clone(),
             operation: approved.operation,
             session: session.clone(),
@@ -2390,4 +2459,123 @@ pub fn with_contracts(mut files: Files, passphrase: &str) -> Result<Files, Strin
         number += 1;
     }
     Ok(files)
+}
+
+#[cfg(test)]
+mod receipt_tests {
+    use super::*;
+    use tau_web::credential::LocalPassphrase;
+    use tau_web::store::{MemoryStorage, Pbkdf2, block_on, unlock};
+
+    #[test]
+    fn independent_encrypted_receipt_and_association_history_replays_in_either_order() {
+        const PASS: &str = "independent receipt fixture passphrase";
+        let mnemonic = bip39::Mnemonic::from_entropy(&[7; 16]).unwrap().to_string();
+        for receipt_first in [false, true] {
+            let mut events = vec![json!({"seed":{"mnemonic":mnemonic}})];
+            events.extend(setup_events(&mnemonic, &["fixture"]));
+            let call = events.len() as u64;
+            let binding = json!({"operation":"order","account":41,"signed_request":73});
+            let mut intent = crate::typed_cases::intent(call, "create");
+            intent["operation_intent"]["receipt_binding"] = binding.clone();
+            intent["operation_intent"]["approved"]["receipt_binding"] = binding.clone();
+            let receipt = json!({"operation_receipt":{
+                "source":"browser_vendor_tls", "call":call,
+                "resource":intent["operation_intent"]["resource"],
+                "target":intent["operation_intent"]["target"],
+                "binding":binding, "validated":true, "returned_vendor":"returned-id"
+            }});
+            let association = json!({"association":{"target":{"vendor_machine":"returned-id"},"entry":"fixture"}});
+            events.push(intent.clone());
+            events.push(if receipt_first {
+                receipt.clone()
+            } else {
+                association.clone()
+            });
+            let prefix = build(PASS, &events);
+            let reopened = block_on(unlock(
+                MemoryStorage::with_files(prefix.clone()),
+                &Pbkdf2,
+                LocalPassphrase::new(PASS.as_bytes().to_vec()),
+            ))
+            .unwrap();
+            assert_eq!(
+                reopened.dispatch().typed_calls[&call].state,
+                tau_web::dispatch::CallState::Unresolved
+            );
+            assert_eq!(
+                reopened.storage().files(),
+                prefix,
+                "legacy framing is read without rewriting"
+            );
+            events.push(if receipt_first {
+                association.clone()
+            } else {
+                receipt.clone()
+            });
+            let files = build(PASS, &events);
+            let opened = read(&files, PASS).unwrap();
+            for ((_, plaintext), expected) in opened.records.iter().zip(&events) {
+                assert_eq!(
+                    serde_json::from_slice::<Value>(plaintext).unwrap(),
+                    *expected
+                );
+            }
+            let reopened = block_on(unlock(
+                MemoryStorage::with_files(files.clone()),
+                &Pbkdf2,
+                LocalPassphrase::new(PASS.as_bytes().to_vec()),
+            ))
+            .unwrap();
+            assert!(matches!(
+                reopened.dispatch().typed_calls[&call].state,
+                tau_web::dispatch::CallState::ReceiptConfirmed {
+                    association: Some(_),
+                    ..
+                }
+            ));
+            assert_eq!(
+                reopened.dispatch().receipts[0].settled,
+                if receipt_first { vec![] } else { vec![call] }
+            );
+            assert!(reopened.sessions().is_empty());
+            assert_eq!(reopened.storage().files(), files);
+            for (number, event) in [(call, intent), (call + 1, receipt), (call + 1, association)] {
+                let mut bad = event;
+                bad.as_object_mut().unwrap().values_mut().next().unwrap()["unknown"] = json!(true);
+                assert!(check_event(number, &bad).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn independent_reader_refuses_malformed_receipt_context_and_evidence_shapes() {
+        let binding = json!({"operation":"restart","account":41,"signed_request":73});
+        let receipt = json!({"operation_receipt":{"source":"browser_vendor_tls","call":1,
+            "resource":{"entry":"fixture"},"target":{"entry":"fixture"},
+            "binding":binding,"validated":true,"returned_vendor":null}});
+        for (key, value) in [
+            ("source", json!("adapter_read")),
+            ("validated", json!("true")),
+            ("call", json!(-1)),
+            ("binding", json!(["restart", 41, 73])),
+            ("returned_vendor", json!(7)),
+        ] {
+            let mut bad = receipt.clone();
+            bad["operation_receipt"][key] = value;
+            assert!(check_event(2, &bad).is_err(), "{key}");
+        }
+        let mut missing = receipt.clone();
+        missing["operation_receipt"]
+            .as_object_mut()
+            .unwrap()
+            .remove("returned_vendor");
+        assert!(check_event(2, &missing).is_err());
+        let mut intent = crate::typed_cases::intent(1, "reset");
+        intent["operation_intent"]["receipt_binding"] = binding.clone();
+        intent["operation_intent"]["approved"]["receipt_binding"] = binding;
+        assert!(check_event(1, &intent).is_ok());
+        intent["operation_intent"]["approved"]["receipt_binding"]["account"] = json!(42);
+        assert!(check_event(1, &intent).is_err());
+    }
 }

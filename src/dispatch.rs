@@ -15,6 +15,8 @@ mod comparison;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) mod fixture;
 #[cfg(all(test, not(target_arch = "wasm32")))]
+mod receipt_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) mod typed_tests;
 
 /// The identity of what admitted a command, not approval of its contents.
@@ -80,11 +82,23 @@ pub struct Disposition {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum CallState {
     Unresolved,
-    Finished { terminal: u64, exit_status: u32 },
-    Disposed { disposition: u64, outcome: Unknown },
+    Finished {
+        terminal: u64,
+        exit_status: u32,
+    },
+    Disposed {
+        disposition: u64,
+        outcome: Unknown,
+    },
     Cancelled,
     NoEffect,
-    Confirmed { observation: u64 },
+    Confirmed {
+        observation: u64,
+    },
+    ReceiptConfirmed {
+        receipt: u64,
+        association: Option<u64>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -121,6 +135,10 @@ pub struct DispositionIssue {
 pub enum SettlingRecord {
     Terminal(TerminalRecord),
     Observation(ObservationRecord),
+    Receipt {
+        receipt: ReceiptRecord,
+        association: Option<AssociationRecord>,
+    },
     Disposition {
         number: u64,
         disposition: Disposition,
@@ -186,6 +204,8 @@ pub struct Dispatch {
     pub typed_calls: BTreeMap<u64, OperationCall>,
     pub observations: Vec<ObservationRecord>,
     pub associations: Vec<Association>,
+    pub association_records: Vec<AssociationRecord>,
+    pub receipts: Vec<ReceiptRecord>,
     pub current_installations: BTreeMap<String, u64>,
     pub inference_standing: Option<DispositionRecord>,
 }
@@ -379,10 +399,33 @@ impl Dispatch {
                 let settled_by = call.and_then(|state| match state {
                     CallState::Finished { terminal, .. } => Some(*terminal),
                     CallState::Confirmed { observation } => Some(*observation),
+                    CallState::ReceiptConfirmed {
+                        receipt,
+                        association,
+                    } => Some(association.map_or(*receipt, |a| a.max(*receipt))),
                     CallState::Disposed { disposition, .. } => Some(*disposition),
                     _ => None,
                 });
                 let settling_record = settled_by.and_then(|number| {
+                    if let Some(CallState::ReceiptConfirmed {
+                        receipt,
+                        association,
+                    }) = call
+                    {
+                        return self
+                            .receipts
+                            .iter()
+                            .find(|r| r.number == *receipt)
+                            .map(|r| SettlingRecord::Receipt {
+                                receipt: r.clone(),
+                                association: association.and_then(|n| {
+                                    self.association_records
+                                        .iter()
+                                        .find(|a| a.number == n)
+                                        .cloned()
+                                }),
+                            });
+                    }
                     self.terminals
                         .iter()
                         .find(|record| record.number == number)
