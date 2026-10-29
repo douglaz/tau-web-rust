@@ -131,10 +131,15 @@ fn replay_rejects_unreserved_or_conflicting_associations() {
     ] {
         let (_, mut store, _) = dispatch::typed_tests::fresh();
         let number = store.records().end;
-        block_on(store.commit(&Event::Association(dispatch::Association {
-            target,
-            entry: "other".into(),
-        })))
+        block_on(
+            store.commit(&Event::Association(
+                dispatch::Association {
+                    target,
+                    entry: "other".into(),
+                }
+                .into(),
+            )),
+        )
         .unwrap();
         let why = reopen(&store)
             .err()

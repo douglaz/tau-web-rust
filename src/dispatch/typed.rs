@@ -18,8 +18,7 @@ pub enum Target {
     Inference,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Association {
     pub target: Target,
     pub entry: String,
@@ -28,7 +27,7 @@ pub struct Association {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct AssociationRecord {
     pub number: u64,
-    pub association: Association,
+    pub association: StoredAssociation,
 }
 
 /// Closed abstractions of the approved LNVPS request and externally validated result.
@@ -101,8 +100,7 @@ pub enum ReceiptSource {
     ProposedText,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Receipt {
     pub source: ReceiptSource,
     pub call: u64,
@@ -116,7 +114,7 @@ pub struct Receipt {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ReceiptRecord {
     pub number: u64,
-    pub receipt: Receipt,
+    pub receipt: StoredReceipt,
     /// What this event settled when received, never rewritten by a later association.
     pub settled: Vec<u64>,
 }
@@ -263,6 +261,7 @@ pub enum RequestRefusal {
     Modes,
     BoundSet,
     Unmapped,
+    IdentityExclusion { records: Vec<u64> },
     Facts,
     InstallationFacts { why: String },
     UnsupportedOperation { operation: Operation },
@@ -271,33 +270,24 @@ pub enum RequestRefusal {
 }
 
 impl Dispatch {
-    /// Apply a committed extra association. Setup owns the initial allocation mappings.
-    pub(crate) fn associate(
+    /// Apply only validated canonical evidence. Quarantine never enters the map.
+    pub(crate) fn associate_stored(
         &mut self,
         number: u64,
-        association: Association,
+        association: StoredAssociation,
     ) -> Result<(), String> {
-        if !matches!(
-            association.target,
-            Target::AllocationIndex(_) | Target::VendorMachine(_)
-        ) {
-            return Err("only allocation indices and vendor ids can be associated".into());
-        }
-        if !self.approved_entries.contains_key(&association.entry) {
-            return Err("association names no approved entry".into());
-        }
-        if let Some(old) = self
-            .associations
-            .iter()
-            .find(|a| a.target == association.target)
-        {
-            return if old == &association {
-                Ok(())
-            } else {
-                Err("target already associated".into())
+        self.validate_association(number, &association)?;
+        let entry = self.association_entry(&association)?.to_owned();
+        if association.admitted() {
+            let raw = Association {
+                target: association.target().ok_or("mapped target missing")?.clone(),
+                entry,
             };
+            if self.association_duplicate(&raw)? {
+                return Ok(());
+            }
+            self.associations.push(raw);
         }
-        self.associations.push(association.clone());
         self.association_records.push(AssociationRecord {
             number,
             association,
@@ -306,57 +296,54 @@ impl Dispatch {
         Ok(())
     }
 
-    fn receipt_matches(intent: &OperationIntent, receipt: &Receipt) -> bool {
-        receipt.source == ReceiptSource::BrowserVendorTls
-            && receipt.validated
-            && receipt.call == intent.call
-            && receipt.resource == intent.resource
-            && receipt.target == intent.target
-            && intent.receipt_binding.as_ref() == Some(&receipt.binding)
-            && receipt.binding.operation.operation() == intent.operation
-    }
-
-    /// Return the durable association constituent for an order; other receipts need none.
-    fn receipt_association(&self, receipt: &Receipt) -> Option<&AssociationRecord> {
+    fn receipt_association(&self, receipt: &ReceiptRecord) -> Option<&AssociationRecord> {
+        let intent = self.receipt_intent(receipt.number, &receipt.receipt)?;
+        let id = receipt.receipt.facts().returned_vendor?;
+        if receipt.receipt.returned_presence() != ReturnedPresence::Retained {
+            return None;
+        }
         self.association_records.iter().find(|record| {
-            receipt.returned_vendor.as_ref().is_some_and(|id| {
-                record.association.target == Target::VendorMachine(id.clone())
-                    && receipt.resource == Resource::Entry(record.association.entry.clone())
-            })
+            record.association.admitted()
+                && record.association.target() == Some(&Target::VendorMachine(id.clone()))
+                && self
+                    .association_entry(&record.association)
+                    .is_ok_and(|entry| intent.resource == Resource::Entry(entry.into()))
         })
     }
 
-    /// One derivation at both constituent arrivals, also used by journal replay.
     fn settle_receipts(&mut self) -> Vec<u64> {
         let mut settled = Vec::new();
         for record in &self.receipts {
-            let receipt = &record.receipt;
-            let association = self.receipt_association(receipt).map(|r| r.number);
-            if receipt.binding.operation == ReceiptOperation::Order && association.is_none() {
+            let Some(intent) = self.receipt_intent(record.number, &record.receipt) else {
+                continue;
+            };
+            let call_id = intent.call;
+            let order = record.receipt.facts().binding.operation == ReceiptOperation::Order;
+            let association = self.receipt_association(record).map(|r| r.number);
+            if order && association.is_none() {
                 continue;
             }
-            for call in self.typed_calls.values_mut() {
-                if record.number <= call.intent.call
-                    || call.state != CallState::Unresolved
-                    || !Self::receipt_matches(&call.intent, receipt)
-                {
-                    continue;
-                }
+            let call = self
+                .typed_calls
+                .get_mut(&call_id)
+                .expect("earlier typed intent");
+            if call.state == CallState::Unresolved {
                 call.state = CallState::ReceiptConfirmed {
                     receipt: record.number,
-                    association: if receipt.binding.operation == ReceiptOperation::Order {
-                        association
-                    } else {
-                        None
-                    },
+                    association: if order { association } else { None },
                 };
-                settled.push(call.intent.call);
+                settled.push(call_id);
             }
         }
         settled
     }
 
-    pub(crate) fn receive(&mut self, number: u64, receipt: Receipt) -> Vec<u64> {
+    pub(crate) fn receive_stored(
+        &mut self,
+        number: u64,
+        receipt: StoredReceipt,
+    ) -> Result<Vec<u64>, String> {
+        self.validate_receipt(number, &receipt)?;
         self.receipts.push(ReceiptRecord {
             number,
             receipt,
@@ -364,7 +351,7 @@ impl Dispatch {
         });
         let settled = self.settle_receipts();
         self.receipts.last_mut().expect("just received").settled = settled.clone();
-        settled
+        Ok(settled)
     }
 
     pub fn resolve(&self, target: &Target) -> Option<Resource> {
@@ -490,6 +477,14 @@ impl Dispatch {
     ) -> Result<(), RequestRefusal> {
         if matches!(operation, Operation::Read | Operation::Inference) {
             return Ok(());
+        }
+        if operation == Operation::Create
+            && let Resource::Entry(entry) = resource
+        {
+            let records = self.identity_exclusions(entry);
+            if !records.is_empty() {
+                return Err(RequestRefusal::IdentityExclusion { records });
+            }
         }
         let calls: Vec<_> = self
             .unresolved(resource)

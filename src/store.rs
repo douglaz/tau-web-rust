@@ -184,8 +184,8 @@ pub(crate) enum Event {
     Intent(Intent),
     OperationIntent(crate::dispatch::OperationIntent),
     OperationObservation(crate::dispatch::Observation),
-    OperationReceipt(crate::dispatch::Receipt),
-    Association(crate::dispatch::Association),
+    OperationReceipt(crate::dispatch::StoredReceipt),
+    Association(crate::dispatch::StoredAssociation),
     OperationResponse {
         call: u64,
         body: String,
@@ -359,6 +359,7 @@ pub struct Store<S> {
     connection_refusals: Vec<ConnectionRefusal>,
     /// Set by a failed append, whose move may have landed: no append follows in this worker.
     failed: Option<String>,
+    uncommitted_evidence: Option<crate::dispatch::EvidenceDiagnostic>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -490,7 +491,12 @@ impl<S: Storage> Store<S> {
             signature_refusals: Vec::new(),
             connection_refusals: Vec::new(),
             failed: None,
+            uncommitted_evidence: None,
         }
+    }
+
+    pub fn uncommitted_evidence(&self) -> Option<&crate::dispatch::EvidenceDiagnostic> {
+        self.uncommitted_evidence.as_ref()
     }
 
     /// The storage the store writes to.
@@ -627,6 +633,9 @@ impl<S: Storage> Store<S> {
         let mut dispatch = self.dispatch.clone();
         let mut allocation = self.allocation().clone();
         dispatch.apply_setup(&mut allocation, &record)?;
+        if matches!(record, crate::dispatch::SetupRecord::Approval(_)) {
+            dispatch.setup_approval = Some(self.next);
+        }
         self.commit(&Event::Setup(record)).await?;
         self.dispatch = dispatch;
         self.allocation = Some(allocation);
@@ -1025,9 +1034,58 @@ impl<S: Storage> Store<S> {
         association: crate::dispatch::Association,
     ) -> Result<(), String> {
         self.check_association(&association)?;
+        if self.dispatch.association_duplicate(&association)? {
+            return Ok(());
+        }
+        let evidence = if matches!(
+            association.target,
+            crate::dispatch::Target::VendorMachine(_)
+        ) && self.dispatch.has_identity_risk()
+        {
+            self.dispatch
+                .protect_association(
+                    self.next,
+                    association,
+                    crate::dispatch::EvidenceProtection::default(),
+                )?
+                .ok_or("unexpected duplicate")?
+        } else {
+            association.into()
+        };
+        self.append_association(evidence).await
+    }
+
+    /// Consume genuine input and complete omission before the first append await.
+    pub fn association_evidence(
+        &mut self,
+        association: crate::dispatch::Association,
+        protection: crate::dispatch::EvidenceProtection,
+    ) -> impl std::future::Future<Output = Result<(), String>> + '_ {
+        let prepared = self
+            .dispatch
+            .protect_association(self.next, association, protection);
+        async move {
+            if let Some(evidence) = prepared? {
+                self.append_association(evidence).await?;
+            }
+            Ok(())
+        }
+    }
+
+    async fn append_association(
+        &mut self,
+        evidence: crate::dispatch::StoredAssociation,
+    ) -> Result<(), String> {
         let mut next = self.dispatch.clone();
-        next.associate(self.next, association.clone())?;
-        self.commit(&Event::Association(association)).await?;
+        next.associate_stored(self.next, evidence.clone())?;
+        if matches!(evidence, crate::dispatch::StoredAssociation::Protected(_)) {
+            self.uncommitted_evidence = Some(crate::dispatch::EvidenceDiagnostic::Association {
+                committed: false,
+                association: evidence.clone(),
+            });
+        }
+        self.commit(&Event::Association(evidence)).await?;
+        self.uncommitted_evidence = None;
         self.dispatch = next;
         Ok(())
     }
@@ -1204,9 +1262,35 @@ impl<S: Storage> Store<S> {
         &mut self,
         receipt: crate::dispatch::Receipt,
     ) -> Result<Vec<u64>, String> {
+        self.append_receipt(receipt.into()).await
+    }
+
+    /// Scoped canonical conversion; omitted originals are gone before append is polled.
+    pub fn protected_operation_receipt(
+        &mut self,
+        receipt: crate::dispatch::Receipt,
+        protection: crate::dispatch::EvidenceProtection,
+    ) -> impl std::future::Future<Output = Result<Vec<u64>, String>> + '_ {
+        let prepared = self
+            .dispatch
+            .protect_receipt(self.next, receipt, protection);
+        async move { self.append_receipt(prepared?).await }
+    }
+
+    async fn append_receipt(
+        &mut self,
+        evidence: crate::dispatch::StoredReceipt,
+    ) -> Result<Vec<u64>, String> {
         let mut next = self.dispatch.clone();
-        let settled = next.receive(self.next, receipt.clone());
-        self.commit(&Event::OperationReceipt(receipt)).await?;
+        let settled = next.receive_stored(self.next, evidence.clone())?;
+        if matches!(evidence, crate::dispatch::StoredReceipt::Protected(_)) {
+            self.uncommitted_evidence = Some(crate::dispatch::EvidenceDiagnostic::Receipt {
+                committed: false,
+                receipt: evidence.clone(),
+            });
+        }
+        self.commit(&Event::OperationReceipt(evidence)).await?;
+        self.uncommitted_evidence = None;
         self.dispatch = next;
         Ok(settled)
     }
@@ -1330,6 +1414,9 @@ impl<S: Storage> Store<S> {
                     self.dispatch
                         .apply_setup(self.allocation.as_mut().expect("seed first"), record)
                         .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
+                    if matches!(record, crate::dispatch::SetupRecord::Approval(_)) {
+                        self.dispatch.setup_approval = Some(number);
+                    }
                 }
                 (_, Event::Delivery(record)) => {
                     self.delivery = self
@@ -1389,12 +1476,18 @@ impl<S: Storage> Store<S> {
                         .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
                 }
                 (_, Event::OperationReceipt(receipt)) => {
-                    self.dispatch.receive(number, receipt.clone());
+                    self.dispatch
+                        .receive_stored(number, receipt.clone())
+                        .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
                 }
                 (_, Event::Association(association)) => {
-                    self.check_association(association)
-                        .and_then(|()| self.dispatch.associate(number, association.clone()))
-                        .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
+                    (|| {
+                        if let crate::dispatch::StoredAssociation::Legacy(raw) = association {
+                            self.check_association(raw)?;
+                        }
+                        self.dispatch.associate_stored(number, association.clone())
+                    })()
+                    .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
                 }
                 (_, Event::Terminal(terminal)) => self
                     .dispatch
@@ -2063,6 +2156,10 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
                     .expect("typed calls serialize");
             report["observations"] =
                 serde_json::to_value(&store.dispatch.observations).expect("observations serialize");
+            if let Some(diagnostic) = store.uncommitted_evidence() {
+                report["uncommitted_evidence"] =
+                    serde_json::to_value(diagnostic).expect("diagnostic serializes");
+            }
             report["receipts"] =
                 serde_json::to_value(&store.dispatch.receipts).expect("receipts serialize");
             report["association_records"] =
@@ -4885,3 +4982,6 @@ mod mode_tests;
 mod declaration_tests;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod receipt_tests;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod protected_tests;
