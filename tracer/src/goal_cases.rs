@@ -549,7 +549,6 @@ pub(super) async fn run(
         "standing",
         "typed_calls",
         "mode_acceptances",
-        "sessions",
         "installations",
         "signature_refusals",
         "setup_offer",
@@ -559,6 +558,22 @@ pub(super) async fn run(
             before_authority.get(key).is_some() && after[key] == before_authority[key],
         );
     }
+    let mut expected_sessions = before_authority["sessions"].clone();
+    for view in expected_sessions.as_array_mut().expect("sessions") {
+        if view["identity"] == session {
+            let mut spent = tau_web::inference_limits::Decimal::parse(
+                view["inference_limits"]["observed_spend"]
+                    .as_str()
+                    .ok_or("original observed usage")?,
+            )?;
+            spent.add(&tau_web::inference_limits::Decimal::parse("0.02")?);
+            view["inference_limits"]["observed_spend"] = spent.text().into();
+        }
+    }
+    case.check(
+        "claimed authority changes only the exact two-turn observed usage",
+        after["sessions"] == expected_sessions,
+    );
     let opened = reader::read(&store_files(&run.dump(tab).await?), PASSPHRASE)?;
     let own_records: Vec<Value> = opened
         .records

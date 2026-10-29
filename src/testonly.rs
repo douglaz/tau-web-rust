@@ -124,6 +124,18 @@ pub fn inference_candidate() -> crate::inference::Candidate {
 }
 
 #[cfg(target_arch = "wasm32")]
+std::thread_local! {static TRANSPORT_APPEND: std::cell::RefCell<Option<String>> = const {std::cell::RefCell::new(None)};}
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub fn test_transport_append(bytes: String) {
+    TRANSPORT_APPEND.with_borrow_mut(|p| *p = Some(bytes));
+}
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn transport_append() -> Option<String> {
+    TRANSPORT_APPEND.with_borrow_mut(Option::take)
+}
+
+#[cfg(target_arch = "wasm32")]
 std::thread_local! {
     static HELD_MOVE: std::cell::RefCell<Option<(js_sys::Promise, js_sys::Function)>> = const { std::cell::RefCell::new(None) };
     static HELD_JOB_READ: std::cell::RefCell<Option<(js_sys::Promise, js_sys::Function)>> = const { std::cell::RefCell::new(None) };

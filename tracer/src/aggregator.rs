@@ -11,13 +11,14 @@ use tokio_rustls::TlsAcceptor;
 pub struct Key {
     pub id: String,
     pub value: String,
-    pub cap: Option<f64>,
+    pub cap: Option<u64>,
     pub expires: Option<u64>,
-    pub spent: f64,
+    pub spent: u64,
     pub revoked: bool,
 }
 pub struct State {
     pub account: String,
+    pub credit_hundredths: u64,
     pub keys: Vec<Key>,
     pub now: u64,
     started: Instant,
@@ -47,6 +48,7 @@ impl State {
                 "fixture-account-{}",
                 hex::encode(crate::fixtures::urandom::<24>())
             ),
+            credit_hundredths: 1_000_000,
             keys: vec![],
             now: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -83,7 +85,7 @@ impl State {
             .is_some_and(|k| {
                 !k.revoked
                     && k.expires.is_none_or(|e| self.now() < e)
-                    && k.cap.is_none_or(|c| k.spent + 0.01 <= c + f64::EPSILON)
+                    && k.cap.is_none_or(|c| k.spent < c)
             })
     }
     pub fn respond(
@@ -109,6 +111,7 @@ impl State {
         }
         let v: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
         let result = match path {
+            "/time" => (200, json!({"issuer_time":self.now()}).to_string()),
             "/account" => (200, json!({"automatic_top_up":self.top_up}).to_string()),
             "/keys" => {
                 let id = format!("fixture-key-{}", self.keys.len());
@@ -119,9 +122,20 @@ impl State {
                 self.keys.push(Key {
                     id: id.clone(),
                     value: value.clone(),
-                    cap: v["cap"].as_str().and_then(|s| s.parse().ok()),
+                    cap: v["cap"].as_str().and_then(|s| {
+                        s.strip_prefix("0.")
+                            .and_then(|s| s.parse().ok())
+                            .or_else(|| {
+                                s.split_once('.').and_then(|(a, b)| {
+                                    a.parse::<u64>()
+                                        .ok()?
+                                        .checked_mul(100)?
+                                        .checked_add(b.parse::<u64>().ok()?)
+                                })
+                            })
+                    }),
                     expires: v["expires"].as_u64(),
-                    spent: 0.,
+                    spent: 0,
                     revoked: false,
                 });
                 (
@@ -129,7 +143,7 @@ impl State {
                     if self.identifier_only {
                         json!({"key_id":id}).to_string()
                     } else {
-                        json!({"key_id":id,"key":value}).to_string()
+                        json!({"key_id":id,"key":value,"cap":self.keys.last().unwrap().cap.map(|c|format!("{}.{:02}",c/100,c%100)),"expires":self.keys.last().unwrap().expires,"unit":"account units"}).to_string()
                     },
                 )
             }
@@ -152,7 +166,24 @@ impl State {
                     .and_then(|s| s.strip_prefix("Bearer "))
                     .unwrap_or("");
                 if !self.accepts(key) {
-                    return Some((402, "{}".into()));
+                    let code = self
+                        .keys
+                        .iter()
+                        .find(|k| k.value == key)
+                        .map(|k| {
+                            if k.expires.is_some_and(|e| self.now() >= e) {
+                                "key_expired"
+                            } else if k.cap.is_some_and(|cap| k.spent >= cap) {
+                                "key_cap_exhausted"
+                            } else {
+                                "key_unavailable"
+                            }
+                        })
+                        .unwrap_or("key_unavailable");
+                    return Some((402, json!({"error":{"code":code}}).to_string()));
+                }
+                if self.credit_hundredths == 0 {
+                    return Some((402, json!({"error":{"code":"account_balance"}}).to_string()));
                 }
                 if self.redirect {
                     return Some((307, String::new()));
@@ -165,7 +196,8 @@ impl State {
                     return Some((404,json!({"error":{"message":"No allowed providers are available for the selected model.","code":404,"metadata":{"requested_providers":["fixture-provider"]}}}).to_string()));
                 }
                 let key = self.keys.iter_mut().find(|k| k.value == key).unwrap();
-                key.spent += 0.01;
+                key.spent += 1;
+                self.credit_hundredths -= 1;
                 let mut reply = json!({"id":if self.no_report {"chatcmpl-fixture"} else {"gen-fixture"},"object":"chat.completion","model":"fixture-model","choices":[{"index":0,"message":{"role":"assistant","content":if self.echo {key.value.as_str()} else {"fixture response"}},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":5,"total_tokens":8}});
                 let mut escaped_key = None;
                 if let Some(mut call) = self.script.pop_front() {
@@ -297,6 +329,9 @@ impl Aggregator {
             .collect()
     }
     pub fn count(&self, path: &str) -> usize {
+        self.count_method("POST", path)
+    }
+    pub fn count_method(&self, method: &str, path: &str) -> usize {
         self.requests
             .lock()
             .unwrap()
@@ -305,7 +340,7 @@ impl Aggregator {
                 String::from_utf8_lossy(r)
                     .lines()
                     .next()
-                    .is_some_and(|s| s.starts_with(&format!("POST {path} ")))
+                    .is_some_and(|s| s.starts_with(&format!("{method} {path} ")))
             })
             .count()
     }
@@ -372,7 +407,7 @@ async fn serve(
             && ((path == "/revoke" && s.hold_revoke)
                 || (path == "/completion" && std::mem::take(&mut s.hold_completion)))
     };
-    if hold {
+    if hold && path == "/revoke" {
         std::future::pending::<()>().await;
     }
     let mint = if method == "POST" && path == "/keys" {
@@ -384,6 +419,10 @@ async fn serve(
         release.notified().await;
     }
     let result = state.lock().unwrap().respond(method, path, &headers, &body);
+    // Charge admission precedes a held completion reply: losing it never refunds the key.
+    if hold && path == "/completion" {
+        std::future::pending::<()>().await;
+    }
     let Some((status, body)) = result else {
         return Ok(());
     };
@@ -426,7 +465,7 @@ mod tests {
         s.respond("POST", "/completion", &h, b"{}");
         s.respond("POST", "/completion", &h, b"{}");
         assert!(!s.accepts(&key));
-        s.keys[0].spent = 0.;
+        s.keys[0].spent = 0;
         s.now = 100;
         assert!(!s.accepts(&key));
         s.now = 99;

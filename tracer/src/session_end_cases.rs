@@ -632,9 +632,11 @@ async fn cold_probe(
         "only the revoke probe is sent after ending",
         sent && count() == probes + 1,
     );
+    let original_key_id = key_id(run, &last_key(run));
+    let revoke = settle_for(run.seen, 5, |_| revoke_sent(run, &original_key_id)).await;
     case.check(
-        "revoke itself is sent",
-        revoke_sent(run, &key_id(run, &last_key(run))),
+        "revoke itself is sent for the original known identity",
+        revoke,
     );
     end_open(run, worker, &mut case).await?;
     cases.push(case);
@@ -802,15 +804,57 @@ async fn rekey_append(
         case.check("append still suspended after socket closes",module(run,worker,"let done=false;self.sessionResult.then(()=>done=true);await new Promise(r=>setTimeout(r,0));return done;").await?==false);
         module(run, worker, "self.releaseMove();return true;").await?;
         let report = answer(run, worker).await?;
+        let evidence = if site == "command" {
+            report["outcome"]["job_record"].clone()
+        } else {
+            report["outcome"][if site == "held" { "calls" } else { "collected" }]
+                .as_array()
+                .and_then(|rs| rs.iter().find(|r| r["number"].is_u64()))
+                .cloned()
+                .unwrap_or(Value::Null)
+        };
         case.check(
             "begun evidence append still completes",
+            evidence["number"].is_u64() && evidence["state"] == "finished",
+        );
+        case.check(
+            "late committed outcome is historical and never actionable",
             if site == "command" {
-                report["outcome"]["done"] == true
+                report["outcome"]["historical"] == true
+                    && report["outcome"]["actionable"] == false
+                    && report["outcome"].get("done").is_none()
+                    && report["outcome"]["call"] == evidence["call"]
+                    && report["outcome"]["terminal"] == evidence["number"]
             } else {
-                report["outcome"][if site == "held" { "calls" } else { "collected" }]
-                    .as_array()
-                    .is_some_and(|rs| rs.iter().any(|r| r["number"].is_u64()))
+                evidence["historical"] == true && evidence["actionable"] == false
             },
+        );
+        let files = store_files(&run.dump(tab).await?);
+        let opened = reader::read(&files, PASSPHRASE)?;
+        let committed = opened
+            .records
+            .iter()
+            .find(|(number, _)| Some(*number) == evidence["number"].as_u64())
+            .and_then(|(_, bytes)| serde_json::from_slice::<Value>(bytes).ok());
+        case.check(
+            "independent reader proves exact original call job boot record and terminal",
+            committed.as_ref().is_some_and(|v| {
+                v["job_terminal"]["call"] == evidence["call"]
+                    && v["job_terminal"]["job"] == evidence["job"]
+                    && v["job_terminal"]["record"] == evidence["record"]
+            }),
+        );
+        if site == "command" {
+            case.check(
+                "late terminal retains exact output and exit outcome",
+                evidence["stdout"] == "rekey-evidence" && evidence["exit_status"] == 0,
+            );
+        }
+        let sends = run.seen.lock().unwrap().ssh_exec.len();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        case.check(
+            "late evidence causes no next SSH effect",
+            run.seen.lock().unwrap().ssh_exec.len() == sends,
         );
         end_open(run, worker, &mut case).await?;
         cases.push(case);

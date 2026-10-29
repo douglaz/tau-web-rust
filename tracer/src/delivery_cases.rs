@@ -11,7 +11,7 @@ fn service(name: &str, lifecycle: &str) -> Value {
 fn measured(v: Value) -> Value {
     json!({"read":"value","value":v})
 }
-fn clean() -> Value {
+pub(super) fn clean() -> Value {
     json!({"inbound":measured(json!([{"proto":"tcp","port":22,"from":"any"}])),"outbound":measured(json!([])),
         "services":measured(json!([])),"spendable":measured(json!(false)),"permitted":measured(json!([])),
         "required":measured(json!([])),"credentials":measured(json!([])),"fixed_default_credentials":measured(json!(true)),

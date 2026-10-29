@@ -1,3 +1,5 @@
+#[path = "lifecycle_cases.rs"]
+mod lifecycle_cases;
 #[path = "session_end_cases.rs"]
 mod session_end_cases;
 // Browser evidence uses real fetch against the loopback fixture, then searches its key needles.
@@ -29,6 +31,7 @@ async fn origin(run: &Run<'_>, worker: &Worker) -> Result<(), String> {
     Ok(())
 }
 async fn infer(run: &Run<'_>, worker: &Worker) -> Result<Value, String> {
+    module(run, worker, "return await m.test_confirm_inference();").await?;
     module(run,worker,&format!("return JSON.parse(await m.inference_request({}));",json!(json!({"machine":"fixture","messages":[{"role":"user","content":"browser prompt never journaled"}]}).to_string()))).await
 }
 async fn resume(run: &Run<'_>, tab: &Tab, worker: &mut Worker) -> Result<(), String> {
@@ -756,6 +759,19 @@ pub(super) async fn run(
     cases.push(case);
 
     let phase = std::env::var("TAU_TRACER_INFERENCE_PHASE").unwrap_or_default();
+    if phase == "lifecycle-boundaries" || phase == "lifecycle-expiry" {
+        return lifecycle_cases::selected(run, tab, worker, cases, phase == "lifecycle-expiry")
+            .await;
+    }
+    if phase == "lifecycle-locked" {
+        return lifecycle_cases::locked_freeze(run, tab, worker, cases).await;
+    }
+    if phase == "lifecycle-repairs" {
+        return lifecycle_cases::repair_cases(run, tab, worker, cases).await;
+    }
+    if phase == "lifecycle" || phase == "lifecycle-core" {
+        return lifecycle_cases::run(run, tab, worker, cases).await;
+    }
     if phase == "sent-reads" {
         return sent_job_read_during_end(run, tab, worker, cases).await;
     }
@@ -774,6 +790,7 @@ pub(super) async fn run(
         job_read_during_end(run, tab, worker, cases).await?;
         sent_job_read_during_end(run, tab, worker, cases).await?;
         session_end_cases::run(run, tab, worker, cases).await?;
+        lifecycle_cases::run(run, tab, worker, cases).await?;
     }
     if phase == "dispatch" {
         return Ok(());
@@ -800,18 +817,28 @@ pub(super) async fn run(
         match end {
             "reload" => *worker = run.reload(tab, worker).await?,
             "hidden" => {
+                let before = run.inspect(worker).await?;
+                let mints = run.aggregator.count("/keys");
+                let revokes = run.aggregator.count("/revoke");
                 let other = run
                     .browser
                     .call(None, "Target.createTarget", json!({"url":"about:blank"}))
                     .await?;
-                *worker = run.worker(tab, Some(&old), false).await?;
-                run.browser
-                    .call(
-                        None,
-                        "Target.closeTarget",
-                        json!({"targetId":other["targetId"]}),
-                    )
-                    .await?;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                case.check(
+                    "scheduled hidden inference uses original session key",
+                    infer(run, worker).await?["finished"] == true,
+                );
+                let after = run.inspect(worker).await?;
+                case.check(
+                    "hide retains original session and limits without mint/revoke",
+                    after["sessions"][0]["identity"] == before["sessions"][0]["identity"]
+                        && after["sessions"][0]["inference_limits"]["original_expiry"]
+                            == before["sessions"][0]["inference_limits"]["original_expiry"]
+                        && run.aggregator.count("/keys") == mints
+                        && run.aggregator.count("/revoke") == revokes
+                        && run.aggregator.state.lock().unwrap().accepts(&key),
+                );
                 run.browser
                     .call(
                         None,
@@ -819,6 +846,15 @@ pub(super) async fn run(
                         json!({"targetId":tab.target}),
                     )
                     .await?;
+                run.browser
+                    .call(
+                        None,
+                        "Target.closeTarget",
+                        json!({"targetId":other["targetId"]}),
+                    )
+                    .await?;
+                cases.push(case);
+                continue;
             }
             "pagehide" | "bfcache" => {
                 let expression = if end == "pagehide" {
@@ -971,6 +1007,9 @@ pub(super) async fn run(
         restart(run, tab, worker).await?;
         let mut case =
             Case::new("mint finishing during session end is revoked before the end answers");
+        if module(run, worker, "return await m.test_confirm_inference();").await? != true {
+            return Err("late mint fixture lacks its fresh synthetic session confirmation".into());
+        }
         let release = Arc::new(tokio::sync::Notify::new());
         run.aggregator.state.lock().unwrap().hold_mint = Some(release.clone());
         let before = run.aggregator.count("/keys");
@@ -1032,11 +1071,12 @@ pub(super) async fn run(
         let result = infer(run, worker).await?;
         run.aggregator.state.lock().unwrap().identifier_only = false;
         let key = last_key(run);
+        let state = run.inspect(worker).await?;
         case.check(
-            "identifier-only response installs no row-2 holding",
+            "identifier-only response installs no row-2 holding and ends missing acceptance",
             result.get("refused").is_some()
-                && run.inspect(worker).await?["sessions"][0]["given"]
-                    == json!([{"row":3,"machine":"fixture"}]),
+                && state["sessions"][0]["session_state"] == "ended"
+                && state["sessions"][0]["given"] == json!([]),
         );
         setup_cases::click(run, tab, "#tau-lock").await?;
         *worker = run.worker(tab, Some(worker), false).await?;

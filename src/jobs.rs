@@ -84,7 +84,7 @@ pub enum Record {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum State {
     Finished,
@@ -159,7 +159,7 @@ pub struct Evidence {
     pub record: Record,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "agreement", rename_all = "snake_case")]
 pub enum Comparison {
     AdvisoryMatch,
@@ -167,7 +167,7 @@ pub enum Comparison {
     NoRecord,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Report {
     pub number: Option<u64>,
     #[serde(flatten)]
@@ -221,6 +221,25 @@ pub fn uncommitted(evidence: &Evidence, machine: &str, command: &str) -> Report 
     let mut report = evidence.report(0, machine, command);
     report.number = None;
     report
+}
+
+/// A stale continuation can still carry truthful outcome/accounting information.
+pub(crate) fn historical(value: &mut serde_json::Value, why: &str) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            if fields.contains_key("call") || fields.contains_key("done") {
+                fields.remove("done");
+                fields.insert("historical".into(), true.into());
+                fields.insert("actionable".into(), false.into());
+                fields.insert("refused".into(), why.into());
+            }
+            for nested in fields.values_mut() {
+                historical(nested, why);
+            }
+        }
+        serde_json::Value::Array(values) => values.iter_mut().for_each(|v| historical(v, why)),
+        _ => {}
+    }
 }
 
 pub fn unresolved(call: u64, why: &str, evidence: Option<&Report>) -> serde_json::Value {

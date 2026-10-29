@@ -170,6 +170,48 @@ fn check_event(number: u64, event: &Value) -> Result<(), String> {
         return crate::inference_reader::shape(number, event);
     }
     match kind.as_str() {
+        "dedicated_reinstall" => {
+            let record = body
+                .as_object()
+                .filter(|o| o.len() == 1)
+                .ok_or("dedicated record kind")?;
+            let (kind, b) = record.iter().next().unwrap();
+            match kind.as_str() {
+                "approve" => {
+                    exact(b, &["reset", "entry", "session", "facts", "modes"])?;
+                    for name in ["reset", "entry", "session"] {
+                        if b[name].as_str().is_none_or(str::is_empty) {
+                            return Err("dedicated approval text".into());
+                        }
+                    }
+                    mode_list(&b["modes"])?;
+                    exact(&b["facts"], &["arguments", "cost_bound", "bundle_commit"])?;
+                }
+                "activation" => exact(b, &["entry"])?,
+                "read" => {
+                    exact(b, &["entry", "activation", "confirmed"])?;
+                    if b["activation"].as_u64().is_none() || b["confirmed"].as_bool().is_none() {
+                        return Err("dedicated read".into());
+                    }
+                }
+                "withdraw" => {
+                    exact(b, &["approval", "reset", "entry"])?;
+                    if b["approval"].as_u64().is_none() {
+                        return Err("dedicated withdrawal".into());
+                    }
+                }
+                "dispatch" => {
+                    exact(b, &["approval", "reset", "read", "intent"])?;
+                    if b["approval"].as_u64().is_none()
+                        || b["read"].as_u64().and_then(|n| n.checked_add(1)) != Some(number)
+                    {
+                        return Err("dedicated immediate read".into());
+                    }
+                    check_event(number, &json!({"operation_intent":b["intent"]}))?;
+                }
+                _ => return Err("unknown dedicated record".into()),
+            }
+        }
         "exposure" => {
             exact_optional(body, &["session", "bound_set"], "accepted_modes")?;
             if body.get("accepted_modes").is_some()
@@ -1313,7 +1355,9 @@ mod tests {
             async fn exchange(&mut self, r: &Request) -> Option<Response> {
                 let body = match r.path {
                     "/account" => r#"{"automatic_top_up":false}"#,
-                    "/keys" => r#"{"key_id":"fixture-key","key":"fixture-private-key"}"#,
+                    "/keys" => {
+                        r#"{"key_id":"fixture-key","key":"fixture-private-key","cap":"0.10","expires":1000,"unit":"account units"}"#
+                    }
                     "/completion" => self.0,
                     _ => "{}",
                 };
@@ -1340,6 +1384,7 @@ mod tests {
             )),
         )
         .unwrap();
+        store.synthetic_confirm_limits(100).unwrap();
         for (body, absent, present, expected) in [
             (
                 r#"{"provider":"","id":"valid-id"}"#,

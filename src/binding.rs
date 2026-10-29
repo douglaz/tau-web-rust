@@ -57,6 +57,7 @@ pub struct Session {
     pub identity: String,
     pub bound_set: Vec<String>,
     pub(crate) given: std::cell::RefCell<Vec<Holding>>,
+    pub(crate) ended: std::cell::Cell<bool>,
 }
 
 impl Session {
@@ -64,6 +65,7 @@ impl Session {
         Self {
             identity,
             bound_set: vec![machine.clone()],
+            ended: std::cell::Cell::new(false),
             given: std::cell::RefCell::new(vec![Holding {
                 machine,
                 credential: Box::new(key),

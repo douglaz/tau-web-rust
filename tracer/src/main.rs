@@ -1961,7 +1961,7 @@ async fn run_cases(
     binding_cases::prepare(run, &tab, &mut worker, PASSPHRASE).await?;
     cases.push(case);
 
-    // twr-ggw.5 AC3: reload, explicit lock, page hide and a killed worker each require unlock again.
+    // Full end requires unlock; ordinary hide keeps the eligible worker.
     let mut case = Case::new("reload requires unlock again (twr-ggw.5 AC3, CNF-82)");
     let before = run.inspect(&worker).await?;
     let old = worker.clone();
@@ -2006,44 +2006,39 @@ async fn run_cases(
 
     worker = settle_unresolved(run, &tab, worker).await?;
     let mut case =
-        Case::new("page hide requires unlock again, and ends its exec (twr-ggw.5 AC3, CNF-82)");
+        Case::new("ordinary page hide retains its worker and scheduled command (CNF-82)");
+    browser.evaluate(&tab.session, "window.__tracerVisibility = []; document.addEventListener('visibilitychange', () => window.__tracerVisibility.push(document.visibilityState))").await?;
+    let before_hidden = run.inspect(&worker).await?;
+    let original_worker = worker.clone();
+    let other = browser
+        .call(None, "Target.createTarget", json!({"url":"about:blank"}))
+        .await?;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    fresh_pace(relay);
+    let hidden_result = run.harness_run(&worker, args("fixture")).await?;
+    case.check(
+        "scheduled command completes while hidden",
+        hidden_result["outcome"]["done"] == true,
+    );
+    case.check(
+        "same session bindings and context survive hide",
+        run.inspect(&worker).await?["sessions"] == before_hidden["sessions"]
+            && run.live_workers(&tab) == vec![original_worker],
+    );
     browser
-        .evaluate(
-            &tab.session,
-            "window.__tracerVisibility = []; document.addEventListener('visibilitychange', () => window.__tracerVisibility.push(document.visibilityState))",
+        .call(
+            None,
+            "Target.activateTarget",
+            json!({"targetId":tab.target}),
         )
         .await?;
-    // The browser's own visibilitychange: in headless Chromium a new tab hides this one.
-    worker = lock_during_command(
-        run,
-        &mut case,
-        &tab,
-        worker,
-        &args,
-        "visibilitychange to hidden",
-        async {
-            let other = browser
-                .call(None, "Target.createTarget", json!({ "url": "about:blank" }))
-                .await?;
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            browser
-                .call(
-                    None,
-                    "Target.activateTarget",
-                    json!({ "targetId": tab.target }),
-                )
-                .await?;
-            browser
-                .call(
-                    None,
-                    "Target.closeTarget",
-                    json!({ "targetId": other["targetId"] }),
-                )
-                .await
-                .map(|_| ())
-        },
-    )
-    .await?;
+    browser
+        .call(
+            None,
+            "Target.closeTarget",
+            json!({"targetId":other["targetId"]}),
+        )
+        .await?;
     let visibility = browser
         .evaluate(&tab.session, "window.__tracerVisibility")
         .await?;
@@ -2140,9 +2135,7 @@ async fn run_cases(
     );
     cases.push(case);
 
-    // One writer: while one tab holds the store, the other neither unlocks nor appends. Opening
-    // the second tab hides the first, whose worker restarts; either tab's worker may then win the
-    // lock, so the roles are read from what the pages and workers report.
+    // Opening another tab hides the first without releasing its writer ownership.
     let mut case = Case::new("one writer (twr-ggw.5, STA-1, STA-7)");
     let first = tab;
     let (second, _) = run.open(tracer_origin, true).await?;
@@ -2155,12 +2148,11 @@ async fn run_cases(
     for _ in 0..300 {
         views = (run.view(&first).await?, run.view(&second).await?);
         let states = [views.0["store"].as_str(), views.1["store"].as_str()];
-        settled = one(&first).is_some_and(|w| w != worker)
+        settled = one(&first).is_some_and(|w| w == worker)
             && one(&second).is_some()
             && views.0["status"] == "ready"
             && views.1["status"] == "ready"
-            && (states == [Some("locked"), Some("in-use")]
-                || states == [Some("in-use"), Some("locked")]);
+            && states == [Some("unlocked"), Some("in-use")];
         if settled {
             break;
         }
@@ -2172,10 +2164,10 @@ async fn run_cases(
     );
     if !settled {
         return Err(format!(
-            "one writer: the tabs did not settle with one offering Unlock and the other waiting: {views:?}"
+            "one writer: the surviving unlocked holder and waiting instance did not remain distinct: {views:?}"
         ));
     }
-    let (holder, other, other_view) = if views.0["store"] == "locked" {
+    let (holder, other, other_view) = if views.0["store"] == "unlocked" {
         println!("   the first tab holds the store");
         (first, second, views.1)
     } else {
@@ -2189,10 +2181,9 @@ async fn run_cases(
             .call(Some(&w.session), "Runtime.enable", json!({}))
             .await?;
     }
-    let view = run.submit(&holder, "unlock", PASSPHRASE).await?;
     case.check(
-        "the tab holding the lock unlocks",
-        view["store"] == "unlocked",
+        "the original hidden holder remains unlocked without another passphrase",
+        run.view(&holder).await?["store"] == "unlocked",
     );
     let held_by_holder = run.inspect(&holder_worker).await?;
     case.check(
@@ -2248,9 +2239,12 @@ async fn run_cases(
         .call(Some(&other_worker.session), "Runtime.enable", json!({}))
         .await?;
     run.submit(&other, "unlock", PASSPHRASE).await?;
+    let successor = run.inspect(&other_worker).await?;
+    let mut durable = held_by_holder.clone();
+    durable["sessions"] = json!([]);
     case.check(
-        "and unlocks the same store",
-        run.inspect(&other_worker).await? == held_by_holder,
+        "and unlocks the same durable store without inheriting runtime session authority",
+        successor == durable && successor["sessions"] == json!([]),
     );
     (tab, worker) = (other, other_worker);
     cases.push(case);

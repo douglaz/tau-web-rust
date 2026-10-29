@@ -363,10 +363,23 @@ pub(super) async fn run(
             "pid":run.sshd.machine.observe()[&id].pid,
             "alive":false, "exit_status":0, "stdout":"", "stderr":""
         });
+        println!("   completed historical read: {entry}");
+        let mut observed_record = entry["job_record"].clone();
+        let historical = [&entry, &observed_record].into_iter().all(|value| {
+            value["historical"] == true
+                && value["actionable"] == false
+                && value.get("done").is_none()
+                && value["refused"].as_str().is_some_and(|why| !why.is_empty())
+        });
+        if let Some(fields) = observed_record.as_object_mut() {
+            for field in ["historical", "actionable", "refused"] {
+                fields.remove(field);
+            }
+        }
         case.check(&format!("criterion 8: {mode} reports not_journaled with the completed job_record and why, without not_read"),
-            report["outcome"]["held"] == true && entry["not_journaled"] == true
+            historical && report["outcome"]["held"] == true && entry["not_journaled"] == true
             && entry.get("not_read").is_none()
-            && entry["job_record"] == json!({"number":null,"call":call,"job":id,
+            && observed_record == json!({"number":null,"call":call,"job":id,
                 "record":expected_record,"state":"finished","agreement":"advisory_match",
                 "stdout":"","stderr":"","exit_status":0})
             && if mode == "writer-stop" {

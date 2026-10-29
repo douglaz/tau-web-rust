@@ -23,12 +23,23 @@ pub(super) fn end() {
             let _ = sender.send(Err("sessions ended".into()));
         }
     });
+    suspend();
+    DOCUMENTS.with_borrow_mut(BTreeMap::clear);
+}
+pub(crate) fn end_session(session: &str) {
+    super::inference::authority_changed();
+    if let Some(sender) = APPROVALS.with_borrow_mut(|pending| pending.remove(session)) {
+        let _ = sender.send(Err("session ended".into()));
+    }
+    DOCUMENTS.with_borrow_mut(|docs| docs.remove(session));
+    PENDING.with_borrow_mut(|pending| pending.remove(session));
+}
+pub(super) fn suspend() {
     FETCHES.with_borrow_mut(|fetches| {
         for f in fetches.drain(..) {
             f.abort();
         }
     });
-    DOCUMENTS.with_borrow_mut(BTreeMap::clear);
 }
 
 #[derive(Deserialize)]
@@ -49,6 +60,7 @@ pub async fn goal_request(request: String) -> String {
         .to_string()
 }
 async fn enter(request: &str) -> Result<(), String> {
+    let continuation = crate::lifecycle::owner().continuation()?;
     if !serde_json::from_str::<Value>(request).is_ok_and(|v| v.is_object()) {
         return Err("goal request".into());
     }
@@ -56,21 +68,27 @@ async fn enter(request: &str) -> Result<(), String> {
     if super::inference::ending() {
         return Err("sessions ended".into());
     }
+    continuation.check()?;
     if let Some(source) = &entry.document_source
         && (!goals::document_url(source) || web_sys::Request::new_with_str(source).is_err())
     {
         return Err("document source".into());
     }
     let source = entry.document_source.clone();
-    {
+    let runtime = {
         let local = local();
         let mut local = local.lock().await;
+        continuation.check()?;
         if super::inference::ending() {
             return Err("sessions ended".into());
         }
         if let Some(why) = local.dispatch_refusal() {
             return Err(why.into());
         }
+        let runtime = local
+            .store()
+            .ok_or("locked")?
+            .live_goal_session(&entry.session)?;
         local
             .store()
             .ok_or("locked")?
@@ -79,23 +97,56 @@ async fn enter(request: &str) -> Result<(), String> {
         if source.is_some() {
             PENDING.with_borrow_mut(|p| p.insert(entry.session.clone()));
         }
+        runtime
+    };
+    let result = async {
+        #[cfg(feature = "tracer")]
+        crate::testonly::session_point("document_send").await;
+        current_document(&runtime, &continuation).await?;
+        if let Some(source) = source
+            && let Some(text) = fetch_document(&source, &runtime, &continuation).await?
+        {
+            let local = local();
+            let mut local = local.lock().await;
+            continuation.check()?;
+            let store = local.store().ok_or("locked")?;
+            store.check_current_session(&runtime)?;
+            let safe = store.protect_output(&Value::String(text))?;
+            DOCUMENTS.with_borrow_mut(|docs| {
+                docs.insert(
+                    entry.session.clone(),
+                    safe.as_str().expect("protected text").into(),
+                )
+            });
+        }
+        Ok(())
     }
-    // The goal's source has committed. End may have begun while that append waited.
-    if super::inference::ending() {
-        PENDING.with_borrow_mut(|p| p.remove(&entry.session));
-        return Err("sessions ended".into());
-    }
-    if let Some(source) = source
-        && let Some(text) = fetch_document(&source).await
-        && !super::inference::ending()
-    {
-        DOCUMENTS.with_borrow_mut(|docs| docs.insert(entry.session.clone(), text));
-    }
+    .await;
     PENDING.with_borrow_mut(|p| p.remove(&entry.session));
-    Ok(())
+    result
 }
 
-async fn fetch_document(source: &str) -> Option<String> {
+async fn current_document(
+    session: &crate::binding::Session,
+    continuation: &crate::lifecycle::Continuation,
+) -> Result<(), String> {
+    let local = local();
+    let mut local = local.lock().await;
+    continuation.check()?;
+    if super::inference::ending() {
+        return Err("sessions ended".into());
+    }
+    local
+        .store()
+        .ok_or("locked")?
+        .check_current_session(session)
+}
+
+async fn fetch_document(
+    source: &str,
+    session: &crate::binding::Session,
+    continuation: &crate::lifecycle::Continuation,
+) -> Result<Option<String>, String> {
     use web_sys::{
         RequestCache, RequestCredentials, RequestInit, RequestMode, RequestRedirect, ResponseType,
     };
@@ -105,13 +156,12 @@ async fn fetch_document(source: &str) -> Option<String> {
     init.set_mode(RequestMode::Cors);
     init.set_cache(RequestCache::NoStore);
     init.set_credentials(RequestCredentials::Omit);
-    let controller = web_sys::AbortController::new().ok()?;
+    let controller = web_sys::AbortController::new().map_err(|_| "document abort controller")?;
     init.set_signal(Some(&controller.signal()));
-    let request = web_sys::Request::new_with_str_and_init(source, &init).ok()?;
+    let request =
+        web_sys::Request::new_with_str_and_init(source, &init).map_err(|_| "document request")?;
     let worker: web_sys::WorkerGlobalScope = js_sys::global().unchecked_into();
-    if super::inference::ending() {
-        return None;
-    }
+    current_document(session, continuation).await?;
     FETCHES.with_borrow_mut(|fs| fs.push(controller.clone()));
     let result = async {
         let response: web_sys::Response = JsFuture::from(worker.fetch_with_request(&request))
@@ -119,6 +169,9 @@ async fn fetch_document(source: &str) -> Option<String> {
             .ok()?
             .dyn_into()
             .ok()?;
+        if current_document(session, continuation).await.is_err() {
+            return None;
+        }
         if !(200..300).contains(&response.status())
             || matches!(
                 response.type_(),
@@ -134,7 +187,10 @@ async fn fetch_document(source: &str) -> Option<String> {
     }
     .await;
     FETCHES.with_borrow_mut(|fs| fs.retain(|f| f != &controller));
-    result
+    #[cfg(feature = "tracer")]
+    crate::testonly::session_point("document_release").await;
+    current_document(session, continuation).await?;
+    Ok(result)
 }
 
 #[wasm_bindgen]
@@ -172,17 +228,6 @@ pub async fn goal_accept(request: String) -> String {
         .await
         .report(result.as_ref().err().map(String::as_str))
         .to_string()
-}
-
-fn publish(report: Value) {
-    let worker: web_sys::DedicatedWorkerGlobalScope = js_sys::global().unchecked_into();
-    let message = js_sys::Object::new();
-    let _ = js_sys::Reflect::set(
-        &message,
-        &JsValue::from_str("requirements_store"),
-        &JsValue::from_str(&report.to_string()),
-    );
-    let _ = worker.post_message(&message);
 }
 
 #[wasm_bindgen]
@@ -253,12 +298,45 @@ pub async fn requirements_answer(request: String) -> String {
 
 struct SessionDriver {
     session: String,
+    live: std::rc::Rc<crate::binding::Session>,
+}
+impl SessionDriver {
+    // Preserve the context and an identifiable unsent step while current authority is withheld.
+    async fn wait_current(&self) -> Result<(), String> {
+        loop {
+            let changed = super::inference::authority_notification();
+            let mut notified = std::pin::pin!(changed.notified());
+            notified.as_mut().enable();
+            if self.ending() {
+                return Err("sessions ended".into());
+            }
+            let ready = {
+                let local = local();
+                let mut local = local.lock().await;
+                local
+                    .store()
+                    .ok_or("locked")?
+                    .check_current_session(&self.live)
+                    .is_ok()
+            };
+            if ready {
+                return Ok(());
+            }
+            if self.ending() {
+                return Err("session ended".into());
+            }
+            notified.await;
+        }
+    }
 }
 impl Driver for SessionDriver {
     fn ending(&self) -> bool {
-        super::inference::ending()
+        super::inference::ending() || self.live.ended.get()
     }
     async fn turn(&mut self, request: &Value) -> Value {
+        if let Err(why) = self.wait_current().await {
+            return json!({"refused":why});
+        }
         crate::inference::infer_tools(
             &mut super::inference::Writer(local()),
             &mut super::inference::Fetch,
@@ -275,11 +353,15 @@ impl Driver for SessionDriver {
         proposal: crate::declaration::Proposal,
         tool: &Tool,
     ) -> Result<(), String> {
+        self.wait_current().await?;
+        let continuation = crate::lifecycle::owner().continuation()?;
+        let generation = super::inference::publication_generation();
         #[cfg(feature = "tracer")]
         crate::testonly::session_point("proposal_writer").await;
-        let receiver = {
+        let (receiver, report) = {
             let local = local();
             let mut local = local.lock().await;
+            continuation.check()?;
             if super::inference::ending() {
                 return Err("sessions ended".into());
             }
@@ -294,24 +376,61 @@ impl Driver for SessionDriver {
             )?;
             let (sender, receiver) = tokio::sync::oneshot::channel();
             APPROVALS.with_borrow_mut(|pending| pending.insert(self.session.clone(), sender));
-            publish(local.report(None));
-            receiver
+            (receiver, local.report(None).to_string())
         };
+        super::inference::publish_report(generation, self.session.clone(), report).await;
         let result = receiver
             .await
             .map_err(|_| "proposal approval cancelled".to_string())?;
-        if super::inference::ending() {
-            return Err("sessions ended".into());
-        }
+        self.wait_current().await?;
         result
     }
     async fn tool(&mut self, tool: &Tool) -> Value {
-        dispatch(&self.session, tool).await
+        if let Err(why) = self.wait_current().await {
+            return json!({"refused":why});
+        }
+        let continuation = crate::lifecycle::owner().continuation();
+        let mut result = dispatch(&self.session, tool).await;
+        if !continuation.as_ref().is_ok_and(|c| c.check().is_ok()) {
+            if let Some(o) = result.as_object_mut() {
+                o.remove("done");
+            }
+            result["historical"] = true.into();
+            result["refused"] = "stale goal result; reconciliation required".into();
+        }
+        let current = local();
+        let mut current = current.lock().await;
+        let Some(store) = current.store() else {
+            return json!({"refused":"locked"});
+        };
+        if let Err(why) = store.live_goal_session(&self.session) {
+            if let Some(o) = result.as_object_mut() {
+                o.remove("done");
+            }
+            result["historical"] = true.into();
+            result["refused"] = why.into();
+        }
+        let mut safe = store
+            .protect_output(&result)
+            .unwrap_or_else(|why| json!({"refused":why}));
+        if let Err(why) = store.live_goal_session(&self.session) {
+            crate::jobs::historical(&mut safe, &why);
+            if let Some(fields) = safe.as_object_mut() {
+                fields.remove("done");
+            }
+            safe["historical"] = true.into();
+            safe["refused"] = why.into();
+        }
+        safe
     }
 }
 
 #[wasm_bindgen]
 pub async fn run_goal(session: String) -> String {
+    let _continuation = match crate::lifecycle::owner().continuation() {
+        Ok(c) => c,
+        Err(why) => return json!({"refused":why}).to_string(),
+    };
     let prepared = async {
         let local = local();
         let mut local = local.lock().await;
@@ -333,19 +452,25 @@ pub async fn run_goal(session: String) -> String {
         if !STARTED.with_borrow_mut(|s| s.insert(session.clone())) {
             return Err("goal already started".into());
         }
-        Ok((goal, live.bound_set[0].clone()))
+        Ok((goal, live))
     }
     .await;
-    let (goal, machine) = match prepared {
+    let (goal, live) = match prepared {
         Ok(v) => v,
         Err(why) => return json!({"refused":why}).to_string(),
     };
+    let machine = live.bound_set[0].clone();
     let document = DOCUMENTS.with_borrow_mut(|d| d.remove(&session));
     #[cfg(feature = "tracer")]
     crate::testonly::session_point("goal_turn").await;
-    goals::run(&mut SessionDriver { session }, &goal, &machine, document)
-        .await
-        .to_string()
+    goals::run(
+        &mut SessionDriver { session, live },
+        &goal,
+        &machine,
+        document,
+    )
+    .await
+    .to_string()
 }
 
 async fn dispatch(session: &str, tool: &Tool) -> Value {
@@ -394,12 +519,16 @@ async fn dispatch(session: &str, tool: &Tool) -> Value {
                 false,
             )
             .await;
-            match result {
+            let result = match result {
                 Ok(done) => {
                     json!({"stdout":String::from_utf8_lossy(&done.stdout),"stderr":String::from_utf8_lossy(&done.stderr),"exit_status":done.exit_status})
                 }
                 Err(why) => why.to_json(),
-            }
+            };
+            journal
+                .release(result)
+                .await
+                .unwrap_or_else(|why| json!({"refused":why}))
         }
         Tool::Job { job, .. } => {
             let live = match journal.connection_session(tool.machine()).await {
@@ -480,4 +609,12 @@ pub async fn test_model_tool(session: String, call: String) -> String {
         Some(tool) => dispatch(&session, &tool).await.to_string(),
         None => json!({"refused":"tool schema"}).to_string(),
     }
+}
+
+#[cfg(feature = "tracer")]
+#[wasm_bindgen]
+pub fn test_document_state(session: String) -> String {
+    json!({"retained":DOCUMENTS.with_borrow(|docs| docs.contains_key(&session)),
+        "pending":PENDING.with_borrow(|pending| pending.contains(&session))})
+    .to_string()
 }

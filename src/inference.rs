@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::Digest;
 use zeroize::Zeroizing;
 
 pub const SESSION_CAP: &str = "0.10";
@@ -17,6 +18,11 @@ pub struct Candidate {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub enum Intent {
+    ClockRead {
+        call: u64,
+        session: String,
+        sent: crate::clock::Pair,
+    },
     AccountRead {
         call: u64,
         session: String,
@@ -26,6 +32,8 @@ pub enum Intent {
         session: String,
         cap: String,
         expires: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence: Option<crate::inference_limits::OriginEvidence>,
     },
     Completion {
         call: u64,
@@ -44,6 +52,7 @@ pub enum Intent {
 impl Intent {
     pub fn call(&self) -> u64 {
         match self {
+            Self::ClockRead { call, .. } => *call,
             Self::AccountRead { call, .. }
             | Self::Mint { call, .. }
             | Self::Completion { call, .. }
@@ -52,6 +61,7 @@ impl Intent {
     }
     pub fn kind(&self) -> &'static str {
         match self {
+            Self::ClockRead { .. } => "clock_read",
             Self::AccountRead { .. } => "account_read",
             Self::Mint { .. } => "mint",
             Self::Completion { .. } => "completion",
@@ -66,6 +76,14 @@ pub struct Terminal {
     pub call: u64,
     pub status: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer_time: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clock_received: Option<crate::clock::Pair>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clock_sent: Option<crate::clock::Pair>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub charge_refusal: Option<ChargeRefusal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub automatic_top_up: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key_id: Option<String>,
@@ -73,6 +91,8 @@ pub struct Terminal {
     pub cap: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -96,10 +116,15 @@ impl Terminal {
         Self {
             call,
             status,
+            issuer_time: None,
+            clock_received: None,
+            clock_sent: None,
+            charge_refusal: None,
             automatic_top_up: None,
             key_id: None,
             cap: None,
             expires: None,
+            unit: None,
             model: None,
             requested_provider: None,
             reported_provider: None,
@@ -112,6 +137,14 @@ impl Terminal {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChargeRefusal {
+    AccountBalance,
+    KeyCapExhausted,
+    KeyExpired,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Call {
     pub intent: Intent,
@@ -120,12 +153,68 @@ pub struct Call {
 
 /// A transport request is transient and never serializable or printable.
 pub struct Request {
+    pub(crate) runtime: Option<std::rc::Rc<crate::binding::Session>>,
+    pub(crate) clock_sent: std::cell::Cell<Option<crate::clock::Pair>>,
+    pub(crate) clock_received: std::cell::Cell<Option<crate::clock::Pair>>,
+    pub(crate) approved_body: crate::store::Address,
+    pub(crate) call: u64,
+    pub(crate) session: String,
+    pub(crate) continuation: Option<crate::lifecycle::Continuation>,
+    pub(crate) scan_revision: u64,
     pub method: &'static str,
     pub origin: String,
     pub path: &'static str,
     pub account: Option<Zeroizing<String>>,
     pub authorization: Option<Zeroizing<String>>,
     pub body: Zeroizing<String>,
+}
+
+impl Request {
+    fn commitment(&self, body: &str) -> [u8; 32] {
+        let mut hash = sha2::Sha256::new();
+        for field in [
+            self.method,
+            &self.origin,
+            self.path,
+            self.account.as_deref().map_or("", |s| s.as_str()),
+            self.authorization.as_deref().map_or("", |s| s.as_str()),
+            body,
+        ] {
+            hash.update((field.len() as u64).to_be_bytes());
+            hash.update(field.as_bytes());
+        }
+        hash.finalize().into()
+    }
+    pub(crate) fn bind_bytes(&mut self) {
+        self.approved_body = crate::store::Address(self.commitment(&self.body));
+    }
+    pub(crate) fn unchanged(&self) -> bool {
+        self.unchanged_body(&self.body)
+    }
+    pub(crate) fn unchanged_body(&self, body: &str) -> bool {
+        self.approved_body.0 == self.commitment(body)
+    }
+    pub(crate) fn retained_unsent(&self) -> Self {
+        Self {
+            runtime: self.runtime.clone(),
+            clock_sent: std::cell::Cell::new(self.clock_sent.get()),
+            clock_received: std::cell::Cell::new(self.clock_received.get()),
+            approved_body: crate::store::Address(self.approved_body.0),
+            call: self.call,
+            session: self.session.clone(),
+            continuation: self.continuation.clone(),
+            scan_revision: self.scan_revision,
+            method: self.method,
+            origin: self.origin.clone(),
+            path: self.path,
+            account: self.account.as_ref().map(|s| Zeroizing::new(s.to_string())),
+            authorization: self
+                .authorization
+                .as_ref()
+                .map(|s| Zeroizing::new(s.to_string())),
+            body: Zeroizing::new(self.body.to_string()),
+        }
+    }
 }
 
 pub struct Finished {
@@ -147,9 +236,23 @@ pub trait Transport {
 /// The driver never holds the store writer across a network wait.
 #[allow(async_fn_in_trait, reason = "single worker")]
 pub trait Journal {
+    async fn probe_authority(
+        &mut self,
+        session: &str,
+    ) -> Result<
+        (
+            crate::lifecycle::Continuation,
+            std::rc::Rc<crate::binding::Session>,
+        ),
+        String,
+    >;
     type MintGuard;
     async fn mint_guard(&mut self, session: &str) -> Self::MintGuard;
     fn can_send(&self, revoke: bool) -> bool;
+    async fn mint_bounds(&mut self, session: &str, now: u64) -> Result<(String, u64), String>;
+    async fn authorize(&mut self, request: &Request, now: u64) -> bool;
+    async fn actionable(&mut self, request: &Request, now: u64) -> bool;
+    async fn current_at(&mut self, session: &str, now: u64) -> Result<(), String>;
     async fn session(&mut self, machine: &str) -> Result<String, String>;
     async fn has_key(&mut self, session: &str) -> Result<bool, String>;
     async fn prepare(
@@ -208,13 +311,34 @@ pub async fn probe(
     origin: &str,
     revoke: bool,
 ) -> Result<(), String> {
+    probe_with(journal, transport, origin, revoke, None).await
+}
+
+pub(crate) async fn probe_with(
+    journal: &mut impl Journal,
+    transport: &mut impl Transport,
+    origin: &str,
+    revoke: bool,
+    subject: Option<(
+        crate::lifecycle::Continuation,
+        std::rc::Rc<crate::binding::Session>,
+    )>,
+) -> Result<(), String> {
     if journal.route(origin, false).await {
         return Ok(());
     }
     if !journal.can_send(revoke) {
         return Err("sessions ended".into());
     }
-    let request = Request {
+    let mut request = Request {
+        runtime: subject.as_ref().map(|(_, s)| s.clone()),
+        clock_sent: std::cell::Cell::new(None),
+        clock_received: std::cell::Cell::new(None),
+        approved_body: crate::store::Address([0; 32]),
+        call: 0,
+        session: String::new(),
+        continuation: subject.map(|(c, _)| c),
+        scan_revision: 0,
         method: "OPTIONS",
         origin: origin.into(),
         path: "/",
@@ -222,6 +346,7 @@ pub async fn probe(
         authorization: Some(Zeroizing::new("probe-placeholder".into())),
         body: Zeroizing::new(String::new()),
     };
+    request.bind_bytes();
     if transport.exchange(&request).await.is_none() {
         return Err("no route to that origin in this build".into());
     }
@@ -229,22 +354,27 @@ pub async fn probe(
     Ok(())
 }
 
-pub(crate) async fn send(
+pub(crate) async fn send_at(
     journal: &mut impl Journal,
     transport: &mut impl Transport,
     session: &str,
     intent: Intent,
     origin: &str,
     body: Value,
+    now: &impl Fn() -> u64,
 ) -> Result<Value, String> {
     let revoke = matches!(intent, Intent::Revoke { .. });
+    if !revoke {
+        journal.current_at(session, now()).await?;
+    }
     let (call, request) = journal.prepare(session, intent, origin, body).await?;
     // Session end may have begun while the durable append was suspended.
-    if !journal.can_send(revoke) {
+    if !journal.can_send(revoke) || !journal.authorize(&request, now()).await {
         return Ok(json!({"unresolved":true,"call":call}));
     }
     match transport.exchange(&request).await {
         Some(response) => {
+            let actionable = revoke || journal.actionable(&request, now()).await;
             match journal.finish(call, &response, &request).await {
                 Ok(finished) => {
                     // A mint can supply its identifier after the end step's first snapshot.
@@ -257,7 +387,16 @@ pub(crate) async fn send(
                             .finish(revoke_call, &response, &revoke_request)
                             .await;
                     }
-                    Ok(finished.report)
+                    let mut report = finished.report;
+                    if !actionable || (!revoke && !journal.actionable(&request, now()).await) {
+                        report.as_object_mut().map(|v| v.remove("body"));
+                        report
+                            .as_object_mut()
+                            .expect("report object")
+                            .entry("refused")
+                            .or_insert(json!("ordinary authority withheld"));
+                    }
+                    Ok(report)
                 }
                 Err(_) => Ok(
                     json!({"unresolved":true,"call":call,"why":"the response terminal could not be committed"}),
@@ -266,6 +405,18 @@ pub(crate) async fn send(
         }
         None => Ok(json!({"unresolved":true,"call":call})),
     }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) async fn send(
+    journal: &mut impl Journal,
+    transport: &mut impl Transport,
+    session: &str,
+    intent: Intent,
+    origin: &str,
+    body: Value,
+) -> Result<Value, String> {
+    send_at(journal, transport, session, intent, origin, body, &|| 100).await
 }
 
 pub async fn infer(
@@ -331,10 +482,12 @@ async fn run(
         .session(request["machine"].as_str().expect("validated"))
         .await?;
     let mint_guard = journal.mint_guard(&session).await;
+    journal.current_at(&session, now()).await?;
     // A recorded mint attempt is checked before even a probe on subsequent requests.
     if !journal.has_key(&session).await? {
-        probe(journal, transport, origin, false).await?;
-        let mut read = send(
+        let subject = journal.probe_authority(&session).await?;
+        probe_with(journal, transport, origin, false, Some(subject)).await?;
+        let mut read = send_at(
             journal,
             transport,
             &session,
@@ -344,6 +497,7 @@ async fn run(
             },
             origin,
             Value::Null,
+            &now,
         )
         .await?;
         if !read["status"]
@@ -361,21 +515,21 @@ async fn run(
             };
             return Ok(read);
         }
-        let expires = now()
-            .checked_add(SESSION_LIFETIME_SECONDS)
-            .ok_or("clock out of range")?;
-        let mut minted = send(
+        let (cap, expires) = journal.mint_bounds(&session, now()).await?;
+        let mut minted = send_at(
             journal,
             transport,
             &session,
             Intent::Mint {
                 call: 0,
                 session: session.clone(),
-                cap: SESSION_CAP.into(),
+                cap: cap.clone(),
                 expires,
+                evidence: None,
             },
             origin,
-            json!({"cap":SESSION_CAP,"expires":expires}),
+            json!({"cap":cap,"expires":expires}),
+            &now,
         )
         .await?;
         if minted["finished"] == true && minted.get("refused").is_some() {
@@ -397,12 +551,13 @@ async fn run(
         }
     }
     drop(mint_guard);
-    probe(journal, transport, origin, false).await?;
+    let subject = journal.probe_authority(&session).await?;
+    probe_with(journal, transport, origin, false, Some(subject)).await?;
     let mut body = compose(candidate, request);
     if let Some(tools) = tools {
         body["tools"] = tools;
     }
-    send(
+    send_at(
         journal,
         transport,
         &session,
@@ -416,6 +571,7 @@ async fn run(
         },
         origin,
         body,
+        &now,
     )
     .await
 }

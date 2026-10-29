@@ -11,7 +11,7 @@ mod delivery;
 #[cfg(target_arch = "wasm32")]
 pub use delivery::*;
 #[cfg(target_arch = "wasm32")]
-mod goals;
+pub(crate) mod goals;
 #[cfg(target_arch = "wasm32")]
 pub(crate) mod inference;
 #[cfg(any(target_arch = "wasm32", test))]
@@ -128,6 +128,25 @@ pub fn valid_request(request: &serde_json::Value) -> bool {
 /// Live connection admission is above the dispatch core used by the formal comparison.
 #[allow(async_fn_in_trait, reason = "single worker")]
 pub trait BoundJournal: Journal {
+    async fn append_bound(
+        &mut self,
+        session: &crate::binding::Session,
+        entry: &Entry,
+        approval: &crate::dispatch::Approval,
+    ) -> Result<u64, AppendRefusal> {
+        self.current(session)
+            .await
+            .map_err(AppendRefusal::Storage)?;
+        self.append(entry, approval).await
+    }
+    async fn current(&self, session: &crate::binding::Session) -> Result<(), String>;
+    async fn release(&self, value: serde_json::Value) -> Result<serde_json::Value, String>;
+    async fn uncommitted(
+        &self,
+        evidence: &crate::jobs::Evidence,
+        machine: &str,
+        command: &str,
+    ) -> Result<crate::jobs::Report, String>;
     async fn connection_session(
         &mut self,
         machine: &str,
