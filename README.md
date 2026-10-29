@@ -5,7 +5,7 @@ browser and provisions real infrastructure on its operator's behalf. Rust, compi
 WebAssembly, following the configuration the specification records.
 
 **The specification lives in [`douglaz/tau-web-spec`](https://github.com/douglaz/tau-web-spec)
-and is vendored here at `spec/`, pinned to an exact commit, today `66762f1`** (spec ADR-0031).
+and is vendored here at `spec/`, pinned to an exact commit, today `9086166`** (spec ADR-0031).
 The build refuses to run if the checked-out tree does not match the pin, and every release
 records the spec commit it was built from. What the build compiles in from the pin:
 
@@ -27,7 +27,7 @@ Start reading at [`spec/00-overview.md`](./spec/00-overview.md). What to build f
 [`spec/07-conformance.md`](./spec/07-conformance.md), and its "Before declaring stage 1
 complete" paragraph.
 
-At the pin `66762f1`, stage 1 is `STG-21`'s scenario: one live LNVPS machine on
+At the pin `9086166`, stage 1 is `STG-21`'s scenario: one live LNVPS machine on
 catalogue plain Arch with no tenant, created through a typed adapter and paid by a Lightning
 invoice from the operator's own wallet. Hermes is installed with its own installer.
 Items 53 and 55 leave their `delivery_reboot` cases to the dedicated row. Item 95
@@ -46,8 +46,8 @@ The **Attest first-contact route** items `18, 23 (attest-window case), 61, 74–
 stage 1. These rows define completion requirements; the implementation described below is
 still under construction.
 
-See [the source-delta and open-citation inventory](docs/spec-66762f1-uptake.md) for this pin's wider contracts and remaining owners. Shared receipt fixtures below establish no live
-adapter, hidden-session continuation, protected-evidence, native-policy or publisher-hosting
+See [the source-delta and open-citation inventory](docs/spec-9086166-uptake.md) for this pin's wider contracts and remaining owners. Shared receipt fixtures below establish no live
+adapter, hidden-session continuation, complete protected-finalizer, native-policy or publisher-hosting
 acceptance. In particular, ordinary hide still locks in `www/boot.js`; twr-ggw.89 owns A1.
 
 ## The harness
@@ -665,25 +665,40 @@ cases. Browser cases use the independent writer to show an
 unresolved reset refusing without relay or SSH contact, confirmation permitting a command, and
 all four continuations preserving the real pinned attempt and collection with no intent.
 
+Canonical operation evidence also uses the closed protected-v1 receipt/association arms
+from Protected browser evidence v1 §3a. Canonical absent, retained and received-present
+withheld identities stay distinct from later display omission. Qualifying withheld evidence
+permanently excludes other entries; quarantined associations grant no target or settling
+constituent. Retained identity conflicts refuse before association append and admitted-map
+duplicates append nothing. Store previews on a clone, applies only after append, and replays
+the authenticated prefix. Scoped read-only projections preserve historical outcomes and
+canonical custody while withholding copied names and reindexing markers. These helpers and
+independent fixture controls supply shared prerequisites for .23's complete finalizer and
+CNF-112's adapter owners; they do not complete either feature. See the
+[uptake inventory](docs/spec-9086166-uptake.md) for exact contracts, unchanged inputs and owners.
+
 **The dispatch companion comparison** follows ADR-0032's comparison rule. It reads
-`spec/docs/design/dispatch-witnesses-v7.json` at run time, never compiled in. Its partition is an
+`spec/docs/design/dispatch-witnesses-v8.json` at run time, never compiled in. Its partition is an
 **implementation reading**: rescue content first, then reboot content in start or steps, then
 stage1. Empty reboot results and installation entries alone never route a trace; pairs stay
-whole. The header requires schema 7, namespace `TauWeb.Dispatch`, 3 events over 8 distinct
+whole. The header requires schema 8, namespace `TauWeb.Dispatch`, 3 events over 8 distinct
 alphabet events, and all 470 traces filtered to distinct request call ids, exactly once and
 starting at `bound.start`. A truncated enumeration fails.
 
-It runs stage1 only: 44 witnesses and 286 enumerated traces. The dedicated bucket, 54/184,
-belongs to twr-i6k.3; reboot, 12/0, belongs to twr-i6k.11. Together they cover 110/470. Each start
+It runs stage1 only: 52 witnesses and 286 enumerated traces. The dedicated bucket, 54/184,
+belongs to twr-i6k.3; reboot, 12/0, belongs to twr-i6k.11. Together they cover 118/470. Each start
 journals a seed-backup completion, one batch approval with one index per entry, explicit fixture
 class/declaration prerequisites, its calls and
-dispositions, including the invalid historical disposition. Extra index and vendor-id mappings
+dispositions, including the invalid historical disposition. Abstract durable journal ordinals
+map explicitly to production record numbers, including starting records and successful reads.
+Setup association constituents count individually; fixture seed/setup shells and approval
+scaffolding do not. Failed appends, refusals and admitted-map duplicates advance no ordinal. Extra index and vendor-id mappings
 are committed as association events and recover from files alone.
 Every outcome and projection member is compared at every step. Oldest-first
 members stay lists; resource/entry members are keyed sets. Unmoved members must stay empty.
 Inference and dispositions on its resource run in the core without store records. This
 comparison remains core-only for inference and does not use the new inference journal path;
-the witness file and its recorded outcomes are unchanged. Replay
+the inference comparison remains core-only at schema 8. Replay
 actually reopens the store. Command requests use the existing intent and job-evidence path,
 with target, session and requester provenance recorded by the production append. The file's
 approval facts map bijectively to the recorded pin admission's fingerprint, and its approval
@@ -701,10 +716,12 @@ own request cache.
 
 Production assumptions are `resourceKey: entry`, `reach: disposed`, `lapse: continuation` and
 all boolean guards true. Every unpaired trace and refused side matches, and each admitted side
-changes exactly its named guard and differs somewhere. All thirteen stage1 guard pairs are required, with both separate orderAssociation admitted traces
-run and checked. Bindings and complete retained receipt fields are compared; schema-7 nullable
+changes exactly its named guard and differs somewhere. All fourteen stage1 guard pairs are required, with both separate orderAssociation admitted traces
+run and checked. Bindings, receipt presence/withholding, quarantine and identity exclusions are compared; schema-8 nullable
 fields must actually be present. Journal compatibility defaults do not loosen witness shapes.
-Unknown vocabulary or members fail with the trace and step. Permanent negative controls include
+Required event-specific outcomes and closed refusal shapes are validated on all three routes,
+including admitted controls. Dedicated/reboot behavior is not executed here. Unknown, absent
+or inapplicable vocabulary or members fail with the trace and step. Permanent negative controls include
 an outcome flip, empty/absent file, unknown event/outcome, truncated enumeration, unknown
 member, missing pair side, a second disabled guard and wrong routing counts.
 
@@ -720,14 +737,15 @@ commit the test ran at:
 ```text
 dispatch companion comparison: passed
   rule: ADR-0032, How the implementation is compared; ticket partition is an implementation reading
-  file: spec/docs/design/dispatch-witnesses-v7.json
-  schema 7, module dispatch, namespace TauWeb.Dispatch, bound: 3 events over an alphabet of 8, distinct request call ids
-  stage1: 44 witnesses / 286 enumerated traces (twr-ggw.8)
+  file: spec/docs/design/dispatch-witnesses-v8.json
+  schema 8, module dispatch, namespace TauWeb.Dispatch, bound: 3 events over an alphabet of 8, distinct request call ids
+  stage1: 52 witnesses / 286 enumerated traces (twr-ggw.8)
   dedicated: 54 witnesses / 184 enumerated traces (twr-i6k.3)
   reboot: 12 witnesses / 0 enumerated traces (twr-i6k.11)
-  total: 110 witnesses / 470 enumerated traces
+  total: 118 witnesses / 470 enumerated traces
   compared: start, every outcome and projection member at every stage1 step; keyed sets compared by key
   commandHold: 4 named / 28 enumerated refusals
+  pair: TauWeb.Dispatch.excluded_order_refused refused matched; TauWeb.Dispatch.excluded_order_sent_without_guard admitted differed at step 4
   pair: TauWeb.Dispatch.order_receipt_association_required refused matched; TauWeb.Dispatch.order_receipt_without_association_admitted admitted differed at step 2
   pair: TauWeb.Dispatch.order_receipt_association_required refused matched; TauWeb.Dispatch.order_receipt_without_association_admitted admitted differed at step 3
   pair: TauWeb.Dispatch.second_command_held refused matched; TauWeb.Dispatch.second_command_without_hold admitted differed at step 2
@@ -742,7 +760,7 @@ dispatch companion comparison: passed
   pair: TauWeb.Dispatch.read_and_inference_never_restricted refused matched; TauWeb.Dispatch.read_and_inference_restricted_without_guard admitted differed at step 5
   pair: TauWeb.Dispatch.disposition_names_own_unresolved_calls refused matched; TauWeb.Dispatch.disposition_ends_call_elsewhere_without_guard admitted differed at step 3
   pair: TauWeb.Dispatch.replacement_in_force refused matched; TauWeb.Dispatch.replaced_continuation_dispatched_without_guard admitted differed at step 5
-  spec commit: 66762f1a63f43977f4ef407c194a73e1ae71458a
+  spec commit: 9086166b0ee62387da6440da059f5b89f01a0d8d
   implementation revision: the commit the test ran at
 ```
 

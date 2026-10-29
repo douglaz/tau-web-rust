@@ -326,11 +326,17 @@ fn receipt_and_association_append_failures_latch_without_live_effect_and_landed_
                     .unwrap_err()
                     .contains("earlier append failed")
             );
+            let mut fresh_association = association("fixture");
+            fresh_association.target = Target::VendorMachine("another-id".into());
             assert!(
-                block_on(store.associate(association("fixture")))
+                block_on(store.associate(fresh_association))
                     .unwrap_err()
                     .contains("earlier append failed")
             );
+            // An admitted duplicate performs no append, even when the writer is latched.
+            if !association_fails {
+                block_on(store.associate(association("fixture"))).unwrap();
+            }
             assert_eq!(store.storage().files(), latched_files);
             let landed = matches!(fault, Fault::LandThenFail(_));
             let mut replayed = reopen(&store);

@@ -9,6 +9,8 @@ mod setup;
 mod typed;
 pub use setup::*;
 pub use typed::*;
+mod evidence;
+pub use evidence::*;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod comparison;
@@ -136,7 +138,7 @@ pub enum SettlingRecord {
     Terminal(TerminalRecord),
     Observation(ObservationRecord),
     Receipt {
-        receipt: ReceiptRecord,
+        receipt: Box<ReceiptRecord>,
         association: Option<AssociationRecord>,
     },
     Disposition {
@@ -195,6 +197,7 @@ pub enum DispatchRefusal {
 #[derive(Clone, Debug, Default)]
 pub struct Dispatch {
     pub approved_entries: BTreeMap<String, ApprovedMachine>,
+    pub setup_approval: Option<u64>,
     pub intent_order: Vec<u64>,
     pub calls: BTreeMap<u64, Call>,
     pub terminals: Vec<TerminalRecord>,
@@ -417,7 +420,7 @@ impl Dispatch {
                             .iter()
                             .find(|r| r.number == *receipt)
                             .map(|r| SettlingRecord::Receipt {
-                                receipt: r.clone(),
+                                receipt: Box::new(r.clone()),
                                 association: association.and_then(|n| {
                                     self.association_records
                                         .iter()
