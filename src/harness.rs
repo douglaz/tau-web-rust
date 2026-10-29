@@ -150,6 +150,7 @@ pub trait BoundJournal: Journal {
     async fn connection_session(
         &mut self,
         machine: &str,
+        origin: Option<&std::rc::Rc<crate::binding::Session>>,
     ) -> Result<std::rc::Rc<crate::binding::Session>, crate::binding::AdmissionRefusal>;
     async fn relay_key(&self) -> Option<crate::credential::RelayKey>;
     fn credentials_available(&self) -> bool {

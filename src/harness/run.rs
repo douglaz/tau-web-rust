@@ -245,9 +245,10 @@ pub async fn run_command(
     journal: &mut impl BoundJournal,
     target: &Target,
     command: &[u8],
+    origin: Option<&std::rc::Rc<Session>>,
     #[cfg(feature = "tracer")] tamper_auth: bool,
 ) -> Result<Done, Refusal> {
-    let session = resolve(journal, &target.machine).await?;
+    let session = resolve(journal, &target.machine, origin).await?;
     journal
         .check_signature(&target.machine, command)
         .await
@@ -646,7 +647,7 @@ pub async fn collect_jobs(
     #[cfg(feature = "tracer")] tamper_auth: bool,
 ) -> Result<Vec<Value>, Refusal> {
     let stop = wait::Stop::collection();
-    let session = resolve(journal, &target.machine).await?;
+    let session = resolve(journal, &target.machine, None).await?;
     let calls = journal
         .collectable(&target.machine)
         .await
@@ -1001,9 +1002,10 @@ async fn text_frame(ws: &mut WsStream) -> Result<Value, String> {
 async fn resolve(
     journal: &mut impl BoundJournal,
     machine: &str,
+    origin: Option<&std::rc::Rc<Session>>,
 ) -> Result<std::rc::Rc<Session>, Refusal> {
     journal
-        .connection_session(machine)
+        .connection_session(machine, origin)
         .await
         .map_err(|refusal| match refusal {
             AdmissionRefusal::NoEntry => Refusal::NoEntry(machine.into()),

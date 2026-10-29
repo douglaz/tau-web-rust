@@ -872,6 +872,25 @@ impl<S: Storage> Store<S> {
         &mut self,
         machine: &str,
     ) -> Result<Rc<Session>, AdmissionRefusal> {
+        self.connection_session_for(machine, None).await
+    }
+
+    pub async fn connection_session_for(
+        &mut self,
+        machine: &str,
+        origin: Option<&Rc<Session>>,
+    ) -> Result<Rc<Session>, AdmissionRefusal> {
+        if let Some(origin) = origin {
+            self.check_current_session(origin)
+                .map_err(AdmissionRefusal::Journal)?;
+            if !origin.bound_set.iter().any(|m| m == machine) {
+                return Err(AdmissionRefusal::Journal("stale session binding".into()));
+            }
+            if !self.dispatch.approved_entries.contains_key(machine) {
+                return Err(AdmissionRefusal::NoEntry);
+            }
+            return Ok(Rc::clone(origin));
+        }
         if self.inference.ended {
             return Err(AdmissionRefusal::Journal("sessions ended".into()));
         }
@@ -5078,8 +5097,12 @@ impl<S: Storage> crate::harness::BoundJournal for Store<S> {
         self.protect_command_results(&value)
     }
 
-    async fn connection_session(&mut self, machine: &str) -> Result<Rc<Session>, AdmissionRefusal> {
-        Store::connection_session(self, machine).await
+    async fn connection_session(
+        &mut self,
+        machine: &str,
+        origin: Option<&Rc<Session>>,
+    ) -> Result<Rc<Session>, AdmissionRefusal> {
+        Store::connection_session_for(self, machine, origin).await
     }
     async fn relay_key(&self) -> Option<crate::credential::RelayKey> {
         Store::relay_key(self)

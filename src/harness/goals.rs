@@ -390,7 +390,7 @@ impl Driver for SessionDriver {
             return json!({"refused":why});
         }
         let continuation = crate::lifecycle::owner().continuation();
-        let mut result = dispatch(&self.session, tool).await;
+        let mut result = dispatch(&self.live, tool).await;
         if !continuation.as_ref().is_ok_and(|c| c.check().is_ok()) {
             if let Some(o) = result.as_object_mut() {
                 o.remove("done");
@@ -403,7 +403,7 @@ impl Driver for SessionDriver {
         let Some(store) = current.store() else {
             return json!({"refused":"locked"});
         };
-        if let Err(why) = store.live_goal_session(&self.session) {
+        if let Err(why) = store.check_current_session(&self.live) {
             if let Some(o) = result.as_object_mut() {
                 o.remove("done");
             }
@@ -413,7 +413,7 @@ impl Driver for SessionDriver {
         let mut safe = store
             .protect_output(&result)
             .unwrap_or_else(|why| json!({"refused":why}));
-        if let Err(why) = store.live_goal_session(&self.session) {
+        if let Err(why) = store.check_current_session(&self.live) {
             crate::jobs::historical(&mut safe, &why);
             if let Some(fields) = safe.as_object_mut() {
                 fields.remove("done");
@@ -473,7 +473,8 @@ pub async fn run_goal(session: String) -> String {
     .to_string()
 }
 
-async fn dispatch(session: &str, tool: &Tool) -> Value {
+async fn dispatch(live: &std::rc::Rc<crate::binding::Session>, tool: &Tool) -> Value {
+    let session = &live.identity;
     {
         let local = local();
         let mut local = local.lock().await;
@@ -486,6 +487,9 @@ async fn dispatch(session: &str, tool: &Tool) -> Value {
         let Some(store) = local.store() else {
             return json!({"refused":"locked"});
         };
+        if let Err(why) = store.check_current_session(live) {
+            return json!({"refused":why});
+        }
         if let Err(why) = store.check_tool(session, tool) {
             return json!({"refused":why});
         }
@@ -515,6 +519,7 @@ async fn dispatch(session: &str, tool: &Tool) -> Value {
                 &mut journal,
                 &target,
                 command.as_bytes(),
+                Some(live),
                 #[cfg(feature = "tracer")]
                 false,
             )
@@ -531,7 +536,7 @@ async fn dispatch(session: &str, tool: &Tool) -> Value {
                 .unwrap_or_else(|why| json!({"refused":why}))
         }
         Tool::Job { job, .. } => {
-            let live = match journal.connection_session(tool.machine()).await {
+            let live = match journal.connection_session(tool.machine(), Some(live)).await {
                 Ok(s) => s,
                 Err(_) => return json!({"refused":"session unavailable"}),
             };
@@ -606,7 +611,20 @@ pub async fn test_model_tool(session: String, call: String) -> String {
         .as_ref()
         .and_then(|v| Tool::parse(v).ok())
     {
-        Some(tool) => dispatch(&session, &tool).await.to_string(),
+        Some(tool) => {
+            let live = {
+                let local = local();
+                let mut local = local.lock().await;
+                local
+                    .store()
+                    .ok_or_else(|| "locked".to_string())
+                    .and_then(|s| s.live_goal_session(&session))
+            };
+            match live {
+                Ok(live) => dispatch(&live, &tool).await.to_string(),
+                Err(why) => json!({"refused":why}).to_string(),
+            }
+        }
         None => json!({"refused":"tool schema"}).to_string(),
     }
 }

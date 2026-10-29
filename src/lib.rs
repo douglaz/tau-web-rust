@@ -227,6 +227,42 @@ mod worker {
         Ok(())
     }
 
+    /// End and rebind while holding the real writer ahead of a queued admission.
+    #[cfg(feature = "tracer")]
+    #[wasm_bindgen]
+    pub async fn test_writer_rebind(
+        session: String,
+        transition: String,
+        release: js_sys::Promise,
+        acquired: js_sys::Function,
+    ) -> Result<String, wasm_bindgen::JsValue> {
+        let local = local();
+        let mut writer = local.lock().await;
+        let origin = writer
+            .store()
+            .ok_or("locked")?
+            .live_goal_session(&session)?;
+        acquired.call0(&wasm_bindgen::JsValue::NULL)?;
+        wasm_bindgen_futures::JsFuture::from(release).await?;
+        let store = writer.store().ok_or("locked")?;
+        let current = if transition == "eligible" {
+            store.check_current_session(&origin)?;
+            origin.clone()
+        } else {
+            store.synthetic_session_transition(&session, &transition)?;
+            store.bind(&origin.bound_set[0]).await?;
+            store
+                .connection_session(&origin.bound_set[0])
+                .await
+                .map_err(|why| format!("{why:?}"))?
+        };
+        Ok(
+            serde_json::json!({"original":origin.identity,"ended":origin.ended.get(),
+            "current":current.identity,"same_object":Rc::ptr_eq(&origin,&current),"before":writer.inspect()})
+            .to_string(),
+        )
+    }
+
     /// Count completed held-request reads without acquiring the writer.
     #[cfg(feature = "tracer")]
     #[wasm_bindgen]
@@ -420,17 +456,30 @@ mod worker {
         async fn connection_session(
             &mut self,
             machine: &str,
+            origin: Option<&Rc<crate::binding::Session>>,
         ) -> Result<Rc<crate::binding::Session>, crate::binding::AdmissionRefusal> {
             #[cfg(feature = "tracer")]
             crate::testonly::session_point("connection_writer").await;
-            let mut local = self.local.lock().await;
+            let writer = std::pin::pin!(self.local.lock());
+            #[cfg(feature = "tracer")]
+            let mut writer = writer;
+            #[cfg(feature = "tracer")]
+            let mut local = match futures_util::poll!(writer.as_mut()) {
+                std::task::Poll::Ready(guard) => guard,
+                std::task::Poll::Pending => {
+                    crate::testonly::session_point("connection_queued").await;
+                    writer.await
+                }
+            };
+            #[cfg(not(feature = "tracer"))]
+            let mut local = writer.await;
             if crate::harness::inference::ending() {
                 return Err(crate::binding::AdmissionRefusal::Journal(
                     "sessions ended".into(),
                 ));
             }
             match local.store() {
-                Some(store) => store.connection_session(machine).await,
+                Some(store) => store.connection_session_for(machine, origin).await,
                 None => Err(crate::binding::AdmissionRefusal::Journal(
                     "the store is locked".into(),
                 )),
@@ -516,9 +565,14 @@ mod worker {
                     Err(refusal) => serde_json::json!({"outcome":refusal.to_json()}),
                 }
             } else {
-                let outcome =
-                    crate::harness::run_command(&NoPins, &mut journal, &target, command.as_bytes())
-                        .await;
+                let outcome = crate::harness::run_command(
+                    &NoPins,
+                    &mut journal,
+                    &target,
+                    command.as_bytes(),
+                    None,
+                )
+                .await;
                 serde_json::json!({ "outcome": crate::harness::report(&outcome) })
             }
         };

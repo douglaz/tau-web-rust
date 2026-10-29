@@ -414,6 +414,9 @@ fn ended_predecessor_does_not_shadow_fresh_binding_and_original_scan_reload() {
             }
         }
         assert!(store.check_current_session(&old).is_err());
+        let files = store.storage.files();
+        assert!(block_on(store.connection_session_for("fixture", Some(&old))).is_err());
+        assert_eq!(store.storage.files(), files);
         assert!(old.ended.get());
         assert!(store.scans.working_material_bytes(&identity).is_none());
         let fresh = block_on(store.bind("fixture")).unwrap();
@@ -427,6 +430,9 @@ fn ended_predecessor_does_not_shadow_fresh_binding_and_original_scan_reload() {
         );
         assert_eq!(block_on(store.session("fixture")).unwrap(), fresh);
         assert!(store.check_current_session(&old).is_err());
+        let files = store.storage.files();
+        assert!(block_on(store.connection_session_for("fixture", Some(&old))).is_err());
+        assert_eq!(store.storage.files(), files);
         assert!(store.goal(&fresh).is_none());
         assert_eq!(store.limit_state(&fresh)["observed_spend"], "0");
         assert_eq!(

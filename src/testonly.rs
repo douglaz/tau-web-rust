@@ -81,6 +81,7 @@ pub async fn run(
             journal,
             target,
             command,
+            None,
             request["tamper_auth"] == json!(true),
         )
         .await;

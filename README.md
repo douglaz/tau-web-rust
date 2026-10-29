@@ -6273,3 +6273,20 @@ A fresh operation scans those same bytes with the now-armed material. Empty plac
 validation and the narrow clock read carry no scanned payload and retain their separate current
 authority checks. Browser cases exercise this last send boundary, an unchanged original mint
 through actual time verification, and dedicated approvals across actual app Lock and worker restart.
+
+
+Queued goal connection admission retains the original runtime session through command and
+requested-job dispatch. After acquiring the Store writer, admission checks that exact object,
+its current authority and its binding to the requested machine before any contact or write.
+Later authentication, command provenance and result checks retain that admitted session.
+Machine-selected operator requests continue to use the eligible current binding.
+
+The `goal_admission_cases` browser fixtures run the real goal loop, observe its admission
+waiting for the writer, then end or exhaust the original session and bind a successor under
+that writer. They assert no stale relay contact, command intent or job evidence. Their job
+prerequisite is a real completed remote job with its local terminal withheld; eligible original
+and successor goals collect its original identity and output. The paired cases also execute
+operator commands. Host binding cases reject a separate object with identical session and
+binding values, including an ended session without inference limits; lifecycle cases retain
+expiry and cap-exhaustion checks. These supplement the existing CNF-102/40 lifecycle fixtures
+and supply no live issuer, production admission or physical-device evidence.

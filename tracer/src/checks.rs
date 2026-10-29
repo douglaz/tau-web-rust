@@ -93,6 +93,8 @@ pub fn needles() -> Vec<(String, Vec<u8>)> {
         "test_relay_key",
         "test_no_credentials",
         "test_writer",
+        "test_writer_rebind",
+        "connection_queued",
         "test_delivery_fixture",
         "test_delivery_state",
         "delivery_read",
