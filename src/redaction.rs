@@ -47,7 +47,7 @@ impl Redacted {
     ) -> Result<Self, String> {
         let mut held = store.held_credentials()?;
         held.borrowed.extend_from_slice(credentials);
-        redact(body, &[], &held)
+        redact(&store.scan_output(&[body])?, &[], &held)
     }
 
     /// Refuse decoded values rather than execute a command altered by redaction.
@@ -71,7 +71,7 @@ impl Redacted {
                 _ => exact(value.to_string().as_bytes()),
             }
         }
-        safe(value, &held)
+        safe(value, &held) && store.protect_output(value).is_ok_and(|safe| safe == *value)
     }
 
     pub(crate) fn for_store<S: Storage>(
@@ -79,7 +79,11 @@ impl Redacted {
         body: &[u8],
         fields: &[&str],
     ) -> Result<Self, String> {
-        redact(body, fields, &store.held_credentials()?)
+        redact(
+            &store.scan_output(&[body])?,
+            fields,
+            &store.held_credentials()?,
+        )
     }
 }
 

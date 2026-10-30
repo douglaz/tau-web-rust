@@ -29,6 +29,128 @@ fn number(v: &Value, k: &str) -> Result<(), String> {
         Ok(())
     }
 }
+
+fn mint_evidence(body: &Value) -> Result<(), String> {
+    let Some(e) = body.get("evidence") else {
+        return Ok(());
+    };
+    object(e, &["confirmed", "origin", "authorized_at", "clock"], &[])?;
+    let c = &e["confirmed"];
+    object(
+        c,
+        &[
+            "session",
+            "account_record",
+            "choice_generation",
+            "profile",
+            "cap_hundredths",
+            "unit",
+            "lifetime_seconds",
+        ],
+        &[],
+    )?;
+    for k in ["session", "choice_generation", "profile", "unit"] {
+        text(c, k)?;
+    }
+    for k in ["account_record", "cap_hundredths", "lifetime_seconds"] {
+        number(c, k)?;
+    }
+    let cap = c["cap_hundredths"].as_u64().ok_or("cap integer")?;
+    let lifetime = c["lifetime_seconds"].as_u64().ok_or("lifetime integer")?;
+    let expiry = body["expires"].as_u64().ok_or("expiry")?;
+    let origin = e["origin"].as_u64().ok_or("origin")?;
+    if !(1..=10000).contains(&cap)
+        || !(60..=86400).contains(&lifetime)
+        || !lifetime.is_multiple_of(60)
+        || c["session"] != body["session"]
+        || c["unit"] != "account units"
+        || expiry > 253402300799
+        || body["cap"] != format!("{}.{:02}", cap / 100, cap % 100)
+        || origin.checked_add(lifetime) != Some(expiry)
+    {
+        return Err("original mint bounds differ".into());
+    }
+    let clock = &e["clock"];
+    object(
+        clock,
+        &[
+            "sent", "received", "earliest", "latest", "minimum", "maximum",
+        ],
+        &[],
+    )?;
+    fn pair(v: &Value) -> Result<(u64, u64), String> {
+        object(v, &["monotonic", "wall"], &[])?;
+        Ok((
+            v["monotonic"]
+                .as_u64()
+                .filter(|n| *n != u64::MAX)
+                .ok_or("monotonic")?,
+            v["wall"]
+                .as_u64()
+                .filter(|n| *n != u64::MAX)
+                .ok_or("wall")?,
+        ))
+    }
+    let (m0, w0) = pair(&clock["sent"])?;
+    let (m1, w1) = pair(&clock["received"])?;
+    let (m, w) = pair(&e["authorized_at"])?;
+    for (base_m, base_w, next_m, next_w) in [(m0, w0, m1, w1), (m1, w1, m, w)] {
+        if next_m < base_m
+            || ((i128::from(next_w) - i128::from(base_w))
+                - (i128::from(next_m) - i128::from(base_m)))
+            .abs()
+                > 5_000_000
+        {
+            return Err("invalid original clock pair".into());
+        }
+    }
+    let a = clock["earliest"].as_u64().ok_or("earliest")?;
+    let b = clock["latest"].as_u64().ok_or("latest")?;
+    fn rate(v: &Value) -> Result<(u128, u128), String> {
+        object(v, &["numerator", "denominator"], &[])?;
+        let n = v["numerator"]
+            .as_u64()
+            .filter(|n| *n > 0)
+            .ok_or("rate numerator")?;
+        let d = v["denominator"]
+            .as_u64()
+            .filter(|n| *n > 0)
+            .ok_or("rate denominator")?;
+        Ok((u128::from(n), u128::from(d)))
+    }
+    let (min_n, min_d) = rate(&clock["minimum"])?;
+    let (max_n, max_d) = rate(&clock["maximum"])?;
+    fn bound(t: u64, elapsed: u64, n: u128, d: u128, ceil: bool) -> Option<u128> {
+        let d = d.checked_mul(1_000_000)?;
+        let n = u128::from(t)
+            .checked_mul(d)?
+            .checked_add(n.checked_mul(u128::from(elapsed))?)?;
+        (n / d).checked_add(u128::from(ceil && n % d != 0))
+    }
+    if a == 0
+        || a > b
+        || b > 253402300799
+        || min_n * max_d > max_n * min_d
+        || bound(
+            a,
+            m.checked_sub(m1).ok_or("negative elapsed")?,
+            min_n,
+            min_d,
+            false,
+        ) != Some(u128::from(origin))
+        || bound(
+            b,
+            m.checked_sub(m0).ok_or("negative elapsed")?,
+            max_n,
+            max_d,
+            true,
+        )
+        .is_none_or(|upper| upper >= u128::from(expiry))
+    {
+        return Err("original interval does not authorize mint".into());
+    }
+    Ok(())
+}
 pub fn shape(n: u64, event: &Value) -> Result<(), String> {
     let (kind, body) = event
         .as_object()
@@ -52,6 +174,7 @@ pub fn shape(n: u64, event: &Value) -> Result<(), String> {
                 .unwrap();
             let fields: &[&str] = match k.as_str() {
                 "account_read" => &["call", "session"],
+                "clock_read" => &["call", "session", "sent"],
                 "mint" => &["call", "session", "cap", "expires"],
                 "completion" => &[
                     "call",
@@ -64,7 +187,10 @@ pub fn shape(n: u64, event: &Value) -> Result<(), String> {
                 "revoke" => &["call", "key_id"],
                 _ => return Err("unknown inference call kind".into()),
             };
-            object(b, fields, &[])?;
+            object(b, fields, if k == "mint" { &["evidence"] } else { &[] })?;
+            if k == "mint" {
+                mint_evidence(b)?;
+            }
             number(b, "call")?;
             if b["call"] != n {
                 return Err("inference identity differs from record number".into());
@@ -72,6 +198,11 @@ pub fn shape(n: u64, event: &Value) -> Result<(), String> {
             for field in fields {
                 match *field {
                     "call" | "expires" => number(b, field)?,
+                    "sent" => {
+                        object(&b["sent"], &["monotonic", "wall"], &[])?;
+                        number(&b["sent"], "monotonic")?;
+                        number(&b["sent"], "wall")?;
+                    }
                     "zdr" => {
                         if b["zdr"] != true {
                             return Err("retention request missing".into());
@@ -86,6 +217,11 @@ pub fn shape(n: u64, event: &Value) -> Result<(), String> {
                 body,
                 &["call", "status"],
                 &[
+                    "issuer_time",
+                    "clock_received",
+                    "clock_sent",
+                    "unit",
+                    "charge_refusal",
                     "automatic_top_up",
                     "key_id",
                     "cap",
@@ -114,14 +250,26 @@ pub fn shape(n: u64, event: &Value) -> Result<(), String> {
                 .filter(|k| !["call", "status"].contains(k))
             {
                 match field {
+                    "charge_refusal" => {
+                        if !matches!(
+                            body[field].as_str(),
+                            Some("account_balance" | "key_cap_exhausted" | "key_expired")
+                        ) {
+                            return Err("invalid charge refusal".into());
+                        }
+                    }
                     "automatic_top_up" => {
                         if !body[field].is_boolean() {
                             return Err("invalid top-up setting".into());
                         }
                     }
-                    "expires" | "prompt_tokens" | "completion_tokens" | "total_tokens" => {
-                        number(body, field)?
+                    "clock_sent" | "clock_received" => {
+                        object(&body[field], &["monotonic", "wall"], &[])?;
+                        number(&body[field], "monotonic")?;
+                        number(&body[field], "wall")?;
                     }
+                    "issuer_time" | "expires" | "prompt_tokens" | "completion_tokens"
+                    | "total_tokens" => number(body, field)?,
                     "spend" => {
                         text(body, field)?;
                         if !serde_json::from_str::<Value>(body[field].as_str().unwrap())
@@ -141,6 +289,7 @@ pub fn shape(n: u64, event: &Value) -> Result<(), String> {
 #[derive(Default)]
 pub struct History {
     account: bool,
+    account_record: Option<u64>,
     sessions: BTreeSet<String>,
     intents: BTreeMap<u64, Value>,
     terminals: BTreeMap<u64, Value>,
@@ -164,6 +313,7 @@ impl History {
                 return Err("invalid account credential record".into());
             }
             self.account = true;
+            self.account_record = Some(n);
         }
         if let Some(intent) = event.get("inference_intent") {
             shape(n, event)?;
@@ -178,6 +328,11 @@ impl History {
             }
             match k.as_str() {
                 "mint" => {
+                    if let Some(e) = b.get("evidence")
+                        && e["confirmed"]["account_record"].as_u64() != self.account_record
+                    {
+                        return Err("mint account generation differs".into());
+                    }
                     if self
                         .intents
                         .values()
@@ -247,8 +402,10 @@ impl History {
             let (kind, b) = intent.as_object().unwrap().iter().next().unwrap();
             let allowed: &[&str] = match kind.as_str() {
                 "account_read" => &["automatic_top_up"],
-                "mint" => &["key_id", "cap", "expires"],
+                "mint" => &["key_id", "cap", "expires", "unit"],
+                "clock_read" => &["issuer_time", "clock_received", "clock_sent"],
                 "completion" => &[
+                    "charge_refusal",
                     "model",
                     "requested_provider",
                     "reported_provider",
@@ -265,16 +422,7 @@ impl History {
             }) {
                 return Err("terminal fields belong to another inference kind".into());
             }
-            if kind == "mint"
-                && t.get("key_id").is_some()
-                && (t["cap"] != b["cap"]
-                    || t["expires"] != b["expires"]
-                    || !t["status"]
-                        .as_u64()
-                        .is_some_and(|s| (200..300).contains(&s)))
-            {
-                return Err("mint bounds differ".into());
-            }
+            // Discrepant issuer facts remain history; replay supplies no usable credential.
             if kind == "completion"
                 && (t["model"] != b["model"] || t["requested_provider"] != b["requested_provider"])
             {

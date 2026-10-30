@@ -73,6 +73,7 @@ pub struct Stop {
     ready: Notify,
     sockets: RefCell<BTreeMap<u64, web_sys::WebSocket>>,
     next_socket: Cell<u64>,
+    continuation: Option<crate::lifecycle::Continuation>,
 }
 
 pub(super) struct SocketRegistration {
@@ -97,7 +98,10 @@ impl Stop {
     }
 
     fn register(machine: Option<&str>) -> Rc<Self> {
-        let stop = Rc::new(Self::default());
+        let stop = Rc::new(Self {
+            continuation: crate::lifecycle::owner().continuation().ok(),
+            ..Self::default()
+        });
         WAITS.with(|waits| {
             let mut waits = waits.borrow_mut();
             waits.retain(|(_, stop)| stop.strong_count() != 0);
@@ -129,7 +133,12 @@ impl Stop {
     }
 
     pub fn stopped(&self) -> bool {
-        self.stopped.get() || super::inference::ending()
+        self.stopped.get()
+            || super::inference::ending()
+            || self
+                .continuation
+                .as_ref()
+                .is_none_or(|c| c.check().is_err())
     }
 
     pub async fn until<T>(&self, work: impl Future<Output = T>) -> Option<T> {

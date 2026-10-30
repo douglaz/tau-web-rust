@@ -8,6 +8,7 @@
 
 pub mod allocation;
 pub mod binding;
+pub mod clock;
 pub mod credential;
 pub mod declaration;
 pub mod delivery;
@@ -15,10 +16,13 @@ pub mod dispatch;
 pub mod goals;
 pub mod harness;
 pub mod inference;
+pub mod inference_limits;
 pub mod jobs;
+pub mod lifecycle;
 pub mod modes;
 pub mod redaction;
 pub mod relay_auth;
+pub mod scan;
 pub mod seed;
 pub mod store;
 #[cfg(feature = "tracer")]
@@ -199,6 +203,66 @@ mod worker {
         Ok(())
     }
 
+    /// Hold the actual writer, then apply one synthetic affected-session condition before
+    /// a queued command can acquire it. No global end or generation change is involved.
+    #[cfg(feature = "tracer")]
+    #[wasm_bindgen]
+    pub async fn test_writer_transition(
+        session: String,
+        transition: String,
+        release: js_sys::Promise,
+        acquired: js_sys::Function,
+    ) -> Result<(), wasm_bindgen::JsValue> {
+        let local = local();
+        let mut writer = local.lock().await;
+        acquired.call0(&wasm_bindgen::JsValue::NULL)?;
+        wasm_bindgen_futures::JsFuture::from(release).await?;
+        if transition != "eligible" && transition != "expired" {
+            writer
+                .store()
+                .ok_or("locked")?
+                .synthetic_session_transition(&session, &transition)
+                .map_err(wasm_bindgen::JsValue::from)?;
+        }
+        Ok(())
+    }
+
+    /// End and rebind while holding the real writer ahead of a queued admission.
+    #[cfg(feature = "tracer")]
+    #[wasm_bindgen]
+    pub async fn test_writer_rebind(
+        session: String,
+        transition: String,
+        release: js_sys::Promise,
+        acquired: js_sys::Function,
+    ) -> Result<String, wasm_bindgen::JsValue> {
+        let local = local();
+        let mut writer = local.lock().await;
+        let origin = writer
+            .store()
+            .ok_or("locked")?
+            .live_goal_session(&session)?;
+        acquired.call0(&wasm_bindgen::JsValue::NULL)?;
+        wasm_bindgen_futures::JsFuture::from(release).await?;
+        let store = writer.store().ok_or("locked")?;
+        let current = if transition == "eligible" {
+            store.check_current_session(&origin)?;
+            origin.clone()
+        } else {
+            store.synthetic_session_transition(&session, &transition)?;
+            store.bind(&origin.bound_set[0]).await?;
+            store
+                .connection_session(&origin.bound_set[0])
+                .await
+                .map_err(|why| format!("{why:?}"))?
+        };
+        Ok(
+            serde_json::json!({"original":origin.identity,"ended":origin.ended.get(),
+            "current":current.identity,"same_object":Rc::ptr_eq(&origin,&current),"before":writer.inspect()})
+            .to_string(),
+        )
+    }
+
     /// Count completed held-request reads without acquiring the writer.
     #[cfg(feature = "tracer")]
     #[wasm_bindgen]
@@ -257,7 +321,13 @@ mod worker {
             entry: &Entry,
             approval: &Approval,
         ) -> Result<u64, AppendRefusal> {
+            let continuation = crate::lifecycle::owner()
+                .continuation()
+                .map_err(AppendRefusal::Storage)?;
+            #[cfg(feature = "tracer")]
+            crate::testonly::session_point("command_writer").await;
             let mut local = self.local.lock().await;
+            continuation.check().map_err(AppendRefusal::Storage)?;
             if crate::harness::inference::ending() {
                 return Err(AppendRefusal::Storage("sessions ended".into()));
             }
@@ -319,20 +389,97 @@ mod worker {
     }
 
     impl crate::harness::BoundJournal for StoreJournal {
+        async fn append_bound(
+            &mut self,
+            session: &crate::binding::Session,
+            entry: &Entry,
+            approval: &Approval,
+        ) -> Result<u64, AppendRefusal> {
+            let continuation = crate::lifecycle::owner()
+                .continuation()
+                .map_err(AppendRefusal::Storage)?;
+            #[cfg(feature = "tracer")]
+            crate::testonly::session_point("command_writer").await;
+            let mut local = self.local.lock().await;
+            continuation.check().map_err(AppendRefusal::Storage)?;
+            if crate::harness::inference::ending() {
+                return Err(AppendRefusal::Storage("sessions ended".into()));
+            }
+            let store = local
+                .store()
+                .ok_or_else(|| AppendRefusal::Storage("the store is locked".into()))?;
+            store
+                .check_current_session(session)
+                .map_err(AppendRefusal::Storage)?;
+            if !session.bound_set.contains(&entry.machine)
+                || entry.provenance.as_ref().and_then(|p| p.session.as_deref())
+                    != Some(&session.identity)
+            {
+                return Err(AppendRefusal::Storage("stale session binding".into()));
+            }
+            store.append(entry, approval).await
+        }
+        async fn uncommitted(
+            &self,
+            evidence: &crate::jobs::Evidence,
+            machine: &str,
+            command: &str,
+        ) -> Result<crate::jobs::Report, String> {
+            self.local
+                .lock()
+                .await
+                .store()
+                .ok_or("locked")?
+                .uncommitted(evidence, machine, command)
+                .await
+        }
+        async fn release(&self, value: serde_json::Value) -> Result<serde_json::Value, String> {
+            #[cfg(feature = "tracer")]
+            crate::testonly::session_point("command_release_writer").await;
+            let mut local = self.local.lock().await;
+            let store = local.store().ok_or("locked")?;
+            store.ensure_scan_references().await?;
+            let safe = store.protect_command_results(&value);
+            if !store.has_live_sessions() {
+                store.clear_scan_working_copies();
+            }
+            safe
+        }
+        async fn current(&self, session: &crate::binding::Session) -> Result<(), String> {
+            self.local
+                .lock()
+                .await
+                .store()
+                .ok_or("locked")?
+                .check_current_session(session)
+        }
         async fn connection_session(
             &mut self,
             machine: &str,
+            origin: Option<&Rc<crate::binding::Session>>,
         ) -> Result<Rc<crate::binding::Session>, crate::binding::AdmissionRefusal> {
             #[cfg(feature = "tracer")]
             crate::testonly::session_point("connection_writer").await;
-            let mut local = self.local.lock().await;
+            let writer = std::pin::pin!(self.local.lock());
+            #[cfg(feature = "tracer")]
+            let mut writer = writer;
+            #[cfg(feature = "tracer")]
+            let mut local = match futures_util::poll!(writer.as_mut()) {
+                std::task::Poll::Ready(guard) => guard,
+                std::task::Poll::Pending => {
+                    crate::testonly::session_point("connection_queued").await;
+                    writer.await
+                }
+            };
+            #[cfg(not(feature = "tracer"))]
+            let mut local = writer.await;
             if crate::harness::inference::ending() {
                 return Err(crate::binding::AdmissionRefusal::Journal(
                     "sessions ended".into(),
                 ));
             }
             match local.store() {
-                Some(store) => store.connection_session(machine).await,
+                Some(store) => store.connection_session_for(machine, origin).await,
                 None => Err(crate::binding::AdmissionRefusal::Journal(
                     "the store is locked".into(),
                 )),
@@ -375,6 +522,7 @@ mod worker {
         request: String,
         collect: bool,
     ) -> Result<String, wasm_bindgen::JsValue> {
+        let continuation = crate::lifecycle::owner().continuation();
         use crate::harness::Target;
         let request: serde_json::Value = serde_json::from_str(&request)
             .map_err(|e| wasm_bindgen::JsValue::from_str(&format!("request: {e}")))?;
@@ -412,23 +560,55 @@ mod worker {
         #[cfg(not(feature = "tracer"))]
         let report = {
             if collect {
-                return Ok(
-                    match crate::harness::collect_jobs(&NoPins, &mut journal, &target).await {
-                        Ok(records) => {
-                            serde_json::json!({"outcome":{"collected":records}}).to_string()
-                        }
-                        Err(refusal) => {
-                            serde_json::json!({"outcome":refusal.to_json()}).to_string()
-                        }
-                    },
-                );
+                match crate::harness::collect_jobs(&NoPins, &mut journal, &target).await {
+                    Ok(records) => serde_json::json!({"outcome":{"collected":records}}),
+                    Err(refusal) => serde_json::json!({"outcome":refusal.to_json()}),
+                }
+            } else {
+                let outcome = crate::harness::run_command(
+                    &NoPins,
+                    &mut journal,
+                    &target,
+                    command.as_bytes(),
+                    None,
+                )
+                .await;
+                serde_json::json!({ "outcome": crate::harness::report(&outcome) })
             }
-            let outcome =
-                crate::harness::run_command(&NoPins, &mut journal, &target, command.as_bytes())
-                    .await;
-            serde_json::json!({ "outcome": crate::harness::report(&outcome) })
         };
-        Ok(report.to_string())
+        #[cfg(feature = "tracer")]
+        crate::testonly::session_point("command_release_writer").await;
+        let mut local = journal.local.lock().await;
+        let Some(store) = local.store() else {
+            return Ok(serde_json::json!({"outcome":{"refused":"locked"}}).to_string());
+        };
+        store
+            .ensure_scan_references()
+            .await
+            .map_err(wasm_bindgen::JsValue::from)?;
+        let mut report = store
+            .protect_output(&report)
+            .unwrap_or_else(|why| serde_json::json!({"outcome":{"refused":why}}));
+        let mut interrupted = false;
+        loop {
+            let encoded = report.to_string();
+            let mut changed = store.current_command_results(&mut report);
+            if !interrupted && !continuation.as_ref().is_ok_and(|c| c.check().is_ok()) {
+                crate::jobs::historical(
+                    &mut report,
+                    "stale actionable result; reconciliation required",
+                );
+                interrupted = true;
+                changed = true;
+            }
+            if changed {
+                continue;
+            }
+            if !store.has_live_sessions() {
+                store.clear_scan_working_copies();
+            }
+            return Ok(encoded);
+        }
     }
 
     /// The tracer build's switch on the store: the next append fails at its move, a real OPFS

@@ -47,8 +47,9 @@ stage 1. These rows define completion requirements; the implementation described
 still under construction.
 
 See [the source-delta and open-citation inventory](docs/spec-9086166-uptake.md) for this pin's wider contracts and remaining owners. Shared receipt fixtures below establish no live
-adapter, hidden-session continuation, complete protected-finalizer, native-policy or publisher-hosting
-acceptance. In particular, ordinary hide still locks in `www/boot.js`; twr-ggw.89 owns A1.
+adapter, complete protected-finalizer, native-policy or publisher-hosting
+acceptance. Ordinary visibility-only hide preserves eligible sessions in `www/boot.js`;
+explicit app Lock and pagehide end them.
 
 ## The harness
 
@@ -389,7 +390,9 @@ The following are **implementation readings**, not claims about the real account
 | End | What happens |
 |---|---|
 | Lock button | revoked at once |
-| `visibilitychange` hidden, document alive | revoked at once |
+| ordinary `visibilitychange` hidden, document alive | same eligible session/key/limits continue while scheduled; no revoke or hidden deadline |
+| processed freeze | cancel safe ordinary transport; retain writer/bindings and original limits; verify before further work hidden or visible |
+| visibility hidden during seed ceremony | full local Lock; words/input cleared; interrupted completion remains owed |
 | `pagehide` dispatched while the document lives | revoked at once (synthetic in the tracer) |
 | bfcache restore | revoked at once (synthetic in the tracer) |
 | seed-backup re-display | revoked at once |
@@ -965,7 +968,7 @@ then does a live session receive the key. A failed append creates no session.
 **Implementation readings:**
 
 - A session lives in the harness worker's memory. Its identity uses its exposure record's
-  number and is never reused after restart. Lock, page hide, reload, crash, bfcache restore and
+  number and is never reused after restart. Lock, pagehide, reload, crash, bfcache restore and
   seed-backup re-display end it. There is no separate end-session act. A bound set has one
   machine; larger sets belong to twr-ggw.22.
 - Replay restores the exposure ledger, never live bindings. Re-entry after a worker ends needs
@@ -1230,7 +1233,7 @@ Re-display terminates the worker through the ordinary lock, ending its live sess
 and held waits. The local passphrase must unwrap a fresh worker's store before the same seed-backup
 ceremony shows words. It journals another completion; a failed append preserves the previous
 record. Nothing stopped resumes: a cut-off call stays unresolved and a held request records no
-intent. Tab close, page hide, worker death, pagehide, bfcache restore and explicit lock remove
+intent. Tab close, worker death, pagehide, bfcache restore and explicit lock remove
 words and input; an incomplete generated seed still owes its seed-backup ceremony at unlock.
 
 The custody exceptions are exactly worker-to-page `{seed_backup_display: "<twelve words>"}`
@@ -1464,7 +1467,7 @@ the host tests run.
   - The passphrase is zeroized once the derivation has run, and the wrapping key right after
     the unwrap. The data key lives until the worker ends.
   - The harness never persists the passphrase.
-- **Lock ends sessions before termination.** On the Lock button, hidden visibility, pagehide,
+- **Lock ends sessions before termination.** On the Lock button, seed-ceremony hide, pagehide,
   bfcache restore and seed-backup re-display, the page clears words and inputs immediately and
   posts the exact-member `{end_sessions:true}` message. Channels close when this end step
   begins, before the store writer is acquired. The worker stops dispatch, clears
@@ -2196,7 +2199,7 @@ compiled for wasm32 and never served. It starts these fixtures on ephemeral loop
 - **An HTTPS server for each build.** The certificate is made per run, and Chrome is told to
   accept it by its key hash alone. It logs every request line, header and body.
 
-The held command is a finite 15-second sleep. Explicit-lock, visibility/pagehide and
+The held command is a finite 15-second sleep. Explicit-lock, pagehide and
 renderer-crash cases drop its connection while it runs; a reboot before the collection cases ends any
 remaining earlier jobs while keeping their records, so they cannot hang a later collection.
 The close-without-status case runs a real command but closes its channel without sending a
@@ -2266,8 +2269,8 @@ browser holds:
   runs on `ring`'s PBKDF2, AES-256-GCM and SHA-256, and derives the seed's keys with the
   `bip39` and `bip32` crates.
 
-In headless Chromium 154 a new tab hides the one before it, which then restarts its worker, as
-page hide must. The cases account for it.
+In headless Chromium 154 a new tab hides the one before it. Ordinary visibility-only hide
+retains its worker and exclusive store lease; the cases account for it.
 
 The full run defines 194 cases.
 
@@ -2312,12 +2315,12 @@ The cases:
 | 7. an unrecorded destination (`CNF-87`) | the pinned machine `fixture` at `127.0.0.2`, a host the pass does not record: `destination` and 1008 |
 | 8. pace (`CNF-87`) | the tracer puts the sshd's host at its window cap just before the run, so the refusal holds whatever the timing: `pace` and 1008 |
 | fail closed (twr-ggw.5 AC1, `CNF-82`) | five edits to OPFS: a wrong passphrase, one byte of the envelope's salt, one byte of record 1's ciphertext, another store's record at the same number, and an envelope of version 2. For each, unlock is refused and the page offers neither Create nor Unlock; for the first two it says "wrong passphrase, or the store was modified". A create request creates nothing, a request is refused before any contact, and OPFS is byte-identical afterwards |
-| reload, explicit lock, page hide and a killed worker (twr-ggw.5 AC3, `CNF-82`) | one case each. The old worker target is gone and one new harness worker exists. The page offers Unlock alone. A request is refused with no TCP connection at the relay. After an unlock, the replayed state lists every command recorded before. Explicit lock and page hide invoke the end step: its socket-close guarantee begins there, as the held-end cases above observe before termination. A killed worker closes its transport by termination. These three lifecycle cases catch a running command after sshd receives its `exec` and observe connection end; explicit lock and page hide also observe the relay's WebSocket end. After unlock the command reads unresolved and sshd receives no second `exec`. Before the Lock button is pressed, text is typed into both passphrase fields and never submitted; both are empty once it is pressed |
+| reload, explicit lock, pagehide and a killed worker (twr-ggw.5 AC3, `CNF-82`) | one case each. The old worker target is gone and one new harness worker exists. The page offers Unlock alone. A request is refused with no TCP connection at the relay. After an unlock, the replayed state lists every command recorded before. Explicit lock and pagehide invoke the end step: its socket-close guarantee begins there, as the held-end cases above observe before termination. A killed worker closes its transport by termination. These three lifecycle cases catch a running command after sshd receives its `exec` and observe connection end; explicit lock and pagehide also observe the relay's WebSocket end. After unlock the command reads unresolved and sshd receives no second `exec`. Before the Lock button is pressed, text is typed into both passphrase fields and never submitted; both are empty once it is pressed |
 | close without exit status (twr-ggw.7, `STA-8`) | the sshd closes without an exit status; replay preserves the unresolved call. A second command answers held, reads its finished record and records no intent or launch |
 | dispositions (twr-ggw.7, `STA-24`) | the independent reader builds a destructive disposition: the request is refused before contact, with no relay connection, SSH connection or append. Replacing it with a continuing disposition admits the command and journals its terminal record |
 | typed reset bars commands before contact until durable confirmation (twr-ggw.8, `STA-24`) | an independently written unresolved reset refuses a command, names its intent and makes no relay or SSH contact or append; a confirming observation permits the command |
 | typed running-system disposition: pinned attempt and collection stay permitted, four cases (twr-ggw.8, `CNF-110`) | one disposed reset per continuation: commands through `run_command` obey the choice before and after collection; a bare pinned attempt reaches the relay and sshd, collects no jobs and appends no intent; the typed call stays disposed with unknown outcome and the choice stays in force |
-| one writer (twr-ggw.5, `STA-1`, `STA-7`) | a second tab opens, which hides the first and restarts its worker, so either tab's worker may win the lock. The holder is the tab that offers Unlock while the other says it is waiting; the roles follow from that. The holder unlocks. The other says it is waiting for the store and offers neither Create nor Unlock; its worker has not read the store, runs nothing and appends nothing. Once the holder's tab closes, the other offers Unlock and unlocks the same store |
+| one writer (twr-ggw.5, `STA-1`, `STA-7`) | a second tab opens and hides the first; the first retains its worker and exclusive lease. The holder is the tab that offers Unlock while the other says it is waiting. The holder unlocks. The other says it is waiting for the store and offers neither Create nor Unlock; its worker has not read the store, runs nothing and appends nothing. Once the holder's tab closes, the other offers Unlock and unlocks the same store |
 | persistent storage (twr-ggw.5 AC6, `STA-23`) | with the `persistent-storage` permission denied, then granted, through `Browser.setPermission`: `navigator.storage.persisted()` reads false, then true, and the page shows the refusal, then "Persistent storage is granted." (`persisted()` already reads true, so that load makes no request), each with the statement that this is a request, not a guarantee |
 | job drop (`CNF-40`) | lock drops a several-second command after launch; `collect_jobs` waits until its observed end, reads the finished record, records no intent and launches nothing |
 | held request on a dropped running command (`CNF-40`) | a separate dropped command remains alive; a held request waits until its observed end, reads the finished record, records no intent and launches nothing |
@@ -2362,7 +2365,7 @@ accepted, dial, OK sent, then the first forwarded byte.
 How the twr-ggw.5 AC3 cases cause their event, where headless Chromium could not give the real one:
 
 - **Page hide** is two events, each caught with a command in flight:
-  - the browser's own `visibilitychange` to hidden, from opening a second tab, and the page
+  - the browser's own `visibilitychange` to hidden, from opening a second tab, preserves the eligible worker and scheduled command; the page
     records it;
   - then a `pagehide` dispatched on the real window. The browser fires its own `pagehide` only
     as a page unloads, which is the reload case.
@@ -6195,3 +6198,95 @@ python3 /var/tmp/tau-ggw14-round4-M79FdJCU/consistency.py
 
 It checks protected text, tracker bytes, branch, pin and witness cleanliness, the nine changed
 files, final source hashes, ten mutation pairs, all gate exits and both 184-case count sites.
+
+
+### Surviving hidden sessions and scan consumers
+
+`STA-23` says "An ordinary visibility-only hide MUST NOT end or pause an unlocked session, clear its runtime authority, or invalidate its approvals."
+It also says "Before further ordinary sends or actionable result publication after a processed suspension or interruption, the surviving worker MUST validate its current authority, bindings, holds, connection state and scan readiness."
+And "A begun durable append MUST finish whole rather than be cancelled partway."
+
+The page distinguishes ordinary hide, processed freeze/resume and full end. Ordinary hide
+keeps the worker, exclusive Web Lock, Store mutex owner, bindings, context and approvals.
+Processed freeze invalidates pending ordinary continuations and clock continuity, closes safe
+transports and preserves unresolved effects. A return never retransmits a possibly sent operation.
+A revalidated new operation uses the same surviving session. Only a retained demonstrably unsent
+mint intent can continue unchanged under its original call and limits; it never creates another attempt.
+
+`ARC-31a` says "Ordinary hide alone neither invalidates established continuous clock evidence nor pauses time."
+It also says "A fresh observation MUST NOT change the recorded origin or expiry, reset consumption, or revive an ended session."
+
+The shared clock consumer uses exact rational outward intervals and both independent wall/monotonic
+discrepancy checks, with strict admission before original expiry. Usage is summed as exact decimal
+text, including precision finer than hundredths. Expiry or established cap exhaustion ends only the
+affected session. Safe late accounting and revocation do not authorize further actions. A narrow
+journaled authenticated time read can repair clock validity while ordinary authority is withheld.
+The page shows original requested expiry, observed consumption, unknown clock validity and actual
+session end separately. Production minting remains refused: the consumed pin has no reviewed real
+issuer profile. Confirmed fixture tuples and time sources establish only synthetic consumer evidence;
+the per-session chooser and its own admission evidence remain twr-ggw.83's work.
+
+`SEC-5` says "Unscanned bytes MUST be withheld; matches become visible redaction markers naming the secret, never silent omissions."
+It also says "For row 23, retained or reloaded scan material is the same independent random key and encrypted reference already recorded, never seed-derived, regenerated on hide or replaced by machine-reported bytes."
+
+The read-only loader authenticates identified required references in the prescribed encrypted
+representation and retains unavailable material as an unarmed barrier. It never discovers authority
+from a file or machine output. The byte consumer compares the prescribed keyed digest over every
+raw window before decoding, retaining cross-chunk windows and protecting nested legacy hex copies,
+normal tool output, collection, historical/uncommitted reports and transcript-only release. Existing
+held-credential protection remains in the same boundary. Reload does no encryption or lifetime write.
+Lock/end clear working copies without retiring encrypted references.
+
+Host cases live in `clock::tests`, `inference_limits::tests`, `store::lifecycle_tests` and
+`store::scan::tests`. Browser cases in `tracer/src/lifecycle_cases.rs` exercise real page lifecycle
+messages, hidden scheduled model/tool work, the same original reference after reload, the retained
+writer, clock repair and stale-result refusal. Existing session-end, seed, goal, delivery and job
+cases retain full-end and uncertainty coverage. These are desktop loopback fixtures, not physical
+Android scheduling or live-issuer evidence; no background survival duration is promised.
+
+The synthetic scan producer runs only in isolated fixture stores. Its encrypted bytes supply no
+production enrollment, reservation, causal replay, counted-encryption or lifetime-event evidence.
+Named marker insertion into legacy job evidence supplies no intrinsic custody or completed protected
+finalization. twr-ggw.23 retains that protocol and atomic page/cache release; these cases claim no
+CNF-95(g) or complete persistent-protocol acceptance. Entry/funding, real profile admission and
+physical-device evidence remain separately owned.
+
+
+`STG-20` says "An approval **stands** from its record until its reset is dispatched, a matching withdrawal is recorded, or the session it was rendered for ends; several approvals for an entry stand independently."
+It also says "A withdrawal whose append fails is not recorded (`STA-3`), so the approval still stands."
+
+The dedicated standing-approval consumer journals the original reset identity, entry, rendering
+session and facts. It requires a newer dispatched activation, the immediately preceding durable
+confirming read, the same binding and the normal typed barrier. Hide changes none of those facts.
+The page offers withdrawal for each standing approval separately; ended-session approvals remain
+visible as no longer usable, without a withdrawal offer. A processed freeze invalidates an old
+reset continuation, and a possibly sent reset has no automatic retry. A begun append remains whole.
+The lifecycle fixtures supply explicitly synthetic dedicated adapter facts and exercise this same
+consumer and typed dispatch boundary. No dedicated vendor adapter or stage-3 admission is supplied;
+there is no dedicated approval path for the stage-1 vendor. The existing comparison partition and
+its dedicated qualifications remain unchanged. No fixture reset establishes a physical disk wipe.
+
+The final inference send also compares the current scan-reference revision with the revision
+that protected the actual request body, after acquiring the Store owner. Arming or reloading a
+reference while a request waits cannot approve bytes scanned under an earlier reference set.
+A fresh operation scans those same bytes with the now-armed material. Empty placeholder route
+validation and the narrow clock read carry no scanned payload and retain their separate current
+authority checks. Browser cases exercise this last send boundary, an unchanged original mint
+through actual time verification, and dedicated approvals across actual app Lock and worker restart.
+
+
+Queued goal connection admission retains the original runtime session through command and
+requested-job dispatch. After acquiring the Store writer, admission checks that exact object,
+its current authority and its binding to the requested machine before any contact or write.
+Later authentication, command provenance and result checks retain that admitted session.
+Machine-selected operator requests continue to use the eligible current binding.
+
+The `goal_admission_cases` browser fixtures run the real goal loop, observe its admission
+waiting for the writer, then end or exhaust the original session and bind a successor under
+that writer. They assert no stale relay contact, command intent or job evidence. Their job
+prerequisite is a real completed remote job with its local terminal withheld; eligible original
+and successor goals collect its original identity and output. The paired cases also execute
+operator commands. Host binding cases reject a separate object with identical session and
+binding values, including an ended session without inference limits; lifecycle cases retain
+expiry and cap-exhaustion checks. These supplement the existing CNF-102/40 lifecycle fixtures
+and supply no live issuer, production admission or physical-device evidence.

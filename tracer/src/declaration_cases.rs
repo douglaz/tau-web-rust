@@ -63,6 +63,9 @@ pub(super) async fn prepare(
         )
         .await?;
     }
+    if module(run, worker, "return await m.test_confirm_inference();").await? != true {
+        return Err("fresh declaration session lacks synthetic confirmed limits".into());
+    }
     let value = json!({"session":session,"text":"Run hermes as user operator on TCP port 443; connect to api.example:443","document_source":null});
     run.browser
         .evaluate(
@@ -120,7 +123,22 @@ pub(super) async fn wait_card(
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    Err("declaration card did not appear".into())
+    let state = run.inspect(worker).await?;
+    let page = run
+        .browser
+        .evaluate(
+            &tab.session,
+            "document.getElementById('tau-setup').textContent",
+        )
+        .await?;
+    Err(format!(
+        "declaration card did not appear: sessions={}; last inference={}; page={page}",
+        state["sessions"],
+        state["inference_calls"]
+            .as_array()
+            .and_then(|calls| calls.last())
+            .unwrap_or(&Value::Null)
+    ))
 }
 
 // The first proposal case must observe unauthorized continuation too: when proposal
@@ -413,7 +431,7 @@ pub(super) async fn run(
 
     for (decision, label) in [("reject", "rejection"), ("end", "session end")] {
         let session = prepare(run, tab, worker, &initial()).await?;
-        module(run, worker, "self.stoppedGoalOutcome=null;const post=self.postMessage.bind(self);self.postMessage=(data,...args)=>{if(data.store?.goal_outcome)self.stoppedGoalOutcome=data.store.goal_outcome.outcome;return post(data,...args);};return true;").await?;
+        module(run, worker, "self.stoppedGoalOutcome=null;const post=self.postMessage.bind(self);self.postMessage=(data,...args)=>{if(data.store?.goal_outcome||data.store?.goal_history)self.stoppedGoalOutcome=(data.store.goal_outcome??data.store.goal_history).outcome;return post(data,...args);};return true;").await?;
         start(
             run,
             tab,
@@ -442,10 +460,14 @@ pub(super) async fn run(
             // There is no race against a timeout: a retained, unresolved waiter leaves
             // null here, while cancellation publishes its named stopped outcome.
             let stopped = module(run, worker, "return self.stoppedGoalOutcome;").await?;
-            let cancelled = stopped["refused"] == "sessions ended";
+            let cancelled = stopped["refused"] == "sessions ended"
+                && stopped["historical"] == true
+                && stopped["actionable"] == false
+                && stopped.get("done").is_none()
+                && stopped.get("body").is_none();
             println!("   end-step loop outcome: {stopped}");
             case.check(
-                "session end settles the approval wait with a stopped loop outcome",
+                "session end settles approval wait with safe non-actionable historical outcome",
                 cancelled,
             );
             if !cancelled {
@@ -463,7 +485,7 @@ pub(super) async fn run(
     }
 
     let session = prepare(run, tab, worker, &initial()).await?;
-    module(run,worker,"self.renderedProposal=0;self.stoppedGoalOutcome=null;const post=self.postMessage.bind(self);self.postMessage=(data,...args)=>{if(data.requirements_store)self.renderedProposal++;if(data.store?.goal_outcome)self.stoppedGoalOutcome=data.store.goal_outcome.outcome;return post(data,...args);};self.proposalPoint=new Promise(ready=>m.test_hold_session_point('proposal_writer',new Promise(release=>self.releaseProposal=release),ready));return true;").await?;
+    module(run,worker,"self.renderedProposal=0;self.stoppedGoalOutcome=null;const post=self.postMessage.bind(self);self.postMessage=(data,...args)=>{if(data.requirements_store||data.store?.sessions?.some(s=>s.pending_requirements))self.renderedProposal++;if(data.store?.goal_outcome||data.store?.goal_history)self.stoppedGoalOutcome=(data.store.goal_outcome??data.store.goal_history).outcome;return post(data,...args);};self.proposalPoint=new Promise(ready=>m.test_hold_session_point('proposal_writer',new Promise(release=>self.releaseProposal=release),ready));return true;").await?;
     start(
         run,
         tab,
@@ -493,7 +515,11 @@ pub(super) async fn run(
     );
     case.check(
         "proposal writer settles the loop with the sessions ended outcome",
-        observed["outcome"] == json!({"refused":"sessions ended"}),
+        observed["outcome"]["refused"] == "sessions ended"
+            && observed["outcome"]["historical"] == true
+            && observed["outcome"]["actionable"] == false
+            && observed["outcome"].get("done").is_none()
+            && observed["outcome"].get("body").is_none(),
     );
     cases.push(case);
     for phase in [
@@ -504,7 +530,7 @@ pub(super) async fn run(
         "failed_append",
     ] {
         let session = prepare(run, tab, worker, &initial()).await?;
-        module(run,worker,"self.goalFinished=new Promise(resolve=>{const post=self.postMessage.bind(self);self.postMessage=(data,...args)=>{if(data.store?.goal_outcome)resolve(data.store.goal_outcome.outcome);return post(data,...args);};});return true;").await?;
+        module(run,worker,"self.goalFinished=new Promise(resolve=>{const post=self.postMessage.bind(self);self.postMessage=(data,...args)=>{if(data.store?.goal_outcome||data.store?.goal_history)resolve((data.store.goal_outcome??data.store.goal_history).outcome);return post(data,...args);};});return true;").await?;
         start(
             run,
             tab,

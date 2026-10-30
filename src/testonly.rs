@@ -81,6 +81,7 @@ pub async fn run(
             journal,
             target,
             command,
+            None,
             request["tamper_auth"] == json!(true),
         )
         .await;
@@ -121,6 +122,18 @@ pub fn inference_candidate() -> crate::inference::Candidate {
         maker: "fixture-maker".into(),
         provider: "fixture-provider".into(),
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+std::thread_local! {static TRANSPORT_APPEND: std::cell::RefCell<Option<String>> = const {std::cell::RefCell::new(None)};}
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub fn test_transport_append(bytes: String) {
+    TRANSPORT_APPEND.with_borrow_mut(|p| *p = Some(bytes));
+}
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn transport_append() -> Option<String> {
+    TRANSPORT_APPEND.with_borrow_mut(Option::take)
 }
 
 #[cfg(target_arch = "wasm32")]

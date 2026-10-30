@@ -157,6 +157,7 @@ impl<S: Storage> Store<S> {
     }
 
     pub fn live_goal_session(&self, session: &str) -> Result<Rc<Session>, String> {
+        self.check_session_authority(session, self.session_pair(session))?;
         if self.inference.ended {
             return Err("sessions ended".into());
         }
@@ -709,6 +710,7 @@ mod tests {
             } else {
                 block_on(store.bind(machine)).unwrap()
             };
+            store.synthetic_confirm_limits(100).unwrap();
             block_on(store.enter_goal(&identity, "Report this machine's status".into(), None))
                 .unwrap();
             block_on(store.accept_mode(&identity, Mode::NoBrief)).unwrap();

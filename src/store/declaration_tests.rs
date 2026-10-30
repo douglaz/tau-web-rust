@@ -817,3 +817,69 @@ fn declaration_loop_checks_end_after_approval_before_invoking_the_companion() {
     );
     assert!(!driver.dispatched);
 }
+
+#[test]
+fn ended_pending_owner_does_not_bar_fresh_binding_but_uncertain_live_owner_still_holds() {
+    let mut s = start();
+    let old = session(&s);
+    propose(&mut s, proposal(minimum()));
+    block_on(s.approve_requirements(&old, "fixture", 42)).unwrap();
+    propose(
+        &mut s,
+        Proposal::TightenClass {
+            machine: "fixture".into(),
+            class: MachineClass::MultiTenant,
+        },
+    );
+    let mut request = crate::dispatch::typed_tests::request(Operation::Reset);
+    request.session = old.clone();
+    request.approved.as_mut().unwrap().session = old.clone();
+    assert!(
+        matches!(block_on(s.check("fixture")),Err(AppendRefusal::Storage(why)) if why=="proposal approval pending")
+    );
+    assert!(
+        matches!(s.check_operation(&request),Err(crate::dispatch::RequestRefusal::InstallationFacts{why}) if why=="proposal approval pending")
+    );
+    s.synthetic_session_transition(&old, "uncertain").unwrap();
+    assert!(
+        matches!(block_on(s.check("fixture")),Err(AppendRefusal::Storage(why)) if why=="proposal approval pending")
+    );
+    assert!(
+        matches!(s.check_operation(&request),Err(crate::dispatch::RequestRefusal::InstallationFacts{why}) if why=="proposal approval pending")
+    );
+    s.synthetic_session_transition(&old, "ended").unwrap();
+    let fresh = block_on(s.bind("fixture")).unwrap();
+    s.synthetic_confirm_limits(100).unwrap();
+    assert!(s.pending_requirements.is_empty());
+    assert!(block_on(s.approve_requirements(&old, "fixture", 42)).is_err());
+    assert_eq!(
+        block_on(s.connection_session("fixture")).unwrap().identity,
+        fresh
+    );
+    let entry = Entry {
+        machine: "fixture".into(),
+        command: b"true".to_vec(),
+        provenance: Some(crate::dispatch::CommandProvenance {
+            target: Target::Entry("fixture".into()),
+            session: Some(fresh.clone()),
+            requester: Requester::Session,
+        }),
+    };
+    let call = block_on(s.append(
+        &entry,
+        &Approval::HarnessPin {
+            machine: "fixture".into(),
+            fingerprint: "SHA256:fixture".into(),
+        },
+    ))
+    .unwrap();
+    block_on(s.terminal(&Terminal {
+        call,
+        exit_status: 0,
+    }))
+    .unwrap();
+    request.session = fresh.clone();
+    request.approved.as_mut().unwrap().session = fresh.clone();
+    s.check_bound_operation(Some(&fresh), &request).unwrap();
+    assert_eq!(block_on(s.operation(&request)).unwrap().session, fresh);
+}

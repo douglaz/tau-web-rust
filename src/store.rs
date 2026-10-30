@@ -55,9 +55,12 @@ use zeroize::{Zeroize, Zeroizing};
 #[cfg(target_arch = "wasm32")]
 pub mod opfs;
 
+pub(crate) mod authority;
 pub mod delivery;
 mod goals;
 pub(crate) mod inference;
+pub mod reinstall;
+mod scan;
 
 /// The directory the store owns in the origin-private file system.
 pub const DIRECTORY: &str = "tau-web-store";
@@ -209,6 +212,7 @@ pub(crate) enum Event {
     },
     InferenceIntent(crate::inference::Intent),
     InferenceTerminal(crate::inference::Terminal),
+    DedicatedReinstall(reinstall::Record),
 }
 
 impl Drop for Event {
@@ -350,6 +354,9 @@ pub struct Store<S> {
     delivery: delivery::State,
     sessions: Vec<Rc<Session>>,
     inference: inference::State,
+    scans: crate::scan::References,
+    reinstall: reinstall::State,
+    authority: Rc<crate::lifecycle::Authority>,
     response_calls: std::collections::BTreeSet<u64>,
     exposure_ledger: Vec<Exposure>,
     conduct_acceptances: Vec<Acceptance>,
@@ -483,6 +490,9 @@ impl<S: Storage> Store<S> {
             delivery: delivery::State::default(),
             sessions: Vec::new(),
             inference: inference::State::default(),
+            scans: Default::default(),
+            reinstall: Default::default(),
+            authority: crate::lifecycle::owner(),
             response_calls: std::collections::BTreeSet::new(),
             exposure_ledger: Vec::new(),
             conduct_acceptances: Vec::new(),
@@ -662,10 +672,16 @@ impl<S: Storage> Store<S> {
         if self
             .sessions
             .iter()
-            .any(|s| s.bound_set.iter().any(|m| m == machine))
+            .any(|s| !s.ended.get() && s.bound_set.iter().any(|m| m == machine))
         {
             return Err("already bound".into());
         }
+        self.pending_requirements.retain(|owner, _| {
+            self.sessions
+                .iter()
+                .any(|s| s.identity == *owner && !s.ended.get())
+        });
+        self.ensure_scan_references().await?;
         let identity = self.dispatch.approved_entries[machine]
             .approved
             .identity
@@ -704,7 +720,14 @@ impl<S: Storage> Store<S> {
         self.sessions
             .iter()
             .map(|s| {
+                let _ = self.check_session_authority(&s.identity, self.session_pair(&s.identity));
                 let mut view = s.inspect();
+                view["inference_limits"] = self.limit_state(&s.identity);
+                view["session_state"] = if s.ended.get() {
+                    json!("ended")
+                } else {
+                    json!("running")
+                };
                 view["goal"] =
                     serde_json::to_value(self.goals.iter().find(|g| g.session == s.identity))
                         .expect("goal serializes");
@@ -763,6 +786,7 @@ impl<S: Storage> Store<S> {
         if self.inference.ended || !self.sessions.iter().any(|s| s.identity == session) {
             return Err("mode acceptance requires a live session".into());
         }
+        self.check_session_authority(session, self.session_pair(session))?;
         let acceptance = Acceptance {
             session: session.into(),
             mode,
@@ -796,7 +820,7 @@ impl<S: Storage> Store<S> {
         if let Some(session) = self
             .sessions
             .iter()
-            .find(|s| s.bound_set.iter().any(|m| m == machine))
+            .find(|s| !s.ended.get() && s.bound_set.iter().any(|m| m == machine))
         {
             for acceptance in self
                 .conduct_acceptances
@@ -848,6 +872,25 @@ impl<S: Storage> Store<S> {
         &mut self,
         machine: &str,
     ) -> Result<Rc<Session>, AdmissionRefusal> {
+        self.connection_session_for(machine, None).await
+    }
+
+    pub async fn connection_session_for(
+        &mut self,
+        machine: &str,
+        origin: Option<&Rc<Session>>,
+    ) -> Result<Rc<Session>, AdmissionRefusal> {
+        if let Some(origin) = origin {
+            self.check_current_session(origin)
+                .map_err(AdmissionRefusal::Journal)?;
+            if !origin.bound_set.iter().any(|m| m == machine) {
+                return Err(AdmissionRefusal::Journal("stale session binding".into()));
+            }
+            if !self.dispatch.approved_entries.contains_key(machine) {
+                return Err(AdmissionRefusal::NoEntry);
+            }
+            return Ok(Rc::clone(origin));
+        }
         if self.inference.ended {
             return Err(AdmissionRefusal::Journal("sessions ended".into()));
         }
@@ -857,8 +900,10 @@ impl<S: Storage> Store<S> {
         if let Some(session) = self
             .sessions
             .iter()
-            .find(|s| s.bound_set.iter().any(|m| m == machine))
+            .find(|s| !s.ended.get() && s.bound_set.iter().any(|m| m == machine))
         {
+            self.check_current_session(session)
+                .map_err(AdmissionRefusal::Journal)?;
             return Ok(Rc::clone(session));
         }
         let refusal = ConnectionRefusal {
@@ -911,7 +956,7 @@ impl<S: Storage> Store<S> {
             .iter()
             .find(|s| Some(s.identity.as_str()) == caller)
             .ok_or(RequestRefusal::BoundSet)?;
-        if request.session != session.identity {
+        if self.check_current_session(session).is_err() || request.session != session.identity {
             return Err(RequestRefusal::BoundSet);
         }
         let resource = self
@@ -1101,10 +1146,7 @@ impl<S: Storage> Store<S> {
         let resource = self.dispatch.check_request(request)?;
         if !matches!(request.operation, Operation::Read | Operation::Inference)
             && let Resource::Entry(machine) = &resource
-            && self
-                .pending_requirements
-                .values()
-                .any(|p| p.proposal.machine() == machine)
+            && self.pending_machine(machine)
         {
             return Err(RequestRefusal::InstallationFacts {
                 why: "proposal approval pending".into(),
@@ -1124,6 +1166,16 @@ impl<S: Storage> Store<S> {
             return Err(RequestRefusal::Modes);
         }
         Ok(())
+    }
+
+    fn pending_machine(&self, machine: &str) -> bool {
+        self.pending_requirements.iter().any(|(owner, pending)| {
+            pending.proposal.machine() == machine
+                && self
+                    .sessions
+                    .iter()
+                    .any(|session| session.identity == *owner && !session.ended.get())
+        })
     }
 
     /// Typed adapters check before contact and again under the writer at append. The return
@@ -1376,6 +1428,9 @@ impl<S: Storage> Store<S> {
                     self.apply_inference(number, &event)
                         .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
                 }
+                (_, Event::DedicatedReinstall(record)) => {
+                    self.replay_reinstall(number, record)?;
+                }
                 (_, Event::Exposure(exposure)) => {
                     self.replay_exposure(number, exposure)
                         .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
@@ -1578,6 +1633,13 @@ impl<S: Storage> Store<S> {
         // duplicate members are rejected and mnemonic buffers retain Event's zeroization.
         let event: Event = serde_json::from_slice(&plaintext)
             .map_err(|_| "its event is not one this version reads".to_string())?;
+        if let Event::DedicatedReinstall(_) = &event {
+            let value: Value =
+                serde_json::from_slice(&plaintext).map_err(|_| "dedicated record shape")?;
+            if serde_json::to_value(&event).map_err(|_| "dedicated record shape")? != value {
+                return Err("dedicated record shape".into());
+            }
+        }
         if let Event::Delivery(_) = &event {
             let value: Value =
                 serde_json::from_slice(&plaintext).map_err(|_| "delivery record shape")?;
@@ -1771,11 +1833,7 @@ impl<S: Storage> Journal for Store<S> {
         self.dispatch
             .check_installation(machine)
             .map_err(AppendRefusal::Storage)?;
-        if self
-            .pending_requirements
-            .values()
-            .any(|p| p.proposal.machine() == machine)
-        {
+        if self.pending_machine(machine) {
             return Err(AppendRefusal::Storage("proposal approval pending".into()));
         }
         Ok(())
@@ -1836,6 +1894,8 @@ impl<S: Storage> Journal for Store<S> {
         &mut self,
         evidence: &crate::jobs::Evidence,
     ) -> Result<crate::jobs::Report, String> {
+        let evidence = self.protect_job_evidence(evidence)?;
+        let evidence = &evidence;
         let call = self
             .dispatch
             .calls
@@ -1844,7 +1904,9 @@ impl<S: Storage> Journal for Store<S> {
         let terminal =
             evidence.record.classify(&call.intent.machine) == crate::jobs::State::Finished;
         let mut next = self.dispatch.clone();
-        let report = next.job_evidence(self.next, evidence.clone(), terminal)?;
+        let report =
+            self.protect_job_report(next.job_evidence(self.next, evidence.clone(), terminal)?)?;
+        let evidence = &report.evidence;
         let event = if terminal {
             Event::JobTerminal(evidence.clone())
         } else {
@@ -2126,10 +2188,68 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
             }),
             State::Refused(why) => json!({ "state": "refused", "reason": why }),
         };
+        if let State::Unlocked(store) = &self.state {
+            let approvals = store.reinstall_approvals();
+            if approvals.as_array().is_some_and(|a| !a.is_empty()) {
+                report["reinstall_approvals"] = approvals;
+            }
+        }
         if let Some(error) = error {
             report["error"] = error.into();
         }
-        report
+        self.protect_report(report)
+    }
+
+    fn protect_report(&self, report: Value) -> Value {
+        match &self.state {
+            State::Unlocked(store) if store.authority.state() == "ended" => {
+                // Durable history remains readable; no runtime session or action survives end.
+                let mut history = serde_json::Map::new();
+                for field in ["seed_backup_owed","seed_backup_completion","setup","delivery","goals",
+                    "mode_acceptances","signature_refusals","installations","exposure_ledger",
+                    "connection_refusals","reinstall_approvals","locked","inference_calls","records",
+                    "calls","terminals","dispositions","standing","jobs","typed_calls","observations",
+                    "uncommitted_evidence","receipts","association_records","current_installations","commands",
+                    "encryption_eligibility"] {
+                    if let Some(value) = report.get(field) { history.insert(field.into(),value.clone()); }
+                }
+                let mut history = Value::Object(history);
+                history["state"] = "unlocked".into();
+                history["lifecycle_state"] = "ended".into();
+                history["seed_backup_stage"] = "inactive".into();
+                history["sessions"] = json!([]);
+                history["error"] = "sessions ended".into();
+                if let Some(deliveries) = history["delivery"].as_array_mut() {
+                    for delivery in deliveries {
+                        delivery["placement_eligible"] = false.into();
+                        delivery["verdict_is_historical"] = true.into();
+                    }
+                }
+                store.protect_output(&history).unwrap_or_else(|_| json!({"state":"unlocked","lifecycle_state":"ended","seed_backup_stage":"inactive","error":"sessions ended; protected history unavailable"}))
+            }
+            State::Unlocked(store) if store.authority.state() == "reconciling" => {
+                json!({"state":"unlocked","lifecycle_state":"reconciling","error":"Reconciliation or clock verification required after suspension."})
+            }
+            State::Unlocked(store) => store.protect_output(&report).map(|mut protected| {
+                // Keep durable delivery facts distinct from the current caller's ability to act.
+                if let Some(deliveries) = protected["delivery"].as_array_mut() {
+                    for delivery in deliveries {
+                        let entitled = delivery["machine"].as_str().is_some_and(|machine| store.sessions.iter().any(|session| {
+                            !session.ended.get() && session.bound_set.iter().any(|bound| bound == machine)
+                                && store.check_current_session(session).is_ok()
+                        }));
+                        if !entitled {
+                            delivery["placement_eligible"] = false.into();
+                            delivery["verdict_is_historical"] = true.into();
+                        }
+                    }
+                }
+                protected
+            }).unwrap_or_else(
+                |why| json!({"state":"unlocked","lifecycle_state":if store.sessions.iter().any(|s| s.ended.get()) { "ended" } else { "reconciling" },"error":why}),
+            ),
+            _ => report,
+        }
     }
 
     /// The journal's projections: calls (including cancelled ones), terminal evidence,
@@ -2181,7 +2301,7 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
                 .collect::<Vec<_>>()
                 .into();
         }
-        report
+        self.protect_report(report)
     }
 }
 
@@ -4961,8 +5081,28 @@ mod tests {
 mod setup_tests;
 
 impl<S: Storage> crate::harness::BoundJournal for Store<S> {
-    async fn connection_session(&mut self, machine: &str) -> Result<Rc<Session>, AdmissionRefusal> {
-        Store::connection_session(self, machine).await
+    async fn uncommitted(
+        &self,
+        evidence: &crate::jobs::Evidence,
+        machine: &str,
+        command: &str,
+    ) -> Result<crate::jobs::Report, String> {
+        let evidence = self.protect_job_evidence(evidence)?;
+        self.protect_job_report(crate::jobs::uncommitted(&evidence, machine, command))
+    }
+    async fn current(&self, session: &Session) -> Result<(), String> {
+        self.check_current_session(session)
+    }
+    async fn release(&self, value: Value) -> Result<Value, String> {
+        self.protect_command_results(&value)
+    }
+
+    async fn connection_session(
+        &mut self,
+        machine: &str,
+        origin: Option<&Rc<Session>>,
+    ) -> Result<Rc<Session>, AdmissionRefusal> {
+        Store::connection_session_for(self, machine, origin).await
     }
     async fn relay_key(&self) -> Option<crate::credential::RelayKey> {
         Store::relay_key(self)
@@ -4983,5 +5123,7 @@ mod declaration_tests;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod receipt_tests;
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod lifecycle_tests;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod protected_tests;

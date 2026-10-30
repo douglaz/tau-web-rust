@@ -34,6 +34,7 @@ pub(crate) fn ready() -> Store<MemoryStorage> {
         b"fixture-account-private-value".to_vec(),
     )))
     .unwrap();
+    s.synthetic_confirm_limits(100).unwrap();
     s
 }
 fn reopen(s: &Store<MemoryStorage>) -> Store<MemoryStorage> {
@@ -57,6 +58,8 @@ pub(crate) struct Fake {
     pub echo_metadata: bool,
     pub identifier_only: bool,
     pub clock: Option<Rc<std::cell::Cell<u64>>>,
+    pub cost: Option<&'static str>,
+    pub charge_refusal: Option<&'static str>,
     pub key_id: Option<&'static str>,
     pub key: Option<&'static str>,
     pub on_mint: Option<Box<dyn FnMut()>>,
@@ -66,7 +69,7 @@ impl Transport for Fake {
         let body = serde_json::from_str(&r.body).unwrap_or(Value::Null);
         self.seen.push((
             r.path.into(),
-            body,
+            body.clone(),
             r.account.is_some(),
             r.authorization.is_some(),
         ));
@@ -81,7 +84,9 @@ impl Transport for Fake {
         if self.lose.take_if(|p| *p == r.path).is_some() {
             return None;
         }
-        let status = if self.fail.take_if(|p| *p == r.path).is_some() {
+        let status = if r.path == "/completion" && self.charge_refusal.is_some() {
+            402
+        } else if self.fail.take_if(|p| *p == r.path).is_some() {
             503
         } else {
             200
@@ -92,10 +97,12 @@ impl Transport for Fake {
             clock.set(clock.get() + 300);
         }
         let body = match r.path {
+            "/completion" if self.charge_refusal.is_some() => json!({"error":{"code":self.charge_refusal.unwrap()}}).to_string(),
+            "/completion" if self.cost.is_some() => format!("{{\"usage\":{{\"cost\":{}}}}}",self.cost.unwrap()),
             "/" => "{}".into(),
             "/account" => json!({"automatic_top_up":self.top_up}).to_string(),
             "/keys" if self.identifier_only => json!({"key_id":"fixture-key-id"}).to_string(),
-            "/keys" => json!({"key_id":self.key_id.unwrap_or("fixture-key-id"),"key":self.key.unwrap_or("fixture-session-private-value")}).to_string(),
+            "/keys" => json!({"key_id":self.key_id.unwrap_or("fixture-key-id"),"key":self.key.unwrap_or("fixture-session-private-value"),"cap":body["cap"],"expires":body["expires"],"unit":"account units"}).to_string(),
             "/revoke" => "{}".into(),
             _ if self.no_report => "\n \n{\"id\":\"chatcmpl-fixture\",\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":5,\"total_tokens\":8}}".into(),
             _ if self.echo_metadata => json!({"provider":r.authorization.as_deref().and_then(|s|s.strip_prefix("Bearer ")).unwrap(),"id":"fixture-account-private-value"}).to_string(),
@@ -109,6 +116,9 @@ impl Transport for Fake {
     }
 }
 pub(crate) fn infer(s: &mut Store<MemoryStorage>, f: &mut Fake) -> Value {
+    if !s.inference.ended {
+        s.synthetic_confirm_limits(100).unwrap();
+    }
     block_on(inference::infer(
         s,
         f,
@@ -310,6 +320,7 @@ fn refused_probe_top_up_and_lost_mint_contact_nothing_further() {
     );
     assert_eq!(s.inference_sweep(), Vec::<String>::new());
     block_on(s.bind("fixture-other")).unwrap();
+    s.synthetic_confirm_limits(100).unwrap();
     let mut r = request();
     r["machine"] = "fixture-other".into();
     assert_eq!(
@@ -326,7 +337,7 @@ fn refused_probe_top_up_and_lost_mint_contact_nothing_further() {
     let mint = f.seen.iter().find(|r| r.0 == "/keys").unwrap();
     assert_eq!(
         mint.1,
-        json!({"cap":inference::SESSION_CAP,"expires":100+inference::SESSION_LIFETIME_SECONDS})
+        json!({"cap":inference::SESSION_CAP,"expires":100+inference::SESSION_LIFETIME_SECONDS,"unit":"account units"})
     );
 }
 
@@ -619,12 +630,9 @@ fn identifier_only_mint_is_recorded_and_revoked_without_installing_a_holding() {
         .unwrap();
     assert_eq!(
         (mint.key_id.as_deref(), mint.cap.as_deref(), mint.expires),
-        (Some("fixture-key-id"), Some("0.10"), Some(1000))
+        (Some("fixture-key-id"), None, None)
     );
-    assert_eq!(
-        s.sessions()[0]["given"],
-        json!([{"row":3,"machine":"fixture"}])
-    );
+    assert_eq!(s.sessions()[0]["given"], json!([]));
     let before = f.seen.len();
     assert!(infer(&mut s, &mut f).get("refused").is_some());
     assert_eq!(
@@ -632,24 +640,12 @@ fn identifier_only_mint_is_recorded_and_revoked_without_installing_a_holding() {
         f.seen.len(),
         "identifier-only mint must not be attempted again"
     );
-    assert_eq!(reopen(&s).inference_sweep(), vec!["fixture-key-id"]);
-    let id = s.end_inference_sessions().remove(0);
-    assert_eq!(
-        block_on(inference::send(
-            &mut s,
-            &mut f,
-            "",
-            InferenceIntent::Revoke {
-                call: 0,
-                key_id: id
-            },
-            "https://127.0.0.1:1",
-            Value::Null
-        ))
-        .unwrap()["finished"],
-        true
+    assert!(
+        reopen(&s).inference_sweep().is_empty(),
+        "the incompatible identifier was already revoked"
     );
-    assert_eq!(f.seen.last().unwrap().0, "/revoke");
+    assert!(f.seen.iter().any(|r| r.0 == "/revoke"));
+    assert!(s.end_inference_sessions().is_empty());
 }
 
 #[test]
@@ -758,6 +754,7 @@ fn mint_requires_the_latest_account_read_for_its_own_session_live_and_replayed()
             session: session.clone(),
             cap: "0.10".into(),
             expires: 1000,
+            evidence: None,
         };
         assert_eq!(
             block_on(s.inference_prepare(
@@ -815,10 +812,28 @@ struct ObservedJournal {
     mint_prepares: usize,
 }
 impl InferenceJournal for ObservedJournal {
+    async fn probe_authority(
+        &mut self,
+        s: &str,
+    ) -> Result<(crate::lifecycle::Continuation, Rc<Session>), String> {
+        self.store.probe_authority(s).await
+    }
+    async fn current_at(&mut self, s: &str, now: u64) -> Result<(), String> {
+        self.store.current_at(s, now).await
+    }
     type MintGuard = ();
     async fn mint_guard(&mut self, _: &str) {}
     fn can_send(&self, revoke: bool) -> bool {
         self.store.can_send(revoke)
+    }
+    async fn mint_bounds(&mut self, s: &str, now: u64) -> Result<(String, u64), String> {
+        self.store.mint_bounds(s, now).await
+    }
+    async fn authorize(&mut self, r: &Request, now: u64) -> bool {
+        self.store.authorize(r, now).await
+    }
+    async fn actionable(&mut self, r: &Request, now: u64) -> bool {
+        self.store.actionable(r, now).await
     }
     async fn session(&mut self, m: &str) -> Result<String, String> {
         self.store.session(m).await
@@ -1194,6 +1209,7 @@ fn mint_finishing_during_session_end_records_its_revoke_before_returning() {
                 session: session.clone(),
                 cap: "0.10".into(),
                 expires: 1000,
+                evidence: None,
             },
             "https://127.0.0.1:1",
             json!({"cap":"0.10","expires":1000}),
@@ -1237,6 +1253,7 @@ fn post_terminal_failures_report_finished_with_their_own_refusal() {
                 session: session.clone(),
                 cap: "0.10".into(),
                 expires: 1000,
+                evidence: None,
             },
             "https://127.0.0.1:1",
             json!({"cap":"0.10","expires":1000}),
@@ -1284,10 +1301,28 @@ struct SharedJournal {
     end_after_mint_append: bool,
 }
 impl InferenceJournal for SharedJournal {
+    async fn probe_authority(
+        &mut self,
+        s: &str,
+    ) -> Result<(crate::lifecycle::Continuation, Rc<Session>), String> {
+        block_on(self.store.borrow_mut().probe_authority(s))
+    }
+    async fn current_at(&mut self, s: &str, now: u64) -> Result<(), String> {
+        block_on(self.store.borrow_mut().current_at(s, now))
+    }
     type MintGuard = ();
     async fn mint_guard(&mut self, _: &str) {}
     fn can_send(&self, revoke: bool) -> bool {
         self.store.borrow().can_send(revoke)
+    }
+    async fn mint_bounds(&mut self, s: &str, now: u64) -> Result<(String, u64), String> {
+        block_on(self.store.borrow_mut().mint_bounds(s, now))
+    }
+    async fn authorize(&mut self, r: &Request, now: u64) -> bool {
+        block_on(self.store.borrow_mut().authorize(r, now))
+    }
+    async fn actionable(&mut self, r: &Request, now: u64) -> bool {
+        block_on(self.store.borrow_mut().actionable(r, now))
     }
     async fn session(&mut self, machine: &str) -> Result<String, String> {
         block_on(self.store.borrow_mut().session(machine))
@@ -1571,4 +1606,275 @@ fn signature_check_after_end_records_no_refusal_live_or_replayed() {
     assert_eq!(store.storage.files(), before);
     assert!(store.signature_refusals().is_empty());
     assert!(reopen(&store).signature_refusals().is_empty());
+}
+
+fn synthetic_prepared_mint(s: &mut Store<MemoryStorage>) -> (u64, Request) {
+    let session = block_on(s.session("fixture")).unwrap();
+    block_on(inference::send(
+        s,
+        &mut Fake::default(),
+        &session,
+        InferenceIntent::AccountRead {
+            call: 0,
+            session: session.clone(),
+        },
+        "https://127.0.0.1:1",
+        Value::Null,
+    ))
+    .unwrap();
+    block_on(s.mint_bounds(&session, 100)).unwrap();
+    block_on(s.inference_prepare(
+        &session,
+        InferenceIntent::Mint {
+            call: 0,
+            session: session.clone(),
+            cap: "0.10".into(),
+            expires: 1000,
+            evidence: None,
+        },
+        "https://127.0.0.1:1",
+        json!({"cap":"0.10","expires":1000,"unit":"account units"}),
+    ))
+    .unwrap()
+}
+
+#[test]
+fn late_identified_mint_reloads_protected_cleanup_and_replay_never_retries_lost_revoke() {
+    for condition in ["valid", "unsafe", "missing", "tampered"] {
+        let mut s = ready();
+        let secret = b"synthetic-stored-secret-value-123";
+        let id = block_on(
+            s.synthetic_scan_fixture("service access".into(), Zeroizing::new(secret.to_vec())),
+        )
+        .unwrap();
+        let name = format!("scan-{id}");
+        let original_blob = s.storage.files()[&name].clone();
+        let material = s.scans.working_material_bytes(&id).unwrap();
+        let (call, sent) = synthetic_prepared_mint(&mut s);
+        assert!(block_on(s.authorize(&sent, 100)));
+        let mut f = Fake::default();
+        let mut response = block_on(f.exchange(&sent)).unwrap();
+        assert!(s.end_inference_sessions().is_empty());
+        assert!(s.scans.working_material_bytes(&id).is_none());
+        assert_eq!(s.storage.files()[&name], original_blob);
+        match condition {
+            "unsafe" => {
+                let mut body: Value = serde_json::from_slice(&response.body).unwrap();
+                body["key_id"] = std::str::from_utf8(secret).unwrap().into();
+                response.body = Zeroizing::new(serde_json::to_vec(&body).unwrap());
+            }
+            "missing" => {
+                let mut files = s.storage.files();
+                files.remove(&name);
+                s.storage = MemoryStorage::with_files(files);
+            }
+            "tampered" => {
+                block_on(s.storage.write(&name, b"{}")).unwrap();
+            }
+            _ => {}
+        }
+        let finished = block_on(s.inference_finish(call, &response, &sent)).unwrap();
+        assert_eq!(finished.report["finished"], true);
+        assert!(finished.report.get("body").is_none());
+        assert!(s.scans.working_material_bytes(&id).is_none());
+        let replay = reopen(&s);
+        if condition == "valid" {
+            let (revoke_call, revoke) = finished
+                .late_revoke
+                .expect("protected late identifier owes revoke");
+            assert_eq!(
+                replay.inference.calls[&call]
+                    .terminal
+                    .as_ref()
+                    .unwrap()
+                    .key_id
+                    .as_deref(),
+                Some("fixture-key-id")
+            );
+            assert!(
+                matches!(&replay.inference.calls[&revoke_call].intent, InferenceIntent::Revoke {key_id, ..} if key_id == "fixture-key-id")
+            );
+            assert!(replay.inference.calls[&revoke_call].terminal.is_none());
+            assert!(
+                replay.inference_sweep().is_empty(),
+                "lost revoke is unknown, never retried"
+            );
+            assert_eq!(s.storage.files()[&name], original_blob);
+            assert_eq!(revoke.path, "/revoke");
+            assert!(block_on(s.authorize(&revoke, 100)));
+            f.lose = Some("/revoke");
+            assert!(block_on(f.exchange(&revoke)).is_none());
+            assert!(f.seen.iter().any(|r| r.0 == "/revoke"));
+            assert!(reopen(&s).inference_sweep().is_empty());
+            block_on(s.reload_scan_references()).unwrap();
+            assert_eq!(
+                s.scans.working_material_bytes(&id).unwrap().as_slice(),
+                material.as_slice()
+            );
+            s.clear_scan_working_copies();
+        } else {
+            assert!(finished.late_revoke.is_none());
+            assert!(
+                replay.inference.calls[&call]
+                    .terminal
+                    .as_ref()
+                    .unwrap()
+                    .key_id
+                    .is_none()
+            );
+            assert!(finished.report.get("refused").is_some());
+        }
+        assert!(
+            plaintext(&s)
+                .iter()
+                .all(|v| !v.to_string().contains(std::str::from_utf8(secret).unwrap()))
+        );
+    }
+}
+
+#[test]
+fn independently_observed_mint_metadata_is_protected_before_append_and_replay() {
+    for field in ["cap", "unit"] {
+        for secret in [
+            "fixture-account-private-value",
+            "held-session-private-value",
+            "returned-mint-private-value",
+        ] {
+            for escaped in [false, true] {
+                let mut s = ready();
+                let other = block_on(s.bind("fixture-other")).unwrap();
+                s.live(&other)
+                    .unwrap()
+                    .given
+                    .borrow_mut()
+                    .push(crate::binding::Holding {
+                        machine: String::new(),
+                        credential: Box::new(SessionInferenceKey(
+                            b"held-session-private-value".to_vec(),
+                        )),
+                    });
+                let (call, sent) = synthetic_prepared_mint(&mut s);
+                let mut body = json!({"key_id":"safe-independent-id","key":"returned-mint-private-value","cap":"0.10","expires":1000,"unit":"account units"});
+                body[field] = secret.into();
+                let mut raw = body.to_string();
+                if escaped {
+                    let encoded = secret
+                        .bytes()
+                        .map(|b| format!("\\u{b:04x}"))
+                        .collect::<String>();
+                    raw = raw.replace(secret, &encoded);
+                }
+                let finished = block_on(s.inference_finish(
+                    call,
+                    &Response {
+                        status: 200,
+                        body: Zeroizing::new(raw.into_bytes()),
+                    },
+                    &sent,
+                ))
+                .unwrap();
+                assert!(finished.report.get("refused").is_some());
+                assert!(
+                    s.sessions[0]
+                        .given
+                        .borrow()
+                        .iter()
+                        .all(|h| h.credential.row() != 2)
+                );
+                let replay = reopen(&s);
+                let terminal = replay.inference.calls[&call].terminal.as_ref().unwrap();
+                let observed = serde_json::to_value(terminal).unwrap();
+                assert_ne!(observed[field], body[field]);
+                for mut record in plaintext(&s) {
+                    if record.get("inference_account").is_some() {
+                        record["inference_account"] = Value::Null;
+                    }
+                    for needle in [
+                        "fixture-account-private-value",
+                        "held-session-private-value",
+                        "returned-mint-private-value",
+                    ] {
+                        assert!(
+                            !record.to_string().contains(needle),
+                            "{field}, escaped={escaped}: {record}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    for cap in ["0.10", "0.09"] {
+        let mut s = ready();
+        let (call, sent) = synthetic_prepared_mint(&mut s);
+        let response = Response { status: 200, body: Zeroizing::new(json!({"key_id":"safe-id","key":"safe-key-value","cap":cap,"expires":1000,"unit":"account units"}).to_string().into_bytes()) };
+        let finished = block_on(s.inference_finish(call, &response, &sent)).unwrap();
+        assert_eq!(finished.report.get("refused").is_none(), cap == "0.10");
+        assert_eq!(
+            reopen(&s).inference.calls[&call]
+                .terminal
+                .as_ref()
+                .unwrap()
+                .cap
+                .as_deref(),
+            Some(cap)
+        );
+        assert_eq!(
+            s.sessions[0]
+                .given
+                .borrow()
+                .iter()
+                .any(|h| h.credential.row() == 2),
+            cap == "0.10"
+        );
+    }
+}
+
+#[test]
+fn protected_late_revoke_failures_preserve_original_identifier_and_unknown_replay() {
+    for append_fails in [false, true] {
+        let mut s = ready();
+        let id = block_on(s.synthetic_scan_fixture(
+            "service access".into(),
+            Zeroizing::new(b"synthetic-cleanup-reference-1234".to_vec()),
+        ))
+        .unwrap();
+        let name = format!("scan-{id}");
+        let blob = s.storage.files()[&name].clone();
+        let (call, sent) = synthetic_prepared_mint(&mut s);
+        assert!(block_on(s.authorize(&sent, 100)));
+        let mut transport = Fake::default();
+        let response = block_on(transport.exchange(&sent)).unwrap();
+        s.end_inference_sessions();
+        let late = block_on(s.inference_finish(call, &response, &sent)).unwrap();
+        let (revoke_call, revoke) = late.late_revoke.unwrap();
+        assert!(block_on(s.authorize(&revoke, 100)));
+        transport.fail = Some("/revoke");
+        let response = block_on(transport.exchange(&revoke)).unwrap();
+        assert_eq!(response.status, 503);
+        if append_fails {
+            s.storage.fault(Fault::Fail(2));
+        }
+        let terminal = block_on(s.inference_finish(revoke_call, &response, &revoke));
+        assert_eq!(terminal.is_err(), append_fails);
+        let replay = reopen(&s);
+        assert_eq!(
+            replay.inference.calls[&call]
+                .terminal
+                .as_ref()
+                .unwrap()
+                .key_id
+                .as_deref(),
+            Some("fixture-key-id")
+        );
+        assert_eq!(
+            replay.inference.calls[&revoke_call].terminal.is_none(),
+            append_fails
+        );
+        assert!(
+            replay.inference_sweep().is_empty(),
+            "recorded failed/unknown revoke is not retried"
+        );
+        assert!(s.scans.working_material_bytes(&id).is_none());
+        assert_eq!(s.storage.files()[&name], blob);
+    }
 }

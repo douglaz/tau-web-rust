@@ -17,21 +17,27 @@ const texts = {
 };
 const clearWords = () => $('seed-backup-words-slot').replaceChildren();
 let redisplay = false;
+let ceremony = false;
+let suspended = false;
 const goalOutcomes = new Map();
 const render = (store) => {
   const { state } = store;
+  $('store-state').dataset.lifecycle = store.lifecycle_state ?? '';
+  if (store.seed_backup_stage !== undefined) ceremony = state === 'unlocked' && store.seed_backup_stage !== 'inactive';
+  if (['locked', 'none', 'refused'].includes(state)) ceremony = false;
   renderSetup(store);
   $('store').dataset.state = state;
   $('store-state').textContent = state === 'refused'
     ? `The local store is refused: ${store.reason}. Reload the page to try again.`
     : [texts[state] ?? state, store.error].filter(Boolean).join(' ');
+  if (store.lifecycle_state) $('store-state').textContent += ` Session state: ${store.lifecycle_state}.`;
   $('create-help').hidden = $('confirm-field').hidden = $('create').hidden = state !== 'none';
   $('passphrase-field').hidden = state !== 'none' && state !== 'locked';
   $('passphrase').autocomplete = state === 'none' ? 'new-password' : 'current-password';
   $('unlock').hidden = state !== 'locked';
   $('lock').hidden = state !== 'unlocked';
   const stage = store.seed_backup_stage;
-  const active = state === 'unlocked' && stage !== 'inactive';
+  const active = state === 'unlocked' && typeof stage === 'string' && stage !== 'inactive';
   clearWords();
   $('seed-backup').hidden = !active;
   $('seed-backup-answer').hidden = stage !== 'showing_words';
@@ -96,6 +102,7 @@ const renderSetup = (store) => {
   paragraph(slot, 'Each machine will be bound alone in its own session.');
   paragraph(slot, "Recurring means each machine is billed by its vendor every month from the moment it is created until it is destroyed or abandoned, whether or not setup finishes. tau-web never pays for a machine and cannot stop a vendor's billing; only you can.");
   if (!approved.length) {
+    if (store.lifecycle_state === 'ended') return;
     const button = document.createElement('button');
     button.type = 'button';
     button.id = 'tau-setup-approve';
@@ -136,14 +143,41 @@ const renderSetup = (store) => {
     if (access) paragraph(section, `Access model: ${access.model}; profile ${access.profile}, revision ${access.revision}.`);
     if (machine.declaration) renderDeclaration(section, machine.declaration);
     renderDelivery(section, machine.entry.machine, store);
+    for (const approval of (store.reinstall_approvals ?? []).filter(a => a.entry === machine.entry.machine)) {
+      paragraph(section, `Dedicated reinstall reset ${approval.reset}: ${approval.state}; rendering session ${approval.session}.`);
+      if (approval.state === 'no longer usable') paragraph(section, 'Approve again in this session to proceed; the new reset requires a newer rescue activation and a confirming read.');
+      if (approval.withdrawal_offer) {
+        paragraph(section, 'A standing destructive reinstall disposition still opens the installation through its own reset. Withdrawal of this approval does not withdraw that disposition. An eligible approved reset can run while hidden; there is no guaranteed withdrawal interval.');
+        const withdraw = document.createElement('button');
+        withdraw.type = 'button'; withdraw.dataset.withdrawReinstall = String(approval.approval);
+        withdraw.textContent = `Withdraw approval for ${approval.reset}`;
+        withdraw.addEventListener('click', () => { withdraw.disabled = true; worker.postMessage({ withdraw_reinstall: { approval: approval.approval, reset: approval.reset, entry: approval.entry } }); });
+        section.append(withdraw);
+      }
+    }
     for (const approval of machine.requirements ?? []) {
       if (approval.proposal.kind === 'tighten_class') paragraph(section, 'Approved tightening: single-purpose to multi-tenant. The original class answer is retained.');
     }
     const installation = (store.installations ?? []).find(i => i.machine === machine.entry.machine);
     if (installation) paragraph(section, `Installation: ${installation.installation}.`);
-    const session = (store.sessions ?? []).find(s => s.bound_set.includes(machine.entry.machine));
+    for (const ended of (store.sessions ?? []).filter(s => s.session_state === 'ended' && s.bound_set.includes(machine.entry.machine))) paragraph(section, `Session ${ended.identity}: ${ended.inference_limits?.state ?? 'ended'}. Approvals from this session are no longer usable.`);
+    const session = (store.sessions ?? []).find(s => s.session_state !== 'ended' && s.bound_set.includes(machine.entry.machine));
     if (session) {
-      paragraph(section, `Session ${session.identity}: bound set ${session.bound_set.join(', ')}.`);
+      paragraph(section, `Session ${session.identity}: bound set ${session.bound_set.join(', ')}; ${session.inference_limits?.state ?? session.session_state ?? 'running'}.`);
+      const limits = session.inference_limits;
+      if (limits) {
+        paragraph(section, `Confirmed limit: ${(BigInt(limits.confirmed.cap_hundredths) / 100n)}.${String(BigInt(limits.confirmed.cap_hundredths) % 100n).padStart(2, '0')} ${limits.confirmed.unit}; lifetime ${limits.confirmed.lifetime_seconds / 60} minutes. No renewal; observed spend ${limits.observed_spend}. Unaccounted spend is not zero or refunded.`);
+        paragraph(section, limits.original_expiry ? `Original requested expiry: ${new Date(limits.original_expiry * 1000).toISOString()} (UTC). All delays and hidden or frozen time consume this lifetime.` : 'Lifetime has not started.');
+        if (limits.state === 'clock-withheld') paragraph(section, 'Clock validity unknown; verification required. The original expiry has not changed.');
+      }
+      if (limits?.state === 'clock-withheld') {
+        if (session.goal) paragraph(section, session.goal.text);
+        const verify = document.createElement('button');
+        verify.type = 'button'; verify.dataset.verifyClock = session.identity;
+        verify.textContent = 'Verify issuer clock';
+        verify.addEventListener('click', () => { verify.disabled = true; worker.postMessage({ verify_clock: session.identity }); });
+        section.append(verify); slot.append(section); continue;
+      }
       const card = document.createElement('section');
       card.dataset.goalCard = session.identity;
       paragraph(card, 'Goal for this session');
@@ -233,6 +267,9 @@ const renderSetup = (store) => {
     }
     slot.append(section);
   }
+  if (store.lifecycle_state === 'ended') {
+    for (const control of slot.querySelectorAll('button, input, textarea')) control.remove();
+  }
 };
 
 const renderDelivery = (section, machine, store) => {
@@ -276,8 +313,8 @@ const renderDelivery = (section, machine, store) => {
     paragraph(card, delivery.report_label);
     for (const report of delivery.reports) paragraph(card, JSON.stringify(report));
   }
-  const session = (store.sessions ?? []).find(s => s.bound_set.includes(machine));
-  if (session) {
+  const session = (store.sessions ?? []).find(s => s.session_state !== 'ended' && s.bound_set.includes(machine));
+  if (session && session.inference_limits?.state !== 'clock-withheld') {
     const button = document.createElement('button');
     button.type = 'button';
     button.dataset.deliveryCheck = machine;
@@ -295,6 +332,8 @@ const start = () => {
   goalOutcomes.clear();
   show('starting', 'Starting the harness…');
   render({ state: 'starting' });
+  suspended = false;
+  ceremony = false;
   worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
   const current = worker;
   worker.onmessage = ({ data }) => {
@@ -310,6 +349,7 @@ const start = () => {
       render({ state, error, reason, ...rest });
     }
     else if (Object.keys(data).length === 1 && typeof data.seed_backup_display === 'string') {
+      if (document.visibilityState === 'hidden') { lock(); return; }
       clearWords();
       const list = document.createElement('ol');
       list.id = 'tau-seed-backup-words';
@@ -324,9 +364,12 @@ const start = () => {
   };
   worker.onerror = (event) => {
     if (worker !== current) return;
+    current.terminate();
     clearWords();
     $('seed-backup-input').value = '';
-    show('failed', `Harness failed: ${event.message ?? 'the worker did not load'}`);
+    $('passphrase').value = $('confirm').value = '';
+    render({ state: 'lost' });
+    show('failed', `Harness lost: ${event.message ?? 'the worker did not load'}. Reload to reopen locked.`);
   };
 };
 
@@ -356,7 +399,17 @@ const lock = () => {
   start();
 };
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'hidden') lock();
+  const hidden = document.visibilityState === 'hidden';
+  if (hidden && ceremony) { lock(); return; }
+  worker.postMessage({ lifecycle: hidden ? 'hidden' : 'visible' });
+});
+document.addEventListener('freeze', () => {
+  if (ceremony) { lock(); return; }
+  suspended = true;
+  worker.postMessage({ lifecycle: 'freeze' });
+});
+document.addEventListener('resume', () => {
+  if (suspended) { suspended = false; worker.postMessage({ lifecycle: 'resume' }); }
 });
 addEventListener('pagehide', lock);
 addEventListener('pageshow', (event) => {

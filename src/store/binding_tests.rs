@@ -508,3 +508,55 @@ fn page_binding_is_refused_while_locked_or_in_seed_backup() {
     );
     assert_eq!(local.storage.files(), before);
 }
+
+#[test]
+fn originating_connection_admission_requires_the_current_runtime_object_without_writes() {
+    let mut store = approved();
+    let id = block_on(store.bind("fixture")).unwrap();
+    let origin = block_on(store.connection_session("fixture")).unwrap();
+    let copied = Rc::new(Session::new(
+        id.clone(),
+        "fixture".into(),
+        store.seed().unwrap().ssh_client_key(1, 0).unwrap(),
+    ));
+    assert_eq!(origin.identity, copied.identity);
+    assert_eq!(origin.bound_set, copied.bound_set);
+    assert!(!Rc::ptr_eq(&origin, &copied));
+    let files = store.storage.files();
+    for (machine, live) in [
+        ("fixture", &copied),
+        ("fixture-other", &origin),
+        ("unknown", &origin),
+    ] {
+        assert!(matches!(
+            block_on(store.connection_session_for(machine, Some(live))),
+            Err(AdmissionRefusal::Journal(_))
+        ));
+        assert_eq!(store.storage.files(), files);
+    }
+    let admitted = block_on(store.connection_session_for("fixture", Some(&origin))).unwrap();
+    assert!(Rc::ptr_eq(&admitted, &origin));
+    assert_eq!(store.storage.files(), files);
+
+    // No inference limits object is needed for irreversible runtime end.
+    origin.ended.set(true);
+    origin.given.borrow_mut().clear();
+    let ended_files = store.storage.files();
+    assert!(block_on(store.connection_session_for("fixture", Some(&origin))).is_err());
+    assert_eq!(store.storage.files(), ended_files);
+    let successor_id = block_on(store.bind("fixture")).unwrap();
+    assert_ne!(id, successor_id);
+    let successor = block_on(store.connection_session("fixture")).unwrap();
+    let files = store.storage.files();
+    assert!(block_on(store.connection_session_for("fixture", Some(&origin))).is_err());
+    assert_eq!(store.storage.files(), files);
+    assert!(Rc::ptr_eq(
+        &block_on(store.connection_session_for("fixture", Some(&successor))).unwrap(),
+        &successor
+    ));
+    assert!(Rc::ptr_eq(
+        &block_on(store.connection_session("fixture")).unwrap(),
+        &successor
+    ));
+    assert_eq!(store.storage.files(), files);
+}
