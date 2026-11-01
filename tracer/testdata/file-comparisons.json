@@ -1,0 +1,252 @@
+{
+  "key": {
+    "cases": [
+      {
+        "id": "seed_cases.c002.p001",
+        "site_id": "seed_cases.c002",
+        "invocation": 1,
+        "assertions": [
+          "seed_cases.a018",
+          "seed_cases.a019"
+        ]
+      }
+    ],
+    "reader_caller_rules": [],
+    "file_read_sources": {},
+    "auxiliary_constructor_rules": [],
+    "file_constructor_sources": [],
+    "file_comparison_sources": {
+      "seed_cases.a019.1": {
+        "predicate": "seed_cases.a019",
+        "left": [
+          "file.seed_cases.dump.005",
+          "browser.store",
+          "each",
+          "inside"
+        ],
+        "right": [
+          "file.seed_cases.dump.003",
+          "browser.store",
+          "once",
+          "inside"
+        ],
+        "policy": "original"
+      }
+    },
+    "file_observation_sources": []
+  },
+  "report": {
+    "mode": "targeted",
+    "plan": {
+      "expected_execution": [
+        "seed_cases.c002.p001"
+      ],
+      "helper_owner_sequences": [
+        {
+          "scenario": "seed_cases.run",
+          "owner": "inside",
+          "case": "seed_cases.c002.p001",
+          "tokens": [
+            "call:runtime.worker"
+          ],
+          "page_operations": [
+            "new:tracer"
+          ],
+          "prepare_domains": []
+        }
+      ],
+      "invocation_root_sequences": [
+        {
+          "scenario": "seed_cases.run",
+          "owner": "inside",
+          "case": "seed_cases.c002.p001",
+          "tokens": [
+            "call:runtime.worker"
+          ],
+          "page_operations": [
+            "new:tracer"
+          ],
+          "prepare_domains": [],
+          "invocation": 1
+        }
+      ],
+      "scenario_scopes": {
+        "seed_cases.run": 1
+      }
+    },
+    "duration_ns": 32,
+    "helper_history": [
+      {
+        "event": "scenario_start",
+        "id": "seed_cases.run",
+        "invocation": 1,
+        "at_ns": 0
+      },
+      {
+        "event": "case_start",
+        "id": "seed_cases.c002.p001",
+        "at_ns": 1
+      },
+      {
+        "event": "call_start",
+        "call": 1,
+        "kind": "runtime.worker",
+        "page": 1,
+        "worker": 0,
+        "at_ns": 2
+      },
+      {
+        "event": "worker_selected",
+        "call": 1,
+        "worker": 1,
+        "operand_ok": true,
+        "at_ns": 3
+      },
+      {
+        "event": "call_end",
+        "call": 1,
+        "at_ns": 4
+      },
+      {
+        "event": "case_end",
+        "id": "seed_cases.c002.p001",
+        "at_ns": 30
+      },
+      {
+        "event": "scenario_end",
+        "id": "seed_cases.run",
+        "invocation": 1,
+        "at_ns": 31
+      }
+    ],
+    "file_captures": [
+      {
+        "source": 1,
+        "kind": "browser.dump",
+        "site": "file.seed_cases.dump.003",
+        "page": 1,
+        "parent": null,
+        "ok": true,
+        "case": "seed_cases.c002.p001",
+        "at_ns": 5,
+        "history_cursor": 5
+      },
+      {
+        "source": 2,
+        "kind": "browser.store",
+        "site": "file.seed_cases.dump.003",
+        "page": 1,
+        "parent": 1,
+        "ok": true,
+        "case": "seed_cases.c002.p001",
+        "at_ns": 6,
+        "history_cursor": 5
+      },
+      {
+        "source": 3,
+        "kind": "browser.dump",
+        "site": "file.seed_cases.dump.005",
+        "page": 1,
+        "parent": null,
+        "ok": true,
+        "case": "seed_cases.c002.p001",
+        "at_ns": 8,
+        "history_cursor": 5
+      },
+      {
+        "source": 4,
+        "kind": "browser.store",
+        "site": "file.seed_cases.dump.005",
+        "page": 1,
+        "parent": 3,
+        "ok": true,
+        "case": "seed_cases.c002.p001",
+        "at_ns": 9,
+        "history_cursor": 5
+      }
+    ],
+    "reader_roots": [],
+    "file_comparisons": [
+      {
+        "site": "seed_cases.a019.1",
+        "predicate": "seed_cases.a019",
+        "left": {
+          "source": 4,
+          "kind": "browser.store",
+          "site": "file.seed_cases.dump.005",
+          "page": 1,
+          "ok": true
+        },
+        "right": {
+          "source": 2,
+          "kind": "browser.store",
+          "site": "file.seed_cases.dump.003",
+          "page": 1,
+          "ok": true
+        },
+        "result": true,
+        "name_ok": true,
+        "case": "seed_cases.c002.p001",
+        "at_ns": 12,
+        "history_cursor": 5,
+        "check_ns": 13,
+        "check_cursor": 5,
+        "check_instance": 1,
+        "controls": [
+          null,
+          null
+        ],
+        "control_ok": true
+      }
+    ],
+    "file_controls": {
+      "captures": [],
+      "uses": []
+    },
+    "blob_sources": [],
+    "cases": [
+      {
+        "id": "seed_cases.c002.p001",
+        "start_ns": 1,
+        "end_ns": 30,
+        "branches": {}
+      }
+    ],
+    "primary_history": [
+      {
+        "case": "seed_cases.c002.p001",
+        "id": "seed_cases.a018.i001",
+        "at_ns": 7,
+        "history_cursor": 5
+      },
+      {
+        "case": "seed_cases.c002.p001",
+        "id": "seed_cases.a019.i001",
+        "at_ns": 13,
+        "history_cursor": 5
+      }
+    ],
+    "file_dump_queries": [
+      {
+        "source": 1,
+        "page": 1,
+        "start_ns": 4,
+        "end_ns": 5,
+        "start_cursor": 5,
+        "end_cursor": 5,
+        "query_ok": true,
+        "completed": true
+      },
+      {
+        "source": 3,
+        "page": 1,
+        "start_ns": 7,
+        "end_ns": 8,
+        "start_cursor": 5,
+        "end_cursor": 5,
+        "query_ok": true,
+        "completed": true
+      }
+    ]
+  }
+}

@@ -3,7 +3,7 @@ use super::*;
 use std::sync::atomic::Ordering;
 
 fn selected(name: &str) -> bool {
-    std::env::var("TAU_TRACER_SESSION_END").map_or(true, |s| {
+    selection::value("TAU_TRACER_SESSION_END").map_or(true, |s| {
         s.split(',').any(|part| {
             part.strip_prefix('=')
                 .map_or_else(|| name.contains(part), |exact| name == exact)
@@ -22,13 +22,23 @@ async fn writer(run: &Run<'_>, worker: &Worker) -> Result<(), String> {
     module(run,worker,"self.writerReady=new Promise(ready=>self.writerWork=m.test_writer(new Promise(release=>self.releaseWriter=release),ready));await self.writerReady;return true;").await?;
     Ok(())
 }
-async fn begin_end(run: &Run<'_>, worker: &Worker) -> Result<(), String> {
+async fn begin_end(
+    run: &Run<'_>,
+    worker: &Worker,
+    input: Option<&fixture_inputs::Input>,
+) -> Result<(), String> {
     run.aggregator.state.lock().unwrap().hold_revoke = true;
-    module(run,worker,"self.endDone=false;self.endWork=m.end_sessions().then(()=>self.endDone=true);await new Promise(r=>setTimeout(r,0));return true;").await?;
+    let expression = "self.endDone=false;self.endWork=m.end_sessions().then(()=>self.endDone=true);await new Promise(r=>setTimeout(r,0));return true;";
+    if let Some(input) = input {
+        fixture_inputs::end_module(input, run, worker, expression).await?;
+    } else {
+        module(run, worker, expression).await?;
+    }
     Ok(())
 }
 async fn end_open(run: &Run<'_>, worker: &Worker, case: &mut Case) -> Result<(), String> {
     case.check(
+        "session_end_cases.a001",
         "checked before end step completes and before worker termination",
         module(run, worker, "return self.endDone;").await? == false,
     );
@@ -71,12 +81,21 @@ async fn reset_with_bindings(
 ) -> Result<(), String> {
     run.relay.session_gate.clear();
     run.aggregator.state.lock().unwrap().hold_revoke = false;
-    *worker = run.reload(tab, worker).await?;
-    if !run.sshd.all_ended().await {
+    *worker = run
+        .reload("session_end_cases.rs::reload#1", tab, worker)
+        .await?;
+    if completion::rejects(
+        "session-end.previous_ssh.closed",
+        !run.sshd
+            .all_ended_at(Some("session.reset.previous_ssh"), json!({}))
+            .await,
+    ) {
         return Err("previous fixture SSH connection did not end".into());
     }
     run.put(tab, files).await?;
-    *worker = run.reload(tab, worker).await?;
+    *worker = run
+        .reload("session_end_cases.rs::reload#2", tab, worker)
+        .await?;
     if bind_all {
         resume(run, tab, worker).await?;
     } else {
@@ -84,20 +103,29 @@ async fn reset_with_bindings(
         run.submit(tab, "unlock", PASSPHRASE).await?;
         setup_cases::click(run, tab, "[data-bind=fixture]").await?;
         let mut bound = false;
-        for _ in 0..300 {
-            bound = run.inspect(worker).await?["sessions"]
-                .as_array()
-                .is_some_and(|sessions| {
-                    sessions
-                        .iter()
-                        .any(|s| s["bound_set"] == json!(["fixture"]))
-                });
-            if bound {
-                break;
+        {
+            let observation = observer::Call::begin(
+                "session_end.unbound.fixture_bound",
+                "serial.observation",
+                Some(&tab.session),
+                json!({"bound":300,"false_sleep_ms":10,"requires_ready":true,"machine":"first","bind_all":bind_all}),
+            );
+            for poll in 0..300 {
+                observation.attempt(poll + 1);
+                bound = observation.inspect(run, worker).await?["sessions"]
+                    .as_array()
+                    .is_some_and(|sessions| {
+                        sessions
+                            .iter()
+                            .any(|s| s["bound_set"] == json!(["fixture"]))
+                    });
+                if observation.poll(poll + 1, bound) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        if !bound {
+        if completion::rejects("session-end.fixture.direct_binding", !bound) {
             return Err("fixture session did not bind".into());
         }
     }
@@ -112,7 +140,10 @@ async fn reset_with_bindings(
     )
     .await?;
     let result = infer(run, worker).await?;
-    if result["finished"] != true {
+    if completion::rejects(
+        "session-end.fixture.inference_finished",
+        result["finished"] != true,
+    ) {
         return Err(format!("session-end fixture inference: {result}"));
     }
     fresh_pace(run.relay);
@@ -120,44 +151,63 @@ async fn reset_with_bindings(
 }
 async fn unresolved(run: &Run<'_>, worker: &Worker) -> Result<(), String> {
     let result = run
-        .harness_run(worker, request(run, "close-without-status"))
+        .harness_run(
+            "session_end_cases.rs#1",
+            worker,
+            request(run, "close-without-status"),
+        )
         .await?;
-    if result["outcome"]["unresolved"] != true {
+    if completion::rejects(
+        "session-end.fixture.unresolved",
+        result["outcome"]["unresolved"] != true,
+    ) {
         return Err(format!("session-end fixture unresolved call: {result}"));
     }
     fresh_pace(run.relay);
     Ok(())
 }
-pub(super) async fn closed(run: &Run<'_>, from: usize, case: &mut Case) {
-    let relay_closed = settle_for(run.seen, 5, |seen| {
-        let connections: std::collections::BTreeSet<_> = seen.relay_log[from..]
-            .iter()
-            .filter_map(|(id, event)| {
-                matches!(
-                    event,
-                    fixtures::Event::ChallengeSent | fixtures::Event::Held(_)
-                )
-                .then_some(*id)
-            })
-            .collect();
-        seen.relay_log[from..].iter().any(|(id, event)| {
-            connections.contains(id)
-                && matches!(
-                    event,
-                    fixtures::Event::Ended | fixtures::Event::Frame("close")
-                )
-        })
-    })
+pub(super) async fn closed(
+    site: &'static str,
+    run: &Run<'_>,
+    from: &fixture_inputs::Input,
+    case: &mut Case,
+) {
+    let observation = observer::Call::begin(
+        site,
+        "session.closed",
+        None,
+        json!({"from":"independent original pre-send relay log cursor"}),
+    );
+    observation.fact("fixture_input", causal::source_seen(run.seen));
+    let relay_closed = settle_for(
+        "session.closed.relay",
+        run.seen,
+        5,
+        json!({"from":"original source caller relay snapshot"}),
+        |seen, observation| fixture_predicates::relay_closed(seen, from, observation),
+    )
     .await;
     case.check(
+        "session_end_cases.a002",
         "relay observes browser socket close during end step",
         relay_closed,
     );
-    let ssh_closed = settle_for(run.seen, 5, |_| {
-        run.sshd.accepted.load(Ordering::SeqCst) == run.sshd.ended.load(Ordering::SeqCst)
-    })
+    let ssh_closed = settle_for(
+        "session.closed.ssh",
+        run.seen,
+        5,
+        json!({}),
+        |_, observation| {
+            observation.ssh_counter(run.sshd, "accepted", &run.sshd.accepted)
+                == observation.ssh_counter(run.sshd, "ended", &run.sshd.ended)
+        },
+    )
     .await;
-    case.check("every dialed sshd observes connection end", ssh_closed);
+    case.check(
+        "session_end_cases.a003",
+        "every dialed sshd observes connection end",
+        ssh_closed,
+    );
 }
 async fn network(
     run: &Run<'_>,
@@ -181,13 +231,14 @@ async fn network(
                 continue;
             }
             reset(run, tab, worker, files).await?;
+            let target_case = catalogue::case_id("session_end_cases.c001", &name);
             if site != "command" {
                 unresolved(run, worker).await?;
             }
             let (log_before, exec_before, auth_before, channel_before) = {
                 let s = run.seen.lock().unwrap();
                 (
-                    s.relay_log.len(),
+                    fixture_inputs::relay(run, worker, &target_case, "relay", &s),
                     s.ssh_exec.len(),
                     s.ssh_auth.len(),
                     s.ssh_channels,
@@ -195,7 +246,13 @@ async fn network(
             };
             let accepted_before = run.sshd.accepted.load(Ordering::SeqCst);
             let rekey = stage.ends_with("-rekey");
-            let rekey_log = run.seen.lock().unwrap().relay_log.len();
+            let rekey_log = fixture_inputs::relay(
+                run,
+                worker,
+                &target_case,
+                "packet",
+                &run.seen.lock().unwrap(),
+            );
             let boundary = if stage == "auth-rekey" {
                 "session_authentication"
             } else {
@@ -205,12 +262,15 @@ async fn network(
             if stage == "auth-rekey" {
                 run.sshd.auth_banner.store(true, Ordering::SeqCst);
             }
+            let mut gate = None;
             if rekey {
                 point(run, worker, boundary).await?;
             } else {
-                run.relay.session_gate.arm(stage);
+                gate = Some(fixture_inputs::arm(run, worker, &target_case, stage));
             }
-            start(
+            fixture_inputs::session_start(
+                &log_before,
+                gate.as_ref(),
                 run,
                 worker,
                 &expression(run, site, "printf should-not-launch"),
@@ -218,8 +278,10 @@ async fn network(
             .await?;
             if rekey {
                 wait_point(run, worker).await?;
-                run.relay.session_gate.arm("rekey");
-                module(
+                gate = Some(fixture_inputs::arm(run, worker, &target_case, "rekey"));
+                fixture_inputs::rekey_module(
+                    &rekey_log,
+                    gate.as_ref().unwrap(),
                     run,
                     worker,
                     &format!(
@@ -229,73 +291,87 @@ async fn network(
                 )
                 .await?;
             }
-            let reached = settle_for(run.seen, 5, |_| {
-                run.relay.session_gate.reached.load(Ordering::SeqCst)
-            })
+            let reached = settle_for(
+                "session.network.stage_reached",
+                run.seen,
+                5,
+                json!({"site":site,"stage":stage}),
+                |_, observation| {
+                    fixture_predicates::stage(run, gate.as_ref().unwrap(), observation)
+                },
+            )
             .await;
-            if !reached {
+            if completion::rejects("session-end.network.stage_reached", !reached) {
                 return Err(format!(
                     "could not arrange {name}: fixture never reached held stage"
                 ));
             }
-            let mut case = Case::new(&name);
+            let mut case = Case::new("session_end_cases.c001", &name);
             if stage == "auth-rekey" {
                 case.check(
+                    "session_end_cases.a004",
                     "authentication service reached before rekey starts",
                     run.seen.lock().unwrap().ssh_authentication_banners == banners + 1,
                 );
             }
             if rekey {
                 case.check(
+                    "session_end_cases.a005",
                     "requested rekey emits a client SSH packet before session end",
-                    settle_for(run.seen, 5, |seen| {
-                        seen.relay_log[rekey_log..].iter().any(|(_, event)| {
-                            matches!(
-                                event,
-                                fixtures::Event::Forwarded(fixtures::Toward::Destination, _)
-                                    | fixtures::Event::Frame("binary")
-                            )
-                        })
-                    })
+                    settle_for(
+                        "session.network.client_packet",
+                        run.seen,
+                        5,
+                        json!({"site":site,"stage":stage,"cursor":"pre-rekey_log"}),
+                        |seen, observation| {
+                            fixture_predicates::packet(seen, &rekey_log, observation)
+                        },
+                    )
                     .await,
                 );
             }
-            begin_end(run, worker).await?;
-            closed(run, log_before, &mut case).await;
+            begin_end(run, worker, Some(&log_before)).await?;
+            closed("session.network.closed", run, &log_before, &mut case).await;
             let report = answer(run, worker).await?;
             case.check(
+                "session_end_cases.a006",
                 "stopped request answers before termination",
                 report.get("wait_expired").is_none(),
             );
             if site == "command" {
                 case.check(
+                    "session_end_cases.a007",
                     "command stopped before intent reports session-end journal refusal",
                     report["outcome"]["refused"] == "journal"
                         && report["outcome"]["why"] == "sessions ended",
                 );
             }
             case.check(
+                "session_end_cases.a008",
                 "no command or job-read exec reaches sshd",
                 run.seen.lock().unwrap().ssh_exec.len() == exec_before,
             );
             if stage == "challenge" {
                 case.check(
+                    "session_end_cases.a009",
                     "before relay dial sshd sees no contact",
                     run.sshd.accepted.load(Ordering::SeqCst) == accepted_before,
                 );
             }
             case.check(
+                "session_end_cases.a010",
                 "no later SSH channel is opened",
                 run.seen.lock().unwrap().ssh_channels == channel_before,
             );
             if ["identification", "kex"].contains(&stage) {
                 case.check(
+                    "session_end_cases.a011",
                     "no later authentication stage is sent",
                     run.seen.lock().unwrap().ssh_auth.len() == auth_before,
                 );
             }
             end_open(run, worker, &mut case).await?;
-            cases.push(case);
+            case.finish(cases);
         }
     }
     Ok(())
@@ -347,7 +423,7 @@ async fn admission(
                         .is_some_and(|machines| machines.contains(&json!("unpinned")))
                 })
             });
-            if !approved || bound {
+            if completion::rejects("session-end.admission.approved_unbound", !approved || bound) {
                 return Err("admission fixture must be approved and unbound before ending".into());
             }
         }
@@ -383,7 +459,7 @@ async fn admission(
             )
             .await?;
         }
-        begin_end(run, worker).await?;
+        begin_end(run, worker, None).await?;
         if behind {
             module(
                 run,
@@ -400,19 +476,21 @@ async fn admission(
         .await?;
         let report = answer(run, worker).await?;
         let after = run.inspect(worker).await?;
-        let mut case = Case::new(&name);
+        let mut case = Case::new("session_end_cases.c002", &name);
         case.check(
+            "session_end_cases.a012",
             "session-end refusal replaces admission or collected answer",
             report["outcome"]["refused"] == "journal"
                 && report["outcome"]["why"] == "sessions ended",
         );
         case.check(
+            "session_end_cases.a013",
             "no connection or signature refusal is committed",
             before["connection_refusals"] == after["connection_refusals"]
                 && before["signature_refusals"] == after["signature_refusals"],
         );
         end_open(run, worker, &mut case).await?;
-        cases.push(case);
+        case.finish(cases);
     }
     Ok(())
 }
@@ -442,7 +520,7 @@ async fn bodies(
                 "self.releasePoint();await new Promise(r=>setTimeout(r,0));return true;",
             )
             .await?;
-            begin_end(run, worker).await?;
+            begin_end(run, worker, None).await?;
             module(
                 run,
                 worker,
@@ -450,13 +528,14 @@ async fn bodies(
             )
             .await?;
         } else {
-            begin_end(run, worker).await?;
+            begin_end(run, worker, None).await?;
             module(run, worker, "self.releasePoint();return true;").await?;
         }
         let report = answer(run, worker).await?;
         let state = run.inspect(worker).await?;
-        let mut case = Case::new(&name);
+        let mut case = Case::new("session_end_cases.c003", &name);
         case.check(
+            "session_end_cases.a014",
             "body absent with session-end refusal and finished call metadata",
             report.get("body").is_none()
                 && report["refused"] == "sessions ended"
@@ -465,13 +544,14 @@ async fn bodies(
                 && report["call"].is_u64(),
         );
         case.check(
+            "session_end_cases.a015",
             "completion terminal remains committed",
             state["inference_calls"]
                 .as_array()
                 .is_some_and(|cs| cs.iter().any(|c| c["terminal"]["call"] == report["call"])),
         );
         end_open(run, worker, &mut case).await?;
-        cases.push(case);
+        case.finish(cases);
     }
     Ok(())
 }
@@ -497,12 +577,26 @@ async fn appends(
                 continue;
             }
             reset(run, tab, worker, files).await?;
+            let target_case = catalogue::case_id("session_end_cases.c004", &name);
             if site != "command" {
                 unresolved(run, worker).await?;
             }
             point(run, worker, "evidence_writer").await?;
-            let log_before = run.seen.lock().unwrap().relay_log.len();
-            start(run, worker, &expression(run, site, "printf evidence-race")).await?;
+            let log_before = fixture_inputs::relay(
+                run,
+                worker,
+                &target_case,
+                "relay",
+                &run.seen.lock().unwrap(),
+            );
+            fixture_inputs::session_start(
+                &log_before,
+                None,
+                run,
+                worker,
+                &expression(run, site, "printf evidence-race"),
+            )
+            .await?;
             wait_point(run, worker).await?;
             let before = run.inspect(worker).await?;
             if begun {
@@ -510,7 +604,7 @@ async fn appends(
             } else {
                 writer(run, worker).await?;
             }
-            begin_end(run, worker).await?;
+            begin_end(run, worker, Some(&log_before)).await?;
             if !begun {
                 module(
                     run,
@@ -519,9 +613,9 @@ async fn appends(
                 )
                 .await?;
             }
-            let mut case = Case::new(&name);
+            let mut case = Case::new("session_end_cases.c004", &name);
             // A command normally queued its disconnect before evidence; read sites still own a channel.
-            closed(run, log_before, &mut case).await;
+            closed("session.append.closed", run, &log_before, &mut case).await;
             if begun {
                 module(run, worker, "self.releaseMove();return true;").await?;
             } else {
@@ -535,6 +629,7 @@ async fn appends(
             let report = answer(run, worker).await?;
             let after = run.inspect(worker).await?;
             case.check(
+                "session_end_cases.a016",
                 "begun append completes whole; queued append commits nothing",
                 if begun {
                     after["jobs"] != before["jobs"]
@@ -544,6 +639,7 @@ async fn appends(
             );
             if !begun && site == "command" {
                 case.check(
+                    "session_end_cases.a017",
                     "uncommitted job record is reported as unresolved evidence",
                     report["outcome"]["unresolved"] == true
                         && report["outcome"].get("job_record").is_some(),
@@ -555,6 +651,7 @@ async fn appends(
                 restart(run, tab, worker).await?;
                 let replay = run.inspect(worker).await?;
                 case.check(
+                    "session_end_cases.a018",
                     "uncommitted evidence leaves command unresolved after unlock",
                     replay["calls"].as_array().is_some_and(|cs| {
                         cs.iter().any(|c| {
@@ -563,7 +660,7 @@ async fn appends(
                     }),
                 );
             }
-            cases.push(case);
+            case.finish(cases);
         }
     }
     Ok(())
@@ -601,11 +698,13 @@ async fn cold_probe(
             })
             .count()
     };
-    let probes = count();
+    let target_case = catalogue::case_id("session_end_cases.c005", name);
+    let probes_input = fixture_inputs::probes(run, worker, &target_case);
+    let probes = fixture_inputs::probe_baseline(&probes_input);
     point(run, worker, "route_writer").await?;
     let req = json!({"machine":"fixture","messages":[{"role":"user","content":"cold route"}]})
         .to_string();
-    start(run,worker,&format!("(async()=>{{const m=await import(new URL('./pkg/tau_web.js',self.location.href).href);return JSON.parse(await m.inference_request({}));}})()",json!(req))).await?;
+    fixture_inputs::cold_start(&probes_input,run,worker,&format!("(async()=>{{const m=await import(new URL('./pkg/tau_web.js',self.location.href).href);return JSON.parse(await m.inference_request({}));}})()",json!(req))).await?;
     wait_point(run, worker).await?;
     writer(run, worker).await?;
     module(
@@ -614,7 +713,7 @@ async fn cold_probe(
         "self.releasePoint();await new Promise(r=>setTimeout(r,0));return true;",
     )
     .await?;
-    begin_end(run, worker).await?;
+    begin_end(run, worker, Some(&probes_input)).await?;
     module(
         run,
         worker,
@@ -622,24 +721,41 @@ async fn cold_probe(
     )
     .await?;
     let report = answer(run, worker).await?;
-    let sent = settle_for(run.seen, 5, |_| count() > probes).await;
-    let mut case = Case::new(name);
+    let sent = settle_for(
+        "session.cold_probe.sent",
+        run.seen,
+        5,
+        json!({"count_origin":"pre-probe count"}),
+        |_, observation| fixture_predicates::probe_ready(run, &probes_input, observation),
+    )
+    .await;
+    let mut case = Case::new("session_end_cases.c005", name);
     case.check(
+        "session_end_cases.a019",
         "stopped inference refuses its cold probe",
         report["refused"] == "sessions ended" && report.get("call").is_none(),
     );
     case.check(
+        "session_end_cases.a020",
         "only the revoke probe is sent after ending",
         sent && count() == probes + 1,
     );
-    let original_key_id = key_id(run, &last_key(run));
-    let revoke = settle_for(run.seen, 5, |_| revoke_sent(run, &original_key_id)).await;
+    let original_key_id = fixture_inputs::key(run, worker, &target_case);
+    let revoke = settle_for(
+        "session.cold_probe.revoke",
+        run.seen,
+        5,
+        json!({"key":"source original session key"}),
+        |_, observation| fixture_predicates::revoke(run, &original_key_id, observation),
+    )
+    .await;
     case.check(
+        "session_end_cases.a021",
         "revoke itself is sent for the original known identity",
         revoke,
     );
     end_open(run, worker, &mut case).await?;
-    cases.push(case);
+    case.finish(cases);
     Ok(())
 }
 
@@ -662,11 +778,21 @@ async fn revoke_probe_control(
     )
     .await?;
     let before = run.aggregator.requests.lock().unwrap().len();
-    begin_end(run, worker).await?;
-    let id = key_id(run, &last_key(run));
-    let sent = settle_for(run.seen, 5, |_| revoke_sent(run, &id)).await;
-    let mut case = Case::new(name);
+    let target_case = catalogue::case_id("session_end_cases.c006", name);
+    let end_input = fixture_inputs::end_marker(run, worker, &target_case);
+    begin_end(run, worker, Some(&end_input)).await?;
+    let id = fixture_inputs::key(run, worker, &target_case);
+    let sent = settle_for(
+        "session.revoke_control.sent",
+        run.seen,
+        5,
+        json!({"key":"source original session key"}),
+        |_, observation| fixture_predicates::revoke(run, &id, observation),
+    )
+    .await;
+    let mut case = Case::new("session_end_cases.c006", name);
     case.check(
+        "session_end_cases.a022",
         "revoke and its dedicated probe still go out",
         sent && run.aggregator.requests.lock().unwrap()[before..]
             .iter()
@@ -676,7 +802,7 @@ async fn revoke_probe_control(
             }),
     );
     end_open(run, worker, &mut case).await?;
-    cases.push(case);
+    case.finish(cases);
     Ok(())
 }
 
@@ -693,21 +819,34 @@ async fn running_command(
         return Ok(());
     }
     reset(run, tab, worker, files).await?;
-    let log_before = run.seen.lock().unwrap().relay_log.len();
-    let ends = run.seen.lock().unwrap().ssh_ends.len();
-    start(
+    let target_case = catalogue::case_id("session_end_cases.c007", name);
+    let log_before = fixture_inputs::relay(
         run,
         worker,
-        &expression(run, "command", "sleep 4; printf detached-end"),
+        &target_case,
+        "relay",
+        &run.seen.lock().unwrap(),
+    );
+    let ends = run.seen.lock().unwrap().ssh_ends.len();
+    let expression = expression(run, "command", "sleep 4; printf detached-end");
+    let source = causal::job_zero("session_end.running", worker, &expression);
+    fixture_inputs::running_page(
+        &log_before,
+        source,
+        run,
+        worker,
+        &format!("self.sessionResult={expression};void 0"),
     )
     .await?;
-    let (call, job) = job_cases::wait_launch(run, worker, 0).await?;
+    let (call, job) =
+        job_cases::wait_launch("session_end.running.wait_launch", source, run, worker, 0).await?;
     let before = run.inspect(worker).await?;
-    begin_end(run, worker).await?;
-    let mut case = Case::new(name);
-    closed(run, log_before, &mut case).await;
+    begin_end(run, worker, Some(&log_before)).await?;
+    let mut case = Case::new("session_end_cases.c007", name);
+    closed("session.running.closed", run, &log_before, &mut case).await;
     let report = answer(run, worker).await?;
     case.check(
+        "session_end_cases.a023",
         "sent command reports unresolved with session end and its send history",
         report["outcome"]["call"] == call
             && report["outcome"]["unresolved"] == true
@@ -716,12 +855,14 @@ async fn running_command(
     );
     let ssh_ends = run.seen.lock().unwrap().ssh_ends[ends..].to_vec();
     case.check(
+        "session_end_cases.a024",
         "sshd received transport EOF, not SSH DISCONNECT",
         ssh_ends.iter().any(|s| s.starts_with("Err(")) && ssh_ends.iter().all(|s| s != "Ok(())"),
     );
 
     let after = run.inspect(worker).await?;
     case.check(
+        "session_end_cases.a025",
         "no command evidence or terminal is appended",
         after["jobs"] == before["jobs"] && after["calls"] == before["calls"],
     );
@@ -730,16 +871,26 @@ async fn running_command(
     restart(run, tab, worker).await?;
     let replay = run.inspect(worker).await?;
     case.check(
+        "session_end_cases.a026",
         "call reads unresolved after unlock",
         replay["calls"].as_array().is_some_and(|cs| {
             cs.iter()
                 .any(|c| c["call"] == call && c["state"] == "unresolved")
         }),
     );
-    job_cases::wait_end(run, &job).await?;
+    job_cases::wait_end(
+        "session_end.running.wait_end",
+        "session_end.running",
+        run,
+        &job,
+    )
+    .await?;
     fresh_pace(run.relay);
-    let collected = run.harness_collect(worker, request(run, "")).await?;
+    let collected = run
+        .harness_collect("session_end_cases.rs#2", worker, request(run, ""))
+        .await?;
     case.check(
+        "session_end_cases.a027",
         "command is collectable after unlock",
         collected["outcome"]["collected"]
             .as_array()
@@ -748,7 +899,7 @@ async fn running_command(
                     .any(|r| r["call"] == call && r["state"] == "finished")
             }),
     );
-    cases.push(case);
+    case.finish(cases);
     Ok(())
 }
 
@@ -766,42 +917,65 @@ async fn rekey_append(
             continue;
         }
         reset(run, tab, worker, files).await?;
+        let target_case = catalogue::case_id("session_end_cases.c008", &name);
         if site != "command" {
             unresolved(run, worker).await?;
         }
-        let log_before = run.seen.lock().unwrap().relay_log.len();
+        let log_before = fixture_inputs::relay(
+            run,
+            worker,
+            &target_case,
+            "relay",
+            &run.seen.lock().unwrap(),
+        );
         point(run, worker, "session_evidence").await?;
-        start(run, worker, &expression(run, site, "printf rekey-evidence")).await?;
+        fixture_inputs::session_start(
+            &log_before,
+            None,
+            run,
+            worker,
+            &expression(run, site, "printf rekey-evidence"),
+        )
+        .await?;
         wait_point(run, worker).await?;
-        let rekey_log = run.seen.lock().unwrap().relay_log.len();
-        run.relay.session_gate.arm("rekey");
-        module(run,worker,"m.test_rekey_session('session_evidence');self.moveReady=new Promise(ready=>m.test_hold_move(new Promise(release=>self.releaseMove=release),ready));self.releasePoint();await self.moveReady;return true;").await?;
-        let reached = settle_for(run.seen, 5, |_| {
-            run.relay.session_gate.reached.load(Ordering::SeqCst)
-        })
+        let rekey_log = fixture_inputs::relay(
+            run,
+            worker,
+            &target_case,
+            "packet",
+            &run.seen.lock().unwrap(),
+        );
+        let gate = fixture_inputs::arm(run, worker, &target_case, "rekey");
+        fixture_inputs::rekey_module(&rekey_log,&gate,run,worker,"m.test_rekey_session('session_evidence');self.moveReady=new Promise(ready=>m.test_hold_move(new Promise(release=>self.releaseMove=release),ready));self.releasePoint();await self.moveReady;return true;").await?;
+        let reached = settle_for(
+            "session.rekey.stage_reached",
+            run.seen,
+            5,
+            json!({"site":site,"stage":"rekey"}),
+            |_, observation| fixture_predicates::stage(run, &gate, observation),
+        )
         .await;
-        if !reached {
+        if completion::rejects("session-end.rekey.actual_stage", !reached) {
             return Err(format!(
                 "could not arrange {name}: rekey did not reach relay"
             ));
         }
-        let mut case = Case::new(&name);
+        let mut case = Case::new("session_end_cases.c008", &name);
         case.check(
+            "session_end_cases.a028",
             "rekey request emits a client SSH packet",
-            settle_for(run.seen, 5, |seen| {
-                seen.relay_log[rekey_log..].iter().any(|(_, event)| {
-                    matches!(
-                        event,
-                        fixtures::Event::Frame("binary")
-                            | fixtures::Event::Forwarded(fixtures::Toward::Destination, _)
-                    )
-                })
-            })
+            settle_for(
+                "session.rekey.client_packet",
+                run.seen,
+                5,
+                json!({"site":site,"cursor":"pre-rekey_log"}),
+                |seen, observation| fixture_predicates::packet(seen, &rekey_log, observation),
+            )
             .await,
         );
-        begin_end(run, worker).await?;
-        closed(run, log_before, &mut case).await;
-        case.check("append still suspended after socket closes",module(run,worker,"let done=false;self.sessionResult.then(()=>done=true);await new Promise(r=>setTimeout(r,0));return done;").await?==false);
+        begin_end(run, worker, Some(&log_before)).await?;
+        closed("session.rekey.closed", run, &log_before, &mut case).await;
+        case.check("session_end_cases.a029", "append still suspended after socket closes",module(run,worker,"let done=false;self.sessionResult.then(()=>done=true);await new Promise(r=>setTimeout(r,0));return done;").await?==false);
         module(run, worker, "self.releaseMove();return true;").await?;
         let report = answer(run, worker).await?;
         let evidence = if site == "command" {
@@ -814,10 +988,12 @@ async fn rekey_append(
                 .unwrap_or(Value::Null)
         };
         case.check(
+            "session_end_cases.a030",
             "begun evidence append still completes",
             evidence["number"].is_u64() && evidence["state"] == "finished",
         );
         case.check(
+            "session_end_cases.a031",
             "late committed outcome is historical and never actionable",
             if site == "command" {
                 report["outcome"]["historical"] == true
@@ -829,14 +1005,15 @@ async fn rekey_append(
                 evidence["historical"] == true && evidence["actionable"] == false
             },
         );
-        let files = store_files(&run.dump(tab).await?);
-        let opened = reader::read(&files, PASSPHRASE)?;
+        let files = store_files(&run.dump_at("file.session_end_cases.dump.001", tab).await?);
+        let opened = reader::read_at("reader.call.session_end.rekey_evidence", &files, PASSPHRASE)?;
         let committed = opened
             .records
             .iter()
             .find(|(number, _)| Some(*number) == evidence["number"].as_u64())
             .and_then(|(_, bytes)| serde_json::from_slice::<Value>(bytes).ok());
         case.check(
+            "session_end_cases.a032",
             "independent reader proves exact original call job boot record and terminal",
             committed.as_ref().is_some_and(|v| {
                 v["job_terminal"]["call"] == evidence["call"]
@@ -846,6 +1023,7 @@ async fn rekey_append(
         );
         if site == "command" {
             case.check(
+                "session_end_cases.a033",
                 "late terminal retains exact output and exit outcome",
                 evidence["stdout"] == "rekey-evidence" && evidence["exit_status"] == 0,
             );
@@ -853,11 +1031,12 @@ async fn rekey_append(
         let sends = run.seen.lock().unwrap().ssh_exec.len();
         tokio::time::sleep(Duration::from_millis(50)).await;
         case.check(
+            "session_end_cases.a034",
             "late evidence causes no next SSH effect",
             run.seen.lock().unwrap().ssh_exec.len() == sends,
         );
         end_open(run, worker, &mut case).await?;
-        cases.push(case);
+        case.finish(cases);
     }
     Ok(())
 }
@@ -868,10 +1047,13 @@ pub(super) async fn run(
     worker: &mut Worker,
     cases: &mut Vec<Case>,
 ) -> Result<(), String> {
-    let saved = store_files(&run.dump(tab).await?);
-    let mnemonic = reader::read(&saved, PASSPHRASE)?.mnemonic()?;
+    let _scenario_span = completion::scenario("session_end_cases.run");
+    let saved = store_files(&run.dump_at("file.session_end_cases.dump.002", tab).await?);
+    let mnemonic = reader::read_at("reader.call.session_end.original", &saved, PASSPHRASE)?
+        .mnemonic_at("reader.aux.call.session_end.original.mnemonic")?;
     let mut events = vec![json!({"seed":{"mnemonic":mnemonic}})];
-    events.extend(reader::setup_events(
+    events.extend(reader::setup_events_at(
+        "reader.aux.call.session_end.setup",
         &mnemonic,
         &["fixture", "fixture-other", "unpinned"],
     ));
@@ -880,11 +1062,11 @@ pub(super) async fn run(
             json!({"setup":{"class":{"machine":machine,"answer":"no","class":"single_purpose"}}}),
         );
     }
-    let files = reader::build(PASSPHRASE, &events);
+    let files = reader::build_at("file.session_end_cases.build.001", PASSPHRASE, &events);
     let identity = events[2]["setup"]["approval"]["entries"][0]["identity"].clone();
     let session = format!("session-{}", events.len());
     events.push(json!({"exposure":{"session":session,"bound_set":[{"machine":"fixture","identity":identity}],"accepted_modes":["no_artifact_pin"]}}));
-    let unpinned = reader::build(PASSPHRASE, &events);
+    let unpinned = reader::build_at("file.session_end_cases.build.002", PASSPHRASE, &events);
     cold_probe(run, tab, worker, &files, cases).await?;
     revoke_probe_control(run, tab, worker, &files, cases).await?;
     network(run, tab, worker, &files, cases).await?;
@@ -895,8 +1077,12 @@ pub(super) async fn run(
     appends(run, tab, worker, &files, cases).await?;
     run.aggregator.state.lock().unwrap().hold_revoke = false;
     run.relay.session_gate.clear();
-    *worker = run.reload(tab, worker).await?;
+    *worker = run
+        .reload("session_end_cases.rs::reload#3", tab, worker)
+        .await?;
     run.put(tab, &saved).await?;
-    *worker = run.reload(tab, worker).await?;
+    *worker = run
+        .reload("session_end_cases.rs::reload#4", tab, worker)
+        .await?;
     resume(run, tab, worker).await
 }

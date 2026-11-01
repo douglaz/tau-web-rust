@@ -102,20 +102,57 @@ pub struct Sshd {
 impl Sshd {
     /// Waits up to 30 s until every connection the sshd accepted has ended, so everything the
     /// client sent before closing has been handled and recorded; whether they all ended.
-    pub async fn cleanup(&self) {
+    #[cfg(test)]
+    pub async fn cleanup(&self) -> bool {
+        self.cleanup_at(None).await
+    }
+
+    pub async fn cleanup_at(&self, site: Option<&'static str>) -> bool {
         self.listener.abort();
         self.machine.reboot();
-        self.all_ended().await;
+        let ended = self
+            .all_ended_at(site, super::json!({"phase":"cleanup"}))
+            .await;
         let tasks = std::mem::take(&mut *self.tasks.lock().expect("exec tasks"));
         for task in tasks {
             let _ = task.await;
         }
         self.machine.cleanup();
+        ended && !self.machine.root.exists()
     }
 
-    pub async fn all_ended(&self) -> bool {
-        for _ in 0..600 {
-            if self.ended.load(Ordering::SeqCst) == self.accepted.load(Ordering::SeqCst) {
+    pub async fn all_ended_at(&self, site: Option<&'static str>, extra: serde_json::Value) -> bool {
+        let observation = site.map(|site| {
+            super::observer::Call::begin(
+                site,
+                "fixture.ssh_ended",
+                None,
+                super::causal::ended_domain(site, self, extra),
+            )
+        });
+        if let Some(observation) = &observation {
+            observation.fact(
+                "fixture_input",
+                super::causal::fixture_role(self) != "unknown",
+            );
+        }
+        for poll in 0..600 {
+            if let Some(observation) = &observation {
+                observation.attempt(poll + 1);
+            }
+            let ended = observation.as_ref().map_or_else(
+                || self.ended.load(Ordering::SeqCst),
+                |o| o.ssh_counter(self, "ended", &self.ended),
+            );
+            let accepted = observation.as_ref().map_or_else(
+                || self.accepted.load(Ordering::SeqCst),
+                |o| o.ssh_counter(self, "accepted", &self.accepted),
+            );
+            let ready = ended == accepted;
+            if observation
+                .as_ref()
+                .map_or(ready, |observation| observation.poll(poll + 1, ready))
+            {
                 return true;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;

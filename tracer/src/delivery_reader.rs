@@ -1,10 +1,13 @@
 //! Independent delivery-record inspection; does not calculate a delivery verdict.
+use crate::semantic;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 fn exact(v: &Value, keys: &[&str]) -> Result<(), String> {
-    if v.as_object()
-        .is_some_and(|o| o.len() == keys.len() && keys.iter().all(|k| o.contains_key(*k)))
-    {
+    if semantic::holds(
+        semantic::catalogue("delivery.g001", keys),
+        v.as_object()
+            .is_some_and(|o| o.len() == keys.len() && keys.iter().all(|k| o.contains_key(*k))),
+    ) {
         Ok(())
     } else {
         Err("delivery members".into())
@@ -16,20 +19,27 @@ pub(super) fn shape(v: &Value) -> Result<(), String> {
             exact(v, &["kind", "check"])?;
             let c = &v["check"];
             exact(c, &["session", "authority", "measurements", "result"])?;
-            if c["session"].as_str().is_none_or(str::is_empty) {
+            if semantic::rejects(
+                "delivery.g002",
+                c["session"].as_str().is_none_or(str::is_empty),
+            ) {
                 return Err("delivery session".into());
             }
             let a = &c["authority"];
             exact(a, &["machine", "requirements", "class", "declaration"])?;
-            if a["machine"].as_str().is_none_or(str::is_empty)
-                || a["requirements"].as_u64().is_none()
-            {
+            if semantic::rejects(
+                "delivery.g003",
+                a["machine"].as_str().is_none_or(str::is_empty)
+                    || a["requirements"].as_u64().is_none(),
+            ) {
                 return Err("delivery authority".into());
             }
-            if !["single_purpose", "multi_tenant"]
-                .iter()
-                .any(|s| a["class"] == *s)
-            {
+            if semantic::rejects(
+                "delivery.g004",
+                !["single_purpose", "multi_tenant"]
+                    .iter()
+                    .any(|s| a["class"] == *s),
+            ) {
                 return Err("delivery class".into());
             }
             crate::declaration_reader::declaration(
@@ -52,10 +62,10 @@ pub(super) fn shape(v: &Value) -> Result<(), String> {
                     "placing_session",
                 ],
             )?;
-            if !m["placing_session"].is_boolean() {
+            if semantic::rejects("delivery.g005", !m["placing_session"].is_boolean()) {
                 return Err("placing-session evidence".into());
             }
-            for f in [
+            for (source_index, f) in [
                 "inbound",
                 "outbound",
                 "services",
@@ -65,22 +75,33 @@ pub(super) fn shape(v: &Value) -> Result<(), String> {
                 "credentials",
                 "fixed_default_credentials",
                 "sshd_posture",
-            ] {
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let _source_slot = semantic::Slot::new("delivery.measurement", source_index);
                 let measurement = &m[f];
                 match measurement["read"].as_str() {
                     Some("missing" | "failed") => exact(measurement, &["read"])?,
                     Some("value") => {
                         exact(measurement, &["read", "value"])?;
                         if ["spendable", "fixed_default_credentials", "sshd_posture"].contains(&f) {
-                            if !measurement["value"].is_boolean() {
+                            if semantic::rejects(
+                                semantic::field_site("delivery.g006", f),
+                                !measurement["value"].is_boolean(),
+                            ) {
                                 return Err("boolean measurement".into());
                             }
-                        } else if !measurement["value"].is_array() {
+                        } else if semantic::rejects(
+                            semantic::field_site("delivery.g007", f),
+                            !measurement["value"].is_array(),
+                        ) {
                             return Err("set measurement".into());
                         }
                     }
                     _ => return Err("measurement read state".into()),
                 }
+                semantic::entered("delivery.g008");
             }
             let r = &c["result"];
             exact(
@@ -101,49 +122,77 @@ pub(super) fn shape(v: &Value) -> Result<(), String> {
                 "placement_eligible",
                 "findings_unknown",
             ] {
-                if !r[f].is_boolean() {
+                if semantic::rejects(semantic::field_site("delivery.g009", f), !r[f].is_boolean()) {
                     return Err("delivery result flag".into());
                 }
             }
-            for row in r["fields"].as_array().ok_or("delivery field results")? {
+            for (source_index, row) in semantic::result(
+                "delivery.g010",
+                r["fields"].as_array().ok_or("delivery field results"),
+            )?
+            .iter()
+            .enumerate()
+            {
+                let _source_slot = semantic::Slot::new("delivery.result_field", source_index);
                 exact(row, &["field", "status", "findings", "notes"])?;
-                if ![
-                    "checked",
-                    "finding",
-                    "blocked",
-                    "schema_error",
-                    "unavailable",
-                ]
-                .iter()
-                .any(|s| row["status"] == *s)
-                {
+                if semantic::rejects(
+                    "delivery.g011",
+                    ![
+                        "checked",
+                        "finding",
+                        "blocked",
+                        "schema_error",
+                        "unavailable",
+                    ]
+                    .iter()
+                    .any(|s| row["status"] == *s),
+                ) {
                     return Err("delivery field status".into());
                 }
                 field(&row["field"])?;
             }
-            for finding in r["findings"].as_array().ok_or("delivery findings")? {
+            for (source_index, finding) in semantic::result(
+                "delivery.g012",
+                r["findings"].as_array().ok_or("delivery findings"),
+            )?
+            .iter()
+            .enumerate()
+            {
+                let _source_slot = semantic::Slot::new("delivery.finding", source_index);
                 exact(finding, &["field", "detail", "service"])?;
                 field(&finding["field"])?;
-                if !finding["detail"].is_string() {
+                if semantic::rejects("delivery.g013", !finding["detail"].is_string()) {
                     return Err("finding text".into());
                 }
             }
-            for note in r["notes"].as_array().ok_or("delivery notes")? {
+            for (source_index, note) in semantic::result(
+                "delivery.g014",
+                r["notes"].as_array().ok_or("delivery notes"),
+            )?
+            .iter()
+            .enumerate()
+            {
+                let _source_slot = semantic::Slot::new("delivery.note", source_index);
                 exact(note, &["service", "text"])?;
-                if ![
-                    "enabled, restart not demonstrated",
-                    "stopped since a restart, as approved",
-                ]
-                .iter()
-                .any(|s| note["text"] == *s)
-                {
+                if semantic::rejects(
+                    "delivery.g015",
+                    ![
+                        "enabled, restart not demonstrated",
+                        "stopped since a restart, as approved",
+                    ]
+                    .iter()
+                    .any(|s| note["text"] == *s),
+                ) {
                     return Err("unknown delivery evidence note".into());
                 }
             }
         }
         Some("application") => {
             exact(v, &["kind", "machine", "name"])?;
-            if v["name"].as_str().is_none_or(str::is_empty) {
+            if semantic::rejects(
+                "delivery.g016",
+                v["name"].as_str().is_none_or(str::is_empty),
+            ) {
                 return Err("application name".into());
             }
         }
@@ -151,25 +200,28 @@ pub(super) fn shape(v: &Value) -> Result<(), String> {
         Some("subsequent_placement") => exact(v, &["kind", "machine", "session"])?,
         _ => return Err("delivery record kind".into()),
     }
+    semantic::entered("delivery.g017");
     Ok(())
 }
 fn field(v: &Value) -> Result<(), String> {
-    if [
-        "version",
-        "inbound",
-        "outbound",
-        "services",
-        "spendable",
-        "permitted",
-        "drift_checks",
-        "required",
-        "default_credentials",
-        "fixed_default_credentials",
-        "sshd_posture",
-    ]
-    .iter()
-    .any(|s| v == *s)
-    {
+    if semantic::holds(
+        semantic::field_site("delivery.g018", v.as_str().unwrap_or("unknown")),
+        [
+            "version",
+            "inbound",
+            "outbound",
+            "services",
+            "spendable",
+            "permitted",
+            "drift_checks",
+            "required",
+            "default_credentials",
+            "fixed_default_credentials",
+            "sshd_posture",
+        ]
+        .iter()
+        .any(|s| v == *s),
+    ) {
         Ok(())
     } else {
         Err("delivery result field".into())
@@ -184,17 +236,24 @@ pub(super) struct History {
 }
 impl History {
     pub fn apply(&mut self, event: &Value) -> Result<(), String> {
+        semantic::entered("delivery.history");
+
         if let Some(c) = event.pointer("/setup/class") {
             self.classes.insert(
-                c["machine"].as_str().ok_or("class machine")?.into(),
+                semantic::result(
+                    "delivery.history.class_machine",
+                    c["machine"].as_str().ok_or("class machine"),
+                )?
+                .into(),
                 c["class"].clone(),
             );
         }
         if let Some(p) = event.pointer("/setup/requirements/proposal") {
-            let machine = p["machine"]
-                .as_str()
-                .ok_or("requirements machine")?
-                .to_owned();
+            let machine = semantic::result(
+                "delivery.history.requirements_machine",
+                p["machine"].as_str().ok_or("requirements machine"),
+            )?
+            .to_owned();
             *self.counts.entry(machine.clone()).or_default() += 1;
             if p["kind"] == "declaration" {
                 self.declarations.insert(machine, p["declaration"].clone());
@@ -206,20 +265,35 @@ impl History {
             shape(v)?;
             if v["kind"] == "check" {
                 let a = &v["check"]["authority"];
-                let machine = a["machine"].as_str().ok_or("delivery machine")?;
-                if self.declarations.get(machine) != Some(&a["declaration"])
-                    || self.classes.get(machine) != Some(&a["class"])
-                    || self.counts.get(machine).copied() != a["requirements"].as_u64()
-                {
+                let machine = semantic::result(
+                    "delivery.history.authority_machine",
+                    a["machine"].as_str().ok_or("delivery machine"),
+                )?;
+                if semantic::rejects(
+                    "delivery.g019",
+                    self.declarations.get(machine) != Some(&a["declaration"])
+                        || self.classes.get(machine) != Some(&a["class"])
+                        || self.counts.get(machine).copied() != a["requirements"].as_u64(),
+                ) {
                     return Err("delivery authority differs from journaled requirements".into());
                 }
             }
-            if v["kind"] == "application"
-                && !self.applications.insert((
-                    v["machine"].as_str().ok_or("application machine")?.into(),
-                    v["name"].as_str().ok_or("application name")?.into(),
-                ))
-            {
+            if semantic::rejects(
+                "delivery.g021",
+                v["kind"] == "application"
+                    && !self.applications.insert((
+                        semantic::result(
+                            "delivery.g020",
+                            v["machine"].as_str().ok_or("application machine"),
+                        )?
+                        .into(),
+                        semantic::result(
+                            "delivery.history.application_name",
+                            v["name"].as_str().ok_or("application name"),
+                        )?
+                        .into(),
+                    )),
+            ) {
                 return Err("duplicate application on machine".into());
             }
         }

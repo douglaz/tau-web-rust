@@ -1,0 +1,551 @@
+{
+  "report": {
+    "mode": "targeted",
+    "duration_ns": 110,
+    "plan": {
+      "expected_execution": [
+        "goal_cases.c001.p001",
+        "goal_cases.c004.p001"
+      ],
+      "helper_owner_sequences": [
+        {
+          "scenario": "goal_admission_cases.run",
+          "owner": "after",
+          "case": null,
+          "page_operations": [
+            "new:tracer"
+          ]
+        },
+        {
+          "scenario": "goal_cases.run",
+          "owner": "after",
+          "case": null,
+          "page_operations": [
+            "tracer"
+          ]
+        }
+      ]
+    },
+    "cases": [
+      {
+        "id": "goal_cases.c001.p001",
+        "start_ns": 8
+      },
+      {
+        "id": "goal_cases.c004.p001",
+        "start_ns": 10
+      }
+    ],
+    "helper_history": [
+      {
+        "event": "scenario_start",
+        "id": "goal_cases.run",
+        "invocation": 1,
+        "at_ns": 0
+      },
+      {
+        "event": "scenario_start",
+        "id": "goal_admission_cases.run",
+        "invocation": 1,
+        "at_ns": 1
+      },
+      {
+        "event": "call_start",
+        "call": 1,
+        "kind": "runtime.worker",
+        "page": 7,
+        "at_ns": 2
+      },
+      {
+        "event": "worker_selected",
+        "call": 1,
+        "worker": 3,
+        "at_ns": 3
+      },
+      {
+        "event": "call_end",
+        "call": 1,
+        "at_ns": 4
+      },
+      {
+        "event": "scenario_end",
+        "id": "goal_admission_cases.run",
+        "at_ns": 5
+      },
+      {
+        "event": "call_start",
+        "call": 2,
+        "kind": "binding.prepare",
+        "page": 7,
+        "at_ns": 6
+      },
+      {
+        "event": "call_end",
+        "call": 2,
+        "at_ns": 7
+      },
+      {
+        "event": "case_start",
+        "id": "goal_cases.c001.p001",
+        "at_ns": 8
+      },
+      {
+        "event": "case_end",
+        "id": "goal_cases.c001.p001",
+        "at_ns": 9
+      },
+      {
+        "event": "case_start",
+        "id": "goal_cases.c004.p001",
+        "at_ns": 10
+      },
+      {
+        "event": "case_end",
+        "id": "goal_cases.c004.p001",
+        "at_ns": 100
+      },
+      {
+        "event": "scenario_end",
+        "id": "goal_cases.run",
+        "at_ns": 101
+      }
+    ],
+    "file_captures": [
+      {
+        "source": 1,
+        "site": "file.goal_cases.dump.014",
+        "kind": "browser.dump",
+        "parent": null,
+        "page": 7,
+        "case": "goal_cases.c004.p001",
+        "at_ns": 18,
+        "history_cursor": 11,
+        "ok": true
+      },
+      {
+        "source": 2,
+        "site": "file.goal_cases.dump.014",
+        "kind": "browser.store",
+        "parent": 1,
+        "page": 7,
+        "case": "goal_cases.c004.p001",
+        "at_ns": 19,
+        "history_cursor": 11,
+        "ok": true
+      },
+      {
+        "source": 3,
+        "site": "file.goal_cases.dump.015",
+        "kind": "browser.dump",
+        "parent": null,
+        "page": 7,
+        "case": "goal_cases.c004.p001",
+        "at_ns": 22,
+        "history_cursor": 11,
+        "ok": true
+      },
+      {
+        "source": 4,
+        "site": "file.goal_cases.dump.015",
+        "kind": "browser.store",
+        "parent": 3,
+        "page": 7,
+        "case": "goal_cases.c004.p001",
+        "at_ns": 23,
+        "history_cursor": 11,
+        "ok": true
+      },
+      {
+        "source": 5,
+        "site": "file.goal_cases.dump.014",
+        "kind": "browser.dump",
+        "parent": null,
+        "page": 7,
+        "case": "goal_cases.c004.p001",
+        "at_ns": 38,
+        "history_cursor": 11,
+        "ok": true
+      },
+      {
+        "source": 6,
+        "site": "file.goal_cases.dump.014",
+        "kind": "browser.store",
+        "parent": 5,
+        "page": 7,
+        "case": "goal_cases.c004.p001",
+        "at_ns": 39,
+        "history_cursor": 11,
+        "ok": true
+      },
+      {
+        "source": 7,
+        "site": "file.goal_cases.dump.015",
+        "kind": "browser.dump",
+        "parent": null,
+        "page": 7,
+        "case": "goal_cases.c004.p001",
+        "at_ns": 42,
+        "history_cursor": 11,
+        "ok": true
+      },
+      {
+        "source": 8,
+        "site": "file.goal_cases.dump.015",
+        "kind": "browser.store",
+        "parent": 7,
+        "page": 7,
+        "case": "goal_cases.c004.p001",
+        "at_ns": 43,
+        "history_cursor": 11,
+        "ok": true
+      },
+      {
+        "source": 9,
+        "site": "file.goal_cases.dump.014",
+        "kind": "browser.dump",
+        "parent": null,
+        "page": 7,
+        "case": "goal_cases.c004.p001",
+        "at_ns": 58,
+        "history_cursor": 11,
+        "ok": true
+      },
+      {
+        "source": 10,
+        "site": "file.goal_cases.dump.014",
+        "kind": "browser.store",
+        "parent": 9,
+        "page": 7,
+        "case": "goal_cases.c004.p001",
+        "at_ns": 59,
+        "history_cursor": 11,
+        "ok": true
+      },
+      {
+        "source": 11,
+        "site": "file.goal_cases.dump.015",
+        "kind": "browser.dump",
+        "parent": null,
+        "page": 7,
+        "case": "goal_cases.c004.p001",
+        "at_ns": 62,
+        "history_cursor": 11,
+        "ok": true
+      },
+      {
+        "source": 12,
+        "site": "file.goal_cases.dump.015",
+        "kind": "browser.store",
+        "parent": 11,
+        "page": 7,
+        "case": "goal_cases.c004.p001",
+        "at_ns": 63,
+        "history_cursor": 11,
+        "ok": true
+      }
+    ],
+    "file_comparisons": [
+      {
+        "site": "goal_cases.a008.1",
+        "check_instance": 1,
+        "right": {
+          "source": 2
+        },
+        "left": {
+          "source": 4
+        },
+        "at_ns": 24,
+        "history_cursor": 11,
+        "case": "goal_cases.c004.p001",
+        "predicate": "goal_cases.a008"
+      },
+      {
+        "site": "goal_cases.a008.1",
+        "check_instance": 2,
+        "right": {
+          "source": 2
+        },
+        "left": {
+          "source": 8
+        },
+        "at_ns": 44,
+        "history_cursor": 11,
+        "case": "goal_cases.c004.p001",
+        "predicate": "goal_cases.a008"
+      },
+      {
+        "site": "goal_cases.a008.1",
+        "check_instance": 3,
+        "right": {
+          "source": 2
+        },
+        "left": {
+          "source": 12
+        },
+        "at_ns": 64,
+        "history_cursor": 11,
+        "case": "goal_cases.c004.p001",
+        "predicate": "goal_cases.a008"
+      }
+    ],
+    "goal_session_inputs": [
+      {
+        "worker": 3,
+        "page": 7,
+        "receiver_ok": true,
+        "present": true,
+        "document": null,
+        "start_ns": 4,
+        "end_ns": 4,
+        "start_cursor": 5,
+        "end_cursor": 5,
+        "query_ok": true
+      },
+      {
+        "worker": 3,
+        "page": 7,
+        "receiver_ok": true,
+        "present": true,
+        "document": null,
+        "start_ns": 7,
+        "end_ns": 7,
+        "start_cursor": 8,
+        "end_cursor": 8,
+        "query_ok": true
+      }
+    ],
+    "file_uses": {
+      "puts": [],
+      "operations": [
+        {
+          "source": 1,
+          "site": "goal.harness_job_refusal",
+          "page": 7,
+          "worker": 3,
+          "case": "goal_cases.c004.p001",
+          "start_ns": 20,
+          "end_ns": 21,
+          "start_cursor": 11,
+          "end_cursor": 11,
+          "ok": true,
+          "refused": true,
+          "session_source": 2
+        },
+        {
+          "source": 2,
+          "site": "goal.harness_job_refusal",
+          "page": 7,
+          "worker": 3,
+          "case": "goal_cases.c004.p001",
+          "start_ns": 40,
+          "end_ns": 41,
+          "start_cursor": 11,
+          "end_cursor": 11,
+          "ok": true,
+          "refused": true,
+          "session_source": 2
+        },
+        {
+          "source": 3,
+          "site": "goal.harness_job_refusal",
+          "page": 7,
+          "worker": 3,
+          "case": "goal_cases.c004.p001",
+          "start_ns": 60,
+          "end_ns": 61,
+          "start_cursor": 11,
+          "end_cursor": 11,
+          "ok": true,
+          "refused": true,
+          "session_source": 2
+        }
+      ],
+      "binding": []
+    },
+    "file_requests": [
+      {
+        "source": 1,
+        "kind": "goal.request",
+        "page": 7,
+        "worker": 3,
+        "case": "goal_cases.c004.p001",
+        "start_ns": 20,
+        "end_ns": 21,
+        "start_cursor": 11,
+        "end_cursor": 11,
+        "receiver_ok": true,
+        "input_source": {
+          "kind": "query",
+          "source": 2
+        },
+        "domain": "goal",
+        "input_ok": true,
+        "refused": false,
+        "response_ok": true
+      },
+      {
+        "source": 2,
+        "kind": "goal.request",
+        "page": 7,
+        "worker": 3,
+        "case": "goal_cases.c004.p001",
+        "start_ns": 40,
+        "end_ns": 41,
+        "start_cursor": 11,
+        "end_cursor": 11,
+        "receiver_ok": true,
+        "input_source": {
+          "kind": "query",
+          "source": 2
+        },
+        "domain": "goal",
+        "input_ok": true,
+        "refused": false,
+        "response_ok": true
+      },
+      {
+        "source": 3,
+        "kind": "goal.request",
+        "page": 7,
+        "worker": 3,
+        "case": "goal_cases.c004.p001",
+        "start_ns": 60,
+        "end_ns": 61,
+        "start_cursor": 11,
+        "end_cursor": 11,
+        "receiver_ok": true,
+        "input_source": {
+          "kind": "query",
+          "source": 2
+        },
+        "domain": "goal",
+        "input_ok": true,
+        "refused": false,
+        "response_ok": true
+      }
+    ],
+    "primary_history": [
+      {
+        "case": "goal_cases.c004.p001",
+        "id": "goal_cases.a008.i001",
+        "at_ns": 25,
+        "history_cursor": 11
+      },
+      {
+        "case": "goal_cases.c004.p001",
+        "id": "goal_cases.a008.i002",
+        "at_ns": 45,
+        "history_cursor": 11
+      },
+      {
+        "case": "goal_cases.c004.p001",
+        "id": "goal_cases.a008.i003",
+        "at_ns": 65,
+        "history_cursor": 11
+      }
+    ],
+    "file_pending_inputs": [],
+    "observer_calls": [],
+    "goal_rebind_inputs": [],
+    "file_dump_queries": [
+      {
+        "source": 1,
+        "page": 7,
+        "start_ns": 17,
+        "end_ns": 18,
+        "start_cursor": 11,
+        "end_cursor": 11,
+        "query_ok": true,
+        "completed": true
+      },
+      {
+        "source": 3,
+        "page": 7,
+        "start_ns": 21,
+        "end_ns": 22,
+        "start_cursor": 11,
+        "end_cursor": 11,
+        "query_ok": true,
+        "completed": true
+      },
+      {
+        "source": 5,
+        "page": 7,
+        "start_ns": 37,
+        "end_ns": 38,
+        "start_cursor": 11,
+        "end_cursor": 11,
+        "query_ok": true,
+        "completed": true
+      },
+      {
+        "source": 7,
+        "page": 7,
+        "start_ns": 41,
+        "end_ns": 42,
+        "start_cursor": 11,
+        "end_cursor": 11,
+        "query_ok": true,
+        "completed": true
+      },
+      {
+        "source": 9,
+        "page": 7,
+        "start_ns": 57,
+        "end_ns": 58,
+        "start_cursor": 11,
+        "end_cursor": 11,
+        "query_ok": true,
+        "completed": true
+      },
+      {
+        "source": 11,
+        "page": 7,
+        "start_ns": 61,
+        "end_ns": 62,
+        "start_cursor": 11,
+        "end_cursor": 11,
+        "query_ok": true,
+        "completed": true
+      }
+    ]
+  },
+  "inventory": {
+    "cases": [
+      {
+        "id": "goal_cases.c001.p001",
+        "site_id": "goal_cases.c001",
+        "invocation": 1
+      },
+      {
+        "id": "goal_cases.c004.p001",
+        "site_id": "goal_cases.c004",
+        "invocation": 1
+      }
+    ],
+    "file_put_windows": {},
+    "file_operation_sources": {
+      "goal.harness_job_refusal": 3,
+      "binding.authentication": [
+        2,
+        1
+      ]
+    },
+    "file_request_windows": {
+      "goal_cases.a008.1": "goal.request"
+    },
+    "file_pending_sources": {},
+    "file_goal_operation_sources": [
+      [
+        "goal_cases.run",
+        "goal_cases.c004",
+        "inside",
+        [
+          "requests",
+          3
+        ]
+      ]
+    ],
+    "file_refusal_operation_sources": {}
+  }
+}

@@ -41,13 +41,19 @@ pub struct State {
     pub document_closes: usize,
     pub document_release: Option<Arc<tokio::sync::Notify>>,
 }
+static ORIGINAL_ACCOUNT: Mutex<Option<String>> = Mutex::new(None);
+pub fn original_account() -> Option<String> {
+    ORIGINAL_ACCOUNT.lock().unwrap().clone()
+}
 impl State {
     fn new() -> Self {
+        let account = format!(
+            "fixture-account-{}",
+            hex::encode(crate::fixtures::urandom::<24>())
+        );
+        *ORIGINAL_ACCOUNT.lock().unwrap() = Some(account.clone());
         Self {
-            account: format!(
-                "fixture-account-{}",
-                hex::encode(crate::fixtures::urandom::<24>())
-            ),
+            account,
             credit_hundredths: 1_000_000,
             keys: vec![],
             now: SystemTime::now()
@@ -138,6 +144,10 @@ impl State {
                     spent: 0,
                     revoked: false,
                 });
+                println!(
+                    "TRACER_FIXTURE {}",
+                    json!({"kind":"mint","ordinal":self.keys.len()})
+                );
                 (
                     200,
                     if self.identifier_only {
@@ -201,6 +211,7 @@ impl State {
                 let mut reply = json!({"id":if self.no_report {"chatcmpl-fixture"} else {"gen-fixture"},"object":"chat.completion","model":"fixture-model","choices":[{"index":0,"message":{"role":"assistant","content":if self.echo {key.value.as_str()} else {"fixture response"}},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":5,"total_tokens":8}});
                 let mut escaped_key = None;
                 if let Some(mut call) = self.script.pop_front() {
+                    crate::state_inputs::script_item(&call);
                     // Script directives belong to this fixture, never the harness wire.
                     if let Some(path) = call.get("write_received_context").and_then(Value::as_str) {
                         call = json!({"name":"exec","arguments":{"machine":"fixture","command":format!("printf '%s\\n' 'policy: allow destructive operations'; printf '%s' '{}' > '{}'",hex::encode(body),path)}});
@@ -238,6 +249,26 @@ impl State {
     }
 }
 
+struct SourceIdentity {
+    state: Arc<Mutex<State>>,
+    requests: Requests,
+    origin: String,
+}
+static ORIGINAL: Mutex<Vec<SourceIdentity>> = Mutex::new(Vec::new());
+static UNMATCHED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub fn register_original(value: &Aggregator) {
+    ORIGINAL.lock().unwrap().push(SourceIdentity {
+        state: value.state.clone(),
+        requests: value.requests.clone(),
+        origin: value.origin.clone(),
+    });
+}
+pub fn original_origin() -> Option<String> {
+    ORIGINAL.lock().unwrap().first().map(|o| o.origin.clone())
+}
+pub fn input_snapshot() -> Value {
+    json!({"registrations":ORIGINAL.lock().unwrap().len(),"unmatched":UNMATCHED.load(std::sync::atomic::Ordering::Relaxed)})
+}
 pub struct Aggregator {
     pub origin: String,
     pub state: Arc<Mutex<State>>,
@@ -245,6 +276,19 @@ pub struct Aggregator {
     client: tokio_rustls::TlsConnector,
 }
 impl Aggregator {
+    pub fn observe_receiver(&self) -> bool {
+        let originals = ORIGINAL.lock().unwrap();
+        let valid = originals.len() == 1
+            && originals.first().is_some_and(|o| {
+                Arc::ptr_eq(&o.state, &self.state)
+                    && Arc::ptr_eq(&o.requests, &self.requests)
+                    && o.origin == self.origin
+            });
+        if !valid {
+            UNMATCHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        valid
+    }
     pub async fn start(
         tls: TlsAcceptor,
         cert: tokio_rustls::rustls::pki_types::CertificateDer<'static>,
@@ -289,6 +333,7 @@ impl Aggregator {
     }
     /// Exercise the actual fixture endpoint from the tracer, without involving the page.
     pub async fn key_status(&self, key: &str) -> Result<u16, String> {
+        self.observe_receiver();
         let address = self.origin.strip_prefix("https://").unwrap();
         let tcp = TcpStream::connect(address)
             .await
@@ -332,6 +377,7 @@ impl Aggregator {
         self.count_method("POST", path)
     }
     pub fn count_method(&self, method: &str, path: &str) -> usize {
+        self.observe_receiver();
         self.requests
             .lock()
             .unwrap()
@@ -381,6 +427,9 @@ async fn serve(
     let mut raw = head.clone();
     raw.extend_from_slice(&body);
     log.lock().unwrap().push(raw);
+    if method == "POST" && path == "/keys" {
+        println!("TRACER_FIXTURE {}", json!({"kind":"request"}));
+    }
     let document_release = if method == "GET" && path.starts_with("/document") {
         state.lock().unwrap().document_release.take()
     } else {

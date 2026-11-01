@@ -9,6 +9,8 @@
 //! record and checks each one's AAD and its link to its predecessor. The tracer runs it on the
 //! bytes the browser wrote, and builds a store with it for the browser to unlock.
 
+use super::reader_checks as root_checks;
+use crate::semantic;
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
@@ -19,11 +21,15 @@ use std::num::NonZeroU32;
 
 // Read the README's authority grammar independently of the harness predicate.
 fn document_url(source: &str) -> bool {
-    if !source.starts_with("https://")
-        || source
-            .chars()
-            .any(|c| c.is_whitespace() || c.is_control() || c == '\\')
-    {
+    semantic::entered("reader.url");
+
+    if semantic::rejects(
+        "reader.url.g001",
+        !source.starts_with("https://")
+            || source
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control() || c == '\\'),
+    ) {
         return false;
     }
     let end = source[8..]
@@ -34,42 +40,49 @@ fn document_url(source: &str) -> bool {
     let host = parts.next().unwrap_or_default();
     if let Some(port) = parts.next() {
         let mut number = 0u32;
-        if port.is_empty() {
+        if semantic::rejects("reader.url.g002", port.is_empty()) {
             return false;
         }
-        for digit in port.bytes() {
-            if !digit.is_ascii_digit() {
+        for (source_index, digit) in port.bytes().enumerate() {
+            let _source_slot = semantic::Slot::new("reader.url.port_digit", source_index);
+            if semantic::rejects("reader.url.g003", !digit.is_ascii_digit()) {
                 return false;
             }
             number = number * 10 + u32::from(digit - b'0');
-            if number > 65535 {
+            if semantic::rejects("reader.url.g004", number > 65535) {
                 return false;
             }
         }
-        if number == 0 || parts.next().is_some() {
+        if semantic::rejects("reader.url.g005", number == 0 || parts.next().is_some()) {
             return false;
         }
     }
-    if host.is_empty() || host.len() > 253 || !host.is_ascii() {
+    if semantic::rejects(
+        "reader.url.g006",
+        host.is_empty() || host.len() > 253 || !host.is_ascii(),
+    ) {
         return false;
     }
     let mut count = 0;
     let mut ipv4 = true;
     let mut last_starts_with_letter = false;
-    for label in host.as_bytes().split(|b| *b == b'.') {
+    for (source_index, label) in host.as_bytes().split(|b| *b == b'.').enumerate() {
+        let _source_slot = semantic::Slot::new("reader.url.label", source_index);
         count += 1;
-        if label.is_empty() || label.len() > 63 {
+        if semantic::rejects("reader.url.g007", label.is_empty() || label.len() > 63) {
             return false;
         }
-        if !label[0].is_ascii_alphanumeric()
-            || !label[label.len() - 1].is_ascii_alphanumeric()
-            || label
-                .iter()
-                .any(|b| !b.is_ascii_alphanumeric() && *b != b'-')
-            || label
-                .get(..4)
-                .is_some_and(|p| p.eq_ignore_ascii_case(b"xn--"))
-        {
+        if semantic::rejects(
+            "reader.url.g008",
+            !label[0].is_ascii_alphanumeric()
+                || !label[label.len() - 1].is_ascii_alphanumeric()
+                || label
+                    .iter()
+                    .any(|b| !b.is_ascii_alphanumeric() && *b != b'-')
+                || label
+                    .get(..4)
+                    .is_some_and(|p| p.eq_ignore_ascii_case(b"xn--")),
+        ) {
             return false;
         }
         last_starts_with_letter = label[0].is_ascii_alphabetic();
@@ -78,54 +91,124 @@ fn document_url(source: &str) -> bool {
             && label.iter().all(u8::is_ascii_digit)
             && label.iter().fold(0u32, |n, b| n * 10 + u32::from(b - b'0')) <= 255;
     }
-    last_starts_with_letter || (count == 4 && ipv4)
+    semantic::holds(
+        "reader.url.g009",
+        last_starts_with_letter || (count == 4 && ipv4),
+    )
 }
 
-pub type Files = BTreeMap<String, Vec<u8>>;
+pub use super::file_inputs::Files;
 
 const ITERATIONS: u32 = 600_000;
 
 /// What the reader learned from a store and its passphrase.
 pub struct Opened {
+    origin: usize,
     pub wrapping_key: [u8; 32],
     pub data_key: [u8; 32],
     /// Each record's number and plaintext, in order.
     pub records: Vec<(u64, Vec<u8>)>,
 }
 
+pub struct Mnemonic {
+    value: String,
+    origin: usize,
+    caller: &'static str,
+}
+impl Mnemonic {
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+    pub fn operand(&self) -> Value {
+        json!({"kind":"reader","source":self.origin,"site":self.caller,"ok":crate::auxiliary::original_phrase_matches(self.origin,&self.value)})
+    }
+}
 impl Opened {
+    pub fn origin(&self) -> usize {
+        self.origin
+    }
     /// The mnemonic the seed record, record 0, carries.
+    #[cfg(test)]
     pub fn mnemonic(&self) -> Result<String, String> {
-        let (_, first) = self.records.first().ok_or("no record")?;
-        let event: Value = serde_json::from_slice(first).map_err(|e| e.to_string())?;
-        event["seed"]["mnemonic"]
-            .as_str()
-            .map(str::to_string)
-            .ok_or_else(|| "record 0 is not the seed".to_string())
+        self.mnemonic_at("reader.aux.call.unregistered")
     }
 
+    pub fn mnemonic_operand_at(&self, caller: &'static str) -> Result<Mnemonic, String> {
+        Ok(Mnemonic {
+            value: self.mnemonic_at(caller)?,
+            origin: self.origin,
+            caller,
+        })
+    }
+    pub fn mnemonic_at(&self, caller: &'static str) -> Result<String, String> {
+        let _helper_call =
+            crate::auxiliary::Call::begin(caller, "reader.aux.mnemonic", self.origin);
+        crate::auxiliary::opened_input(self.origin, &self.records);
+
+        let (_, first) = semantic::result(
+            "reader.mnemonic.first_record",
+            self.records.first().ok_or("no record"),
+        )?;
+        let event: Value = semantic::result(
+            "reader.mnemonic.json",
+            serde_json::from_slice(first).map_err(|e| e.to_string()),
+        )?;
+        semantic::result(
+            "reader.mnemonic.seed_text",
+            event["seed"]["mnemonic"]
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| "record 0 is not the seed".to_string()),
+        )
+    }
+
+    #[cfg(test)]
     pub fn seed_id(&self) -> Result<String, String> {
-        seed_id(&self.mnemonic()?)
+        self.seed_id_at("reader.aux.call.unregistered")
+    }
+
+    pub fn seed_id_at(&self, caller: &'static str) -> Result<String, String> {
+        let _helper_call =
+            crate::auxiliary::Call::begin(caller, "reader.aux.opened_seed_id", self.origin);
+
+        seed_id_at(
+            "reader.aux.call.opened_seed_id.seed_id",
+            0,
+            &self.mnemonic_at("reader.aux.call.opened_seed_id.mnemonic")?,
+        )
     }
 
     /// Read the encrypted completion independently; require this reader's own seed identifier.
-    pub fn seed_backups(&self) -> Result<Vec<String>, String> {
-        let id = self.seed_id()?;
+    pub fn seed_backups_at(&self, caller: &'static str) -> Result<Vec<String>, String> {
+        let _helper_call =
+            crate::auxiliary::Call::begin(caller, "reader.aux.seed_backups", self.origin);
+
+        let id = self.seed_id_at("reader.aux.call.seed_backups.seed_id")?;
         let mut completions = Vec::new();
-        for (_, bytes) in &self.records {
-            let event: Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+        for (source_index, (_, bytes)) in self.records.iter().enumerate() {
+            let _source_slot = semantic::Slot::new("reader.aux.backup_record", source_index);
+            let event: Value = semantic::result(
+                "reader.backup.record_json",
+                serde_json::from_slice(bytes).map_err(|e| e.to_string()),
+            )?;
             if let Some(record) = event.pointer("/allocation/seed_backup") {
-                if record["seed"] != id {
+                if semantic::rejects("reader.backup.own_seed", record["seed"] != id) {
                     return Err("completion names another seed".into());
                 }
-                if record.as_object().is_none_or(|o| o.len() != 2) {
+                if semantic::rejects(
+                    "reader.backup.exact_two_fields",
+                    record.as_object().is_none_or(|o| o.len() != 2),
+                ) {
                     return Err("completion has extra fields".into());
                 }
                 completions.push(
-                    record["completion"]
-                        .as_str()
-                        .ok_or("completion is not text")?
-                        .to_string(),
+                    semantic::result(
+                        "reader.backup.completion_text",
+                        record["completion"]
+                            .as_str()
+                            .ok_or("completion is not text"),
+                    )?
+                    .to_string(),
                 );
             }
         }
@@ -156,31 +239,44 @@ impl Opened {
 
 /// Reads the documented plaintext shapes independently of the harness's event types.
 fn check_event(number: u64, event: &Value) -> Result<(), String> {
-    let object = event.as_object().ok_or("event is not an object")?;
-    if object.len() != 1 {
+    semantic::entered("reader.semantic.event");
+
+    let object = semantic::result(
+        "reader.semantic.g001",
+        event.as_object().ok_or("event is not an object"),
+    )?;
+    if semantic::rejects("reader.semantic.g002", object.len() != 1) {
         return Err("event does not name exactly one kind".into());
     }
     let (kind, body) = object.iter().next().expect("one kind");
     let text = |name: &str| {
-        body[name]
-            .as_str()
-            .ok_or_else(|| format!("{kind}: {name} is not text"))
+        semantic::result(
+            semantic::field_site("reader.semantic.text", name),
+            body[name]
+                .as_str()
+                .ok_or_else(|| format!("{kind}: {name} is not text")),
+        )
     };
     if kind.starts_with("inference_") {
         return crate::inference_reader::shape(number, event);
     }
     match kind.as_str() {
         "dedicated_reinstall" => {
-            let record = body
-                .as_object()
-                .filter(|o| o.len() == 1)
-                .ok_or("dedicated record kind")?;
+            let record = semantic::result(
+                "reader.semantic.g003",
+                body.as_object()
+                    .filter(|o| o.len() == 1)
+                    .ok_or("dedicated record kind"),
+            )?;
             let (kind, b) = record.iter().next().unwrap();
             match kind.as_str() {
                 "approve" => {
                     exact(b, &["reset", "entry", "session", "facts", "modes"])?;
                     for name in ["reset", "entry", "session"] {
-                        if b[name].as_str().is_none_or(str::is_empty) {
+                        if semantic::rejects(
+                            semantic::field_site("reader.semantic.g004", name),
+                            b[name].as_str().is_none_or(str::is_empty),
+                        ) {
                             return Err("dedicated approval text".into());
                         }
                     }
@@ -190,88 +286,118 @@ fn check_event(number: u64, event: &Value) -> Result<(), String> {
                 "activation" => exact(b, &["entry"])?,
                 "read" => {
                     exact(b, &["entry", "activation", "confirmed"])?;
-                    if b["activation"].as_u64().is_none() || b["confirmed"].as_bool().is_none() {
+                    if semantic::rejects(
+                        "reader.semantic.g005",
+                        b["activation"].as_u64().is_none() || b["confirmed"].as_bool().is_none(),
+                    ) {
                         return Err("dedicated read".into());
                     }
                 }
                 "withdraw" => {
                     exact(b, &["approval", "reset", "entry"])?;
-                    if b["approval"].as_u64().is_none() {
+                    if semantic::rejects("reader.semantic.g006", b["approval"].as_u64().is_none()) {
                         return Err("dedicated withdrawal".into());
                     }
                 }
                 "dispatch" => {
                     exact(b, &["approval", "reset", "read", "intent"])?;
-                    if b["approval"].as_u64().is_none()
-                        || b["read"].as_u64().and_then(|n| n.checked_add(1)) != Some(number)
-                    {
+                    if semantic::rejects(
+                        "reader.semantic.g007",
+                        b["approval"].as_u64().is_none()
+                            || b["read"].as_u64().and_then(|n| n.checked_add(1)) != Some(number),
+                    ) {
                         return Err("dedicated immediate read".into());
                     }
                     check_event(number, &json!({"operation_intent":b["intent"]}))?;
                 }
                 _ => return Err("unknown dedicated record".into()),
             }
+            semantic::entered("reader.semantic.g008");
         }
         "exposure" => {
             exact_optional(body, &["session", "bound_set"], "accepted_modes")?;
-            if body.get("accepted_modes").is_some()
-                && body["accepted_modes"] != json!([])
-                && body["accepted_modes"] != json!(["no_artifact_pin"])
-            {
+            if semantic::rejects(
+                "reader.semantic.g009",
+                body.get("accepted_modes").is_some()
+                    && body["accepted_modes"] != json!([])
+                    && body["accepted_modes"] != json!(["no_artifact_pin"]),
+            ) {
                 return Err("invalid binding acceptance".into());
             }
-            if text("session")? != format!("session-{number}") {
+            if semantic::rejects(
+                "reader.semantic.g010",
+                text("session")? != format!("session-{number}"),
+            ) {
                 return Err("exposure identity differs from record number".into());
             }
-            let set = body["bound_set"]
-                .as_array()
-                .filter(|s| s.len() == 1)
-                .ok_or("invalid bound set")?;
-            for bound in set {
+            let set = semantic::result(
+                "reader.semantic.g011",
+                body["bound_set"]
+                    .as_array()
+                    .filter(|s| s.len() == 1)
+                    .ok_or("invalid bound set"),
+            )?;
+            for (source_index, bound) in set.iter().enumerate() {
+                let _source_slot = semantic::Slot::new("reader.bound_set", source_index);
                 exact(bound, &["machine", "identity"])?;
-                if bound["machine"].as_str().is_none_or(str::is_empty) {
+                if semantic::rejects(
+                    "reader.semantic.g012",
+                    bound["machine"].as_str().is_none_or(str::is_empty),
+                ) {
                     return Err("invalid bound machine".into());
                 }
                 let id = &bound["identity"];
                 exact(id, &["seed", "derivation_version", "family", "index"])?;
-                if id["seed"].as_str().is_none_or(|s| {
-                    s.len() != 64 || hex::decode(s).is_err() || s != s.to_lowercase()
-                }) || id["derivation_version"] != 1
-                    || id["family"] != "machines"
-                    || !id["index"].as_u64().is_some_and(|i| i <= 0x7fff_ffff)
-                {
+                if semantic::rejects(
+                    "reader.semantic.g013",
+                    id["seed"].as_str().is_none_or(|s| {
+                        s.len() != 64 || hex::decode(s).is_err() || s != s.to_lowercase()
+                    }) || id["derivation_version"] != 1
+                        || id["family"] != "machines"
+                        || !id["index"].as_u64().is_some_and(|i| i <= 0x7fff_ffff),
+                ) {
                     return Err("invalid bound identity".into());
                 }
             }
         }
         "goal" => {
             exact(body, &["session", "text", "source", "document_source"])?;
-            if text("session")?.is_empty()
-                || text("text")?.trim().is_empty()
-                || text("source")? != "operator_session_goal_card"
-                || !(body["document_source"].is_null()
-                    || body["document_source"].as_str().is_some_and(document_url))
-            {
+            if semantic::rejects(
+                "reader.semantic.g014",
+                text("session")?.is_empty()
+                    || text("text")?.trim().is_empty()
+                    || text("source")? != "operator_session_goal_card"
+                    || !(body["document_source"].is_null()
+                        || body["document_source"].as_str().is_some_and(document_url)),
+            ) {
                 return Err("invalid session goal".into());
             }
         }
         "mode_acceptance" => {
             exact(body, &["session", "mode"])?;
-            if text("session")?.is_empty() || text("mode")? != "no_brief" {
+            if semantic::rejects(
+                "reader.semantic.g015",
+                text("session")?.is_empty() || text("mode")? != "no_brief",
+            ) {
                 return Err("invalid conduct acceptance".into());
             }
         }
         "signature_refusal" => {
             exact(body, &["machine", "form"])?;
-            if text("machine")?.is_empty()
-                || !["signature_level_never", "untrusted_repository"].contains(&text("form")?)
-            {
+            if semantic::rejects(
+                "reader.semantic.g016",
+                text("machine")?.is_empty()
+                    || !["signature_level_never", "untrusted_repository"].contains(&text("form")?),
+            ) {
                 return Err("invalid signature refusal".into());
             }
         }
         "connection_refusal" => {
             exact(body, &["machine", "reason"])?;
-            if text("machine")?.is_empty() || text("reason")? != "unbound" {
+            if semantic::rejects(
+                "reader.semantic.g017",
+                text("machine")?.is_empty() || text("reason")? != "unbound",
+            ) {
                 return Err("invalid connection refusal".into());
             }
         }
@@ -280,55 +406,70 @@ fn check_event(number: u64, event: &Value) -> Result<(), String> {
         }
         "command" | "intent" => {
             text("machine")?;
-            hex::decode(text("command")?).map_err(|_| "command is not hex")?;
+            semantic::result(
+                "reader.semantic.g018",
+                hex::decode(text("command")?).map_err(|_| "command is not hex"),
+            )?;
             if kind == "intent" {
                 if let Some(provenance) = body.get("provenance") {
                     exact(provenance, &["target", "session", "requester"])?;
                     target(&provenance["target"])?;
-                    if !(provenance["session"].is_null()
-                        || provenance["session"].as_str().is_some())
-                        || !["session", "operator", "harness_flow"]
-                            .contains(&provenance["requester"].as_str().unwrap_or(""))
-                    {
+                    if semantic::rejects(
+                        "reader.semantic.g019",
+                        !(provenance["session"].is_null()
+                            || provenance["session"].as_str().is_some())
+                            || !["session", "operator", "harness_flow"]
+                                .contains(&provenance["requester"].as_str().unwrap_or("")),
+                    ) {
                         return Err("invalid command provenance".into());
                     }
                 }
-                if body.get("request").is_some() {
+                if semantic::rejects("reader.semantic.g020", body.get("request").is_some()) {
                     return Err("unknown command request member".into());
                 }
                 if let Some(job) = body.get("job")
-                    && !job.as_str().is_some_and(|id| {
-                        id.len() == 48
-                            && id
-                                .bytes()
-                                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-                    })
+                    && semantic::rejects(
+                        "reader.semantic.g021",
+                        !job.as_str().is_some_and(|id| {
+                            id.len() == 48
+                                && id
+                                    .bytes()
+                                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                        }),
+                    )
                 {
                     return Err("intent has invalid job identity".into());
                 }
-                if body["call"].as_u64() != Some(number) {
+                if semantic::rejects(
+                    "reader.semantic.g022",
+                    body["call"].as_u64() != Some(number),
+                ) {
                     return Err("intent identity differs from record number".into());
                 }
                 let approval = &body["approval"];
                 if !approval.is_null() {
                     let pin = &approval["harness_pin"];
-                    if !approval.as_object().is_some_and(|fields| fields.len() == 1)
-                        || !pin.as_object().is_some_and(|fields| fields.len() == 2)
-                        || pin["machine"].as_str().is_none()
-                        || pin["fingerprint"].as_str().is_none()
-                    {
+                    if semantic::rejects(
+                        "reader.semantic.g023",
+                        !approval.as_object().is_some_and(|fields| fields.len() == 1)
+                            || !pin.as_object().is_some_and(|fields| fields.len() == 2)
+                            || pin["machine"].as_str().is_none()
+                            || pin["fingerprint"].as_str().is_none(),
+                    ) {
                         return Err("intent admission has no machine or fingerprint".into());
                     }
                 }
             }
         }
         "terminal" => {
-            if body["call"].as_u64().is_none()
-                || body["exit_status"]
-                    .as_u64()
-                    .and_then(|status| u32::try_from(status).ok())
-                    .is_none()
-            {
+            if semantic::rejects(
+                "reader.semantic.g024",
+                body["call"].as_u64().is_none()
+                    || body["exit_status"]
+                        .as_u64()
+                        .and_then(|status| u32::try_from(status).ok())
+                        .is_none(),
+            ) {
                 return Err("terminal has no call identity or exit status".into());
             }
         }
@@ -347,17 +488,25 @@ fn check_event(number: u64, event: &Value) -> Result<(), String> {
                 ],
                 &["restated_modes", "receipt_binding"],
             )?;
-            if body["call"].as_u64() != Some(number) {
+            if semantic::rejects(
+                "reader.semantic.g025",
+                body["call"].as_u64() != Some(number),
+            ) {
                 return Err("typed identity differs from record number".into());
             }
             resource(&body["resource"])?;
             target(&body["target"])?;
-            if body["resource"] == "inference" || body["target"] == "inference" {
+            if semantic::rejects(
+                "reader.semantic.g026",
+                body["resource"] == "inference" || body["target"] == "inference",
+            ) {
                 return Err("typed operation_intent cannot name inference".into());
             }
-            if !["create", "reset", "reinstall", "destroy", "read"].contains(&text("operation")?)
-                || !["session", "operator", "harness_flow"].contains(&text("requester")?)
-            {
+            if semantic::rejects(
+                "reader.semantic.g027",
+                !["create", "reset", "reinstall", "destroy", "read"].contains(&text("operation")?)
+                    || !["session", "operator", "harness_flow"].contains(&text("requester")?),
+            ) {
                 return Err("unknown typed operation or requester".into());
             }
             text("session")?;
@@ -376,13 +525,15 @@ fn check_event(number: u64, event: &Value) -> Result<(), String> {
             )?;
             let list = body.get("restated_modes").cloned().unwrap_or(json!([]));
             mode_list(&list)?;
-            if list
-                != body["approved"]
+            if semantic::rejects(
+                "reader.semantic.g028",
+                list != body["approved"]
                     .get("restated_modes")
                     .cloned()
                     .unwrap_or(json!([]))
-                || (!["destroy", "reinstall"].contains(&text("operation")?) && list != json!([]))
-            {
+                    || (!["destroy", "reinstall"].contains(&text("operation")?)
+                        && list != json!([])),
+            ) {
                 return Err("invalid restated modes".into());
             }
             if let Some(binding) = body.get("receipt_binding").filter(|v| !v.is_null()) {
@@ -397,7 +548,10 @@ fn check_event(number: u64, event: &Value) -> Result<(), String> {
                 "requester",
                 "facts",
             ] {
-                if body[key] != body["approved"][key] {
+                if semantic::rejects(
+                    semantic::field_site("reader.semantic.g029", key),
+                    body[key] != body["approved"][key],
+                ) {
                     return Err("typed intent differs from its approval".into());
                 }
             }
@@ -406,9 +560,11 @@ fn check_event(number: u64, event: &Value) -> Result<(), String> {
             exact(body, &["target", "entry"])?;
             target(&body["target"])?;
             text("entry")?;
-            if body["target"].get("allocation_index").is_none()
-                && body["target"].get("vendor_machine").is_none()
-            {
+            if semantic::rejects(
+                "reader.semantic.g030",
+                body["target"].get("allocation_index").is_none()
+                    && body["target"].get("vendor_machine").is_none(),
+            ) {
                 return Err("association target is not an allocation index or vendor id".into());
             }
         }
@@ -428,62 +584,70 @@ fn check_event(number: u64, event: &Value) -> Result<(), String> {
             resource(&body["resource"])?;
             target(&body["target"])?;
             receipt_binding(&body["binding"])?;
-            if ![
-                "browser_vendor_tls",
-                "arbitrary_response",
-                "job_output",
-                "notify_event",
-                "proposed_text",
-            ]
-            .contains(&text("source")?)
-                || body["call"].as_u64().is_none()
-                || !body["validated"].is_boolean()
-                || !(body["returned_vendor"].is_null() || body["returned_vendor"].is_string())
-            {
+            if semantic::rejects(
+                "reader.semantic.g031",
+                ![
+                    "browser_vendor_tls",
+                    "arbitrary_response",
+                    "job_output",
+                    "notify_event",
+                    "proposed_text",
+                ]
+                .contains(&text("source")?)
+                    || body["call"].as_u64().is_none()
+                    || !body["validated"].is_boolean()
+                    || !(body["returned_vendor"].is_null() || body["returned_vendor"].is_string()),
+            ) {
                 return Err("invalid receipt evidence".into());
             }
         }
         "operation_response" => {
             exact(body, &["call", "body"])?;
             let bytes = text("body")?;
-            if body["call"].as_u64().is_none()
-                || hex::decode(bytes).is_err()
-                || bytes.to_ascii_lowercase() != bytes
-            {
+            if semantic::rejects(
+                "reader.semantic.g032",
+                body["call"].as_u64().is_none()
+                    || hex::decode(bytes).is_err()
+                    || bytes.to_ascii_lowercase() != bytes,
+            ) {
                 return Err("invalid operation response".into());
             }
         }
         "operation_observation" => {
             exact(body, &["resource", "operation", "reports", "calls"])?;
             resource(&body["resource"])?;
-            if ![
-                "create",
-                "reset",
-                "reinstall",
-                "destroy",
-                "read",
-                "exec",
-                "inference",
-            ]
-            .contains(&text("operation")?)
-                || !["confirmed", "ended", "unknown"].contains(&text("reports")?)
-                || !body["calls"]
-                    .as_array()
-                    .is_some_and(|calls| calls.iter().all(|call| call.as_u64().is_some()))
-            {
+            if semantic::rejects(
+                "reader.semantic.g033",
+                ![
+                    "create",
+                    "reset",
+                    "reinstall",
+                    "destroy",
+                    "read",
+                    "exec",
+                    "inference",
+                ]
+                .contains(&text("operation")?)
+                    || !["confirmed", "ended", "unknown"].contains(&text("reports")?)
+                    || !body["calls"]
+                        .as_array()
+                        .is_some_and(|calls| calls.iter().all(|call| call.as_u64().is_some())),
+            ) {
                 return Err("invalid typed observation".into());
             }
         }
         "job_terminal" | "job_observation" => {
-            if body["call"].as_u64().is_none() {
+            if semantic::rejects("reader.semantic.g034", body["call"].as_u64().is_none()) {
                 return Err("job evidence has no call".into());
             }
             let id = text("job")?;
-            if id.len() != 48
-                || !id
-                    .bytes()
-                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-            {
+            if semantic::rejects(
+                "reader.semantic.g035",
+                id.len() != 48
+                    || !id
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            ) {
                 return Err("job evidence has invalid identity".into());
             }
             let record = &body["record"];
@@ -491,59 +655,77 @@ fn check_event(number: u64, event: &Value) -> Result<(), String> {
                 Some("missing") if kind == "job_observation" => {}
                 Some("incomplete") if kind == "job_observation" => {
                     for field in ["machine", "command"] {
-                        if !record[field].is_null()
-                            && !record[field].as_str().is_some_and(|s| {
-                                hex::decode(s).is_ok() && s.to_ascii_lowercase() == s
-                            })
-                        {
+                        if semantic::rejects(
+                            semantic::field_site("reader.semantic.g036", field),
+                            !record[field].is_null()
+                                && !record[field].as_str().is_some_and(|s| {
+                                    hex::decode(s).is_ok() && s.to_ascii_lowercase() == s
+                                }),
+                        ) {
                             return Err("incomplete job bytes are not lowercase hex".into());
                         }
                     }
                 }
                 Some("present") => {
                     for field in ["machine", "command", "stdout", "stderr"] {
-                        let value = record[field].as_str().ok_or("job bytes are not text")?;
-                        if hex::decode(value).is_err() || value.to_ascii_lowercase() != value {
+                        let value = semantic::result(
+                            semantic::field_site("reader.semantic.g037", field),
+                            record[field].as_str().ok_or("job bytes are not text"),
+                        )?;
+                        if semantic::rejects(
+                            semantic::field_site("reader.semantic.g038", field),
+                            hex::decode(value).is_err() || value.to_ascii_lowercase() != value,
+                        ) {
                             return Err("job bytes are not lowercase hex".into());
                         }
                     }
                     for field in ["boot", "current_boot"] {
-                        if !record[field].as_str().is_some_and(|s| !s.is_empty()) {
+                        if semantic::rejects(
+                            semantic::field_site("reader.semantic.g039", field),
+                            !record[field].as_str().is_some_and(|s| !s.is_empty()),
+                        ) {
                             return Err("job has no boot identity".into());
                         }
                     }
-                    if record["pid"]
-                        .as_u64()
-                        .and_then(|p| u32::try_from(p).ok())
-                        .is_none()
-                        || record["alive"].as_bool().is_none()
-                        || (!record["exit_status"].is_null()
-                            && !record["exit_status"].as_u64().is_some_and(|s| s <= 128))
-                        || (kind == "job_terminal" && record["exit_status"].is_null())
-                    {
+                    if semantic::rejects(
+                        "reader.semantic.g040",
+                        record["pid"]
+                            .as_u64()
+                            .and_then(|p| u32::try_from(p).ok())
+                            .is_none()
+                            || record["alive"].as_bool().is_none()
+                            || (!record["exit_status"].is_null()
+                                && !record["exit_status"].as_u64().is_some_and(|s| s <= 128))
+                            || (kind == "job_terminal" && record["exit_status"].is_null()),
+                    ) {
                         return Err("job has invalid liveness or exit code".into());
                     }
                 }
                 _ => return Err("unknown job record kind".into()),
             }
+            semantic::entered("reader.semantic.g041");
         }
         "disposition" => {
             text("machine")?;
             text("uncertainty")?;
-            if ![
-                "destructive_reinstall",
-                "abandonment",
-                "as_if_done",
-                "as_if_not_done",
-            ]
-            .contains(&text("continuation")?)
-            {
+            if semantic::rejects(
+                "reader.semantic.g042",
+                ![
+                    "destructive_reinstall",
+                    "abandonment",
+                    "as_if_done",
+                    "as_if_not_done",
+                ]
+                .contains(&text("continuation")?),
+            ) {
                 return Err("unknown continuation".into());
             }
-            if !body["calls"]
-                .as_array()
-                .is_some_and(|calls| calls.iter().all(|call| call.as_u64().is_some()))
-            {
+            if semantic::rejects(
+                "reader.semantic.g043",
+                !body["calls"]
+                    .as_array()
+                    .is_some_and(|calls| calls.iter().all(|call| call.as_u64().is_some())),
+            ) {
                 return Err("disposition has no call identities".into());
             }
         }
@@ -551,112 +733,157 @@ fn check_event(number: u64, event: &Value) -> Result<(), String> {
         "delivery" => crate::delivery_reader::shape(body)?,
         "allocation" => {
             if let Some(record) = body.get("seed_backup")
-                && (record.as_object().is_none_or(|o| o.len() != 2)
-                    || record["seed"].as_str().is_none_or(|id| {
-                        id.len() != 64
-                            || !id
-                                .bytes()
-                                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-                    })
-                    || ![json!("full_reentry"), json!("skipped")].contains(&record["completion"]))
+                && semantic::rejects(
+                    "reader.semantic.g044",
+                    record.as_object().is_none_or(|o| o.len() != 2)
+                        || record["seed"].as_str().is_none_or(|id| {
+                            id.len() != 64
+                                || !id
+                                    .bytes()
+                                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+                        })
+                        || ![json!("full_reentry"), json!("skipped")]
+                            .contains(&record["completion"]),
+                )
             {
                 return Err("invalid seed-backup record".into());
             }
         }
         _ => return Err(format!("unknown event kind {kind}")),
     }
+    semantic::entered("reader.semantic.g045");
     Ok(())
 }
 
 fn access(value: &Value) -> Result<(), String> {
     exact(value, &["model", "profile", "revision"])?;
-    if value["model"] != "maintained"
-        || value["profile"] != "ad-hoc"
-        || value["revision"]
-            .as_u64()
-            .is_none_or(|n| u32::try_from(n).is_err())
-    {
+    if semantic::rejects(
+        "reader.semantic.g046",
+        value["model"] != "maintained"
+            || value["profile"] != "ad-hoc"
+            || value["revision"]
+                .as_u64()
+                .is_none_or(|n| u32::try_from(n).is_err()),
+    ) {
         return Err("invalid ad-hoc access".into());
     }
     Ok(())
 }
 fn check_setup(value: &Value) -> Result<(), String> {
-    let object = value.as_object().ok_or("setup is not an object")?;
-    if object.len() != 1 {
+    let object = semantic::result(
+        "reader.semantic.g047",
+        value.as_object().ok_or("setup is not an object"),
+    )?;
+    if semantic::rejects("reader.semantic.g048", object.len() != 1) {
         return Err("setup must name one act".into());
     }
     let (kind, body) = object.iter().next().unwrap();
     match kind.as_str() {
         "approval" => {
             exact(body, &["entries", "monthly_sat", "annual_sat"])?;
-            let entries = body["entries"]
-                .as_array()
-                .filter(|e| !e.is_empty())
-                .ok_or("empty setup")?;
+            let entries = semantic::result(
+                "reader.semantic.g049",
+                body["entries"]
+                    .as_array()
+                    .filter(|e| !e.is_empty())
+                    .ok_or("empty setup"),
+            )?;
             let mut names = std::collections::BTreeSet::new();
             let mut total = 0u64;
-            for approved in entries {
+            for (source_index, approved) in entries.iter().enumerate() {
+                let _source_slot = semantic::Slot::new("reader.setup_entry", source_index);
                 exact(approved, &["entry", "identity", "access"])?;
                 let entry = &approved["entry"];
                 exact(entry, &["machine", "vendor", "product", "region", "cost"])?;
                 for key in ["machine", "vendor", "product", "region"] {
-                    if entry[key].as_str().is_none_or(str::is_empty) {
+                    if semantic::rejects(
+                        semantic::field_site("reader.semantic.g050", key),
+                        entry[key].as_str().is_none_or(str::is_empty),
+                    ) {
                         return Err("invalid machine fact".into());
                     }
                 }
-                if !names.insert(entry["machine"].as_str().unwrap()) {
+                if semantic::rejects(
+                    "reader.semantic.g051",
+                    !names.insert(entry["machine"].as_str().unwrap()),
+                ) {
                     return Err("duplicate approved entry".into());
                 }
                 exact(&entry["cost"], &["amount", "unit", "period"])?;
-                if entry["cost"]["unit"] != "sat" || entry["cost"]["period"] != "month" {
+                if semantic::rejects(
+                    "reader.semantic.g052",
+                    entry["cost"]["unit"] != "sat" || entry["cost"]["period"] != "month",
+                ) {
                     return Err("invalid recurring cost".into());
                 }
-                total = total
-                    .checked_add(
-                        entry["cost"]["amount"]
-                            .as_u64()
-                            .ok_or("cost is not integer")?,
-                    )
-                    .ok_or("cost overflow")?;
+                total = semantic::result(
+                    "reader.semantic.g054",
+                    total
+                        .checked_add(semantic::result(
+                            "reader.semantic.g053",
+                            entry["cost"]["amount"]
+                                .as_u64()
+                                .ok_or("cost is not integer"),
+                        )?)
+                        .ok_or("cost overflow"),
+                )?;
                 let id = &approved["identity"];
                 exact(id, &["seed", "derivation_version", "family", "index"])?;
-                if id["seed"].as_str().is_none_or(|s| {
-                    s.len() != 64
-                        || !s
-                            .bytes()
-                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-                }) || id["derivation_version"] != 1
-                    || id["family"] != "machines"
-                    || !id["index"].as_u64().is_some_and(|n| n < (1 << 31))
-                {
+                if semantic::rejects(
+                    "reader.semantic.g055",
+                    id["seed"].as_str().is_none_or(|s| {
+                        s.len() != 64
+                            || !s
+                                .bytes()
+                                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                    }) || id["derivation_version"] != 1
+                        || id["family"] != "machines"
+                        || !id["index"].as_u64().is_some_and(|n| n < (1 << 31)),
+                ) {
                     return Err("invalid approved allocation identity".into());
                 }
                 if !approved["access"].is_null() {
                     access(&approved["access"])?;
                 }
             }
-            let monthly = body["monthly_sat"]
-                .as_u64()
-                .ok_or("monthly total is not integer")?;
-            let annual = body["annual_sat"]
-                .as_u64()
-                .ok_or("annual total is not integer")?;
-            let expected_annual = total.checked_mul(12).ok_or("annual cost overflow")?;
-            if monthly != total || annual != expected_annual {
+            let monthly = semantic::result(
+                "reader.semantic.g056",
+                body["monthly_sat"]
+                    .as_u64()
+                    .ok_or("monthly total is not integer"),
+            )?;
+            let annual = semantic::result(
+                "reader.semantic.g057",
+                body["annual_sat"]
+                    .as_u64()
+                    .ok_or("annual total is not integer"),
+            )?;
+            let expected_annual = semantic::result(
+                "reader.semantic.g058",
+                total.checked_mul(12).ok_or("annual cost overflow"),
+            )?;
+            if semantic::rejects(
+                "reader.semantic.g059",
+                monthly != total || annual != expected_annual,
+            ) {
                 return Err("incorrect setup totals".into());
             }
         }
         "class" => {
             exact(body, &["machine", "answer", "class"])?;
-            if !body["machine"].is_string() {
+            if semantic::rejects("reader.semantic.g060", !body["machine"].is_string()) {
                 return Err("class needs a machine".into());
             }
-            let class = match body["answer"].as_str() {
-                Some("yes" | "not_sure") => "multi_tenant",
-                Some("no") => "single_purpose",
-                _ => return Err("unknown class answer".into()),
+            let class = {
+                let source_class = match body["answer"].as_str() {
+                    Some("yes" | "not_sure") => "multi_tenant",
+                    Some("no") => "single_purpose",
+                    _ => return Err("unknown class answer".into()),
+                };
+                semantic::entered("reader.semantic.g061");
+                source_class
             };
-            if body["class"] != class {
+            if semantic::rejects("reader.semantic.g062", body["class"] != class) {
                 return Err("class differs from answer".into());
             }
         }
@@ -666,19 +893,43 @@ fn check_setup(value: &Value) -> Result<(), String> {
         }
         "access" => {
             exact(body, &["machine", "access"])?;
-            if !body["machine"].is_string() {
+            if semantic::rejects("reader.semantic.g063", !body["machine"].is_string()) {
                 return Err("access needs a machine".into());
             }
             access(&body["access"])?;
         }
         _ => return Err("unknown setup act".into()),
     }
+    semantic::entered("reader.semantic.g064");
     Ok(())
 }
 
 /// Independent fixture records, preceding every reader-built store's new dispatches.
+#[cfg(test)]
 pub fn setup_events(mnemonic: &str, machines: &[&str]) -> Vec<Value> {
-    let seed = seed_id(mnemonic).expect("fixture mnemonic");
+    setup_events_at("reader.aux.call.unregistered", mnemonic, machines)
+}
+
+pub fn setup_events_at(caller: &'static str, mnemonic: &str, machines: &[&str]) -> Vec<Value> {
+    let roster = match machines {
+        ["fixture"] => "one",
+        ["fixture", "fixture-other"] => "two",
+        ["fixture", "fixture-other", "unpinned"] => "three",
+        _ => "unknown",
+    };
+    let _standalone = crate::auxiliary::standalone(
+        "reader.aux.constructor",
+        json!({"caller":caller,"roster":roster}),
+    );
+    let _call = crate::auxiliary::Call::begin(caller, "reader.aux.setup_events", 0);
+    semantic::entered(match roster {
+        "one" => "reader.setup_events.roster.one",
+        "two" => "reader.setup_events.roster.two",
+        "three" => "reader.setup_events.roster.three",
+        _ => "reader.setup_events.roster.unknown",
+    });
+    let seed =
+        seed_id_at("reader.aux.call.setup_events.seed_id", 0, mnemonic).expect("fixture mnemonic");
     let entries: Vec<_> = machines.iter().enumerate().map(|(index, machine)| json!({
         "entry":{"machine":machine,"vendor":"Fixture vendor","product":"Fixture machine","region":"Fixture region","cost":{"amount":1000,"unit":"sat","period":"month"}},
         "identity":{"seed":seed,"derivation_version":1,"family":"machines","index":index},
@@ -691,36 +942,51 @@ pub fn setup_events(mnemonic: &str, machines: &[&str]) -> Vec<Value> {
 }
 
 fn exact(value: &Value, fields: &[&str]) -> Result<(), String> {
-    let object = value.as_object().ok_or("record body is not an object")?;
-    if object.len() != fields.len() || fields.iter().any(|k| !object.contains_key(*k)) {
+    let object = semantic::result(
+        semantic::catalogue("reader.semantic.g065", fields),
+        value.as_object().ok_or("record body is not an object"),
+    )?;
+    if semantic::rejects(
+        semantic::catalogue("reader.semantic.g066", fields),
+        object.len() != fields.len() || fields.iter().any(|k| !object.contains_key(*k)),
+    ) {
         return Err("unknown or missing typed member".into());
     }
     Ok(())
 }
 
 fn resource(value: &Value) -> Result<(), String> {
+    semantic::entered("reader.semantic.resource");
+
     if value == "inference" {
         return Ok(());
     }
     exact(value, &["entry"])?;
-    if value["entry"].as_str().is_none() {
+    if semantic::rejects("reader.semantic.g067", value["entry"].as_str().is_none()) {
         return Err("resource entry is not text".into());
     }
     Ok(())
 }
 
 fn target(value: &Value) -> Result<(), String> {
+    semantic::entered("reader.semantic.target");
+
     if value == "inference" {
         return Ok(());
     }
-    let object = value.as_object().ok_or("typed target is not an object")?;
-    if object.len() == 1
-        && (value["entry"].is_string()
-            || value["vendor_machine"].is_string()
-            || value["allocation_index"]
-                .as_u64()
-                .is_some_and(|n| n <= u64::from(u32::MAX)))
-    {
+    let object = semantic::result(
+        "reader.semantic.g068",
+        value.as_object().ok_or("typed target is not an object"),
+    )?;
+    if semantic::holds(
+        "reader.semantic.g069",
+        object.len() == 1
+            && (value["entry"].is_string()
+                || value["vendor_machine"].is_string()
+                || value["allocation_index"]
+                    .as_u64()
+                    .is_some_and(|n| n <= u64::from(u32::MAX))),
+    ) {
         return Ok(());
     }
     Err("unknown typed target".into())
@@ -728,12 +994,14 @@ fn target(value: &Value) -> Result<(), String> {
 
 fn facts(value: &Value) -> Result<(), String> {
     exact(value, &["arguments", "cost_bound", "bundle_commit"])?;
-    if value["arguments"]
-        .as_object()
-        .is_none_or(|a| a.values().any(|v| !v.is_string()))
-        || value["cost_bound"].as_u64().is_none()
-        || !value["bundle_commit"].is_string()
-    {
+    if semantic::rejects(
+        "reader.semantic.g070",
+        value["arguments"]
+            .as_object()
+            .is_none_or(|a| a.values().any(|v| !v.is_string()))
+            || value["cost_bound"].as_u64().is_none()
+            || !value["bundle_commit"].is_string(),
+    ) {
         return Err("invalid typed facts".into());
     }
     Ok(())
@@ -741,10 +1009,12 @@ fn facts(value: &Value) -> Result<(), String> {
 
 fn receipt_binding(value: &Value) -> Result<(), String> {
     exact(value, &["operation", "account", "signed_request"])?;
-    if ![json!("order"), json!("stop"), json!("restart")].contains(&value["operation"])
-        || value["account"].as_u64().is_none()
-        || value["signed_request"].as_u64().is_none()
-    {
+    if semantic::rejects(
+        "reader.semantic.g071",
+        ![json!("order"), json!("stop"), json!("restart")].contains(&value["operation"])
+            || value["account"].as_u64().is_none()
+            || value["signed_request"].as_u64().is_none(),
+    ) {
         return Err("invalid receipt binding".into());
     }
     Ok(())
@@ -770,10 +1040,17 @@ fn exact_optional(value: &Value, required: &[&str], optional: &str) -> Result<()
 }
 
 fn mode_list(value: &Value) -> Result<(), String> {
-    let modes = value.as_array().ok_or("modes are not a list")?;
+    let modes = semantic::result(
+        "reader.semantic.g072",
+        value.as_array().ok_or("modes are not a list"),
+    )?;
     let mut seen = Vec::new();
-    for mode in modes {
-        if ![json!("no_artifact_pin"), json!("no_brief")].contains(mode) || seen.contains(mode) {
+    for (source_index, mode) in modes.iter().enumerate() {
+        let _source_slot = semantic::Slot::new("reader.mode", source_index);
+        if semantic::rejects(
+            "reader.semantic.g073",
+            ![json!("no_artifact_pin"), json!("no_brief")].contains(mode) || seen.contains(mode),
+        ) {
             return Err("unknown or repeated mode".into());
         }
         seen.push(mode.clone());
@@ -793,6 +1070,8 @@ struct ModeHistory {
 
 impl ModeHistory {
     fn check_and_apply(&mut self, event: &Value) -> Result<(), String> {
+        semantic::entered("reader.semantic.mode_history");
+
         if let Some(exposure) = event.get("exposure") {
             let machine = exposure["bound_set"][0]["machine"]
                 .as_str()
@@ -800,7 +1079,10 @@ impl ModeHistory {
             let accepted = exposure
                 .get("accepted_modes")
                 .is_some_and(|m| m != &json!([]));
-            if accepted && self.exposed_machines.contains(machine) {
+            if semantic::rejects(
+                "reader.semantic.g074",
+                accepted && self.exposed_machines.contains(machine),
+            ) {
                 return Err("binding acceptance follows an earlier exposure".into());
             }
             self.exposed_machines.insert(machine.into());
@@ -816,15 +1098,20 @@ impl ModeHistory {
         }
         if let Some(goal) = event.get("goal") {
             let session = goal["session"].as_str().expect("checked goal");
-            if !self.exposed_sessions.contains(session) || !self.goals.insert(session.into()) {
+            if semantic::rejects(
+                "reader.semantic.g075",
+                !self.exposed_sessions.contains(session) || !self.goals.insert(session.into()),
+            ) {
                 return Err("goal names no exposure or repeats a session".into());
             }
         }
         if let Some(acceptance) = event.get("mode_acceptance") {
             let session = acceptance["session"].as_str().expect("checked acceptance");
-            if !self.exposed_sessions.contains(session)
-                || self.closed_conduct_windows.contains(session)
-            {
+            if semantic::rejects(
+                "reader.semantic.g076",
+                !self.exposed_sessions.contains(session)
+                    || self.closed_conduct_windows.contains(session),
+            ) {
                 return Err("conduct acceptance outside its window".into());
             }
             self.closed_conduct_windows.insert(session.into());
@@ -836,9 +1123,12 @@ impl ModeHistory {
             self.closed_conduct_windows.insert(session.into());
         }
         if let Some(refusal) = event.get("signature_refusal")
-            && !self
-                .unpinned_installations
-                .contains(refusal["machine"].as_str().expect("checked refusal"))
+            && semantic::rejects(
+                "reader.semantic.g077",
+                !self
+                    .unpinned_installations
+                    .contains(refusal["machine"].as_str().expect("checked refusal")),
+            )
         {
             return Err("signature refusal has no installation mode".into());
         }
@@ -847,12 +1137,28 @@ impl ModeHistory {
 }
 
 fn b64(field: &Value, name: &str) -> Result<Vec<u8>, String> {
-    let text = field[name]
-        .as_str()
-        .ok_or_else(|| format!("{name}: not a string"))?;
-    URL_SAFE_NO_PAD
-        .decode(text)
-        .map_err(|e| format!("{name}: {e}"))
+    let (text_site, decode_site) = match name {
+        "salt" => ("reader.b64.text.salt", "reader.b64.decode.salt"),
+        "nonce" => ("reader.b64.text.nonce", "reader.b64.decode.nonce"),
+        "wrapped_key" => (
+            "reader.b64.text.wrapped_key",
+            "reader.b64.decode.wrapped_key",
+        ),
+        "ciphertext" => ("reader.b64.text.ciphertext", "reader.b64.decode.ciphertext"),
+        _ => ("reader.b64.text.unknown", "reader.b64.decode.unknown"),
+    };
+    let text = root_checks::result(
+        text_site,
+        field[name]
+            .as_str()
+            .ok_or_else(|| format!("{name}: not a string")),
+    )?;
+    root_checks::result(
+        decode_site,
+        URL_SAFE_NO_PAD
+            .decode(text)
+            .map_err(|e| format!("{name}: {e}")),
+    )
 }
 
 fn wrapping_key(passphrase: &str, salt: &[u8]) -> [u8; 32] {
@@ -872,7 +1178,11 @@ fn aes(key: &[u8; 32]) -> LessSafeKey {
 }
 
 fn nonce(bytes: &[u8]) -> Result<Nonce, String> {
-    Nonce::try_assume_unique_for_key(bytes).map_err(|_| format!("a {}-byte nonce", bytes.len()))
+    root_checks::result(
+        "reader.nonce.length",
+        Nonce::try_assume_unique_for_key(bytes)
+            .map_err(|_| format!("a {}-byte nonce", bytes.len())),
+    )
 }
 
 fn open_sealed(
@@ -882,9 +1192,12 @@ fn open_sealed(
     sealed: &[u8],
 ) -> Result<Vec<u8>, String> {
     let mut in_out = sealed.to_vec();
-    let plain = aes(key)
-        .open_in_place(nonce(nonce_bytes)?, Aad::from(aad.as_bytes()), &mut in_out)
-        .map_err(|_| format!("the tag fails under the AAD {aad:?}"))?;
+    let plain = root_checks::result(
+        "reader.aead.open",
+        aes(key)
+            .open_in_place(nonce(nonce_bytes)?, Aad::from(aad.as_bytes()), &mut in_out)
+            .map_err(|_| format!("the tag fails under the AAD {aad:?}")),
+    )?;
     Ok(plain.to_vec())
 }
 
@@ -906,18 +1219,45 @@ fn address(bytes: &[u8]) -> String {
 
 /// Reads a store's files with its passphrase. Every record must decrypt under the AAD its
 /// header and its predecessor's content address give, in order from 0 with no gap.
-pub fn read(files: &Files, passphrase: &str) -> Result<Opened, String> {
-    let envelope: Value = serde_json::from_slice(files.get("envelope.json").ok_or("no envelope")?)
-        .map_err(|e| format!("envelope: {e}"))?;
+#[cfg(test)]
+pub fn read(files: &BTreeMap<String, Vec<u8>>, passphrase: &str) -> Result<Opened, String> {
+    read_at(
+        "reader.call.host_fixture",
+        &files.clone().into(),
+        passphrase,
+    )
+}
+
+pub fn read_at(site: &'static str, files: &Files, passphrase: &str) -> Result<Opened, String> {
+    let root = root_checks::Read::begin(site, files);
+    let envelope: Value = root_checks::result(
+        "reader.envelope.json",
+        serde_json::from_slice(root_checks::result(
+            "reader.envelope.lookup",
+            files.get("envelope.json").ok_or("no envelope"),
+        )?)
+        .map_err(|e| format!("envelope: {e}")),
+    )?;
     let expected = json!({
         "version": 1, "purpose": "local", "kdf": "PBKDF2-SHA256", "iterations": ITERATIONS,
     });
     for (field, value) in expected.as_object().expect("an object") {
-        if envelope[field] != *value {
+        let site = match field.as_str() {
+            "iterations" => "reader.envelope.constant.iterations",
+            "kdf" => "reader.envelope.constant.kdf",
+            "purpose" => "reader.envelope.constant.purpose",
+            "version" => "reader.envelope.constant.version",
+            _ => "reader.envelope.constant.unknown",
+        };
+        if root_checks::rejects(site, envelope[field] != *value) {
             return Err(format!("envelope {field}: {}", envelope[field]));
         }
     }
-    let id = envelope["id"].as_str().ok_or("envelope id")?.to_string();
+    let id = root_checks::result(
+        "reader.envelope.id",
+        envelope["id"].as_str().ok_or("envelope id"),
+    )?
+    .to_string();
     let salt = b64(&envelope, "salt")?;
     let wrapping_key = wrapping_key(passphrase, &salt);
     let unwrapped = open_sealed(
@@ -926,35 +1266,51 @@ pub fn read(files: &Files, passphrase: &str) -> Result<Opened, String> {
         &format!("tau-web/local/v1/{id}"),
         &b64(&envelope, "wrapped_key")?,
     )?;
-    let data_key: [u8; 32] = unwrapped
-        .try_into()
-        .map_err(|_| "a data key not 32 bytes")?;
+    let data_key: [u8; 32] = root_checks::result(
+        "reader.data_key.length",
+        unwrapped.try_into().map_err(|_| "a data key not 32 bytes"),
+    )?;
     let mut numbers: Vec<u64> = files
         .keys()
         .filter(|name| !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit()))
-        .map(|name| name.parse().map_err(|_| format!("record {name}")))
+        .map(|name| {
+            root_checks::result(
+                "reader.file.number",
+                name.parse().map_err(|_| format!("record {name}")),
+            )
+        })
         .collect::<Result<_, _>>()?;
     numbers.sort_unstable();
     let mut previous = "0".repeat(64);
     let mut records = Vec::new();
+    let mut original_events = Vec::new();
     let mut mode_history = ModeHistory::default();
     let mut delivery_history = crate::delivery_reader::History::default();
     let mut requirements_history = crate::declaration_reader::History::default();
     let mut inference_history = crate::inference_reader::History::default();
+    let mut inference_inputs = crate::semantic_domains::inference::InferenceInputs::default();
+    let mut mode_inputs = crate::semantic_domains::reader::ReaderModeInputs::default();
+    let mut declaration_inputs =
+        crate::semantic_domains::declaration_delivery::DeclarationInputs::default();
     for (expected, number) in (0..).zip(numbers) {
-        if number != expected {
+        if root_checks::rejects("reader.record.contiguous", number != expected) {
             return Err(format!("record {expected} missing"));
         }
         let bytes = &files[&number.to_string()];
-        let record: Value =
-            serde_json::from_slice(bytes).map_err(|e| format!("record {number}: {e}"))?;
-        if record["id"] != id.as_str()
-            || record["number"] != number
-            || record["previous"] != previous.as_str()
-        {
+        let record: Value = root_checks::result(
+            "reader.record.json",
+            serde_json::from_slice(bytes).map_err(|e| format!("record {number}: {e}")),
+        )?;
+        if root_checks::rejects(
+            "reader.record.header",
+            record["id"] != id.as_str()
+                || record["number"] != number
+                || record["previous"] != previous.as_str(),
+        ) {
             return Err(format!("record {number}: header {record}"));
         }
-        let kind = record["type"].as_str().ok_or("type")?;
+        let kind =
+            root_checks::result("reader.record.type", record["type"].as_str().ok_or("type"))?;
         let aad = format!("tau-web/local/v1/{id}/{kind}/{number}/{previous}");
         let plaintext = open_sealed(
             &data_key,
@@ -963,25 +1319,61 @@ pub fn read(files: &Files, passphrase: &str) -> Result<Opened, String> {
             &b64(&record, "ciphertext")?,
         )
         .map_err(|e| format!("record {number}: {e}"))?;
-        let event: Value =
-            serde_json::from_slice(&plaintext).map_err(|e| format!("record {number}: {e}"))?;
-        check_event(number, &event).map_err(|e| format!("record {number}: {e}"))?;
-        inference_history
-            .apply(number, &event)
-            .map_err(|e| format!("record {number}: {e}"))?;
-        mode_history
-            .check_and_apply(&event)
-            .map_err(|e| format!("record {number}: {e}"))?;
-        requirements_history
-            .apply(&event)
-            .map_err(|e| format!("record {number}: {e}"))?;
-        delivery_history
-            .apply(&event)
-            .map_err(|e| format!("record {number}: {e}"))?;
+        let event: Value = root_checks::result(
+            "reader.record.plaintext_json",
+            serde_json::from_slice(&plaintext).map_err(|e| format!("record {number}: {e}")),
+        )?;
+        let _record_slot = semantic::Slot::new("reader.record", number as usize);
+        root_checks::input_domain(json!({
+            "event":crate::semantic_domains::reader::reader_event(&event),
+            "inference":inference_inputs.event(number, &event),
+            "modes":mode_inputs.event(&event),
+            "declaration":declaration_inputs.event(&event),
+            "delivery":crate::semantic_domains::declaration_delivery::delivery_history(&event)
+        }));
+        {
+            let _phase = semantic::Slot::new("reader.event", 0);
+            check_event(number, &event).map_err(|e| format!("record {number}: {e}"))?;
+        }
+        {
+            let _phase = semantic::Slot::new("inference.history", 0);
+            inference_history
+                .apply(number, &event)
+                .map_err(|e| format!("record {number}: {e}"))?;
+        }
+        {
+            let _phase = semantic::Slot::new("reader.mode_history", 0);
+            mode_history
+                .check_and_apply(&event)
+                .map_err(|e| format!("record {number}: {e}"))?;
+        }
+        {
+            let _phase = semantic::Slot::new("declaration.history", 0);
+            requirements_history
+                .apply(&event)
+                .map_err(|e| format!("record {number}: {e}"))?;
+        }
+        {
+            let _phase = semantic::Slot::new("delivery.history", 0);
+            delivery_history
+                .apply(&event)
+                .map_err(|e| format!("record {number}: {e}"))?;
+        }
+        original_events.push(event);
         records.push((number, plaintext));
         previous = address(bytes);
     }
+    let origin = root.finish()?;
+    crate::auxiliary::register(
+        origin,
+        &records,
+        passphrase,
+        wrapping_key,
+        data_key,
+        original_events,
+    );
     Ok(Opened {
+        origin,
         wrapping_key,
         data_key,
         records,
@@ -990,7 +1382,14 @@ pub fn read(files: &Files, passphrase: &str) -> Result<Opened, String> {
 
 /// Builds a store with `passphrase` holding `events`, record 0 first: the envelope and one file
 /// per record, each record in the serialization README states.
+#[cfg(test)]
 pub fn build(passphrase: &str, events: &[Value]) -> Files {
+    build_at("", passphrase, events)
+}
+
+pub fn build_at(site: &'static str, passphrase: &str, events: &[Value]) -> Files {
+    super::settle_inputs::construction(site, events);
+    let input_ok = super::file_inputs::constructor_input(site, passphrase, events);
     let random = |n| {
         ring::rand::generate::<[u8; 32]>(&ring::rand::SystemRandom::new())
             .expect("randomness")
@@ -1035,7 +1434,8 @@ pub fn build(passphrase: &str, events: &[Value]) -> Files {
         previous = address(&bytes);
         files.insert(number.to_string(), bytes);
     }
-    files
+    let valid = input_ok && crate::file_recipes::output_matches(&files, passphrase, events);
+    super::file_inputs::constructed_with_input(files, site, valid)
 }
 
 /// A record's stored bytes: its members in the stored order (`id`, `type`, `number`,
@@ -1076,10 +1476,24 @@ pub fn encodings(what: &str, bytes: &[u8]) -> Vec<(String, Vec<u8>)> {
     out
 }
 
+#[cfg(test)]
 pub fn seed_id(mnemonic: &str) -> Result<String, String> {
-    let seed = bip39::Mnemonic::parse_normalized(mnemonic)
-        .map_err(|e| e.to_string())?
-        .to_seed_normalized("");
+    seed_id_at("reader.aux.call.unregistered", 0, mnemonic)
+}
+
+pub fn seed_id_from_latest_at(caller: &'static str, mnemonic: &str) -> Result<String, String> {
+    seed_id_at(caller, root_checks::last_origin(), mnemonic)
+}
+
+pub fn seed_id_at(caller: &'static str, origin: usize, mnemonic: &str) -> Result<String, String> {
+    let _helper_call = crate::auxiliary::Call::begin(caller, "reader.aux.seed_id", origin);
+    crate::auxiliary::mnemonic_input(mnemonic);
+
+    let seed = semantic::result(
+        "reader.seed_id.mnemonic_parse",
+        bip39::Mnemonic::parse_normalized(mnemonic).map_err(|e| e.to_string()),
+    )?
+    .to_seed_normalized("");
     let mut bytes = b"tau-web seed id v1\0".to_vec();
     bytes.extend_from_slice(&seed);
     Ok(hex::encode(digest(&SHA256, &bytes)))
@@ -1089,9 +1503,24 @@ pub fn seed_id(mnemonic: &str) -> Result<String, String> {
 /// seed and the seed identifier, and roles 0–4's private and public keys at indices 0 and 1
 /// (credential format v1: `m/707285'/1'/role'/index'`, every step hardened; roles 0 and 4 are
 /// Ed25519 seeds, roles 1–3 secp256k1 secrets with x-only public keys).
+#[cfg(test)]
 pub fn seed_secrets(mnemonic: &str) -> Result<Vec<(String, Vec<u8>)>, String> {
+    seed_secrets_at("reader.aux.call.unregistered", 0, mnemonic)
+}
+
+pub fn seed_secrets_at(
+    caller: &'static str,
+    origin: usize,
+    mnemonic: &str,
+) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let _helper_call = crate::auxiliary::Call::begin(caller, "reader.aux.seed_secrets", origin);
+    crate::auxiliary::mnemonic_input(mnemonic);
+
     use bip32::{ChildNumber, XPrv};
-    let parsed = bip39::Mnemonic::parse_normalized(mnemonic).map_err(|e| e.to_string())?;
+    let parsed = semantic::result(
+        "reader.seed_secrets.mnemonic_parse",
+        bip39::Mnemonic::parse_normalized(mnemonic).map_err(|e| e.to_string()),
+    )?;
     let (entropy, length) = parsed.to_entropy_array();
     let seed = parsed.to_seed_normalized("");
     let mut id = b"tau-web seed id v1\0".to_vec();
@@ -1108,13 +1537,31 @@ pub fn seed_secrets(mnemonic: &str) -> Result<Vec<(String, Vec<u8>)>, String> {
         ),
     ];
     let step = |key: &XPrv, i| key.derive_child(ChildNumber::new(i, true).expect("hardened"));
-    let top = XPrv::new(seed).map_err(|e| e.to_string())?;
-    let version =
-        step(&step(&top, 707_285).map_err(|e| e.to_string())?, 1).map_err(|e| e.to_string())?;
+    let top = semantic::result(
+        "reader.seed_secrets.root_key",
+        XPrv::new(seed).map_err(|e| e.to_string()),
+    )?;
+    let purpose = semantic::result(
+        "reader.seed_secrets.purpose_child",
+        step(&top, 707_285).map_err(|e| e.to_string()),
+    )?;
+    let version = semantic::result(
+        "reader.seed_secrets.version_child",
+        step(&purpose, 1).map_err(|e| e.to_string()),
+    )?;
     for role in 0..5 {
-        let branch = step(&version, role).map_err(|e| e.to_string())?;
+        let _source_role = semantic::Slot::new("reader.aux.seed_secrets.role", role as usize);
+        let branch = semantic::result(
+            "reader.seed_secrets.role_child",
+            step(&version, role).map_err(|e| e.to_string()),
+        )?;
         for index in 0..2 {
-            let child = step(&branch, index).map_err(|e| e.to_string())?;
+            let _source_index =
+                semantic::Slot::new("reader.aux.seed_secrets.index", index as usize);
+            let child = semantic::result(
+                "reader.seed_secrets.index_child",
+                step(&branch, index).map_err(|e| e.to_string()),
+            )?;
             let private: [u8; 32] = child.private_key().to_bytes().into();
             let public = if role == 0 || role == 4 {
                 russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&private)
@@ -1129,6 +1576,7 @@ pub fn seed_secrets(mnemonic: &str) -> Result<Vec<(String, Vec<u8>)>, String> {
                 private.to_vec(),
             ));
             secrets.push((format!("role {role} index {index}, public"), public));
+            semantic::entered("reader.seed_secrets.key_pair");
         }
     }
     Ok(secrets)
@@ -1136,7 +1584,19 @@ pub fn seed_secrets(mnemonic: &str) -> Result<Vec<(String, Vec<u8>)>, String> {
 
 /// Each secret the store and its passphrase hold, in every encoding: the passphrase, the
 /// wrapping and data keys, and the seed's.
+#[cfg(test)]
 pub fn needles(passphrase: &str, opened: &Opened) -> Result<Vec<(String, Vec<u8>)>, String> {
+    needles_at("reader.aux.call.unregistered", passphrase, opened)
+}
+
+pub fn needles_at(
+    caller: &'static str,
+    passphrase: &str,
+    opened: &Opened,
+) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let _helper_call = crate::auxiliary::Call::begin(caller, "reader.aux.needles", opened.origin);
+    crate::auxiliary::needles_input(opened, passphrase);
+
     let mut secrets = vec![
         ("the passphrase".to_string(), passphrase.as_bytes().to_vec()),
         ("the wrapping key".to_string(), opened.wrapping_key.to_vec()),
@@ -1146,27 +1606,85 @@ pub fn needles(passphrase: &str, opened: &Opened) -> Result<Vec<(String, Vec<u8>
         .drain(..)
         .flat_map(|(what, bytes)| encodings(&what, &bytes))
         .collect();
-    needles.extend(seed_needles(&opened.mnemonic()?)?);
+    needles.extend(seed_needles_at(
+        "reader.aux.call.needles.seed_needles",
+        0,
+        &opened.mnemonic_at("reader.aux.call.needles.mnemonic")?,
+    )?);
     Ok(needles)
 }
 
 /// Independent BIP-32 derivation for fixture enrolment and each machine's authorized_keys.
+#[cfg(test)]
 pub fn role_key(mnemonic: &str, role: u32, index: u32) -> Result<[u8; 32], String> {
+    role_key_at("reader.aux.call.unregistered", 0, mnemonic, role, index)
+}
+
+pub fn role_key_from_latest_at(
+    caller: &'static str,
+    mnemonic: &str,
+    role: u32,
+    index: u32,
+) -> Result<[u8; 32], String> {
+    role_key_at(caller, root_checks::last_origin(), mnemonic, role, index)
+}
+
+pub fn role_key_at(
+    caller: &'static str,
+    origin: usize,
+    mnemonic: &str,
+    role: u32,
+    index: u32,
+) -> Result<[u8; 32], String> {
+    let _helper_call = crate::auxiliary::Call::begin(caller, "reader.aux.role_key", origin);
+    crate::auxiliary::mnemonic_input(mnemonic);
+
     use bip32::{ChildNumber, XPrv};
-    let seed = bip39::Mnemonic::parse_normalized(mnemonic)
-        .map_err(|e| e.to_string())?
-        .to_seed_normalized("");
-    let mut key = XPrv::new(seed).map_err(|e| e.to_string())?;
-    for component in [707_285, 1, role, index] {
-        key = key
-            .derive_child(ChildNumber::new(component, true).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
+    semantic::entered(match (role, index) {
+        (0, 0) => "reader.role_key.machine.first",
+        (0, 1) => "reader.role_key.machine.second",
+        (3, 0) => "reader.role_key.pass.first",
+        (3, 1) => "reader.role_key.pass.second",
+        _ => "reader.role_key.unknown",
+    });
+    let seed = semantic::result(
+        "reader.role_key.mnemonic_parse",
+        bip39::Mnemonic::parse_normalized(mnemonic).map_err(|e| e.to_string()),
+    )?
+    .to_seed_normalized("");
+    let mut key = semantic::result(
+        "reader.role_key.root_key",
+        XPrv::new(seed).map_err(|e| e.to_string()),
+    )?;
+    for (source_index, component) in [707_285, 1, role, index].into_iter().enumerate() {
+        let _source_component = semantic::Slot::new("reader.aux.role_key.path", source_index);
+        key = semantic::result(
+            "reader.role_key.child_key",
+            key.derive_child(semantic::result(
+                "reader.role_key.path_component",
+                ChildNumber::new(component, true).map_err(|e| e.to_string()),
+            )?)
+            .map_err(|e| e.to_string()),
+        )?;
+        semantic::entered("reader.role_key.component");
     }
     Ok(key.private_key().to_bytes().into())
 }
 
 /// Phrase encodings and structural array detection, independent of public JSON field names.
+#[cfg(test)]
 pub fn mnemonic_needles(mnemonic: &str) -> Vec<(String, Vec<u8>)> {
+    mnemonic_needles_at("reader.aux.call.unregistered", 0, mnemonic)
+}
+
+pub fn mnemonic_needles_at(
+    caller: &'static str,
+    origin: usize,
+    mnemonic: &str,
+) -> Vec<(String, Vec<u8>)> {
+    let _helper_call = crate::auxiliary::Call::begin(caller, "reader.aux.mnemonic_needles", origin);
+    crate::auxiliary::mnemonic_input(mnemonic);
+
     let mut needles = encodings("the mnemonic", mnemonic.as_bytes());
     needles.push((
         "the mnemonic word array".into(),
@@ -1175,13 +1693,30 @@ pub fn mnemonic_needles(mnemonic: &str) -> Vec<(String, Vec<u8>)> {
     needles
 }
 
+#[cfg(test)]
 pub fn seed_needles(mnemonic: &str) -> Result<Vec<(String, Vec<u8>)>, String> {
-    let mut needles: Vec<_> = seed_secrets(mnemonic)?
-        .into_iter()
-        .filter(|(what, _)| what != "the mnemonic")
-        .flat_map(|(what, bytes)| encodings(&what, &bytes))
-        .collect();
-    needles.extend(mnemonic_needles(mnemonic));
+    seed_needles_at("reader.aux.call.unregistered", 0, mnemonic)
+}
+
+pub fn seed_needles_at(
+    caller: &'static str,
+    origin: usize,
+    mnemonic: &str,
+) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let _helper_call = crate::auxiliary::Call::begin(caller, "reader.aux.seed_needles", origin);
+    crate::auxiliary::mnemonic_input(mnemonic);
+
+    let mut needles: Vec<_> =
+        seed_secrets_at("reader.aux.call.seed_needles.seed_secrets", 0, mnemonic)?
+            .into_iter()
+            .filter(|(what, _)| what != "the mnemonic")
+            .flat_map(|(what, bytes)| encodings(&what, &bytes))
+            .collect();
+    needles.extend(mnemonic_needles_at(
+        "reader.aux.call.seed_needles.mnemonic_needles",
+        0,
+        mnemonic,
+    ));
     Ok(needles)
 }
 
@@ -1546,7 +2081,7 @@ mod tests {
                 .err()
                 .expect("independent reader must refuse");
             let production = block_on(unlock(
-                MemoryStorage::with_files(files),
+                MemoryStorage::with_files(files.into()),
                 &Pbkdf2,
                 LocalPassphrase::new(PASS.as_bytes().to_vec()),
             ))
@@ -1578,7 +2113,7 @@ mod tests {
         assert!(read(&files, PASS).is_ok());
         assert!(
             block_on(unlock(
-                MemoryStorage::with_files(files),
+                MemoryStorage::with_files(files.into()),
                 &Pbkdf2,
                 LocalPassphrase::new(PASS.as_bytes().to_vec())
             ))
@@ -1780,7 +2315,7 @@ mod tests {
                 observation
             );
             let replayed = block_on(unlock(
-                MemoryStorage::with_files(files),
+                MemoryStorage::with_files(files.into()),
                 &Pbkdf2,
                 tau_web::credential::LocalPassphrase::new(PASS.as_bytes().to_vec()),
             ))
@@ -1830,7 +2365,7 @@ mod tests {
         bad["operation_response"]["extra"] = json!(true);
         assert!(check_event(2, &bad).is_err());
         let store = block_on(unlock(
-            MemoryStorage::with_files(files),
+            MemoryStorage::with_files(files.into()),
             &Pbkdf2,
             tau_web::credential::LocalPassphrase::new(PASS.as_bytes().to_vec()),
         ))
@@ -1973,7 +2508,7 @@ mod tests {
             ];
             let files = build(PASS, &events);
             let replayed = block_on(unlock(
-                MemoryStorage::with_files(files.clone()),
+                MemoryStorage::with_files(files.clone().into()),
                 &Pbkdf2,
                 tau_web::credential::LocalPassphrase::new(PASS.as_bytes().to_vec()),
             ))
@@ -2195,7 +2730,7 @@ mod tests {
                 json!({ "command": { "machine": "other", "command": hex::encode([0xff, 0]) } }),
             ],
         );
-        let storage = MemoryStorage::with_files(files.clone());
+        let storage = MemoryStorage::with_files(files.clone().into());
         let store = block_on(unlock(
             storage.clone(),
             &Pbkdf2,
@@ -2300,7 +2835,7 @@ mod tests {
             ],
         );
         let refused = block_on(unlock(
-            MemoryStorage::with_files(files),
+            MemoryStorage::with_files(files.into()),
             &Pbkdf2,
             tau_web::credential::LocalPassphrase::new(PASS.as_bytes().to_vec()),
         ))
@@ -2447,7 +2982,8 @@ mod inference_secret_tests {
 /// Add independently approved declaration history to a dispatch fixture. Existing record
 /// numbers and command history stay intact; tests of proposal entry use the original files.
 pub fn with_contracts(mut files: Files, passphrase: &str) -> Result<Files, String> {
-    let opened = read(&files, passphrase)?;
+    let original = files.clone();
+    let opened = read_at("reader.call.binding.contracts_source", &files, passphrase)?;
     let events: Vec<Value> = opened
         .records
         .iter()
@@ -2503,7 +3039,12 @@ pub fn with_contracts(mut files: Files, passphrase: &str) -> Result<Files, Strin
         files.insert(number.to_string(), bytes);
         number += 1;
     }
-    Ok(files)
+    Ok(crate::file_inputs::contracts_output(
+        &original,
+        files,
+        opened.origin(),
+        passphrase,
+    ))
 }
 
 #[cfg(test)]
@@ -2539,7 +3080,7 @@ mod receipt_tests {
             });
             let prefix = build(PASS, &events);
             let reopened = block_on(unlock(
-                MemoryStorage::with_files(prefix.clone()),
+                MemoryStorage::with_files(prefix.clone().into()),
                 &Pbkdf2,
                 LocalPassphrase::new(PASS.as_bytes().to_vec()),
             ))
@@ -2567,7 +3108,7 @@ mod receipt_tests {
                 );
             }
             let reopened = block_on(unlock(
-                MemoryStorage::with_files(files.clone()),
+                MemoryStorage::with_files(files.clone().into()),
                 &Pbkdf2,
                 LocalPassphrase::new(PASS.as_bytes().to_vec()),
             ))

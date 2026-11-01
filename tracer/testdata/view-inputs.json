@@ -1,0 +1,157 @@
+{
+  "report": {
+    "mode": "targeted",
+    "plan": {
+      "expected_execution": [],
+      "helper_owner_sequences": [
+        {
+          "scenario": "main.run",
+          "owner": "inside",
+          "case": "main.c002.p001",
+          "page_operations": [
+            "new:tracer"
+          ]
+        }
+      ]
+    },
+    "helper_history": [
+      {
+        "event": "scenario_start",
+        "id": "main.run",
+        "invocation": 1,
+        "at_ns": 0
+      },
+      {
+        "event": "case_start",
+        "id": "main.c002.p001",
+        "at_ns": 1
+      },
+      {
+        "event": "call_start",
+        "call": 1,
+        "kind": "runtime.settled",
+        "page": 7,
+        "at_ns": 2
+      },
+      {
+        "event": "attempt",
+        "ordinal": 1,
+        "at_ns": 3
+      },
+      {
+        "event": "check",
+        "id": "runtime.store.not_failed",
+        "at_ns": 6
+      },
+      {
+        "event": "poll",
+        "ready": true,
+        "at_ns": 8
+      },
+      {
+        "event": "check",
+        "id": "runtime.store.ready_nontransient",
+        "at_ns": 10
+      },
+      {
+        "event": "call_end",
+        "call": 1,
+        "at_ns": 12
+      },
+      {
+        "event": "case_end",
+        "id": "main.c002.p001",
+        "at_ns": 13
+      },
+      {
+        "event": "scenario_end",
+        "id": "main.run",
+        "at_ns": 14
+      }
+    ],
+    "runtime_inputs": [
+      {
+        "call": 1,
+        "parameters": {
+          "in_use": false
+        }
+      }
+    ],
+    "observer_calls": [],
+    "observer_prior_inputs": [],
+    "cases": [],
+    "primary_history": [],
+    "view_inputs": {
+      "captures": [
+        {
+          "source": 1,
+          "kind": "runtime",
+          "site": null,
+          "call": 1,
+          "attempt": 1,
+          "slot": null,
+          "in_use": false,
+          "page": 7,
+          "case": "main.c002.p001",
+          "start_ns": 4,
+          "end_ns": 5,
+          "start_cursor": 4,
+          "end_cursor": 4,
+          "query_ok": true
+        }
+      ],
+      "uses": [
+        {
+          "kind": "failed",
+          "call": 1,
+          "attempt": 1,
+          "sources": [
+            1
+          ],
+          "result": false,
+          "ok": true,
+          "at_ns": 5,
+          "history_cursor": 4,
+          "check_ns": null,
+          "check_cursor": null,
+          "check_instance": null
+        },
+        {
+          "kind": "ready",
+          "call": 1,
+          "attempt": 1,
+          "sources": [
+            1
+          ],
+          "result": true,
+          "ok": true,
+          "at_ns": 7,
+          "history_cursor": 5,
+          "check_ns": null,
+          "check_cursor": null,
+          "check_instance": null
+        },
+        {
+          "kind": "returned",
+          "call": 1,
+          "attempt": null,
+          "sources": [
+            1
+          ],
+          "result": true,
+          "ok": true,
+          "at_ns": 11,
+          "history_cursor": 7,
+          "check_ns": null,
+          "check_cursor": null,
+          "check_instance": null
+        }
+      ]
+    }
+  },
+  "inventory": {
+    "cases": [],
+    "view_observer_sources": {},
+    "view_direct_sources": {}
+  }
+}

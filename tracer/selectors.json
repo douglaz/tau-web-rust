@@ -1,0 +1,76 @@
+{
+  "TAU_TRACER_HOLD_CASE": [
+    "all",
+    "drop",
+    "simultaneous",
+    "stop",
+    "writer-stop",
+    "append-error",
+    "shared-stop",
+    "legacy",
+    "unreachable",
+    "destructive"
+  ],
+  "TAU_TRACER_SEED_CASE": [
+    "all",
+    "create",
+    "mismatch",
+    "failed-append"
+  ],
+  "TAU_TRACER_SETUP_CASE": [
+    "all",
+    "existing"
+  ],
+  "TAU_TRACER_MODE_CASE": [
+    "*"
+  ],
+  "TAU_TRACER_GOALS": [
+    "*"
+  ],
+  "TAU_TRACER_GOAL_CASE": [
+    "declaration",
+    "admission",
+    "card",
+    "context",
+    "outcome",
+    "hold",
+    "barrier",
+    "credential",
+    "document_pending",
+    "document_end"
+  ],
+  "TAU_TRACER_DELIVERY": [
+    "*"
+  ],
+  "TAU_TRACER_DELIVERY_CASE": [
+    "all",
+    "reports",
+    "incomplete"
+  ],
+  "TAU_TRACER_INFERENCE": [
+    "*"
+  ],
+  "TAU_TRACER_INFERENCE_PHASE": [
+    "core",
+    "dispatch",
+    "cutoff",
+    "command-intent",
+    "sent-reads",
+    "session-end",
+    "lifecycle",
+    "lifecycle-core",
+    "lifecycle-boundaries",
+    "lifecycle-expiry",
+    "lifecycle-locked",
+    "lifecycle-repairs"
+  ],
+  "TAU_TRACER_INFERENCE_END": [
+    "lock",
+    "hidden",
+    "pagehide",
+    "reload",
+    "bfcache",
+    "redisplay"
+  ],
+  "TAU_TRACER_SESSION_END": []
+}

@@ -3,12 +3,25 @@ use super::*;
 
 const FAMILIES: [&str; 3] = ["machines", "passes", "handoffs"];
 
-async fn wait_stage(run: &Run<'_>, tab: &Tab, stage: &str) -> Result<(), String> {
-    for _ in 0..300 {
+async fn wait_stage(
+    site: &'static str,
+    run: &Run<'_>,
+    tab: &Tab,
+    stage: &str,
+) -> Result<(), String> {
+    let observer = observer::Call::begin(
+        site,
+        "seed.wait_stage",
+        Some(&tab.session),
+        json!({"stage":match stage {"display"=>"display","answering"=>"answering","inactive"=>"inactive",_=>"unknown"}}),
+    );
+
+    for poll in 0..300 {
+        observer.attempt(poll + 1);
         let ready = run.browser.evaluate(&tab.session, &format!(
             "(() => {{ const s=document.getElementById('tau-seed-backup'); return {} === 'inactive' ? s.hidden : !s.hidden && ({} === 'display' ? !!document.getElementById('tau-seed-backup-words') : !document.getElementById('tau-seed-backup-entry').hidden); }})()",
             json!(stage), json!(stage))).await?;
-        if ready == true {
+        if observer.poll(poll + 1, ready == true) {
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -29,22 +42,26 @@ async fn click(run: &Run<'_>, tab: &Tab, id: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub(super) async fn skip(run: &Run<'_>, tab: &Tab) -> Result<(), String> {
-    wait_stage(run, tab, "display").await?;
+pub(super) async fn skip(site: &'static str, run: &Run<'_>, tab: &Tab) -> Result<(), String> {
+    let _observer = observer::Call::begin(site, "seed.skip", Some(&tab.session), json!({}));
+
+    wait_stage("seed.skip.display", run, tab, "display").await?;
     click(run, tab, "seed-backup-answer").await?;
-    wait_stage(run, tab, "answering").await?;
+    wait_stage("seed.skip.answering", run, tab, "answering").await?;
     click(run, tab, "seed-backup-skip").await?;
-    wait_stage(run, tab, "inactive").await
+    wait_stage("seed.skip.inactive", run, tab, "inactive").await
 }
 
-async fn phrase(run: &Run<'_>, tab: &Tab) -> Result<String, String> {
-    wait_stage(run, tab, "display").await?;
-    let words = run.browser.evaluate(&tab.session,
-        "Array.from(document.querySelectorAll('#tau-seed-backup-words li'), n=>n.textContent).join(' ')").await?;
-    words
-        .as_str()
-        .map(str::to_string)
-        .ok_or("no displayed words".into())
+async fn phrase(
+    site: &'static str,
+    run: &Run<'_>,
+    tab: &Tab,
+) -> Result<observer::DisplayedPhrase, String> {
+    let _observer = observer::Call::begin(site, "seed.phrase", Some(&tab.session), json!({}));
+
+    wait_stage("seed.phrase.display", run, tab, "display").await?;
+    observer::displayed_words(run, tab,
+        "Array.from(document.querySelectorAll('#tau-seed-backup-words li'), n=>n.textContent).join(' ')").await
 }
 
 async fn document(run: &Run<'_>, tab: &Tab) -> Result<Value, String> {
@@ -87,26 +104,37 @@ async fn collision_controls(
         .collect();
     let mut baseline: Option<Documents> = None;
     for (index, words) in controls.iter().enumerate() {
-        let mut case = Case::new(&format!(
-            "seed-backup collision control {}: {}",
-            index + 1,
-            if tracer { "tracer" } else { "served" }
-        ));
+        let mut case = Case::new(
+            "seed_cases.c001",
+            &format!(
+                "seed-backup collision control {}: {}",
+                index + 1,
+                if tracer { "tracer" } else { "served" }
+            ),
+        );
         run.put(
             tab,
-            &reader::build(pass, &[json!({"seed":{"mnemonic":words}})]),
+            &reader::build_at(
+                "file.seed_cases.build.001",
+                pass,
+                &[json!({"seed":{"mnemonic":words}})],
+            ),
         )
         .await?;
-        *worker = run.reload(tab, worker).await?;
+        *worker = run.reload("seed_cases.rs::reload#1", tab, worker).await?;
         run.submit(tab, "unlock", pass).await?;
         case.check(
+            "seed_cases.a001",
             "control owing the seed-backup ceremony displays exactly its twelve words",
-            phrase(run, tab).await? == *words,
+            phrase("seed.collision.initial_phrase", run, tab)
+                .await?
+                .collision(&observer::collision_phrase(index + 1, words)),
         );
         language(run, tab, &mut case).await?;
         run.browser.evaluate(&tab.session,
             "window.__seedLanguageLeak=document.createElement('span'); window.__seedLanguageLeak.hidden=true; window.__seedLanguageLeak.textContent='proven'; document.body.append(window.__seedLanguageLeak)").await?;
         case.check(
+            "seed_cases.a002",
             "language check reports a planted hidden reserved claim with words displayed",
             !language_clear(run, tab).await?,
         );
@@ -118,13 +146,14 @@ async fn collision_controls(
             .await?;
         language(run, tab, &mut case).await?;
         click(run, tab, "seed-backup-answer").await?;
-        wait_stage(run, tab, "answering").await?;
+        wait_stage("seed.collision.initial_answering", run, tab, "answering").await?;
         language(run, tab, &mut case).await?;
         let answering = document(run, tab).await?;
         run.browser.evaluate(&tab.session,&format!(r#"(() => {{
             window.__seedLeak={}.split(' ').map(word=>{{const n=document.createElement('span'); n.hidden=true;n.textContent=word;document.body.append(n);return n;}});
         }})()"#,json!(words))).await?;
         case.check(
+            "seed_cases.a003",
             "hidden check reports twelve planted hidden word elements",
             !absent(run, tab, &answering).await?,
         );
@@ -135,15 +164,30 @@ async fn collision_controls(
             )
             .await?;
         case.check(
+            "seed_cases.a004",
             "removing the planted elements restores the entire answering document",
             absent(run, tab, &answering).await?,
         );
         if check_mismatch {
-            reenter(run, tab, controls[(index + 1) % controls.len()]).await?;
-            let returned = wait_stage(run, tab, "display").await.is_ok();
+            reenter(
+                "seed.collision.mismatch_entry",
+                run,
+                tab,
+                controls[(index + 1) % controls.len()],
+            )
+            .await?;
+            let returned = wait_stage("seed.collision.mismatch_display", run, tab, "display")
+                .await
+                .is_ok();
             case.check(
+                "seed_cases.a005",
                 "control mismatch returns to its original display",
-                returned && phrase(run, tab).await? == *words,
+                crate::state_inputs::all!(
+                    returned,
+                    phrase("seed.collision.mismatch_phrase", run, tab)
+                        .await?
+                        .collision(&observer::collision_phrase(index + 1, words))
+                ),
             );
             if !returned {
                 return Err("control mismatch completed instead of returning to display".into());
@@ -156,32 +200,39 @@ async fn collision_controls(
         let locked = document(run, tab).await?;
         language(run, tab, &mut case).await?;
         run.submit(tab, "unlock", pass).await?;
-        phrase(run, tab).await?;
+        phrase("seed.collision.unlock_phrase", run, tab).await?;
         click(run, tab, "seed-backup-answer").await?;
-        wait_stage(run, tab, "answering").await?;
-        reenter(run, tab, words).await?;
-        wait_stage(run, tab, "inactive").await?;
+        wait_stage("seed.collision.unlock_answering", run, tab, "answering").await?;
+        reenter("seed.collision.complete_entry", run, tab, words).await?;
+        wait_stage("seed.collision.completed", run, tab, "inactive").await?;
         language(run, tab, &mut case).await?;
         case.check(
+            "seed_cases.a006",
             "control full re-entry is durably recorded",
-            read(&run.dump(tab).await?, pass)?.seed_backups()? == ["full_reentry"],
+            read(
+                "reader.call.seed.collision_completion",
+                &run.dump_at("file.seed_cases.dump.001", tab).await?,
+                pass,
+            )?
+            .seed_backups_at("reader.aux.call.seed.collision_completion.seed_backups")?
+                == ["full_reentry"],
         );
         let old = worker.clone();
         click(run, tab, "redisplay").await?;
         *worker = run.worker(tab, Some(&old), false).await?;
         run.submit(tab, "unlock", pass).await?;
-        skip(run, tab).await?;
+        skip("seed.collision.redisplay_skip", run, tab).await?;
         let old = worker.clone();
         click(run, tab, "redisplay").await?;
         *worker = run.worker(tab, Some(&old), false).await?;
         run.submit(tab, "unlock", pass).await?;
-        phrase(run, tab).await?;
+        phrase("seed.collision.redisplay_phrase", run, tab).await?;
         click(run, tab, "seed-backup-answer").await?;
-        wait_stage(run, tab, "answering").await?;
+        wait_stage("seed.collision.redisplay_answering", run, tab, "answering").await?;
         let redisplay = document(run, tab).await?;
         language(run, tab, &mut case).await?;
         click(run, tab, "seed-backup-skip").await?;
-        wait_stage(run, tab, "inactive").await?;
+        wait_stage("seed.collision.redisplay_inactive", run, tab, "inactive").await?;
         let old = worker.clone();
         click(run, tab, "redisplay").await?;
         *worker = run.worker(tab, Some(&old), false).await?;
@@ -195,18 +246,22 @@ async fn collision_controls(
         };
         if let Some(baseline) = &baseline {
             case.check(
+                "seed_cases.a007",
                 "answering document and fields are identical under different seeds",
                 documents.answering == baseline.answering,
             );
             case.check(
+                "seed_cases.a008",
                 "locked document and fields are identical under different seeds",
                 documents.locked == baseline.locked,
             );
             case.check(
+                "seed_cases.a009",
                 "re-display answering document and fields are identical under different seeds",
                 documents.redisplay == baseline.redisplay,
             );
             case.check(
+                "seed_cases.a010",
                 "wrong-passphrase document and fields are identical under different seeds",
                 documents.wrong_pass == baseline.wrong_pass,
             );
@@ -214,7 +269,7 @@ async fn collision_controls(
             baseline = Some(documents);
         }
         language(run, tab, &mut case).await?;
-        cases.push(case);
+        case.finish(cases);
     }
     Ok(baseline.expect("four controls"))
 }
@@ -230,31 +285,50 @@ async fn language_clear(run: &Run<'_>, tab: &Tab) -> Result<bool, String> {
 
 async fn language(run: &Run<'_>, tab: &Tab, case: &mut Case) -> Result<(), String> {
     case.check(
+        "seed_cases.a011",
         "CNF-44: page text makes none of the reserved claims",
         language_clear(run, tab).await?,
     );
     Ok(())
 }
 
-async fn reenter(run: &Run<'_>, tab: &Tab, words: &str) -> Result<(), String> {
+async fn reenter(site: &'static str, run: &Run<'_>, tab: &Tab, words: &str) -> Result<(), String> {
+    let observer = observer::Call::begin(site, "seed.reenter", Some(&tab.session), json!({}));
+    observer.fact(
+        "words_input",
+        observer::reentry_matches(site, &tab.session, words),
+    );
+
     let cleared = run.browser.evaluate(&tab.session, &format!(
         "(() => {{ const f=document.getElementById('tau-seed-backup-input'); f.value={}; document.getElementById('tau-seed-backup-check').click(); return f.value === ''; }})()", json!(words))).await?;
-    if cleared != true {
+    if !observer.fact("field_cleared", cleared == true) {
         return Err("re-entry field not cleared immediately".into());
     }
     Ok(())
 }
 
-async fn allocate(run: &Run<'_>, worker: &Worker, family: &str) -> Result<Value, String> {
+async fn allocate(
+    site: &'static str,
+    run: &Run<'_>,
+    worker: &Worker,
+    family: &str,
+) -> Result<Value, String> {
+    seed_operations::allocation(site, worker, family);
     run.browser.evaluate(&worker.session, &format!(
         "(async()=>{{const m=await import(new URL('./pkg/tau_web.js',self.location.href).href); return JSON.parse(await m.test_allocate({}));}})()",json!(family))).await
 }
 
-async fn gated(run: &Run<'_>, worker: &Worker, case: &mut Case) -> Result<(), String> {
+async fn gated(
+    site: &'static str,
+    run: &Run<'_>,
+    worker: &Worker,
+    case: &mut Case,
+) -> Result<(), String> {
     for family in FAMILIES {
         case.check(
+            "seed_cases.a012",
             &format!("{family}: allocation refuses with the seed-backup gate's reason"),
-            allocate(run, worker, family).await?["refused"]
+            allocate(site, run, worker, family).await?["refused"]
                 == tau_web::allocation::Refusal::BackupMissing.to_string(),
         );
     }
@@ -262,17 +336,24 @@ async fn gated(run: &Run<'_>, worker: &Worker, case: &mut Case) -> Result<(), St
 }
 
 async fn refused_dispatch(
+    site: &'static str,
     run: &Run<'_>,
     worker: &Worker,
     args: &Value,
     case: &mut Case,
 ) -> Result<(), String> {
+    let _dispatch = seed_operations::Dispatch::begin(site, run, worker, args);
     let before = run.inspect(worker).await?;
     take(run.seen);
-    let command = run.harness_run(worker, args.clone()).await?;
-    let collect = run.harness_collect(worker, args.clone()).await?;
+    let command = run
+        .harness_run("seed_cases.rs#1", worker, args.clone())
+        .await?;
+    let collect = run
+        .harness_collect("seed_cases.rs#2", worker, args.clone())
+        .await?;
     let observed = take(run.seen);
     case.check(
+        "seed_cases.a013",
         "command and collection refuse before relay/SSH contact and append",
         command == json!({"outcome":{"refused":"seed_backup"}})
             && collect == command
@@ -283,8 +364,8 @@ async fn refused_dispatch(
     Ok(())
 }
 
-fn read(files: &Files, pass: &str) -> Result<reader::Opened, String> {
-    reader::read(&store_files(files), pass)
+fn read(site: &'static str, files: &Files, pass: &str) -> Result<reader::Opened, String> {
+    reader::read_at(site, &store_files(files), pass)
 }
 
 pub(super) async fn run(
@@ -296,6 +377,7 @@ pub(super) async fn run(
     args: &dyn Fn(&str) -> Value,
     cases: &mut Vec<Case>,
 ) -> Result<(), String> {
+    let _scenario_span = completion::scenario("seed_cases.run");
     run.browser
         .call(
             None,
@@ -304,25 +386,34 @@ pub(super) async fn run(
         )
         .await?;
     *worker = run.worker(tab, None, false).await?;
-    let saved = store_files(&run.dump(tab).await?);
-    let selected = std::env::var("TAU_TRACER_SEED_CASE").unwrap_or_else(|_| "all".into());
+    let saved = store_files(&run.dump_at("file.seed_cases.dump.002", tab).await?);
+    let selected = selection::value("TAU_TRACER_SEED_CASE").unwrap_or_else(|_| "all".into());
     let full_run = selected == "all";
     let documents = collision_controls(run, tab, worker, pass, tracer, full_run, cases).await?;
     if full_run || selected == "create" || selected == "mismatch" {
-        let mut case = Case::new(if tracer {
-            "seed-backup create, hidden answer and mismatch: tracer"
-        } else {
-            "seed-backup create, hidden answer and mismatch: served"
-        });
+        let mut case = Case::new(
+            "seed_cases.c002",
+            if tracer {
+                "seed-backup create, hidden answer and mismatch: tracer"
+            } else {
+                "seed-backup create, hidden answer and mismatch: served"
+            },
+        );
         run.put(tab, &Files::new()).await?;
-        *worker = run.reload(tab, worker).await?;
+        *worker = run.reload("seed_cases.rs::reload#2", tab, worker).await?;
         run.submit(tab, "create", pass).await?;
-        let words = phrase(run, tab).await?;
-        let before = run.dump(tab).await?;
-        let opened = read(&before, pass)?;
+        let words = phrase("seed.create.initial_phrase", run, tab).await?;
+        let before = run.dump_at("file.seed_cases.dump.003", tab).await?;
+        let opened = read("reader.call.seed.created", &before, pass)?;
         case.check(
+            "seed_cases.a014",
             "all twelve numbered words are the reader's record-0 mnemonic",
-            words == opened.mnemonic()? && words.split(' ').count() == 12,
+            crate::state_inputs::all!(
+                words.mnemonic(
+                    &opened.mnemonic_operand_at("reader.aux.call.seed.created.mnemonic")?
+                ),
+                words.split(' ').count() == 12
+            ),
         );
         let text = run
             .browser
@@ -332,22 +423,37 @@ pub(super) async fn run(
             )
             .await?;
         case.check(
+            "seed_cases.a015",
             "page explains all three allocation families are refused until recorded",
             text.as_str()
                 .is_some_and(|t| t.contains("machines, relay passes and handoffs are refused")),
         );
-        refused_dispatch(run, worker, &args("fixture"), &mut case).await?;
+        refused_dispatch(
+            "seed.create.refused_dispatch",
+            run,
+            worker,
+            &args("fixture"),
+            &mut case,
+        )
+        .await?;
         if tracer {
-            gated(run, worker, &mut case).await?;
+            gated("seed.create.display_allocations", run, worker, &mut case).await?;
         }
         case.check(
+            "seed_cases.a016",
             "nothing appended at display",
-            run.dump(tab).await? == before,
+            file_inputs::equal_primary(
+                "seed_cases.a016.1",
+                "seed_cases.a016",
+                &(run.dump_at("file.seed_cases.dump.004", tab).await?),
+                &(before),
+            ),
         );
         language(run, tab, &mut case).await?;
         click(run, tab, "seed-backup-answer").await?;
-        wait_stage(run, tab, "answering").await?;
+        wait_stage("seed.create.answering", run, tab, "answering").await?;
         case.check(
+            "seed_cases.a017",
             "answering document and fields equal an independent seed's document",
             absent(run, tab, &documents.answering).await?,
         );
@@ -355,75 +461,112 @@ pub(super) async fn run(
         let different = bip39::Mnemonic::from_entropy(&[17; 16])
             .map_err(|e| e.to_string())?
             .to_string();
-        reenter(run, tab, &different).await?;
-        let returned = wait_stage(run, tab, "display").await.is_ok();
+        reenter("seed.create.mismatch_entry", run, tab, &different).await?;
+        let returned = wait_stage("seed.create.mismatch_display", run, tab, "display")
+            .await
+            .is_ok();
         case.check(
+            "seed_cases.a018",
             "different valid mnemonic returns to the original display",
-            returned && phrase(run, tab).await? == words,
+            crate::state_inputs::all!(
+                returned,
+                phrase("seed.create.mismatch_phrase", run, tab)
+                    .await?
+                    .same_as(&words)
+            ),
         );
         case.check(
+            "seed_cases.a019",
             "reader finds no completion after mismatch",
-            run.dump(tab).await? == before
-                && read(&run.dump(tab).await?, pass)?
-                    .seed_backups()?
-                    .is_empty(),
+            crate::state_inputs::all!(
+                file_inputs::equal_primary(
+                    "seed_cases.a019.1",
+                    "seed_cases.a019",
+                    &(run.dump_at("file.seed_cases.dump.005", tab).await?),
+                    &(before),
+                ),
+                read(
+                    "reader.call.seed.mismatch_absence",
+                    &run.dump_at("file.seed_cases.dump.006", tab).await?,
+                    pass,
+                )?
+                .seed_backups_at("reader.aux.call.seed.mismatch_absence.seed_backups")?
+                .is_empty()
+            ),
         );
         if tracer {
-            gated(run, worker, &mut case).await?;
+            gated("seed.create.mismatch_allocations", run, worker, &mut case).await?;
         }
         language(run, tab, &mut case).await?;
-        cases.push(case);
+        case.finish(cases);
     }
     if full_run {
         for full in [true, false] {
-            let mut case = Case::new(match (tracer, full) {
-                (true, true) => "seed-backup full re-entry and restart: tracer",
-                (false, true) => "seed-backup full re-entry and restart: served",
-                (true, false) => "seed-backup explicit skip and restart: tracer",
-                (false, false) => "seed-backup explicit skip and restart: served",
-            });
+            let mut case = Case::new(
+                "seed_cases.c003",
+                match (tracer, full) {
+                    (true, true) => "seed-backup full re-entry and restart: tracer",
+                    (false, true) => "seed-backup full re-entry and restart: served",
+                    (true, false) => "seed-backup explicit skip and restart: tracer",
+                    (false, false) => "seed-backup explicit skip and restart: served",
+                },
+            );
             run.put(tab, &Files::new()).await?;
-            *worker = run.reload(tab, worker).await?;
+            *worker = run.reload("seed_cases.rs::reload#3", tab, worker).await?;
             run.submit(tab, "create", pass).await?;
-            let words = phrase(run, tab).await?;
+            let words = phrase("seed.completion.initial_phrase", run, tab).await?;
             click(run, tab, "seed-backup-answer").await?;
-            wait_stage(run, tab, "answering").await?;
+            wait_stage("seed.completion.answering", run, tab, "answering").await?;
             case.check(
+                "seed_cases.a020",
                 "completion's answering document equals an independent seed's document",
                 absent(run, tab, &documents.answering).await?,
             );
             if full {
-                reenter(run, tab, &format!("  {}\n", words.replace(' ', "\t"))).await?;
+                reenter(
+                    "seed.completion.full_entry",
+                    run,
+                    tab,
+                    &format!("  {}\n", words.replace(' ', "\t")),
+                )
+                .await?;
             } else {
                 click(run, tab, "seed-backup-skip").await?;
             }
-            wait_stage(run, tab, "inactive").await?;
+            wait_stage("seed.completion.inactive", run, tab, "inactive").await?;
             let completion = if full { "full_reentry" } else { "skipped" };
-            let opened = read(&run.dump(tab).await?, pass)?;
+            let opened = read(
+                "reader.call.seed.completion",
+                &run.dump_at("file.seed_cases.dump.007", tab).await?,
+                pass,
+            )?;
             case.check(
+                "seed_cases.a021",
                 "independent reader decrypts this seed's distinct completion with no words",
-                opened.seed_backups()? == [completion] && opened.records.len() == 2,
+                opened.seed_backups_at("reader.aux.call.seed.completion.seed_backups")?
+                    == [completion]
+                    && opened.records.len() == 2,
             );
-            let text = run.view(tab).await?;
+            let text = run.view_at("view.seed.completion_text", tab).await?;
             case.check(
+                "seed_cases.a022",
                 "page states which completion was recorded",
-                text["text"].as_str().is_some_and(|t| {
-                    t.contains(if full {
-                        "all twelve words re-entered"
-                    } else {
-                        "re-entry check skipped"
-                    })
-                }),
+                text.completion_text(full),
             );
             language(run, tab, &mut case).await?;
             if tracer {
                 for family in FAMILIES {
                     case.check(
+                        "seed_cases.a023",
                         &format!("{family}: first index admitted"),
-                        allocate(run, worker, family).await?["identity"]["index"] == 0,
+                        allocate("seed.completion.first_allocations", run, worker, family).await?["identity"]["index"] == 0,
                     );
                 }
-                let opened = read(&run.dump(tab).await?, pass)?;
+                let opened = read(
+                    "reader.call.seed.allocations_after_completion",
+                    &run.dump_at("file.seed_cases.dump.008", tab).await?,
+                    pass,
+                )?;
                 let reservations: Vec<Value> = opened
                     .records
                     .iter()
@@ -435,59 +578,93 @@ pub(super) async fn run(
                     })
                     .collect();
                 case.check(
+                    "seed_cases.a024",
                     "reader sees all three reservations after completion",
                     reservations.len() == 3
-                        && reservations
-                            .iter()
-                            .all(|r| r["seed"] == opened.seed_id().unwrap() && r["index"] == 0),
+                        && reservations.iter().enumerate().all(|(source_index, r)| {
+                            let _source_slot =
+                                semantic::Slot::new("reader.aux.seed_allocation", source_index);
+                            r["seed"]
+                                == opened
+                                    .seed_id_at("reader.aux.call.seed.allocations.seed_id")
+                                    .unwrap()
+                                && r["index"] == 0
+                        }),
                 );
             }
-            *worker = run.reload(tab, worker).await?;
+            *worker = run.reload("seed_cases.rs::reload#4", tab, worker).await?;
             run.submit(tab, "unlock", pass).await?;
             case.check(
+                "seed_cases.a025",
                 "restart shows no seed-backup ceremony and retains the same record",
                 run.inspect(worker).await?["seed_backup_stage"] == "inactive"
-                    && read(&run.dump(tab).await?, pass)?.seed_backups()? == [completion],
+                    && read(
+                        "reader.call.seed.completion_reopened",
+                        &run.dump_at("file.seed_cases.dump.009", tab).await?,
+                        pass,
+                    )?
+                    .seed_backups_at("reader.aux.call.seed.completion_reopened.seed_backups")?
+                        == [completion],
             );
             if tracer {
                 for family in FAMILIES {
                     case.check(
+                        "seed_cases.a026",
                         &format!("{family}: next index after reopen"),
-                        allocate(run, worker, family).await?["identity"]["index"] == 1,
+                        allocate("seed.completion.next_allocations", run, worker, family).await?["identity"]["index"] == 1,
                     );
                 }
             }
-            cases.push(case);
+            case.finish(cases);
         }
     }
     if tracer && (full_run || selected == "failed-append") {
         for full in [false, true] {
-            let mut case = Case::new(if full {
-                "seed-backup full re-entry failed OPFS move"
-            } else {
-                "seed-backup skip failed OPFS move"
-            });
+            let mut case = Case::new(
+                "seed_cases.c004",
+                if full {
+                    "seed-backup full re-entry failed OPFS move"
+                } else {
+                    "seed-backup skip failed OPFS move"
+                },
+            );
             run.put(tab, &Files::new()).await?;
-            *worker = run.reload(tab, worker).await?;
+            *worker = run.reload("seed_cases.rs::reload#5", tab, worker).await?;
             run.submit(tab, "create", pass).await?;
-            let words = phrase(run, tab).await?;
-            let before = store_files(&run.dump(tab).await?);
+            let words = phrase("seed.failed_append.initial_phrase", run, tab).await?;
+            let before = store_files(
+                &file_inputs::dump_at(run, tab, DUMP, "seed.failed_append.baseline").await?,
+            );
             click(run, tab, "seed-backup-answer").await?;
-            wait_stage(run, tab, "answering").await?;
+            wait_stage("seed.failed_append.answering", run, tab, "answering").await?;
             run.browser.evaluate(&worker.session,"(async()=>{const m=await import(new URL('./pkg/tau_web.js',self.location.href).href); await m.test_seed_backup_fail_append();})()").await?;
             if full {
-                reenter(run, tab, &words).await?;
+                reenter("seed.failed_append.full_entry", run, tab, &words).await?;
             } else {
                 click(run, tab, "seed-backup-skip").await?;
             }
-            for _ in 0..300 {
-                if run.inspect(worker).await?["seed_backup_stage"] == "append_failed" {
-                    break;
+            {
+                let observation = observer::Call::begin(
+                    "seed.failed_append.observed",
+                    "serial.observation",
+                    Some(&tab.session),
+                    json!({"bound":300,"false_sleep_ms":50,"requires_ready":false,"completion":if full {"full_reentry"} else {"skip"}}),
+                );
+                for poll in 0..300 {
+                    observation.attempt(poll + 1);
+                    if observation.poll(
+                        poll + 1,
+                        observation.inspect(run, worker).await?["seed_backup_stage"]
+                            == "append_failed",
+                    ) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(50)).await;
             }
             let state = run.inspect(worker).await?;
             case.check(
+                "seed_cases.a027",
                 "failed completion is not applied and still owed",
                 state["seed_backup_owed"] == true && state["seed_backup_completion"].is_null(),
             );
@@ -496,6 +673,7 @@ pub(super) async fn run(
                 .evaluate(&tab.session, "document.body.textContent")
                 .await?;
             case.check(
+                "seed_cases.a028",
                 "page says not recorded, still owed, reload and unlock",
                 page.as_str().is_some_and(|t| {
                     t.contains("not recorded")
@@ -503,51 +681,88 @@ pub(super) async fn run(
                         && t.contains("seed-backup ceremony is still owed")
                 }),
             );
-            gated(run, worker, &mut case).await?;
+            gated("seed.failed_append.allocations", run, worker, &mut case).await?;
             language(run, tab, &mut case).await?;
-            *worker = run.reload(tab, worker).await?;
+            *worker = run.reload("seed_cases.rs::reload#6", tab, worker).await?;
             run.submit(tab, "unlock", pass).await?;
             case.check(
+                "seed_cases.a029",
                 "next unlock owes the same words and reader finds no completion",
-                phrase(run, tab).await? == words
-                    && read(&run.dump(tab).await?, pass)?
-                        .seed_backups()?
-                        .is_empty()
-                    && read(&run.dump(tab).await?, pass)?.records
-                        == reader::read(&before, pass)?.records,
+                crate::state_inputs::all!(
+                    phrase("seed.failed_append.reopened_phrase", run, tab)
+                        .await?
+                        .same_as(&words),
+                    read(
+                        "reader.call.seed.failed_completion_absence",
+                        &run.dump_at("file.seed_cases.dump.010", tab).await?,
+                        pass,
+                    )?
+                    .seed_backups_at("reader.aux.call.seed.failed_completion_absence.seed_backups")?
+                    .is_empty(),
+                    read(
+                        "reader.call.seed.failed_completion_current",
+                        &run.dump_at("file.seed_cases.dump.011", tab).await?,
+                        pass,
+                    )?
+                    .records
+                        == reader::read_at(
+                            "reader.call.seed.failed_completion_baseline",
+                            &before,
+                            pass,
+                        )?
+                        .records
+                ),
             );
-            cases.push(case);
+            case.finish(cases);
         }
     }
     if full_run {
-        let mut case = Case::new(if tracer {
-            "seed-backup creation-finishing unlock: tracer"
-        } else {
-            "seed-backup creation-finishing unlock: served"
-        });
-        run.put(tab, &reader::build(pass, &[])).await?;
-        *worker = run.reload(tab, worker).await?;
+        let mut case = Case::new(
+            "seed_cases.c005",
+            if tracer {
+                "seed-backup creation-finishing unlock: tracer"
+            } else {
+                "seed-backup creation-finishing unlock: served"
+            },
+        );
+        run.put(
+            tab,
+            &reader::build_at("file.seed_cases.build.002", pass, &[]),
+        )
+        .await?;
+        *worker = run.reload("seed_cases.rs::reload#7", tab, worker).await?;
         run.submit(tab, "unlock", pass).await?;
         case.check(
+            "seed_cases.a030",
             "envelope-only unlock displays the mnemonic the reader finds in new record 0",
-            phrase(run, tab).await? == read(&run.dump(tab).await?, pass)?.mnemonic()?,
+            phrase("seed.envelope.phrase", run, tab).await?.mnemonic(
+                &(read(
+                    "reader.call.seed.envelope_finished",
+                    &run.dump_at("file.seed_cases.dump.012", tab).await?,
+                    pass,
+                )?
+                .mnemonic_operand_at("reader.aux.call.seed.envelope_finished.mnemonic")?),
+            ),
         );
-        cases.push(case);
+        case.finish(cases);
         for answering in [false, true] {
             for trigger in ["lock", "hidden", "pagehide", "pageshow", "close", "crash"] {
-                let mut case = Case::new(&format!(
-                    "seed-backup interrupted {} by {trigger}: {}",
-                    if answering { "answering" } else { "display" },
-                    if tracer { "tracer" } else { "served" }
-                ));
+                let mut case = Case::new(
+                    "seed_cases.c006",
+                    &format!(
+                        "seed-backup interrupted {} by {trigger}: {}",
+                        if answering { "answering" } else { "display" },
+                        if tracer { "tracer" } else { "served" }
+                    ),
+                );
                 run.put(tab, &Files::new()).await?;
-                *worker = run.reload(tab, worker).await?;
+                *worker = run.reload("seed_cases.rs::reload#8", tab, worker).await?;
                 run.submit(tab, "create", pass).await?;
-                let words = phrase(run, tab).await?;
-                let before = store_files(&run.dump(tab).await?);
+                let words = phrase("seed.interrupt.initial_phrase", run, tab).await?;
+                let before = store_files(&run.dump_at("file.seed_cases.dump.013", tab).await?);
                 if answering {
                     click(run, tab, "seed-backup-answer").await?;
-                    wait_stage(run, tab, "answering").await?;
+                    wait_stage("seed.interrupt.answering", run, tab, "answering").await?;
                 }
                 run.browser
                     .evaluate(
@@ -556,6 +771,52 @@ pub(super) async fn run(
                     )
                     .await?;
                 let old = worker.clone();
+                let interruption = operation_windows::Operation::begin(
+                    "seed.interrupt",
+                    &old,
+                    history::active_case_id()
+                        .and_then(|id| {
+                            id.rsplit_once(".p")
+                                .and_then(|(_, n)| n.parse::<usize>().ok())
+                        })
+                        .is_some_and(|n| {
+                            ["lock", "hidden", "pagehide", "pageshow", "close", "crash"]
+                                .get((n - 1) % 6)
+                                == Some(&trigger)
+                        }),
+                );
+                match trigger {
+                    "lock" => interruption.page(
+                        &tab.session,
+                        "document.getElementById(\"tau-lock\").click()",
+                    ),
+                    "pagehide" | "pageshow" => interruption.page(
+                        &tab.session,
+                        &format!(
+                            "dispatchEvent(new PageTransitionEvent({},{{persisted:{}}}))",
+                            json!(trigger),
+                            trigger == "pageshow"
+                        ),
+                    ),
+                    "close" | "crash" => {
+                        if trigger == "crash" {
+                            interruption.expect(Some(&tab.session), "Page.crash", json!({}));
+                        }
+                        interruption.expect(
+                            None,
+                            "Target.closeTarget",
+                            json!({"targetId":tab.target}),
+                        );
+                    }
+                    "hidden" => {
+                        interruption.expect(
+                            None,
+                            "Target.createTarget",
+                            json!({"url":"about:blank"}),
+                        );
+                    }
+                    _ => {}
+                }
                 match trigger {
                     "close" | "crash" => {
                         run.collect(tab).await?;
@@ -578,6 +839,13 @@ pub(super) async fn run(
                             .call(None, "Target.createTarget", json!({"url":"about:blank"}))
                             .await?;
                         let id = cover["targetId"].as_str().ok_or("no cover target")?;
+                        interruption.expect(None, "Target.activateTarget", json!({"targetId":id}));
+                        interruption.expect(None, "Target.closeTarget", json!({"targetId":id}));
+                        interruption.expect(
+                            None,
+                            "Target.activateTarget",
+                            json!({"targetId":tab.target}),
+                        );
                         run.browser
                             .call(None, "Target.activateTarget", json!({"targetId":id}))
                             .await?;
@@ -602,7 +870,9 @@ pub(super) async fn run(
                         *worker = run.worker(tab, Some(&old), false).await?;
                     }
                 }
+                interruption.finish();
                 case.check(
+                    "seed_cases.a031",
                     &format!(
                         "{trigger}, answering={answering}: lock removes mnemonic and typed input"
                     ),
@@ -617,35 +887,58 @@ pub(super) async fn run(
                             == true,
                 );
                 run.submit(tab, "unlock", pass).await?;
-                case.check(&format!("{trigger}: next unlock still owes same seed-backup ceremony with nothing appended"),phrase(run,tab).await?==words && store_files(&run.dump(tab).await?)==before);
+                case.check("seed_cases.a032",
+&format!("{trigger}: next unlock still owes same seed-backup ceremony with nothing appended"),
+crate::state_inputs::all!(
+phrase("seed.interrupt.reopened_phrase", run,tab).await?.same_as(&words),
+file_inputs::equal_primary("seed_cases.a032.1", "seed_cases.a032", &(store_files(&run.dump_at("file.seed_cases.dump.014", tab).await?)), &(before))
+));
                 language(run, tab, &mut case).await?;
-                cases.push(case);
+                case.finish(cases);
             }
         }
         // Sessions end with the harness worker; goals and tools run in it.
-        let mut case = Case::new(if tracer {
-            "seed-backup re-display ends dispatch connections and waits"
-        } else {
-            "seed-backup re-display requires passphrase: served"
-        });
-        skip(run, tab).await?;
+        let mut case = Case::new(
+            "seed_cases.c007",
+            if tracer {
+                "seed-backup re-display ends dispatch connections and waits"
+            } else {
+                "seed-backup re-display requires passphrase: served"
+            },
+        );
+        skip("seed.redisplay.initial_skip", run, tab).await?;
         let mut before = run.inspect(worker).await?;
+        let mut socket_input = None;
         if tracer {
-            setup_cases::approve(run, tab, worker).await?;
+            setup_cases::approve("seed.redisplay.setup_approve", run, tab, worker).await?;
             binding_cases::prepare(run, tab, worker, pass).await?;
             take(run.seen);
             fresh_pace(run.relay);
             let mut request = args("fixture");
             request["command"] = LOCK_COMMAND.into();
-            run.harness_start(worker, request).await?;
+            let exec_input = fixture_inputs::static_wait(run, worker, &case.id, "exec");
+            let socket = fixture_inputs::static_wait(run, worker, &case.id, "socket");
+            fixture_inputs::static_start(&exec_input, Some(&socket), run, worker, request).await?;
+            socket_input = Some(socket);
             case.check(
+                "seed_cases.a033",
                 "running command reached fixture exec",
-                settle_for(run.seen, 20, |s| exec_command_is(s, LOCK_COMMAND)).await,
+                settle_for(
+                    "seed.redisplay.running_exec",
+                    run.seen,
+                    20,
+                    json!({"command":"lock_command"}),
+                    |s, observation| {
+                        fixture_predicates::exec(s, LOCK_COMMAND, &exec_input, observation)
+                    },
+                )
+                .await,
             );
             before = run.inspect(worker).await?;
             run.browser.evaluate(&worker.session,&format!("self.__seedHeld = {}.then(r=>{{self.__seedHeldDone=true;return r;}}); self.__seedHeldDone=false; true",run_expression(&args("fixture")))).await?;
             tokio::time::sleep(Duration::from_millis(200)).await;
             case.check(
+                "seed_cases.a034",
                 "held request is waiting without a second intent",
                 run.browser
                     .evaluate(&worker.session, "self.__seedHeldDone")
@@ -655,9 +948,14 @@ pub(super) async fn run(
             );
         }
         let old = worker.clone();
-        click(run, tab, "redisplay").await?;
+        if let Some(input) = socket_input.as_ref() {
+            fixture_inputs::seed_click(input, run, tab, &old, "redisplay").await?;
+        } else {
+            click(run, tab, "redisplay").await?;
+        }
         *worker = run.worker(tab, Some(&old), false).await?;
         case.check(
+            "seed_cases.a035",
             "before passphrase no mnemonic is displayed",
             run.browser
                 .evaluate(
@@ -668,37 +966,70 @@ pub(super) async fn run(
                 == true,
         );
         if tracer {
-            let gone = settle_for(run.seen, 20, |s| {
-                s.relay_log
-                    .iter()
-                    .any(|(_, e)| matches!(e, Event::Frame("close") | Event::Ended))
-            })
+            let gone = settle_for(
+                "seed.redisplay.socket_closed",
+                run.seen,
+                20,
+                json!({}),
+                |s, observation| {
+                    fixture_predicates::socket(s, true, socket_input.as_ref().unwrap(), observation)
+                },
+            )
             .await;
             case.check(
+                "seed_cases.a036",
                 "before words, relay and SSH connections ended and held worker is gone",
-                gone && run.sshd.all_ended().await && !run.live_workers(tab).contains(&old),
+                gone && run
+                    .sshd
+                    .all_ended_at(Some("seed.redisplay.ssh_closed"), json!({}))
+                    .await
+                    && !run.live_workers(tab).contains(&old),
             );
         }
+        drop(socket_input);
         run.submit(tab, "unlock", pass).await?;
-        let words = phrase(run, tab).await?;
+        let words = phrase("seed.redisplay.phrase", run, tab).await?;
         language(run, tab, &mut case).await?;
-        refused_dispatch(run, worker, &args("fixture"), &mut case).await?;
+        refused_dispatch(
+            "seed.reentry.displayed_refusal",
+            run,
+            worker,
+            &args("fixture"),
+            &mut case,
+        )
+        .await?;
         click(run, tab, "seed-backup-answer").await?;
-        wait_stage(run, tab, "answering").await?;
+        wait_stage("seed.redisplay.answering", run, tab, "answering").await?;
         case.check(
+            "seed_cases.a037",
             "re-display removes words while answering",
             absent(run, tab, &documents.redisplay).await?,
         );
-        refused_dispatch(run, worker, &args("fixture"), &mut case).await?;
-        reenter(run, tab, &words).await?;
-        wait_stage(run, tab, "inactive").await?;
+        refused_dispatch(
+            "seed.reentry.answering_refusal",
+            run,
+            worker,
+            &args("fixture"),
+            &mut case,
+        )
+        .await?;
+        reenter("seed.redisplay.full_entry", run, tab, &words).await?;
+        wait_stage("seed.redisplay.inactive", run, tab, "inactive").await?;
         case.check(
+            "seed_cases.a038",
             "re-display journals another completion",
-            read(&run.dump(tab).await?, pass)?.seed_backups()? == ["skipped", "full_reentry"],
+            read(
+                "reader.call.seed.redisplay_completion",
+                &run.dump_at("file.seed_cases.dump.015", tab).await?,
+                pass,
+            )?
+            .seed_backups_at("reader.aux.call.seed.redisplay_completion.seed_backups")?
+                == ["skipped", "full_reentry"],
         );
         if tracer {
             let after = run.inspect(worker).await?;
             case.check(
+                "seed_cases.a039",
                 "cut-off call unresolved; held request records no intent and never resumes",
                 after["calls"] == before["calls"]
                     && after["commands"] == before["commands"]
@@ -709,6 +1040,7 @@ pub(super) async fn run(
             tokio::time::sleep(Duration::from_millis(200)).await;
             let observed = take(run.seen);
             case.check(
+                "seed_cases.a040",
                 "no second exec after completion",
                 observed.ssh_exec.is_empty(),
             );
@@ -716,17 +1048,25 @@ pub(super) async fn run(
         let old = worker.clone();
         click(run, tab, "redisplay").await?;
         *worker = run.worker(tab, Some(&old), false).await?;
-        let persisted = store_files(&run.dump(tab).await?);
+        let persisted = store_files(&run.dump_at("file.seed_cases.dump.016", tab).await?);
         run.submit(tab, "unlock", WRONG_PASSPHRASE).await?;
         case.check(
+            "seed_cases.a041",
             "wrong passphrase shows no word and journals nothing",
-            absent(run, tab, &documents.wrong_pass).await?
-                && store_files(&run.dump(tab).await?) == persisted,
+            crate::state_inputs::all!(
+                absent(run, tab, &documents.wrong_pass).await?,
+                file_inputs::equal_primary(
+                    "seed_cases.a041.1",
+                    "seed_cases.a041",
+                    &(store_files(&run.dump_at("file.seed_cases.dump.017", tab).await?)),
+                    &(persisted),
+                )
+            ),
         );
-        cases.push(case);
+        case.finish(cases);
     }
     run.put(tab, &saved).await?;
-    *worker = run.reload(tab, worker).await?;
+    *worker = run.reload("seed_cases.rs::reload#9", tab, worker).await?;
     run.submit(tab, "unlock", pass).await?;
     Ok(())
 }

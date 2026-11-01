@@ -7,19 +7,50 @@ async fn fresh(
     worker: &mut Worker,
     saved: &Files,
 ) -> Result<String, String> {
+    fresh_impl(None, run, tab, worker, saved).await
+}
+async fn fresh_session(
+    site: &'static str,
+    run: &Run<'_>,
+    tab: &Tab,
+    worker: &mut Worker,
+    saved: &Files,
+) -> Result<session_operands::Session, String> {
+    let raw = fresh_impl(Some(site), run, tab, worker, saved).await?;
+    Ok(session_operands::selected(site, raw))
+}
+async fn fresh_impl(
+    input_site: Option<&'static str>,
+    run: &Run<'_>,
+    tab: &Tab,
+    worker: &mut Worker,
+    saved: &Files,
+) -> Result<String, String> {
     reset(run, tab, worker, saved).await?;
     let result = infer(run, worker).await?;
-    if result["finished"] != true || result.get("body").is_none() {
+    if completion::rejects(
+        "lifecycle-repairs.initial_completion.finished_with_body",
+        result["finished"] != true || result.get("body").is_none(),
+    ) {
         return Err(format!(
             "lifecycle race prerequisite did not reach completion: {result}"
         ));
     }
-    run.inspect(worker).await?["sessions"]
+    let original = if let Some(site) = input_site {
+        session_operands::state(site, run, worker).await?
+    } else {
+        run.inspect(worker).await?
+    };
+    let session = original["sessions"]
         .as_array()
         .and_then(|ss| ss.iter().find(|s| s["bound_set"] == json!(["fixture"])))
         .and_then(|s| s["identity"].as_str())
-        .map(str::to_owned)
-        .ok_or("fixture session".into())
+        .map(str::to_owned);
+    completion::prerequisite(
+        "lifecycle-repairs.original_session.present",
+        session.is_some(),
+    );
+    session.ok_or("fixture session".into())
 }
 async fn hold(run: &Run<'_>, worker: &Worker, point: &str) -> Result<(), String> {
     module(run,worker,&format!("self.raceReady=new Promise(ready=>m.test_hold_session_point({},new Promise(release=>self.raceRelease=release),ready));return true;",json!(point))).await?;
@@ -38,11 +69,18 @@ async fn transition(
             .unwrap()
             .iter()
             .find(|c| c["kind"] == "mint" && c["intent"]["mint"]["session"] == session)
-            .ok_or("mint")?;
+            .ok_or("mint")
+            .checked("repairs.transition.mint")?;
         let intent = &mint["intent"]["mint"];
         let clock = &intent["evidence"]["clock"];
-        let delta = intent["expires"].as_u64().ok_or("expiry")?
-            - clock["latest"].as_u64().ok_or("anchor")?;
+        let delta = intent["expires"]
+            .as_u64()
+            .ok_or("expiry")
+            .checked("repairs.transition.expiry")?
+            - clock["latest"]
+                .as_u64()
+                .ok_or("anchor")
+                .checked("repairs.transition.anchor")?;
         module(
             run,
             worker,
@@ -86,6 +124,7 @@ pub(super) async fn run(
     saved: &Files,
     cases: &mut Vec<Case>,
 ) -> Result<(), String> {
+    let _scenario_span = completion::scenario("lifecycle_repairs.run");
     mint_custody(run, tab, worker, saved, cases).await?;
     clock_terminal(run, tab, worker, saved, cases).await?;
     command_writer(run, tab, worker, saved, cases).await?;
@@ -135,11 +174,15 @@ async fn clock_terminal(
         .await?;
         let result = module(run, worker, "return JSON.parse(await self.raceWork);").await?;
         event(run, tab, "resume").await?;
-        let mut case = Case::new(&format!(
-            "clock response {} terminal append cannot repair after processed freeze",
-            if begun { "during begun" } else { "queued for" }
-        ));
+        let mut case = Case::new(
+            "lifecycle_repairs.c001",
+            &format!(
+                "clock response {} terminal append cannot repair after processed freeze",
+                if begun { "during begun" } else { "queued for" }
+            ),
+        );
         case.check(
+            "lifecycle_repairs.a001",
             "late authenticated clock terminal retains original call and refusal",
             result["finished"] == true
                 && result["call"].is_u64()
@@ -147,17 +190,24 @@ async fn clock_terminal(
         );
         let state = run.inspect(worker).await?;
         case.check(
+            "lifecycle_repairs.a002",
             "old observation does not establish ordinary clock validity",
             state["sessions"][0]["inference_limits"]["state"] == "clock-withheld",
         );
         let sends = run.aggregator.count("/completion");
         case.check(
+            "lifecycle_repairs.a003",
             "no completion can use the invalidated observation",
             infer(run, worker).await?.get("refused").is_some()
                 && run.aggregator.count("/completion") == sends,
         );
-        let opened = reader::read(&store_files(&run.dump(tab).await?), PASSPHRASE)?;
+        let opened = reader::read_at(
+            "reader.call.lifecycle_repairs.clock_terminal",
+            &store_files(&run.dump_at("file.lifecycle_repairs.dump.001", tab).await?),
+            PASSPHRASE,
+        )?;
         case.check(
+            "lifecycle_repairs.a004",
             "independent reader retains late measured time terminal",
             opened.records.iter().any(|(_, b)| {
                 serde_json::from_slice::<Value>(b).is_ok_and(|v| {
@@ -177,6 +227,7 @@ async fn clock_terminal(
         )
         .await?;
         case.check(
+            "lifecycle_repairs.a005",
             "fresh current verification repairs same session",
             repaired["finished"] == true && repaired.get("refused").is_none(),
         );
@@ -188,16 +239,18 @@ async fn clock_terminal(
             "observed_spend",
         ] {
             case.check(
+                "lifecycle_repairs.a006",
                 &format!("repair preserves original {field}"),
                 current[field] == original[field],
             );
         }
         case.check(
+            "lifecycle_repairs.a007",
             "same-generation eligible completion still sends",
             infer(run, worker).await?["finished"] == true
                 && run.aggregator.count("/completion") == sends + 1,
         );
-        cases.push(case);
+        case.finish(cases);
     }
     Ok(())
 }
@@ -235,30 +288,38 @@ async fn command_writer(
         let after = run.inspect(worker).await?;
         let admitted = kind == "eligible";
         if kind == "expired"
-            && after["sessions"][0]["inference_limits"]["state"] != "session expired"
+            && completion::rejects(
+                "lifecycle-repairs.writer.expiry_established",
+                after["sessions"][0]["inference_limits"]["state"] != "session expired",
+            )
         {
             return Err(format!(
                 "writer expiry prerequisite did not establish expiry: {}",
                 after["sessions"]
             ));
         }
-        let mut case = Case::new(&format!(
-            "command acquired writer validates affected session {kind} before intent"
-        ));
+        let mut case = Case::new(
+            "lifecycle_repairs.c002",
+            &format!("command acquired writer validates affected session {kind} before intent"),
+        );
         case.check(
+            "lifecycle_repairs.a008",
             "transition does not rely on global end or generation",
             module(run, worker, "return String(m.publication_generation());").await? == generation,
         );
         case.check(
+            "lifecycle_repairs.a009",
             "only eligible original caller records intent and job",
             after["commands"].as_array().unwrap().len()
                 == before["commands"].as_array().unwrap().len() + usize::from(admitted),
         );
         case.check(
+            "lifecycle_repairs.a010",
             "refused writer creates no barrier",
             admitted || after["calls"] == before["calls"],
         );
         case.check(
+            "lifecycle_repairs.a011",
             "actual SSH send follows current eligibility",
             if admitted {
                 result["outcome"]["done"] == true && run.seen.lock().unwrap().ssh_exec.len() > execs
@@ -267,7 +328,7 @@ async fn command_writer(
                     && run.seen.lock().unwrap().ssh_exec.len() == execs
             },
         );
-        cases.push(case);
+        case.finish(cases);
     }
     Ok(())
 }
@@ -281,13 +342,20 @@ async fn documents(
 ) -> Result<(), String> {
     for point in ["document_send", "document_release"] {
         for kind in ["eligible", "expired", "uncertain", "ended"] {
-            let session = fresh(run, tab, worker, saved).await?;
+            let session = fresh_session(
+                "lifecycle_repairs.document.pending_cleared",
+                run,
+                tab,
+                worker,
+                saved,
+            )
+            .await?;
             hold(run, worker, point).await?;
             status(run, worker).await?;
             run.aggregator.state.lock().unwrap().document = "scheduled hidden document".into();
             let count = run.aggregator.count_method("GET", "/document");
             let source = format!("{}/document", run.aggregator.origin);
-            run.browser.evaluate(&tab.session,&format!("(()=>{{const card=document.querySelector('[data-machine=fixture]');card.querySelector('[data-goal-text]').value='Read the scheduled document';card.querySelector('[data-document-source]').value={};card.querySelector('[data-goal-enter]').click();return true;}})()",json!(source))).await?;
+            session_operands::entry("lifecycle_repairs.document.pending_cleared",run,tab,&format!("(()=>{{const card=document.querySelector('[data-machine=fixture]');card.querySelector('[data-goal-text]').value='Read the scheduled document';card.querySelector('[data-document-source]').value={};card.querySelector('[data-goal-enter]').click();return true;}})()",json!(source))).await?;
             module(run, worker, "await self.raceReady;return true;").await?;
             let generation =
                 module(run, worker, "return String(m.publication_generation());").await?;
@@ -295,39 +363,48 @@ async fn documents(
             visibility(run, tab, "hidden").await?;
             module(run, worker, "self.raceRelease();return true;").await?;
             let mut state = Value::Null;
-            for _ in 0..200 {
-                state = module(
-                    run,
-                    worker,
-                    &format!(
-                        "return JSON.parse(m.test_document_state({}));",
-                        json!(session)
-                    ),
-                )
-                .await?;
-                if state["pending"] == false {
-                    break;
+            {
+                let observation = observer::Call::begin(
+                    "lifecycle_repairs.document.pending_cleared",
+                    "serial.observation",
+                    Some(&tab.session),
+                    json!({"bound":200,"false_sleep_ms":20,"requires_ready":false,"point":point,"transition":kind}),
+                );
+                for poll in 0..200 {
+                    observation.attempt(poll + 1);
+                    state = observation.session_document(run, worker, &session).await?;
+                    if observation.poll(
+                        poll + 1,
+                        observation.session_predicate(&session, &state, None),
+                    ) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            let mut case = Case::new(&format!(
-                "page goal document {point} checks affected session {kind}"
-            ));
+            let mut case = Case::new(
+                "lifecycle_repairs.c003",
+                &format!("page goal document {point} checks affected session {kind}"),
+            );
             case.check(
+                "lifecycle_repairs.a012",
                 "no global generation change masks individual transition",
                 module(run, worker, "return String(m.publication_generation());").await?
                     == generation,
             );
             case.check(
+                "lifecycle_repairs.a013",
                 "document GET reaches only eligible send boundary",
                 run.aggregator.count_method("GET", "/document")
                     == count + usize::from(point == "document_release" || kind == "eligible"),
             );
             case.check(
+                "lifecycle_repairs.a014",
                 "only current eligible document is retained",
                 state["pending"] == false && state["retained"] == (kind == "eligible"),
             );
             case.check(
+                "lifecycle_repairs.a015",
                 "safe source history remains durable",
                 run.inspect(worker).await?["goals"]
                     .as_array()
@@ -337,7 +414,7 @@ async fn documents(
                     }),
             );
             visibility(run, tab, "visible").await?;
-            cases.push(case);
+            case.finish(cases);
         }
     }
     Ok(())
@@ -363,14 +440,17 @@ async fn publications(
         )
         .await?;
         let dom=run.browser.evaluate(&tab.session,"({state:document.getElementById('tau-store').dataset.state,lock:!document.getElementById('tau-lock').hidden,text:document.getElementById('tau-setup').textContent,verify:!!document.querySelector('[data-verify-clock]'),other:!!document.querySelector('[data-machine=fixture-other] [data-goal-card]')})").await?;
-        let mut case = Case::new(&format!(
-            "actual final postMessage and DOM keep current state after session {kind}"
-        ));
+        let mut case = Case::new(
+            "lifecycle_repairs.c004",
+            &format!("actual final postMessage and DOM keep current state after session {kind}"),
+        );
         case.check(
+            "lifecycle_repairs.a016",
             "unlocked app always retains explicit Lock",
             dom["state"] == "unlocked" && dom["lock"] == true,
         );
         case.check(
+            "lifecycle_repairs.a017",
             "only eligible final result is actionable",
             dom["text"]
                 .as_str()
@@ -379,18 +459,21 @@ async fn publications(
         );
         if kind == "uncertain" {
             case.check(
+                "lifecycle_repairs.a018",
                 "clock-withheld state retains verification control",
                 dom["verify"] == true,
             );
         }
         if kind == "ended" {
             case.check(
+                "lifecycle_repairs.a019",
                 "other eligible session keeps its controls",
                 dom["other"] == true,
             );
         }
         let posted = module(run, worker, "return self.racePosted;").await?;
         case.check(
+            "lifecycle_repairs.a020",
             "actual posted payload contains no stale actionable outcome",
             posted.as_array().is_some_and(|messages| {
                 messages
@@ -401,7 +484,7 @@ async fn publications(
                         .all(|m| m["store"].get("goal_outcome").is_some() == (kind == "eligible"))
             }),
         );
-        cases.push(case);
+        case.finish(cases);
     }
     Ok(())
 }
@@ -414,18 +497,32 @@ async fn source_append(
     cases: &mut Vec<Case>,
 ) -> Result<(), String> {
     for kind in ["eligible", "expired", "uncertain"] {
-        let session = fresh(run, tab, worker, saved).await?;
+        let session = fresh_session(
+            "lifecycle_repairs.source_append.completed",
+            run,
+            tab,
+            worker,
+            saved,
+        )
+        .await?;
         let state = run.inspect(worker).await?;
         let mint = state["inference_calls"]
             .as_array()
             .unwrap()
             .iter()
             .find(|c| c["kind"] == "mint" && c["intent"]["mint"]["session"] == session)
-            .ok_or("mint prerequisite")?;
+            .ok_or("mint prerequisite")
+            .checked("repairs.source_append.mint")?;
         let intent = &mint["intent"]["mint"];
         let clock = &intent["evidence"]["clock"];
-        let delta = intent["expires"].as_u64().ok_or("expiry")?
-            - clock["latest"].as_u64().ok_or("anchor")?;
+        let delta = intent["expires"]
+            .as_u64()
+            .ok_or("expiry")
+            .checked("repairs.source_append.expiry")?
+            - clock["latest"]
+                .as_u64()
+                .ok_or("anchor")
+                .checked("repairs.source_append.anchor")?;
         let sample = match kind {
             "expired" => Some((
                 clock["sent"]["monotonic"].as_u64().unwrap() + delta * 1_000_000,
@@ -441,7 +538,7 @@ async fn source_append(
         module(run,worker,"self.sourceReady=new Promise(ready=>m.test_hold_move(new Promise(release=>self.sourceRelease=release),ready));return true;").await?;
         let before = run.aggregator.count_method("GET", "/document");
         let source = format!("{}/document", run.aggregator.origin);
-        run.browser.evaluate(&tab.session,&format!("(()=>{{const card=document.querySelector('[data-machine=fixture]');card.querySelector('[data-goal-text]').value='Read after source append';card.querySelector('[data-document-source]').value={};card.querySelector('[data-goal-enter]').click();return true;}})()",json!(source))).await?;
+        session_operands::entry("lifecycle_repairs.source_append.completed",run,tab,&format!("(()=>{{const card=document.querySelector('[data-machine=fixture]');card.querySelector('[data-goal-text]').value='Read after source append';card.querySelector('[data-document-source]').value={};card.querySelector('[data-goal-enter]').click();return true;}})()",json!(source))).await?;
         module(run, worker, "await self.sourceReady;return true;").await?;
         if let Some((monotonic, wall)) = sample {
             module(
@@ -457,36 +554,42 @@ async fn source_append(
         }
         module(run, worker, "self.sourceRelease();return true;").await?;
         let mut complete = false;
-        for _ in 0..200 {
-            let state = run.inspect(worker).await?;
-            let document = module(
-                run,
-                worker,
-                &format!(
-                    "return JSON.parse(m.test_document_state({}));",
-                    json!(session)
-                ),
-            )
-            .await?;
-            complete = state["goals"]
-                .as_array()
-                .is_some_and(|gs| gs.iter().any(|g| g["session"] == session))
-                && document["pending"] == false;
-            if complete {
-                break;
+        {
+            let observation = observer::Call::begin(
+                "lifecycle_repairs.source_append.completed",
+                "serial.observation",
+                Some(&tab.session),
+                json!({"bound":200,"false_sleep_ms":20,"requires_ready":false,"transition":kind}),
+            );
+            for poll in 0..200 {
+                observation.attempt(poll + 1);
+                let state = observation.inspect(run, worker).await?;
+                let document = observation.session_document(run, worker, &session).await?;
+                complete = observation.session_predicate(&session, &document, Some(&state));
+                if observation.poll(poll + 1, complete) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        let mut case = Case::new(&format!(
-            "individual session {kind} during begun goal source append fences document GET"
-        ));
-        case.check("source append completes whole as durable history", complete);
+        let mut case = Case::new(
+            "lifecycle_repairs.c005",
+            &format!(
+                "individual session {kind} during begun goal source append fences document GET"
+            ),
+        );
         case.check(
+            "lifecycle_repairs.a021",
+            "source append completes whole as durable history",
+            complete,
+        );
+        case.check(
+            "lifecycle_repairs.a022",
             "current original limits govern actual GET after append",
             run.aggregator.count_method("GET", "/document")
                 == before + usize::from(kind == "eligible"),
         );
-        cases.push(case);
+        case.finish(cases);
     }
     Ok(())
 }
@@ -516,14 +619,17 @@ async fn command_release(
         module(run, worker, "self.raceRelease();return true;").await?;
         let report = module(run, worker, "return JSON.parse(await self.raceWork);").await?;
         let outcome = &report["outcome"];
-        let mut case = Case::new(&format!(
-            "final command release retains committed evidence after session {kind}"
-        ));
+        let mut case = Case::new(
+            "lifecycle_repairs.c006",
+            &format!("final command release retains committed evidence after session {kind}"),
+        );
         case.check(
+            "lifecycle_repairs.a023",
             "only eligible final release carries done",
             (outcome["done"] == true) == (kind == "eligible"),
         );
         case.check(
+            "lifecycle_repairs.a024",
             "committed call job terminal and exact output survive release",
             outcome["call"].is_u64()
                 && outcome["terminal"].is_u64()
@@ -532,12 +638,18 @@ async fn command_release(
         );
         if kind != "eligible" {
             case.check(
+                "lifecycle_repairs.a025",
                 "stale release is explicitly non-actionable history",
                 outcome["historical"] == true && outcome["actionable"] == false,
             );
         }
-        let opened = reader::read(&store_files(&run.dump(tab).await?), PASSPHRASE)?;
+        let opened = reader::read_at(
+            "reader.call.lifecycle_repairs.command_release",
+            &store_files(&run.dump_at("file.lifecycle_repairs.dump.002", tab).await?),
+            PASSPHRASE,
+        )?;
         case.check(
+            "lifecycle_repairs.a026",
             "independent reader retains original final job evidence",
             opened.records.iter().any(|(n, b)| {
                 Some(*n) == outcome["terminal"].as_u64()
@@ -547,7 +659,7 @@ async fn command_release(
                     })
             }),
         );
-        cases.push(case);
+        case.finish(cases);
     }
     Ok(())
 }
@@ -567,7 +679,8 @@ async fn prepared_publication(
             .unwrap()
             .iter()
             .find(|c| c["kind"] == "mint" && c["intent"]["mint"]["session"] == session)
-            .ok_or("affected mint")?;
+            .ok_or("affected mint")
+            .checked("repairs.prepared_publication.mint")?;
         let intent = &mint["intent"]["mint"];
         let clock = &intent["evidence"]["clock"];
         let delta = intent["expires"].as_u64().unwrap() - clock["latest"].as_u64().unwrap();
@@ -596,10 +709,12 @@ async fn prepared_publication(
         )
         .await?;
         let posts = module(run, worker, "return self.finalPosts;").await?;
-        let mut case = Case::new(&format!(
-            "prepared scanned publication validates final authority after {kind}"
-        ));
+        let mut case = Case::new(
+            "lifecycle_repairs.c007",
+            &format!("prepared scanned publication validates final authority after {kind}"),
+        );
         case.check(
+            "lifecycle_repairs.a027",
             "only eligible prepared result reaches actual postMessage",
             posts.as_array().is_some_and(|ps| {
                 !ps.is_empty()
@@ -608,15 +723,16 @@ async fn prepared_publication(
                         .all(|p| p["store"].get("goal_outcome").is_some() == (kind == "eligible"))
             }),
         );
-        case.check("withheld prepared result keeps truthful unlocked state and Lock",run.browser.evaluate(&tab.session,"document.getElementById('tau-store').dataset.state==='unlocked'&&!document.getElementById('tau-lock').hidden").await?==true);
+        case.check("lifecycle_repairs.a028", "withheld prepared result keeps truthful unlocked state and Lock",run.browser.evaluate(&tab.session,"document.getElementById('tau-store').dataset.state==='unlocked'&&!document.getElementById('tau-lock').hidden").await?==true);
         if kind == "expired" {
             case.check(
+                "lifecycle_repairs.a029",
                 "expiry after protection is actually established",
                 run.inspect(worker).await?["sessions"][0]["inference_limits"]["state"]
                     == "session expired",
             );
         }
-        cases.push(case);
+        case.finish(cases);
     }
     Ok(())
 }
@@ -633,7 +749,8 @@ async fn mint_custody(
         let initial = run.inspect(worker).await?;
         let session = initial["sessions"][0]["identity"]
             .as_str()
-            .ok_or("mint session")?
+            .ok_or("mint session")
+            .checked("repairs.mint_custody.session")?
             .to_owned();
         let confirmed = initial["sessions"][0]["inference_limits"]["confirmed"].clone();
         let mints = run.aggregator.count("/keys");
@@ -655,11 +772,15 @@ async fn mint_custody(
         )
         .await?;
         let result = module(run, worker, "return JSON.parse(await self.mintWork);").await?;
-        let mut case = Case::new(&format!(
-            "original mint key custody survives freeze {} terminal append with use withheld",
-            if begun { "during begun" } else { "queued for" }
-        ));
+        let mut case = Case::new(
+            "lifecycle_repairs.c008",
+            &format!(
+                "original mint key custody survives freeze {} terminal append with use withheld",
+                if begun { "during begun" } else { "queued for" }
+            ),
+        );
         case.check(
+            "lifecycle_repairs.a030",
             "old mint workflow publishes no ordinary body or completion",
             result.get("refused").is_some()
                 && result.get("body").is_none()
@@ -675,11 +796,13 @@ async fn mint_custody(
         )
         .await?;
         case.check(
+            "lifecycle_repairs.a031",
             "narrow fresh verification repairs same original key before ordinary resume",
             repaired["finished"] == true && repaired.get("refused").is_none(),
         );
         let withheld = infer(run, worker).await?;
         case.check(
+            "lifecycle_repairs.a032",
             "clock repair alone grants no ordinary authority during suspension",
             withheld.get("refused").is_some() && run.aggregator.count("/completion") == completions,
         );
@@ -687,11 +810,14 @@ async fn mint_custody(
         let state = run.inspect(worker).await?;
         let mint = state["inference_calls"]
             .as_array()
-            .ok_or_else(|| format!("missing mint history after resume: {state}"))?
+            .ok_or_else(|| format!("missing mint history after resume: {state}"))
+            .checked("repairs.mint_custody.history")?
             .iter()
             .find(|c| c["kind"] == "mint" && c["intent"]["mint"]["session"] == session)
-            .ok_or("original mint terminal")?;
+            .ok_or("original mint terminal")
+            .checked("repairs.mint_custody.terminal")?;
         case.check(
+            "lifecycle_repairs.a033",
             "exact original lower-tier key remains held by the same non-ended session",
             mint["state"] == "finished"
                 && mint["terminal"]["key_id"].is_string()
@@ -702,6 +828,7 @@ async fn mint_custody(
         );
         let limits = &state["sessions"][0]["inference_limits"];
         case.check(
+            "lifecycle_repairs.a034",
             "custody and repair preserve original confirmed tuple origin expiry and consumption",
             limits["confirmed"] == confirmed
                 && limits["original_origin"] == mint["intent"]["mint"]["evidence"]["origin"]
@@ -710,13 +837,14 @@ async fn mint_custody(
         );
         let next = infer(run, worker).await?;
         case.check(
+            "lifecycle_repairs.a035",
             "fresh eligible request uses original key without replacement mint",
             next["finished"] == true
                 && next.get("body").is_some()
                 && run.aggregator.count("/completion") == completions + 1
                 && run.aggregator.count("/keys") == mints + 1,
         );
-        cases.push(case);
+        case.finish(cases);
     }
     Ok(())
 }
@@ -750,7 +878,10 @@ async fn status_carriers(
                 setup_cases::click(run, tab, "[data-delivery-check=fixture]").await?;
                 module(run, worker, "await self.raceReady;return true;").await?;
                 let state = run.inspect(worker).await?;
-                if state["delivery"][0]["verdict"] != "Delivered" {
+                if completion::rejects(
+                    "lifecycle-repairs.delivery.committed",
+                    state["delivery"][0]["verdict"] != "Delivered",
+                ) {
                     return Err(format!(
                         "delivery publication prerequisite never reached committed Delivered: {}",
                         state["delivery"]
@@ -764,22 +895,36 @@ async fn status_carriers(
             transition(run, worker, &session, kind).await?;
             module(run, worker, "self.raceRelease();return true;").await?;
             let mut posted = Value::Null;
-            for _ in 0..200 {
-                posted = module(
-                    run,
-                    worker,
-                    "return self.carrierPosts.find(p=>p.store)?.store??null;",
-                )
-                .await?;
-                if posted.is_object() {
-                    break;
+            {
+                let observation = observer::Call::begin(
+                    "lifecycle_repairs.carrier.posted",
+                    "serial.observation",
+                    Some(&tab.session),
+                    json!({"bound":200,"false_sleep_ms":20,"requires_ready":false,"carrier":carrier,"transition":kind}),
+                );
+                for poll in 0..200 {
+                    observation.attempt(poll + 1);
+                    posted = observation
+                        .module(
+                            run,
+                            worker,
+                            "return self.carrierPosts.find(p=>p.store)?.store??null;",
+                        )
+                        .await?;
+                    if observation.poll(poll + 1, posted.is_object()) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            let mut case = Case::new(&format!(
-                "queued actual {carrier} publication refreshes current controls after individual session {kind}"
-            ));
+            let mut case = Case::new(
+                "lifecycle_repairs.c009",
+                &format!(
+                    "queued actual {carrier} publication refreshes current controls after individual session {kind}"
+                ),
+            );
             case.check(
+                "lifecycle_repairs.a036",
                 "final status uses current affected session without a global generation change",
                 module(run, worker, "return String(m.publication_generation());").await?
                     == generation
@@ -794,28 +939,32 @@ async fn status_carriers(
             );
             let dom=run.browser.evaluate(&tab.session,"({lock:!document.getElementById('tau-lock').hidden,target:!!document.querySelector('[data-machine=fixture] [data-goal-card]'),other:!!document.querySelector('[data-machine=fixture-other] [data-goal-card]'),verify:!!document.querySelector('[data-machine=fixture] [data-verify-clock]'),delivery:!!document.querySelector('[data-delivery-check=fixture]')})").await?;
             case.check(
+                "lifecycle_repairs.a037",
                 "Lock and another eligible session remain operable",
                 dom["lock"] == true && dom["other"] == true,
             );
             case.check(
+                "lifecycle_repairs.a038",
                 "only eligible current target retains ordinary controls",
                 dom["target"] == (kind == "eligible") && dom["delivery"] == (kind == "eligible"),
             );
             if kind == "uncertain" {
                 case.check(
+                    "lifecycle_repairs.a039",
                     "clock-withheld target retains narrow verification control",
                     dom["verify"] == true,
                 );
             }
             if carrier == "delivery" && kind == "ended" {
                 case.check(
+                    "lifecycle_repairs.a040",
                     "completed delivery remains safe history with placement disabled",
                     posted["delivery"][0]["verdict"] == "Delivered"
                         && posted["delivery"][0]["verdict_is_historical"] == true
                         && posted["delivery"][0]["placement_eligible"] == false,
                 );
             }
-            cases.push(case);
+            case.finish(cases);
         }
     }
     Ok(())

@@ -15,28 +15,68 @@
 //! `scripts/tracer.sh` builds both directories and runs the first.
 
 mod aggregator;
+mod auxiliary;
 mod binding_cases;
+mod catalogue;
+mod causal;
 mod cdp;
 mod checks;
+mod completion;
+mod counter_inputs;
 mod declaration_cases;
 mod declaration_reader;
 mod delivery_cases;
 mod delivery_reader;
+mod file_domains;
+mod file_inputs;
+mod file_installations;
+mod file_recipes;
+mod file_uses;
+mod file_windows;
+mod fixture_inputs;
+mod fixture_predicates;
 mod fixtures;
 mod goal_cases;
+mod history;
 mod hold_cases;
 mod inference_cases;
 mod inference_reader;
+mod inputs;
+mod inventory;
 mod job_cases;
+mod key_inputs;
 mod keys;
+mod logical_checks;
 mod machine;
 #[cfg(test)]
 mod matrix;
 mod mode_cases;
+mod observer;
+mod operation_windows;
+mod page_queries;
+mod predicate_inputs;
 mod reader;
+mod reader_checks;
+mod requirements;
 mod seed_cases;
+mod seed_operations;
+mod selection;
+mod semantic;
+mod semantic_domains;
+mod served_checks;
+mod session_operands;
+mod settle_inputs;
 mod setup_cases;
+mod state_inputs;
+mod state_operation_domains;
+mod state_operation_recipes;
+mod state_reload_domains;
+mod strict_json;
+mod timing_output;
+use logical_checks::Observe as _;
 mod typed_cases;
+mod view_domains;
+mod view_inputs;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -58,15 +98,66 @@ async fn main() {
         .collect::<Vec<_>>()
         .as_slice()
     {
-        ["check-absence", dir] => checks::absence(Path::new(dir)),
+        ["check-absence", dir] => checks::absence(Path::new(dir)).and_then(|()| {
+            let preflight = json!({"schema":1,"duration_ns":completion::now(),"auxiliary_calls":auxiliary::snapshot(),"served_checks":served_checks::snapshot()});
+            auxiliary::validate_preflight(&preflight, true)?;
+            served_checks::validate_absence(&preflight,Path::new(dir))?;
+            println!("TRACER_PREFLIGHT {preflight}");
+            Ok(())
+        }),
         ["check-csp", dir] => checks::csp(Path::new(dir)),
-        ["run", served, tracer] => run(Path::new(served), Path::new(tracer)).await,
+        ["list"] => {
+            println!("{}", catalogue::cases());
+            Ok(())
+        }
+        ["verify", capture, served, tracer] => {
+            completion::verify_capture(Path::new(capture), Path::new(served), Path::new(tracer))
+        }
+        ["run" | "full", served, tracer, rest @ ..] => {
+            completion::supervise(
+                "full",
+                Path::new(served),
+                Path::new(tracer),
+                &rest.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            )
+            .await
+        }
+        ["targeted", served, tracer, rest @ ..] => {
+            completion::supervise(
+                "targeted",
+                Path::new(served),
+                Path::new(tracer),
+                &rest.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            )
+            .await
+        }
+        [
+            "execute",
+            mode @ ("full" | "targeted"),
+            served,
+            tracer,
+            rest @ ..,
+        ] => {
+            match selection::admit(
+                mode,
+                &rest.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            ) {
+                Ok(selected) => match selection::install(selected) {
+                    Ok(()) => run(Path::new(served), Path::new(tracer), mode).await,
+                    Err(e) => Err(e),
+                },
+                Err(e) => Err(e),
+            }
+        }
         _ => Err(
             "usage: tracer run <served-dir> <tracer-dir> | check-absence <dir> | check-csp <dir>"
                 .into(),
         ),
     };
     if let Err(e) = result {
+        if args.first().is_some_and(|s| s == "targeted") {
+            eprintln!("TARGETED FAIL");
+        }
         eprintln!("FAIL: {e}");
         std::process::exit(1);
     }
@@ -95,28 +186,55 @@ const STORE: &str = "tau-web-store/";
 
 /// One case's verdict: the assertions that failed, empty when it passed.
 struct Case {
+    id: String,
+    site: &'static str,
     name: String,
     failures: Vec<String>,
+    assertions: Vec<Value>,
+    branches: std::collections::BTreeMap<&'static str, &'static str>,
+    start: u64,
+    end: u64,
 }
 
 impl Case {
-    fn new(name: &str) -> Case {
+    fn new(site: &'static str, name: &str) -> Case {
         println!("\n== {name}");
+        let id = catalogue::case_id(site, name);
+        let start = history::event(json!({"event":"case_start","id":id}));
         Case {
+            id,
+            site,
             name: name.into(),
             failures: Vec::new(),
+            assertions: Vec::new(),
+            branches: std::collections::BTreeMap::new(),
+            start,
+            end: 0,
         }
     }
 
-    fn check(&mut self, what: &str, holds: bool) {
-        println!("   [{}] {what}", if holds { "ok" } else { "FAILED" });
-        if !holds {
-            self.failures.push(what.to_string());
+    fn finish(mut self, cases: &mut Vec<Case>) {
+        self.end = history::event(json!({"event":"case_end","id":self.id}));
+        println!(
+            "TRACER_CASE_TIMING {}",
+            json!({"id":self.id,"start_ns":self.start,"end_ns":self.end})
+        );
+        cases.push(self);
+    }
+
+    fn branch(&mut self, name: &'static str, value: &'static str) {
+        if self.branches.insert(name, value).is_some() {
+            self.failures
+                .push(format!("duplicate scenario branch: {name}"));
         }
     }
 }
 
-async fn run(served: &Path, tracer: &Path) -> Result<(), String> {
+async fn run(served: &Path, tracer: &Path, mode: &str) -> Result<(), String> {
+    completion::now();
+    let execution_span = completion::Span::start("execution");
+    let provenance = completion::provenance(served, tracer)?;
+    let mut timings = Vec::new();
     let chrome = std::env::var("CHROME").map_err(|_| {
         "CHROME is not set: the tracer needs a Chrome or Chromium binary and never skips"
             .to_string()
@@ -127,12 +245,24 @@ async fn run(served: &Path, tracer: &Path) -> Result<(), String> {
             .map_err(|e| format!("{}: {e}", served_page.display()))?,
     )?;
 
+    let target = std::env::var("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).join("../target"));
+    std::fs::create_dir_all(&target).map_err(|e| format!("{}: {e}", target.display()))?;
+    let profile = target.join(format!("tracer-chrome-{}", std::process::id()));
+    if profile.exists() {
+        return Err("browser profile is not fresh".into());
+    }
+    let fixture_span = completion::Span::start("fixtures");
     let seen = Observed::default();
     let tls = fixtures::tls();
     let aggregator = aggregator::Aggregator::start(tls.acceptor.clone(), tls.cert.clone()).await;
+    aggregator::register_original(&aggregator);
     let sshd = fixtures::sshd(seen.clone()).await;
     let sshd_other = fixtures::sshd(seen.clone()).await;
+    causal::register(&seen, &sshd, &sshd_other);
     let relay = fixtures::relay(seen.clone(), tls.acceptor.clone(), vec![], false).await;
+    fixture_inputs::register(&seen, &relay, &sshd);
     let (served_origin, served_requests) = fixtures::https(
         served.to_path_buf(),
         tls.acceptor.clone(),
@@ -150,13 +280,21 @@ async fn run(served: &Path, tracer: &Path) -> Result<(), String> {
         sshd.port, relay.url
     );
     println!("served build at {served_origin}, tracer build at {tracer_origin}");
+    timings.push(fixture_span.finish());
 
-    let target = std::env::var("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).join("../target"));
-    std::fs::create_dir_all(&target).map_err(|e| format!("{}: {e}", target.display()))?;
-    let profile = target.join(format!("tracer-chrome-{}", std::process::id()));
-    let browser = cdp::Browser::launch(&chrome, profile, &tls.spki_sha256).await?;
+    let browser_span = completion::Span::start("browser");
+    let browser = match cdp::Browser::launch(&chrome, profile, &tls.spki_sha256).await {
+        Ok(browser) => browser,
+        Err(error) => {
+            browser_span.fail();
+            let cleanup_span = completion::Span::start("cleanup");
+            sshd.cleanup_at(Some("cleanup.ssh.primary")).await;
+            sshd_other.cleanup_at(Some("cleanup.ssh.other")).await;
+            cleanup_span.finish();
+            return Err(error);
+        }
+    };
+    timings.push(browser_span.finish());
     let context = Run {
         browser: &browser,
         aggregator: &aggregator,
@@ -166,8 +304,11 @@ async fn run(served: &Path, tracer: &Path) -> Result<(), String> {
         relay: &relay,
         messages: RefCell::default(),
         uncleared: RefCell::default(),
+        same_browser: RefCell::new(false),
     };
     let mut cases = Vec::new();
+    let groups_span = completion::Span::start("groups");
+    history::start();
     let outcome = run_cases(
         &context,
         &served_origin,
@@ -177,9 +318,15 @@ async fn run(served: &Path, tracer: &Path) -> Result<(), String> {
         &mut cases,
     )
     .await;
-    browser.close().await;
-    sshd.cleanup().await;
-    sshd_other.cleanup().await;
+    timings.push(groups_span.finish());
+    let same_browser = *context.same_browser.borrow();
+    drop(context);
+    let cleanup_span = completion::Span::start("cleanup");
+    let browser_clean = browser.close().await;
+    let sshd_clean = sshd.cleanup_at(Some("cleanup.ssh.primary")).await;
+    let other_clean = sshd_other.cleanup_at(Some("cleanup.ssh.other")).await;
+    let cleanup = browser_clean && sshd_clean && other_clean;
+    timings.push(cleanup_span.finish());
 
     // The summary names every case that ran, even when one stopped the run.
     println!("\n== summary ({} cases)", cases.len());
@@ -194,17 +341,42 @@ async fn run(served: &Path, tracer: &Path) -> Result<(), String> {
         .filter(|c| !c.failures.is_empty())
         .map(|c| c.name.as_str())
         .collect();
+    inputs::finish();
+    let report = completion::report(
+        mode,
+        &provenance,
+        &cases,
+        timings,
+        outcome.is_ok() && failed.is_empty(),
+        same_browser,
+        cleanup,
+    )?;
+    println!("TRACER_EVIDENCE {report}");
+    execution_span.finish();
     if let Err(e) = outcome {
         Err(format!(
             "the run stopped after {} cases: {e}; cases failed: {}",
             cases.len(),
             failed.join(", ")
         ))
-    } else if failed.is_empty() {
-        println!("TRACER PASS");
+    } else if failed.is_empty() && cleanup {
+        // Only the supervising process can publish a gate verdict, after checking actual exit.
         Ok(())
+    } else if !cleanup {
+        Err("tracer cleanup did not complete".into())
     } else {
         Err(format!("tracer cases failed: {}", failed.join(", ")))
+    }
+}
+
+impl Drop for Case {
+    fn drop(&mut self) {
+        if self.end == 0 {
+            println!(
+                "TRACER_CASE_TIMING {}",
+                json!({"id":self.id,"start_ns":self.start,"end_ns":completion::now(),"status":"incomplete"})
+            );
+        }
     }
 }
 
@@ -218,9 +390,26 @@ fn show(seen: &Seen) {
 }
 
 /// Waits up to `seconds` until `holds` holds of what the fixtures have observed so far.
-async fn settle_for(seen: &Observed, seconds: u64, holds: impl Fn(&Seen) -> bool) -> bool {
-    for _ in 0..seconds * 20 {
-        if holds(&seen.lock().expect("observations lock")) {
+async fn settle_for(
+    site: &'static str,
+    seen: &Observed,
+    seconds: u64,
+    extra: Value,
+    holds: impl Fn(&Seen, &observer::Call) -> bool,
+) -> bool {
+    let observation = observer::Call::begin(
+        site,
+        "fixture.wait",
+        None,
+        causal::wait_domain(site, seconds, extra),
+    );
+    observation.fact("fixture_input", causal::source_seen(seen));
+    for poll in 0..seconds * 20 {
+        observation.attempt(poll as usize + 1);
+        if observation.poll(
+            poll as usize + 1,
+            holds(&seen.lock().expect("observations lock"), &observation),
+        ) {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -228,9 +417,19 @@ async fn settle_for(seen: &Observed, seconds: u64, holds: impl Fn(&Seen) -> bool
     false
 }
 
-/// Waits up to 5 s until `holds` holds of what the fixtures have observed so far.
-async fn settle(seen: &Observed, holds: impl Fn(&Seen) -> bool) {
-    settle_for(seen, 5, holds).await;
+/// Waits up to 5 s; the original caller deliberately ignores exhaustion.
+async fn settle(reason: &str, seen: &Observed, input: &fixture_inputs::Input) {
+    let observation = observer::Call::begin(
+        "main.refusal.wait_close",
+        "fixture.settle",
+        None,
+        json!({"reason":reason,"ignored_result":true}),
+    );
+    observation.fact("fixture_input", causal::source_seen(seen));
+    settle_for("fixture.settle.wait", seen, 5, json!({}), |seen, call| {
+        fixture_predicates::socket(seen, false, input, call)
+    })
+    .await;
 }
 
 /// Forgets the relay fixture's pace state, so a dialing case never meets a refusal for `pace`
@@ -383,10 +582,16 @@ struct Tab {
 }
 
 /// A harness worker: its DevTools session and its target.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 struct Worker {
     session: String,
     target: String,
+}
+
+impl std::fmt::Debug for Worker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Worker")
+    }
 }
 
 /// The browser, the fixtures, and what the tracer gathers across cases.
@@ -402,6 +607,7 @@ struct Run<'a> {
     messages: RefCell<Vec<Value>>,
     /// Submits after which a passphrase field still held text.
     uncleared: RefCell<Vec<String>>,
+    same_browser: RefCell<bool>,
 }
 
 impl Run<'_> {
@@ -524,17 +730,22 @@ impl Run<'_> {
         old: Option<&Worker>,
         in_use: bool,
     ) -> Result<Worker, String> {
+        let call = history::Call::page("runtime.worker", &tab.session);
+        let exclusion = observer::worker_input(call.id(), &tab.session, old, in_use);
+        completion::prerequisite_request("runtime.worker.ready");
         let from = self.browser.event_count();
-        for _ in 0..300 {
-            if let [worker] = self.live_workers(tab).as_slice()
-                && Some(worker) != old
-            {
+        for poll in 0..300 {
+            call.attempt(poll + 1);
+            let candidate = exclusion.candidate(self, tab, old);
+            if call.poll(candidate.is_some()) {
+                let worker = candidate.expect("the actual worker-selection predicate passed");
                 if let Err(error) = self
                     .browser
                     .call(Some(&worker.session), "Runtime.enable", json!({}))
                     .await
                 {
                     if error.contains("Session with given id not found") {
+                        call.observe("retry", json!({}));
                         continue;
                     }
                     return Err(error);
@@ -550,7 +761,9 @@ impl Run<'_> {
                         json!({}),
                     )
                     .await?;
+                call.select(&worker);
                 self.settled(tab, in_use).await?;
+                completion::prerequisite("runtime.worker.ready", true);
                 return Ok(worker.clone());
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -575,16 +788,23 @@ impl Run<'_> {
                 )
             })
             .map(|e| {
-                json!({"method":e["method"],"session":e["sessionId"],"child_session":e["params"]["sessionId"],"target":e["params"]["targetId"],"attached_target":e["params"]["targetInfo"]["targetId"],"type":e["params"]["targetInfo"]["type"],"reason":e["params"]["reason"],"status":e["params"]["status"],"error_code":e["params"]["errorCode"],"exception_id":e["params"]["exceptionDetails"]["exceptionId"]})
+                json!({"method":e["method"],"page_event":e["sessionId"]==tab.session,"worker_event":live.iter().any(|w|e["sessionId"]==w.session),"type":e["params"]["targetInfo"]["type"],"status":e["params"]["status"],"error_code":e["params"]["errorCode"]})
             })
             .collect();
         println!(
-            "   worker timeout: page={:?}, old={old:?}, live={live:?}, events={}",
-            tab.session,
+            "   worker timeout: page={} old_present={} live_count={} events={}",
+            history::page_id(&tab.session),
+            old.is_some(),
+            live.len(),
             json!(events)
         );
         // These best-effort observations happen after the wait has already failed.
-        let view = match tokio::time::timeout(Duration::from_secs(2), self.view(tab)).await {
+        let view = match tokio::time::timeout(
+            Duration::from_secs(2),
+            self.view_at("view.runtime.worker_timeout", tab),
+        )
+        .await
+        {
             Ok(Ok(view)) => json!({"status":view["status"],"store":view["store"]}),
             Ok(Err(_)) => json!({"query":"failed"}),
             Err(_) => json!({"query":"timed_out"}),
@@ -593,37 +813,51 @@ impl Run<'_> {
             match tokio::time::timeout(Duration::from_secs(2), self.harness_targets(&tab.origin))
                 .await
             {
-                Ok(Ok(targets)) => json!({"workers":targets}),
+                Ok(Ok(targets)) => json!({"worker_count":targets.len()}),
                 Ok(Err(_)) => json!({"query":"failed"}),
                 Err(_) => json!({"query":"timed_out"}),
             };
         println!("   worker timeout observations: view={view}, targets={targets}");
         Err(format!(
-            "{}: no new harness worker in 30 s ({:?})",
-            tab.origin, live
+            "{}: no new harness worker in 30 s (live count {})",
+            tab.origin,
+            live.len()
         ))
     }
 
-    async fn view(&self, tab: &Tab) -> Result<Value, String> {
-        self.browser.evaluate(&tab.session, VIEW).await
+    async fn view_at(&self, site: &'static str, tab: &Tab) -> Result<view_inputs::View, String> {
+        view_inputs::read(view_inputs::Origin::Direct(site), self, tab, VIEW).await
     }
 
     /// Waits up to 30 s for the page to report its worker ready and its store a state that is
     /// not transient; the page's view. The store is in use elsewhere for a moment after a
     /// reload, while the old document's worker still holds the lock, so that state counts only
     /// with `in_use`.
-    async fn settled(&self, tab: &Tab, in_use: bool) -> Result<Value, String> {
-        let mut view = Value::Null;
-        for _ in 0..300 {
-            view = self.view(tab).await?;
-            if view["status"] == "failed" {
+    async fn settled(&self, tab: &Tab, in_use: bool) -> Result<view_inputs::View, String> {
+        let call = history::Call::page("runtime.settled", &tab.session);
+        observer::settled_input(call.id(), in_use);
+        completion::prerequisite_request("runtime.store.ready_nontransient");
+        let mut view = view_inputs::View::empty();
+        for poll in 0..300 {
+            call.attempt(poll + 1);
+            completion::prerequisite_request("runtime.store.not_failed");
+            view = view_inputs::read(
+                view_inputs::Origin::Runtime {
+                    call: call.id(),
+                    attempt: poll + 1,
+                    in_use,
+                },
+                self,
+                tab,
+                VIEW,
+            )
+            .await?;
+            if completion::rejects("runtime.store.not_failed", view.failed(call.id(), poll + 1)) {
                 return Err(format!("{}: {view}", tab.origin));
             }
-            let state = view["store"].as_str().unwrap_or_default();
-            let transient =
-                ["starting", "working", ""].contains(&state) || (state == "in-use" && !in_use);
-            if view["status"] == "ready" && !transient {
-                return Ok(view);
+            if call.poll(view.ready(call.id(), poll + 1, in_use)) {
+                completion::prerequisite("runtime.store.ready_nontransient", true);
+                return Ok(view.returned(call.id()));
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -635,7 +869,14 @@ impl Run<'_> {
 
     /// Types `passphrase` into the page's field (and its confirmation, to create), presses
     /// `kind`'s button, and checks the fields are empty at once; the page's view once settled.
-    async fn submit(&self, tab: &Tab, kind: &str, passphrase: &str) -> Result<Value, String> {
+    async fn submit(
+        &self,
+        tab: &Tab,
+        kind: &str,
+        passphrase: &str,
+    ) -> Result<view_inputs::View, String> {
+        let _call = history::Call::page("runtime.submit", &tab.session);
+        let passphrase_role = observer::passphrase_role(passphrase);
         let passphrase = serde_json::to_string(passphrase).expect("a JSON string");
         let left = self
             .browser
@@ -652,7 +893,9 @@ impl Run<'_> {
                 ),
             )
             .await?;
-        if left != json!(["", ""]) {
+        let cleared = left == json!(["", ""]);
+        observer::submission(_call.id(), kind, passphrase_role, cleared);
+        if !cleared {
             self.uncleared.borrow_mut().push(format!("{kind}: {left}"));
         }
         let view = self.settled(tab, false).await?;
@@ -660,16 +903,19 @@ impl Run<'_> {
         Ok(view)
     }
 
+    async fn inspect_state_at(
+        &self,
+        site: &'static str,
+        worker: &Worker,
+    ) -> Result<state_inputs::State, String> {
+        state_inputs::inspect(site, self, worker).await
+    }
+
     /// The replayed state, read in the worker's own context.
     async fn inspect(&self, worker: &Worker) -> Result<Value, String> {
+        seed_operations::operation("inspect", worker, None);
         self.browser
-            .evaluate(
-                &worker.session,
-                "(async () => {
-                    const module = await import(new URL('./pkg/tau_web.js', self.location.href).href);
-                    return JSON.parse(await module.store_state());
-                })()",
-            )
+            .evaluate(&worker.session, state_inputs::EXPRESSION)
             .await
     }
 
@@ -677,22 +923,37 @@ impl Run<'_> {
     /// to: this evaluates in the worker's own context, over its DevTools session, and calls
     /// `run_command` on the module the worker already loaded (the same URL, so the same
     /// initialized module).
-    async fn harness_run(&self, worker: &Worker, args: Value) -> Result<Value, String> {
+    async fn harness_run(&self, site: &str, worker: &Worker, args: Value) -> Result<Value, String> {
+        let operation = state_inputs::Operation::begin(site, "run", worker);
+        operation.request(self, worker, &args);
+        seed_operations::operation("run", worker, Some(&args));
         let report = self
             .browser
             .evaluate(&worker.session, &run_expression(&args))
             .await?;
         println!("   harness reported: {report}");
+        operation.finish();
         Ok(report)
     }
 
-    async fn harness_collect(&self, worker: &Worker, args: Value) -> Result<Value, String> {
-        self.browser
+    async fn harness_collect(
+        &self,
+        site: &str,
+        worker: &Worker,
+        args: Value,
+    ) -> Result<Value, String> {
+        let operation = state_inputs::Operation::begin(site, "collect", worker);
+        operation.request(self, worker, &args);
+        seed_operations::operation("collect", worker, Some(&args));
+        let result = self
+            .browser
             .evaluate(
                 &worker.session,
                 &run_expression(&args).replace("module.run_command(", "module.collect_jobs("),
             )
-            .await
+            .await?;
+        operation.finish();
+        Ok(result)
     }
 
     /// Starts one command in the worker and returns at once, leaving it in flight.
@@ -720,57 +981,26 @@ impl Run<'_> {
     }
 
     /// Reloads the page: a new document, so a new harness worker.
-    async fn reload(&self, tab: &Tab, old: &Worker) -> Result<Worker, String> {
+    async fn reload(&self, site: &str, tab: &Tab, old: &Worker) -> Result<Worker, String> {
+        let operation = state_inputs::Operation::begin(site, "reload", old);
+        operation.reload(tab);
         self.collect(tab).await?;
         self.browser
             .call(Some(&tab.session), "Page.reload", json!({}))
             .await?;
-        self.worker(tab, Some(old), false).await
+        let worker = self.worker(tab, Some(old), false).await?;
+        operation.successor(&worker);
+        Ok(worker)
     }
 
     /// The origin's private file system, every file by path.
-    async fn dump(&self, tab: &Tab) -> Result<Files, String> {
-        let dumped = self.browser.evaluate(&tab.session, DUMP).await?;
-        dumped
-            .as_object()
-            .ok_or("no dump")?
-            .iter()
-            .map(|(path, b64)| {
-                let bytes = STANDARD
-                    .decode(b64.as_str().unwrap_or_default())
-                    .map_err(|e| format!("{path}: {e}"))?;
-                Ok((path.clone(), bytes))
-            })
-            .collect()
+    async fn dump_at(&self, site: &'static str, tab: &Tab) -> Result<Files, String> {
+        file_inputs::dump_at(self, tab, DUMP, site).await
     }
 
     /// Replaces the store's directory with `files`, by name.
     async fn put(&self, tab: &Tab, files: &Files) -> Result<(), String> {
-        let files: serde_json::Map<String, Value> = files
-            .iter()
-            .map(|(name, bytes)| (name.clone(), STANDARD.encode(bytes).into()))
-            .collect();
-        self.browser
-            .evaluate(
-                &tab.session,
-                &format!(
-                    "(async (files) => {{
-                        const root = await navigator.storage.getDirectory();
-                        await root.removeEntry('tau-web-store', {{ recursive: true }}).catch(() => {{}});
-                        const directory = await root.getDirectoryHandle('tau-web-store', {{ create: true }});
-                        for (const [name, b64] of Object.entries(files)) {{
-                            const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
-                            const writable = await (await directory.getFileHandle(name, {{ create: true }})).createWritable();
-                            await writable.write(bytes);
-                            await writable.close();
-                        }}
-                        return true;
-                    }})({})",
-                    Value::Object(files)
-                ),
-            )
-            .await
-            .map(|_| ())
+        file_inputs::install(self, tab, files).await
     }
 }
 
@@ -797,10 +1027,7 @@ fn exec_command_is(seen: &Seen, command: &str) -> bool {
 
 /// The store's files from a dump of the whole file system.
 fn store_files(dumped: &Files) -> Files {
-    dumped
-        .iter()
-        .filter_map(|(path, bytes)| Some((path.strip_prefix(STORE)?.to_string(), bytes.clone())))
-        .collect()
+    file_inputs::store_files(dumped)
 }
 
 /// Errors the page or its worker reported: exceptions, `console.error`, and log entries.
@@ -871,28 +1098,34 @@ async fn run_cases(
     requests: &[&fixtures::Requests],
     cases: &mut Vec<Case>,
 ) -> Result<(), String> {
-    if std::env::var_os("TAU_TRACER_DELIVERY").is_some() {
+    let _scenario_span = completion::scenario("main.run");
+    if selection::present("TAU_TRACER_DELIVERY").is_some() {
         let (tab, mut worker) = run.open(tracer_origin, false).await?;
         delivery_cases::run(run, &tab, &mut worker, cases).await?;
         return Ok(());
     }
-    if std::env::var_os("TAU_TRACER_GOALS").is_some() {
+    if selection::present("TAU_TRACER_GOALS").is_some() {
         let (tab, mut worker) = run.open(tracer_origin, false).await?;
         goal_cases::run(run, &tab, &mut worker, cases).await?;
         return Ok(());
     }
-    if std::env::var_os("TAU_TRACER_INFERENCE").is_some() {
+    if selection::present("TAU_TRACER_INFERENCE").is_some() {
         let (mut tab, mut worker) = run.open(tracer_origin, false).await?;
         let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
         let mut events = vec![json!({"seed":{"mnemonic":mnemonic}})];
-        events.extend(reader::setup_events(
+        events.extend(reader::setup_events_at(
+            "reader.aux.call.main.inference_setup",
             mnemonic,
             &["fixture", "fixture-other"],
         ));
         for machine in ["fixture", "fixture-other"] {
             events.push(json!({"setup":{"class":{"machine":machine,"answer":"no","class":"single_purpose"}}}));
         }
-        run.put(&tab, &reader::build(PASSPHRASE, &events)).await?;
+        run.put(
+            &tab,
+            &reader::build_at("file.main.build.001", PASSPHRASE, &events),
+        )
+        .await?;
         inference_cases::run(run, &mut tab, &mut worker, cases).await?;
         inference_cases::no_plaintext(run, &tab, &worker, cases).await?;
         return Ok(());
@@ -926,6 +1159,7 @@ async fn run_cases(
 
     // The served build loads, and its harness worker runs a request on what it has stored.
     let mut case = Case::new(
+        "main.c001",
         "the served build loads, derives bound credentials and has no pin or request hook",
     );
     let from = browser.event_count();
@@ -937,8 +1171,9 @@ async fn run_cases(
         &[&served_tab.session, &served_worker.session],
     );
     println!("   errors reported: {errors:?}");
-    case.check("the harness worker reported ready", true);
+    case.check("main.a001", "the harness worker reported ready", true);
     case.check(
+        "main.a002",
         "the page and its worker reported no error",
         errors.is_empty(),
     );
@@ -952,113 +1187,129 @@ async fn run_cases(
         )
         .await?;
     println!("   page globals: {globals}");
-    case.check(
+    case.check("main.a003",
         "the page defines no request hook: typeof window.tauWeb is \"undefined\", and no global holds the worker",
         globals == json!({ "tauWeb": "undefined", "workers": [] }),
     );
-    let view = run.view(&served_tab).await?;
+    let view = run.view_at("view.main.initial_served", &served_tab).await?;
     case.check(
+        "main.a004",
         "with no store, the page offers Create and nothing else",
-        view["store"] == "none"
-            && view["create"] == true
-            && view["unlock"] == false
-            && view["lock"] == false,
+        view.primary("main.a004"),
     );
     take(seen);
     let report = run
-        .harness_run(&served_worker, served_args("fixture"))
+        .harness_run("main.rs#1", &served_worker, served_args("fixture"))
         .await?;
     let observed = take(seen);
     case.check(
+        "main.a005",
         "with no unlocked store, the served harness refuses before any contact (STA-23)",
         report == locked && observed.relay_accepted == 0 && observed.ssh_connections == 0,
     );
     let report = run
-        .harness_collect(&served_worker, served_args("fixture"))
+        .harness_collect("main.rs#2", &served_worker, served_args("fixture"))
         .await?;
     let observed = take(seen);
     case.check(
+        "main.a006",
         "collection also refuses while locked before contact",
         report == locked && observed.relay_accepted == 0 && observed.ssh_connections == 0,
     );
     let view = run.submit(&served_tab, "create", SERVED_PASSPHRASE).await?;
     case.check(
+        "main.a007",
         "a store is created in the served build, and the page offers Lock",
         view["store"] == "unlocked" && view["lock"] == true,
     );
     let report = run
-        .harness_run(&served_worker, served_args("fixture"))
+        .harness_run("main.rs#3", &served_worker, served_args("fixture"))
         .await?;
     let observed = take(seen);
     case.check(
+        "main.a008",
         "owed seed-backup ceremony refuses before contact or append",
         report == json!({"outcome":{"refused":"seed_backup"}})
             && observed.relay_accepted == 0
             && observed.ssh_connections == 0
             && run.inspect(&served_worker).await?["records"] == json!([0]),
     );
-    seed_cases::skip(run, &served_tab).await?;
-    let before_approval = run.inspect(&served_worker).await?;
+    seed_cases::skip("main.served.seed_skip", run, &served_tab).await?;
+    let before_approval = run
+        .inspect_state_at("state.main.before_approval", &served_worker)
+        .await?;
     let report = run
-        .harness_run(&served_worker, served_args("fixture"))
+        .harness_run("main.rs#4", &served_worker, served_args("fixture"))
         .await?;
     let observed = take(seen);
     case.check(
+        "main.a009",
         "served command before approval names no entry before contact or append",
-        report["outcome"] == json!({"refused":"no-entry","machine":"fixture"})
-            && observed.relay_accepted == 0
-            && observed.ssh_connections == 0
-            && run.inspect(&served_worker).await? == before_approval,
+        crate::state_inputs::all!(
+            report["outcome"] == json!({"refused":"no-entry","machine":"fixture"}),
+            observed.relay_accepted == 0,
+            observed.ssh_connections == 0,
+            run.inspect_state_at("state.main.no_entry.after", &served_worker)
+                .await?
+                .same_at("main.a009", &before_approval, &[""])
+        ),
     );
-    setup_cases::approve(run, &served_tab, &served_worker).await?;
+    setup_cases::approve(
+        "main.served.setup_approve",
+        run,
+        &served_tab,
+        &served_worker,
+    )
+    .await?;
     binding_cases::prepare(run, &served_tab, &mut served_worker, SERVED_PASSPHRASE).await?;
     let report = run
-        .harness_run(&served_worker, served_args("fixture"))
+        .harness_run("main.rs#5", &served_worker, served_args("fixture"))
         .await?;
     let observed = take(seen);
     show(&observed);
-    case.check(
+    case.check("main.a010",
         "called in its worker on the machine the tracer build pins, the served harness refused for the missing pin (CHN-R4)",
         report == json!({ "outcome": { "refused": "no-pin" } }),
     );
     case.check(
+        "main.a011",
         "the relay fixture accepted no TCP connection, and the sshd saw none",
         observed.relay_accepted == 0 && observed.ssh_connections == 0,
     );
-    case.check(
+    case.check("main.a012",
         "only the seed, completion, setup approval, two class answers, two approved fixture declarations and two exposure entries were appended",
         run.inspect(&served_worker).await?["records"] == json!([0, 1, 2, 3, 4, 5, 6, 7, 8]),
     );
     let report = run
-        .harness_collect(&served_worker, served_args("fixture"))
+        .harness_collect("main.rs#6", &served_worker, served_args("fixture"))
         .await?;
     let observed = take(seen);
     case.check(
+        "main.a013",
         "served collection refuses the missing pin before contact or append",
         report == json!({"outcome":{"refused":"no-pin"}})
             && observed.relay_accepted == 0
             && observed.ssh_connections == 0
             && run.inspect(&served_worker).await?["records"] == json!([0, 1, 2, 3, 4, 5, 6, 7, 8]),
     );
-    cases.push(case);
+    case.finish(cases);
 
     // The tracer build: a store created in the browser, read by the independent reader; and a
     // store the reader built, unlocked in the browser.
     let (mut tab, mut worker) = run.open(tracer_origin, false).await?;
-    let mut case = Case::new("create and unlock (twr-ggw.5, CNF-82)");
-    let view = run.view(&tab).await?;
-    case.check(
+    let mut case = Case::new("main.c002", "create and unlock (twr-ggw.5, CNF-82)");
+    let view = run.view_at("view.main.initial_tracer", &tab).await?;
+    case.check("main.a014",
         "with no store, the page offers Create, stating the 16-character minimum and a password manager",
-        view["store"] == "none"
-            && view["create"] == true
-            && browser
+        state_inputs::all!(view.primary("main.a014"), browser
                 .evaluate(&tab.session, "document.getElementById('tau-create-help').textContent")
                 .await?
                 .as_str()
-                .is_some_and(|t| t.contains("at least 16 characters") && t.contains("password manager")),
+                .is_some_and(|t| t.contains("at least 16 characters") && t.contains("password manager")),)
     );
     let short = run.submit(&tab, "create", "fifteen chars!!").await?;
     case.check(
+        "main.a015",
         "a passphrase of 15 characters is refused, and Create is still offered",
         short["store"] == "none"
             && short["create"] == true
@@ -1068,26 +1319,28 @@ async fn run_cases(
     );
     let view = run.submit(&tab, "create", PASSPHRASE).await?;
     case.check(
+        "main.a016",
         "the store is created and unlocked",
         view["store"] == "unlocked",
     );
-    let created = store_files(&run.dump(&tab).await?);
-    let opened = reader::read(&created, PASSPHRASE);
-    case.check(
+    let created = store_files(&run.dump_at("file.main.dump.001", &tab).await?);
+    let opened = reader::read_at("reader.call.main.created", &created, PASSPHRASE);
+    case.check("main.a017",
         "the independent reader reads the browser-written store: the envelope, then record 0, the seed",
         opened.as_ref().is_ok_and(|o| {
-            o.records.len() == 1 && o.mnemonic().is_ok_and(|m| reader::seed_secrets(&m).is_ok())
+            o.records.len() == 1 && o.mnemonic_at("reader.aux.call.main.created.mnemonic").is_ok_and(|m| reader::seed_secrets_at("reader.aux.call.main.created.seed_secrets", o.origin(), &m).is_ok())
         }),
     );
     if let Err(e) = &opened {
         println!("   the reader: {e}");
     }
-    case.check(
+    case.check("main.a018",
         "the worker's replayed state is record 0 alone",
         run.inspect(&worker).await?
             == json!({ "state": "unlocked", "seed_backup_owed": true, "seed_backup_completion": null, "seed_backup_stage": "showing_words", "locked": false, "records": [0], "commands": [], "calls": [], "terminals": [], "dispositions": [], "standing": {}, "jobs": [], "typed_calls": [], "inference_calls": [], "observations": [], "receipts": [], "association_records": [], "current_installations": {}, "setup": [], "delivery": [], "setup_offer": tau_web::dispatch::fixture_setup(), "sessions":[],"goals":[],"exposure_ledger":[],"connection_refusals":[],"mode_acceptances":[],"signature_refusals":[],"installations":[] }),
     );
-    let host = reader::build(
+    let host = reader::build_at(
+        "file.main.build.002",
         HOST_PASSPHRASE,
         &[
             json!({ "seed": { "mnemonic": include_str!("../../tests/vectors/seed-backup-collisions.txt").lines().next().expect("control mnemonic") } }),
@@ -1095,34 +1348,41 @@ async fn run_cases(
         ],
     );
     run.put(&tab, &host).await?;
-    worker = run.reload(&tab, &worker).await?;
+    worker = run.reload("main.rs::reload#1", &tab, &worker).await?;
     let view = run.submit(&tab, "unlock", HOST_PASSPHRASE).await?;
-    case.check(
+    case.check("main.a019",
         "a store the independent reader built unlocks in the browser: WebCrypto's PBKDF2 agrees with the host's",
         view["store"] == "unlocked",
     );
-    case.check(
+    case.check("main.a020",
         "and replays: its command reads back under its number",
         run.inspect(&worker).await?["commands"]
             == json!([{ "number": 1, "machine": "fixture", "command": hex::encode("built on the host") }]),
     );
     case.check(
+        "main.a021",
         "the unlock wrote nothing",
-        store_files(&run.dump(&tab).await?) == host,
+        file_inputs::equal_primary(
+            "main.a021.1",
+            "main.a021",
+            &(store_files(&run.dump_at("file.main.dump.002", &tab).await?)),
+            &(host),
+        ),
     );
     run.put(&tab, &created).await?;
-    worker = run.reload(&tab, &worker).await?;
+    worker = run.reload("main.rs::reload#2", &tab, &worker).await?;
     let view = run.submit(&tab, "unlock", PASSPHRASE).await?;
     case.check(
+        "main.a022",
         "the browser's store, put back, unlocks again",
         view["store"] == "unlocked" && run.inspect(&worker).await?["records"] == json!([0]),
     );
-    cases.push(case);
+    case.finish(cases);
 
     // Keep the independent-reader and write-free unlock checks above before any completion.
-    seed_cases::skip(run, &tab).await?;
-    let completed = store_files(&run.dump(&tab).await?);
-    if std::env::var_os("TAU_TRACER_MODE_CASE").is_some() {
+    seed_cases::skip("main.tracer.seed_skip", run, &tab).await?;
+    let completed = store_files(&run.dump_at("file.main.dump.003", &tab).await?);
+    if selection::present("TAU_TRACER_MODE_CASE").is_some() {
         mode_cases::run(run, &tab, &mut worker, PASSPHRASE, true, &args, cases).await?;
         mode_cases::run(
             run,
@@ -1136,8 +1396,8 @@ async fn run_cases(
         .await?;
         return Ok(());
     }
-    if std::env::var_os("TAU_TRACER_HOLD_CASE").is_none()
-        && std::env::var_os("TAU_TRACER_SETUP_CASE").is_none()
+    if selection::present("TAU_TRACER_HOLD_CASE").is_none()
+        && selection::present("TAU_TRACER_SETUP_CASE").is_none()
     {
         seed_cases::run(run, &mut tab, &mut worker, PASSPHRASE, true, &args, cases).await?;
         seed_cases::run(
@@ -1150,7 +1410,7 @@ async fn run_cases(
             cases,
         )
         .await?;
-        if std::env::var_os("TAU_TRACER_SEED_CASE").is_some() {
+        if selection::present("TAU_TRACER_SEED_CASE").is_some() {
             return Ok(());
         }
         browser
@@ -1162,12 +1422,12 @@ async fn run_cases(
             .await?;
         worker = run.worker(&tab, None, false).await?;
         run.put(&tab, &completed).await?;
-        worker = run.reload(&tab, &worker).await?;
+        worker = run.reload("main.rs::reload#3", &tab, &worker).await?;
         run.submit(&tab, "unlock", PASSPHRASE).await?;
     }
-    if std::env::var_os("TAU_TRACER_HOLD_CASE").is_none()
-        && std::env::var_os("TAU_TRACER_SEED_CASE").is_none()
-        && std::env::var("TAU_TRACER_SETUP_CASE").as_deref() != Ok("existing")
+    if selection::present("TAU_TRACER_HOLD_CASE").is_none()
+        && selection::present("TAU_TRACER_SEED_CASE").is_none()
+        && selection::value("TAU_TRACER_SETUP_CASE").as_deref() != Ok("existing")
     {
         setup_cases::run(run, &mut tab, &mut worker, PASSPHRASE, true, &args, cases).await?;
         setup_cases::run(
@@ -1188,21 +1448,21 @@ async fn run_cases(
             )
             .await?;
         worker = run.worker(&tab, None, false).await?;
-        if std::env::var_os("TAU_TRACER_SETUP_CASE").is_some() {
+        if selection::present("TAU_TRACER_SETUP_CASE").is_some() {
             return Ok(());
         }
         run.submit(&tab, "unlock", PASSPHRASE).await?;
     }
-    setup_cases::approve(run, &tab, &worker).await?;
+    setup_cases::approve("main.tracer.setup_approve", run, &tab, &worker).await?;
     binding_cases::prepare(run, &tab, &mut worker, PASSPHRASE).await?;
     // A focused fixture run for reproducible unresolved-command mutation checks.
-    if std::env::var_os("TAU_TRACER_HOLD_CASE").is_some() {
+    if selection::present("TAU_TRACER_HOLD_CASE").is_some() {
         hold_cases::run(run, &tab, worker, &args, cases).await?;
         return Ok(());
     }
 
     // Case 4 (AC6): the policy Chrome loaded is the served page's, and it is enforced.
-    let mut case = Case::new("4. the page runs under ARC-33's policy (AC6)");
+    let mut case = Case::new("main.c003", "4. the page runs under ARC-33's policy (AC6)");
     let loaded = browser
         .evaluate(
             &tab.session,
@@ -1218,6 +1478,7 @@ async fn run_cases(
             .collect::<Vec<_>>()
     };
     case.check(
+        "main.a023",
         "the loaded page carries the served page's policy, token for token",
         loaded.as_array().is_some_and(|policies| {
             policies.len() == 1
@@ -1240,10 +1501,12 @@ async fn run_cases(
         .await?;
     println!("   page, inline script injected: {probe}");
     case.check(
+        "main.a024",
         "the injected inline script did not run",
         probe["ran"] == false,
     );
     case.check(
+        "main.a025",
         "it raised an enforced script-src violation",
         probe["violations"].as_array().is_some_and(|v| {
             v.iter().any(|v| {
@@ -1280,76 +1543,119 @@ async fn run_cases(
     let worker_ws = browser.evaluate(&worker.session, socket_probe).await?;
     println!("   page, a ws: socket opened: {page_ws}");
     println!("   worker, a ws: socket opened: {worker_ws}");
-    case.check("connect-src refuses ws: in the page", refused(&page_ws));
     case.check(
+        "main.a026",
+        "connect-src refuses ws: in the page",
+        refused(&page_ws),
+    );
+    case.check(
+        "main.a027",
         "connect-src refuses ws: in the worker, under its response's policy",
         refused(&worker_ws),
     );
     let case_4 = cases.len();
-    cases.push(case);
+    let policy_page = (tab.target.clone(), tab.session.clone());
+    case.finish(cases);
 
     // Case 3 (AC3): no pin, no contact.
-    let mut case = Case::new("3. a machine with no pin is refused before any contact (AC3)");
-    let prior_no_pin = store_files(&run.dump(&tab).await?);
-    let mnemonic = reader::read(&prior_no_pin, PASSPHRASE)?.mnemonic()?;
+    let mut case = Case::new(
+        "main.c004",
+        "3. a machine with no pin is refused before any contact (AC3)",
+    );
+    let prior_no_pin = store_files(&run.dump_at("file.main.dump.004", &tab).await?);
+    let mnemonic = reader::read_at("reader.call.main.pre_no_pin", &prior_no_pin, PASSPHRASE)?
+        .mnemonic_at("reader.aux.call.main.pre_no_pin.mnemonic")?;
     let mut no_pin_events = vec![json!({"seed":{"mnemonic":mnemonic}})];
-    no_pin_events.extend(reader::setup_events(
+    no_pin_events.extend(reader::setup_events_at(
+        "reader.aux.call.main.no_pin_setup",
         &mnemonic,
         &["fixture", "fixture-other", "unpinned"],
     ));
-    run.put(&tab, &reader::build(PASSPHRASE, &no_pin_events))
-        .await?;
-    worker = run.reload(&tab, &worker).await?;
+    run.put(
+        &tab,
+        &reader::build_at("file.main.build.003", PASSPHRASE, &no_pin_events),
+    )
+    .await?;
+    worker = run.reload("main.rs::reload#4", &tab, &worker).await?;
     run.submit(&tab, "unlock", PASSPHRASE).await?;
     binding_cases::prepare(run, &tab, &mut worker, PASSPHRASE).await?;
     take(seen);
-    let report = run.harness_run(&worker, args("unpinned")).await?;
+    let report = run
+        .harness_run("main.rs#7", &worker, args("unpinned"))
+        .await?;
     let observed = take(seen);
     show(&observed);
     case.check(
+        "main.a028",
         "the harness refused for the missing pin",
         report["outcome"]["refused"] == "no-pin",
     );
     case.check(
+        "main.a029",
         "the relay fixture accepted no TCP connection",
         observed.relay_accepted == 0,
     );
     case.check(
+        "main.a030",
         "the relay fixture dialed nothing",
         observed.relay_dials.is_empty(),
     );
     case.check(
+        "main.a031",
         "the fixture sshd saw no connection",
         observed.ssh_connections == 0,
     );
     case.check(
+        "main.a032",
         "nothing is pinned afterwards",
         report["pinned_after"].is_null(),
     );
     case.check(
+        "main.a033",
         "nothing was journaled",
         report["journal_entries"] == json!([]),
     );
     run.put(&tab, &prior_no_pin).await?;
-    worker = run.reload(&tab, &worker).await?;
+    worker = run.reload("main.rs::reload#5", &tab, &worker).await?;
     run.submit(&tab, "unlock", PASSPHRASE).await?;
     binding_cases::prepare(run, &tab, &mut worker, PASSPHRASE).await?;
-    cases.push(case);
+    case.finish(cases);
 
-    let mut case = Case::new("oversized launch refuses before intent and contact (twr-ggw.71)");
-    let original = store_files(&run.dump(&tab).await?);
-    let before = run.inspect(&worker).await?;
+    let mut case = Case::new(
+        "main.c005",
+        "oversized launch refuses before intent and contact (twr-ggw.71)",
+    );
+    let original = store_files(&run.dump_at("file.main.dump.005", &tab).await?);
+    let before = run
+        .inspect_state_at("state.main.oversize.before", &worker)
+        .await?;
     let command = "x".repeat(30_000);
     let bytes = tau_web::jobs::launch_size("fixture", command.as_bytes());
     let mut oversized = args("fixture");
     oversized["command"] = command.into();
     take(seen);
     fresh_pace(relay);
-    let report = run.harness_run(&worker, oversized).await?;
-    sshd.all_ended().await;
+    let operation = operation_windows::Operation::begin(
+        "main.oversize",
+        &worker,
+        oversized == {
+            let mut expected = operation_windows::original_request(run, "fixture");
+            expected["command"] = json!("x".repeat(30_000));
+            expected
+        },
+    );
+    operation.run(&worker, &oversized);
+    let report = run.harness_run("main.rs#8", &worker, oversized).await?;
+    operation.finish();
+    sshd.all_ended_at(
+        Some("main.oversize.connection_end"),
+        json!({"ignored_result":true}),
+    )
+    .await;
     let observed = take(seen);
     println!("   oversized launch outcome: {}", report["outcome"]);
     case.check(
+        "main.a034",
         "the refusal explains the command is too long, with composed bytes and limit",
         report["outcome"]
             == json!({
@@ -1360,12 +1666,23 @@ async fn run_cases(
             }),
     );
     case.check(
+        "main.a035",
         "no intent, call or record is journaled",
-        report["journal_entries"] == json!([])
-            && run.inspect(&worker).await? == before
-            && store_files(&run.dump(&tab).await?) == original,
+        crate::state_inputs::all!(
+            report["journal_entries"] == json!([]),
+            run.inspect_state_at("state.main.oversize.after", &worker)
+                .await?
+                .same_at("main.a035", &before, &[""]),
+            file_inputs::equal_primary(
+                "main.a035.1",
+                "main.a035",
+                &(store_files(&run.dump_at("file.main.dump.006", &tab).await?)),
+                &(original),
+            )
+        ),
     );
     case.check(
+        "main.a036",
         "the relay accepted no connection and the sshd received no connection or exec",
         observed.relay_accepted == 0
             && observed.relay_dials.is_empty()
@@ -1375,10 +1692,11 @@ async fn run_cases(
     let mut normal = args("fixture");
     normal["command"] = "echo ok; exit 7".into();
     fresh_pace(relay);
-    let report = run.harness_run(&worker, normal).await?;
+    let report = run.harness_run("main.rs#9", &worker, normal).await?;
     let after = run.inspect(&worker).await?;
     let observed = take(seen);
     case.check(
+        "main.a037",
         "the same store admits the next command and records its exit and terminal",
         report["outcome"]["done"] == true
             && report["outcome"]["stdout"] == "ok\n"
@@ -1393,17 +1711,20 @@ async fn run_cases(
             }),
     );
     run.put(&tab, &original).await?;
-    worker = run.reload(&tab, &worker).await?;
+    worker = run.reload("main.rs::reload#6", &tab, &worker).await?;
     run.submit(&tab, "unlock", PASSPHRASE).await?;
     binding_cases::prepare(run, &tab, &mut worker, PASSPHRASE).await?;
     take(seen);
-    cases.push(case);
+    case.finish(cases);
 
     // Case 5: the relay fixture's AUTH check is real.
-    let mut case = Case::new("5. a wrongly signed AUTH is refused, and nothing is dialed");
+    let mut case = Case::new(
+        "main.c006",
+        "5. a wrongly signed AUTH is refused, and nothing is dialed",
+    );
     let mut tampered = args("fixture");
     tampered["tamper_auth"] = true.into();
-    let report = run.harness_run(&worker, tampered).await?;
+    let report = run.harness_run("main.rs#10", &worker, tampered).await?;
     let observed = take(seen);
     show(&observed);
     let one_connection = |observed: &Seen| {
@@ -1411,46 +1732,62 @@ async fn run_cases(
             && observed.relay_connections == [format!("/v1/tcp/127.0.0.1/{}", sshd.port)]
     };
     case.check(
+        "main.a038",
         "the relay fixture accepted exactly one connection, upgraded on the sshd's path",
         one_connection(&observed),
     );
     case.check(
+        "main.a039",
         "the harness got {\"ok\": false, \"reason\": \"auth\"} and close 1008",
         report["outcome"] == json!({ "refused": "relay", "reason": "auth", "close_code": 1008 }),
     );
     case.check(
+        "main.a040",
         "the relay fixture refused at check 2 of WIR-6 (paid-tcp-relay 844e834), with close 1008",
         observed.relay_refusals == [("auth".into(), "2 signature".into(), 1008)],
     );
     case.check(
+        "main.a041",
         "the relay fixture dialed nothing",
         observed.relay_dials.is_empty(),
     );
     case.check(
+        "main.a042",
         "the fixture sshd saw no connection",
         observed.ssh_connections == 0,
     );
-    cases.push(case);
+    case.finish(cases);
 
     // Case 1 (AC1): recorded, then sent; and it reconciles.
-    let mut case = Case::new("1. the command is recorded, then sent, and reconciles (AC1)");
+    let mut case = Case::new(
+        "main.c007",
+        "1. the command is recorded, then sent, and reconciles (AC1)",
+    );
     fresh_pace(relay);
-    let report = run.harness_run(&worker, args("fixture")).await?;
+    let report = run
+        .harness_run("main.rs#11", &worker, args("fixture"))
+        .await?;
     let observed = take(seen);
     show(&observed);
-    let journal = reader::read(&store_files(&run.dump(&tab).await?), PASSPHRASE)?;
+    let journal = reader::read_at(
+        "reader.call.main.recorded_command",
+        &store_files(&run.dump_at("file.main.dump.007", &tab).await?),
+        PASSPHRASE,
+    )?;
     let intent: Value = serde_json::from_slice(
         &journal
             .records
             .iter()
             .find(|(n, _)| Some(*n) == report["outcome"]["call"].as_u64())
-            .ok_or("missing command intent")?
+            .ok_or("missing command intent")
+            .checked("main.command.intent")?
             .1,
     )
     .map_err(|e| e.to_string())?;
     let journal_job = intent["intent"]["job"]
         .as_str()
-        .ok_or("missing journal job identity")?;
+        .ok_or("missing journal job identity")
+        .checked("main.command.job")?;
     let journal_machine = intent["intent"]["machine"]
         .as_str()
         .ok_or("missing journal machine")?;
@@ -1465,14 +1802,19 @@ async fn run_cases(
         .as_str()
         .and_then(|h| hex::decode(h).ok())
         .unwrap_or_default();
-    case.check("the harness completed the command", outcome["done"] == true);
     case.check(
+        "main.a043",
+        "the harness completed the command",
+        outcome["done"] == true,
+    );
+    case.check("main.a044",
         "the relay fixture accepted one connection, checked the AUTH, dialed the sshd once, refused nothing",
         one_connection(&observed)
             && observed.relay_dials == [format!("127.0.0.1:{}", sshd.port)]
             && observed.relay_refusals.is_empty(),
     );
     case.check(
+        "main.a045",
         "the fixture sshd admitted the derived machine client key",
         observed
             .ssh_auth
@@ -1480,6 +1822,7 @@ async fn run_cases(
             .any(|(user, _, admitted)| user == "tracer" && *admitted),
     );
     case.check(
+        "main.a046",
         "the fixture sshd received exactly the journal entry, byte for byte",
         observed.ssh_exec
             == [hex::decode(outcome["sent"].as_str().unwrap_or("")).unwrap_or_default()]
@@ -1493,19 +1836,24 @@ async fn run_cases(
                 == Some(journal_command.clone()),
     );
     case.check(
+        "main.a047",
         "the journal entry is the command",
         recorded == COMMAND.as_bytes(),
     );
     case.check(
+        "main.a048",
         "the harness's read-back matches what it sent",
         outcome["recorded"] == hex::encode(COMMAND) && outcome["recorded_machine"] == "fixture",
     );
     case.check(
+        "main.a049",
         "the journal holds that one new entry",
         report["journal_entries"] == json!([hex::encode(COMMAND)]),
     );
-    let replayed = run.inspect(&worker).await?;
-    case.check(
+    let replayed = run
+        .inspect_state_at("state.main.completed.replay", &worker)
+        .await?;
+    case.check("main.a050",
         "the store holds the command and terminal under their journal identities",
         replayed["records"] == json!((0..=outcome["terminal"].as_u64().unwrap()).collect::<Vec<_>>())
             && replayed["commands"]
@@ -1519,6 +1867,7 @@ async fn run_cases(
                 == json!([{ "number": outcome["terminal"], "call": outcome["call"], "exit_status": EXIT_STATUS }]),
     );
     case.check(
+        "main.a051",
         "the output and exit status came back",
         outcome["stdout"] == STDOUT
             && outcome["stderr"] == STDERR
@@ -1526,15 +1875,17 @@ async fn run_cases(
             && observed.ssh_exit == [0],
     );
     case.check(
+        "main.a052",
         "one exec on a channel: no pty, shell or subsystem (ARC-7)",
         observed.ssh_other_requests.is_empty(),
     );
     case.check(
+        "main.a053",
         "the host key presented was the pin",
         outcome["host_key"] == pinned.as_str(),
     );
     let logs = observed.relay_logs();
-    case.check(
+    case.check("main.a054",
         "the relay fixture's log reads challenge sent, AUTH received, accepted, dial, OK sent, then the first forwarded byte (WIR-10, paid-tcp-relay 844e834)",
         logs.len() == 1
             && logs[0].get(..6).is_some_and(|first| {
@@ -1554,62 +1905,87 @@ async fn run_cases(
     let mut failing = args("fixture");
     failing["fail_append"] = true.into();
     fresh_pace(relay);
-    let before_failure = run.inspect(&worker).await?;
-    let report = run.harness_run(&worker, failing).await?;
+    let before_failure = run
+        .inspect_state_at("state.main.failed.before", &worker)
+        .await?;
+    let report = run.harness_run("main.rs#12", &worker, failing).await?;
     // Every byte the harness sent before it closed has reached the sshd once the connection has
     // ended there, so an exec sent before the append cannot still be in flight.
-    let ended = sshd.all_ended().await;
+    let ended = sshd
+        .all_ended_at(
+            Some("main.failed_append.connection_end"),
+            json!({"ignored_result":false}),
+        )
+        .await;
     let observed = take(seen);
     show(&observed);
     case.check(
+        "main.a055",
         "a failed append: the sshd connection ended before its observations were read",
         ended,
     );
     case.check(
+        "main.a056",
         "a failed append: the harness reports the refusal",
         report["outcome"]["refused"] == "journal",
     );
     case.check(
+        "main.a057",
         "a failed append: the sshd admitted the client and received no exec request",
         observed.ssh_auth.iter().any(|(_, _, admitted)| *admitted) && observed.ssh_exec.is_empty(),
     );
     case.check(
+        "main.a058",
         "a failed append: nothing was journaled",
         report["journal_entries"] == json!([]),
     );
-    cases.push(case);
+    case.finish(cases);
     let case_1_in_this_session = cases.len() - 1;
+    *run.same_browser.borrow_mut() = policy_page == (tab.target.clone(), tab.session.clone());
 
     // twr-ggw.5 AC2: the failed append above was not applied, and is not replayed.
-    let mut case = Case::new("a failed append is not applied (twr-ggw.5 AC2, STA-3)");
-    let after_failure = run.inspect(&worker).await?;
+    let mut case = Case::new(
+        "main.c008",
+        "a failed append is not applied (twr-ggw.5 AC2, STA-3)",
+    );
+    let after_failure = run
+        .inspect_state_at("state.main.failed.after", &worker)
+        .await?;
     println!("   replayed before {before_failure}, after {after_failure}");
-    case.check(
+    case.check("main.a059",
         "the append failed at a storage call: the move was refused, and the staging file is all it left",
         report["outcome"]["why"].as_str().is_some_and(|why| why.starts_with("move")),
     );
     case.check(
+        "main.a060",
         "the replayed state has no record for it",
-        after_failure == before_failure && after_failure["records"] == replayed["records"],
+        after_failure.failed_append_at("main.a060", &before_failure, &replayed),
     );
-    worker = run.reload(&tab, &worker).await?;
+    worker = run.reload("main.rs::reload#7", &tab, &worker).await?;
     run.submit(&tab, "unlock", PASSPHRASE).await?;
     case.check(
+        "main.a061",
         "after a reload and an unlock, none appears",
-        run.inspect(&worker).await? == binding_cases::replayed(&before_failure),
+        run.inspect_state_at("state.main.failed.reload", &worker)
+            .await?
+            .replayed_at("main.a061", &before_failure),
     );
     binding_cases::prepare(run, &tab, &mut worker, PASSPHRASE).await?;
-    cases.push(case);
+    case.finish(cases);
 
-    let mut case = Case::new("close without exit status stays unresolved (twr-ggw.7, STA-8)");
+    let mut case = Case::new(
+        "main.c009",
+        "close without exit status stays unresolved (twr-ggw.7, STA-8)",
+    );
     fresh_pace(relay);
     let mut closing = args("fixture");
     closing["command"] = "close-without-status".into();
-    let report = run.harness_run(&worker, closing).await?;
+    let report = run.harness_run("main.rs#13", &worker, closing).await?;
     let observed = take(seen);
     let call = report["outcome"]["call"].clone();
     let before = run.inspect(&worker).await?;
     case.check(
+        "main.a062",
         "the close reports unresolved, with a call identity and no failed or done report",
         report["outcome"]["unresolved"] == true
             && call.as_u64().is_some()
@@ -1619,6 +1995,7 @@ async fn run_cases(
             && observed.ssh_exit.is_empty(),
     );
     case.check(
+        "main.a063",
         "the recorded call is unresolved and has no terminal",
         before["calls"].as_array().is_some_and(|calls| {
             calls
@@ -1628,11 +2005,12 @@ async fn run_cases(
             .as_array()
             .is_some_and(|ts| ts.iter().all(|t| t["call"] != call)),
     );
-    worker = run.reload(&tab, &worker).await?;
+    worker = run.reload("main.rs::reload#8", &tab, &worker).await?;
     run.submit(&tab, "unlock", PASSPHRASE).await?;
     tokio::time::sleep(Duration::from_secs(1)).await;
     let observed = take(seen);
     case.check(
+        "main.a064",
         "replay preserves the unresolved call and sends no second exec",
         run.inspect(&worker).await? == binding_cases::replayed(&before)
             && observed.ssh_exec.is_empty()
@@ -1641,21 +2019,24 @@ async fn run_cases(
     binding_cases::prepare(run, &tab, &mut worker, PASSPHRASE).await?;
     fresh_pace(relay);
     let commands = before["commands"].clone();
-    let held = run.harness_run(&worker, args("fixture")).await?;
+    let held = run
+        .harness_run("main.rs#14", &worker, args("fixture"))
+        .await?;
     let observed = take(seen);
-    case.check("criterion 10: a second command beside the unresolved close is held, reads only, records no intent",
+    case.check("main.a065", "criterion 10: a second command beside the unresolved close is held, reads only, records no intent",
         held["outcome"]["held"] == true && held["outcome"]["calls"][0]["call"] == call
         && held["outcome"]["calls"][0]["state"] == "finished"
         && observed.relay_dials.len() == 1 && job_cases::only_reads(&observed)
         && run.inspect(&worker).await?["commands"] == commands);
-    worker = settle_unresolved(run, &tab, worker).await?;
-    cases.push(case);
+    worker = settle_unresolved("settle.main.001", run, &tab, worker).await?;
+    case.finish(cases);
 
     let mut case = Case::new(
+        "main.c010",
         "dispositions refuse before contact and continuing permits dispatch (twr-ggw.7, STA-24)",
     );
-    let original = store_files(&run.dump(&tab).await?);
-    let opened = reader::read(&original, PASSPHRASE)?;
+    let original = store_files(&run.dump_at("file.main.dump.008", &tab).await?);
+    let opened = reader::read_at("reader.call.main.pre_disposition", &original, PASSPHRASE)?;
     let mut events: Vec<Value> = opened
         .records
         .iter()
@@ -1665,36 +2046,67 @@ async fn run_cases(
     events.push(json!({"intent":{"call":call,"machine":"fixture","command":hex::encode(COMMAND),"approval":{"harness_pin":{"machine":"fixture","fingerprint":pinned}}}}));
     let destructive = events.len() as u64;
     events.push(json!({"disposition":{"machine":"fixture","calls":[call],"continuation":"destructive_reinstall","uncertainty":"the command outcome is unknown"}}));
-    run.put(&tab, &reader::build(PASSPHRASE, &events)).await?;
-    worker = run.reload(&tab, &worker).await?;
+    run.put(
+        &tab,
+        &reader::build_at("file.main.build.004", PASSPHRASE, &events),
+    )
+    .await?;
+    worker = run.reload("main.rs::reload#9", &tab, &worker).await?;
     run.submit(&tab, "unlock", PASSPHRASE).await?;
     binding_cases::prepare(run, &tab, &mut worker, PASSPHRASE).await?;
     take(seen);
     fresh_pace(relay);
     let before = run.inspect(&worker).await?;
-    let files_before = store_files(&run.dump(&tab).await?);
-    let report = run.harness_run(&worker, args("fixture")).await?;
+    let files_before = store_files(&run.dump_at("file.main.dump.009", &tab).await?);
+    let operation = operation_windows::Operation::begin("main.disposition", &worker, true);
+    operation.run(
+        &worker,
+        &operation_windows::original_request(run, "fixture"),
+    );
+    let report = run
+        .harness_run("main.rs#15", &worker, args("fixture"))
+        .await?;
+    operation.finish();
     // If the pre-contact check is removed, the atomic append check still refuses, but the relay sees contact.
-    sshd.all_ended().await;
+    sshd.all_ended_at(
+        Some("main.disposition.connection_end"),
+        json!({"ignored_result":true}),
+    )
+    .await;
     let observed = take(seen);
-    case.check("a destructive disposition is named, and the relay and sshd saw no connection",
+    case.check("main.a066", "a destructive disposition is named, and the relay and sshd saw no connection",
         report["outcome"] == json!({"refused":"disposition","disposition":destructive,"continuation":"destructive_reinstall"})
         && observed.relay_accepted == 0 && observed.ssh_connections == 0);
     case.check(
+        "main.a067",
         "the refusal appends nothing",
-        run.inspect(&worker).await? == before
-            && store_files(&run.dump(&tab).await?) == files_before,
+        crate::state_inputs::all!(
+            run.inspect(&worker).await? == before,
+            file_inputs::equal_primary(
+                "main.a067.1",
+                "main.a067",
+                &(store_files(&run.dump_at("file.main.dump.010", &tab).await?)),
+                &(files_before),
+            )
+        ),
     );
     events.push(json!({"disposition":{"machine":"fixture","calls":[call],"continuation":"as_if_not_done","uncertainty":"the command outcome is unknown"}}));
-    run.put(&tab, &reader::build(PASSPHRASE, &events)).await?;
-    worker = run.reload(&tab, &worker).await?;
+    run.put(
+        &tab,
+        &reader::build_at("file.main.build.005", PASSPHRASE, &events),
+    )
+    .await?;
+    worker = run.reload("main.rs::reload#10", &tab, &worker).await?;
     run.submit(&tab, "unlock", PASSPHRASE).await?;
     binding_cases::prepare(run, &tab, &mut worker, PASSPHRASE).await?;
     fresh_pace(relay);
-    let report = run.harness_run(&worker, args("fixture")).await?;
+    let report = run
+        .harness_run("main.rs#16", &worker, args("fixture"))
+        .await?;
     let observed = take(seen);
     let after = run.inspect(&worker).await?;
     case.check(
+        "main.a068",
         "a continuing replacement dispatches and commits the exit status terminal",
         report["outcome"]["done"] == true
             && exec_command_is(&observed, COMMAND)
@@ -1711,66 +2123,78 @@ async fn run_cases(
                 })
             }),
     );
-    let files = store_files(&run.dump(&tab).await?);
+    let files = store_files(&run.dump_at("file.main.dump.011", &tab).await?);
     case.check(
+        "main.a069",
         "the independent reader reads the browser terminal after the replacement",
-        reader::read(&files, PASSPHRASE).is_ok(),
+        reader::read_at("reader.call.main.replacement_terminal", &files, PASSPHRASE).is_ok(),
     );
     run.put(&tab, &original).await?;
-    worker = run.reload(&tab, &worker).await?;
+    worker = run.reload("main.rs::reload#11", &tab, &worker).await?;
     run.submit(&tab, "unlock", PASSPHRASE).await?;
     binding_cases::prepare(run, &tab, &mut worker, PASSPHRASE).await?;
     take(seen);
-    cases.push(case);
+    case.finish(cases);
 
     // Case 2 (AC2): a host key other than the pin halts, before authentication, once.
-    let mut case = Case::new("2. a host key other than the pin halts the connection (AC2)");
+    let mut case = Case::new(
+        "main.c011",
+        "2. a host key other than the pin halts the connection (AC2)",
+    );
     sshd.present_other.store(true, Ordering::SeqCst);
     fresh_pace(relay);
-    let report = run.harness_run(&worker, args("fixture")).await?;
+    let report = run
+        .harness_run("main.rs#17", &worker, args("fixture"))
+        .await?;
     tokio::time::sleep(Duration::from_secs(2)).await; // room for a reconnect, which must not come
     sshd.present_other.store(false, Ordering::SeqCst);
     let observed = take(seen);
     show(&observed);
     let other = keys::fingerprint(&keys::HOST_KEY_OTHER);
     case.check(
+        "main.a070",
         "the harness halted in the key check, naming both fingerprints",
         report["outcome"] == json!({ "refused": "host-key", "pinned": pinned, "presented": other }),
     );
     case.check(
+        "main.a071",
         "the fixture sshd saw no authentication attempt and no exec",
         observed.ssh_auth.is_empty() && observed.ssh_exec.is_empty(),
     );
     case.check(
+        "main.a072",
         "nothing was journaled",
         report["journal_entries"] == json!([]),
     );
     case.check(
+        "main.a073",
         "exactly one connection: no automatic reconnect (ARC-41)",
         one_connection(&observed)
             && observed.relay_dials.len() == 1
             && observed.ssh_connections == 1,
     );
-    cases.push(case);
+    case.finish(cases);
 
     // Cases 6–8 (twr-ggw.3): the relay refusals a correct client meets. Each is refused at its
     // check of WIR-6 (paid-tcp-relay 844e834) with one frame and close 1008, before any dial.
     let refused = |case: &mut Case, report: &Value, observed: &Seen, reason: &str, host: &str| {
-        case.check(
+        case.check("main.a074",
             &format!("the harness reported {{\"refused\": \"relay\", \"reason\": \"{reason}\", \"close_code\": 1008}}"),
             report["outcome"] == json!({ "refused": "relay", "reason": reason, "close_code": 1008 }),
         );
         case.check(
+            "main.a075",
             "the relay fixture accepted exactly one connection",
             observed.relay_accepted == 1
                 && observed.relay_connections == [format!("/v1/tcp/{host}/{}", sshd.port)],
         );
         case.check(
+            "main.a076",
             "nothing was dialed, and the fixture sshd saw no connection",
             observed.relay_dials.is_empty() && observed.ssh_connections == 0,
         );
         let logs = observed.relay_logs();
-        case.check(
+        case.check("main.a077",
             "the relay fixture's log shows no frame from the client after its refusal, but the close",
             logs.len() == 1
                 && logs[0]
@@ -1783,146 +2207,114 @@ async fn run_cases(
                     }),
         );
     };
-    let closed = |s: &Seen| s.relay_log.iter().any(|(_, e)| *e == Event::Frame("close"));
 
-    let mut case = Case::new("6. a relay key with no pass is refused for `pass` (twr-ggw.3)");
-    let saved_pass_store = store_files(&run.dump(&tab).await?);
-    let mnemonic = reader::read(&saved_pass_store, PASSPHRASE)?.mnemonic()?;
+    let mut case = Case::new(
+        "main.c012",
+        "6. a relay key with no pass is refused for `pass` (twr-ggw.3)",
+    );
+    let saved_pass_store = store_files(&run.dump_at("file.main.dump.012", &tab).await?);
+    let mnemonic = reader::read_at(
+        "reader.call.main.pre_no_pass",
+        &saved_pass_store,
+        PASSPHRASE,
+    )?
+    .mnemonic_at("reader.aux.call.main.pre_no_pass.mnemonic")?;
     let mut no_pass = vec![json!({"seed":{"mnemonic":mnemonic}})];
-    no_pass.extend(reader::setup_events(
+    no_pass.extend(reader::setup_events_at(
+        "reader.aux.call.main.no_pass_setup",
         &mnemonic,
         &["fixture", "fixture-other"],
     ));
-    run.put(&tab, &reader::build(PASSPHRASE, &no_pass)).await?;
-    worker = run.reload(&tab, &worker).await?;
+    run.put(
+        &tab,
+        &reader::build_at("file.main.build.006", PASSPHRASE, &no_pass),
+    )
+    .await?;
+    worker = run.reload("main.rs::reload#12", &tab, &worker).await?;
     run.submit(&tab, "unlock", PASSPHRASE).await?;
     binding_cases::prepare_without_enrolment(run, &tab, &mut worker, PASSPHRASE).await?;
     take(seen);
-    let failed = run.harness_run(&worker, args("fixture")).await?;
+    let failed = run
+        .harness_run("main.rs#18", &worker, args("fixture"))
+        .await?;
     let observed = take(seen);
     case.check(
+        "main.a078",
         "no journaled pass refuses no-credentials after the pin lookup without contact",
         failed["outcome"] == json!({"refused":"no-credentials"})
             && observed.relay_accepted == 0
             && observed.ssh_connections == 0,
     );
     run.put(&tab, &saved_pass_store).await?;
-    worker = run.reload(&tab, &worker).await?;
+    worker = run.reload("main.rs::reload#13", &tab, &worker).await?;
     run.submit(&tab, "unlock", PASSPHRASE).await?;
     binding_cases::prepare(run, &tab, &mut worker, PASSPHRASE).await?;
     let enrolled_passes = std::mem::take(&mut *relay.passes.lock().expect("passes lock"));
     let without = args("fixture");
     fresh_pace(relay);
-    let report = run.harness_run(&worker, without).await?;
-    settle(seen, closed).await;
+    let (refusal_input, report) =
+        fixture_inputs::refusal_run(run, &worker, &case.id, without).await?;
+    settle("pass", seen, &refusal_input).await;
+    drop(refusal_input);
     let observed = take(seen);
     show(&observed);
     refused(&mut case, &report, &observed, "pass", "127.0.0.1");
     *relay.passes.lock().expect("passes lock") = enrolled_passes;
-    cases.push(case);
+    case.finish(cases);
 
-    let mut case =
-        Case::new("7. an unrecorded destination is refused for `destination` (twr-ggw.3)");
+    let mut case = Case::new(
+        "main.c013",
+        "7. an unrecorded destination is refused for `destination` (twr-ggw.3)",
+    );
     let mut unrecorded = args("fixture");
     unrecorded["host"] = "127.0.0.2".into();
     fresh_pace(relay);
-    let report = run.harness_run(&worker, unrecorded).await?;
-    settle(seen, closed).await;
+    let (refusal_input, report) =
+        fixture_inputs::refusal_run(run, &worker, &case.id, unrecorded).await?;
+    settle("destination", seen, &refusal_input).await;
+    drop(refusal_input);
     let observed = take(seen);
     show(&observed);
     refused(&mut case, &report, &observed, "destination", "127.0.0.2");
-    cases.push(case);
+    case.finish(cases);
 
-    let mut case = Case::new("8. a dial the pace does not allow is refused for `pace` (twr-ggw.3)");
+    let mut case = Case::new(
+        "main.c014",
+        "8. a dial the pace does not allow is refused for `pace` (twr-ggw.3)",
+    );
     // The sshd's host at its window cap, now: refused for a whole window, whatever the timing.
     relay.pace.lock().expect("pace lock").arm("127.0.0.1");
-    let report = run.harness_run(&worker, args("fixture")).await?;
-    settle(seen, closed).await;
+    let (refusal_input, report) =
+        fixture_inputs::refusal_run(run, &worker, &case.id, args("fixture")).await?;
+    settle("pace", seen, &refusal_input).await;
+    drop(refusal_input);
     fresh_pace(relay);
     let observed = take(seen);
     show(&observed);
     refused(&mut case, &report, &observed, "pace", "127.0.0.1");
-    cases.push(case);
+    case.finish(cases);
 
     // twr-ggw.5 AC1: each modification edited into OPFS is refused, the page offers no Create, and OPFS is
     // byte for byte as it was.
-    let mut case = Case::new("fail closed (twr-ggw.5 AC1, CNF-82)");
-    let baseline = store_files(&run.dump(&tab).await?);
+    let mut case = Case::new("main.c015", "fail closed (twr-ggw.5 AC1, CNF-82)");
+    let baseline = store_files(&run.dump_at("file.main.dump.013", &tab).await?);
     let baseline_state = run.inspect(&worker).await?;
-    let flip = |value: &mut Value, field: &str| {
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        let mut bytes = URL_SAFE_NO_PAD
-            .decode(value[field].as_str().unwrap_or_default())
-            .unwrap_or_default();
-        if let Some(first) = bytes.first_mut() {
-            *first ^= 1;
-        }
-        value[field] = URL_SAFE_NO_PAD.encode(bytes).into();
-    };
-    let edited = |name: &str, change: &dyn Fn(&mut Value)| -> Files {
-        let mut files = baseline.clone();
-        let mut value: Value = serde_json::from_slice(&files[name]).unwrap_or_default();
-        change(&mut value);
-        let bytes = if name == "envelope.json" {
-            value.to_string().into_bytes()
-        } else {
-            reader::record_bytes(&value)
-        };
-        files.insert(name.into(), bytes);
-        files
-    };
-    let mut foreign = baseline.clone();
-    foreign.insert(
-        "1".into(),
-        reader::build(
-            PASSPHRASE,
-            &[
-                json!({ "seed": { "mnemonic": include_str!("../../tests/vectors/seed-backup-collisions.txt").lines().next().expect("control mnemonic") } }),
-                json!({ "command": { "machine": "fixture", "command": hex::encode(COMMAND) } }),
-            ],
-        )["1"]
-            .clone(),
+    let foreign = reader::build_at(
+        "file.main.build.007",
+        PASSPHRASE,
+        &[
+            json!({ "seed": { "mnemonic": include_str!("../../tests/vectors/seed-backup-collisions.txt").lines().next().expect("control mnemonic") } }),
+            json!({ "command": { "machine": "fixture", "command": hex::encode(COMMAND) } }),
+        ],
     );
-    // The last field: whether the refusal is the envelope's tag, where a wrong passphrase and a
-    // modified envelope cannot be told apart.
-    let variants: Vec<(&str, Files, &str, bool)> = vec![
-        (
-            "a wrong passphrase",
-            baseline.clone(),
-            WRONG_PASSPHRASE,
-            true,
-        ),
-        (
-            "a modified envelope: one byte of the salt",
-            edited("envelope.json", &|e| flip(e, "salt")),
-            PASSPHRASE,
-            true,
-        ),
-        (
-            "a modified record: one byte of record 1's ciphertext",
-            edited("1", &|r| flip(r, "ciphertext")),
-            PASSPHRASE,
-            false,
-        ),
-        (
-            "a record from another store, at the same number",
-            foreign,
-            PASSPHRASE,
-            false,
-        ),
-        (
-            "an envelope of an unknown format: version 2",
-            edited("envelope.json", &|e| e["version"] = 2.into()),
-            PASSPHRASE,
-            false,
-        ),
-    ];
+    let variants = file_inputs::refusal_variants(&baseline, &foreign);
     for (what, files, passphrase, tag) in variants {
         run.put(&tab, &files).await?;
-        worker = run.reload(&tab, &worker).await?;
+        worker = run.reload("main.rs::reload#14", &tab, &worker).await?;
         let view = run.submit(&tab, "unlock", passphrase).await?;
-        let after = store_files(&run.dump(&tab).await?);
+        let after = store_files(&run.dump_at("file.main.dump.014", &tab).await?);
         case.check(
+            "main.a079",
             &format!("{what}: unlock is refused, and the page offers neither Create nor Unlock"),
             view["store"] == "refused"
                 && view["create"] == false
@@ -1931,6 +2323,7 @@ async fn run_cases(
         );
         if tag {
             case.check(
+                "main.a080",
                 &format!("{what}: the page claims no certainty about the cause"),
                 view["text"]
                     .as_str()
@@ -1938,34 +2331,51 @@ async fn run_cases(
             );
         }
         case.check(
+            "main.a081",
             &format!("{what}: a create request creates nothing, and the store stays refused"),
             run.submit(&tab, "create", PASSPHRASE).await?["store"] == "refused",
         );
         case.check(
+            "main.a082",
             &format!("{what}: OPFS is byte-identical afterwards"),
-            after == files && store_files(&run.dump(&tab).await?) == files,
+            crate::state_inputs::all!(
+                file_inputs::equal_primary("main.a082.1", "main.a082", &(after), &(files)),
+                file_inputs::equal_primary(
+                    "main.a082.2",
+                    "main.a082",
+                    &(store_files(&run.dump_at("file.main.dump.015", &tab).await?)),
+                    &(files),
+                )
+            ),
         );
         case.check(
+            "main.a083",
             &format!("{what}: the worker runs nothing"),
-            run.harness_run(&worker, args("fixture")).await? == locked
+            run.harness_run("main.rs#19", &worker, args("fixture"))
+                .await?
+                == locked
                 && take(seen).relay_accepted == 0,
         );
     }
     run.put(&tab, &baseline).await?;
-    worker = run.reload(&tab, &worker).await?;
+    worker = run.reload("main.rs::reload#15", &tab, &worker).await?;
     run.submit(&tab, "unlock", PASSPHRASE).await?;
     case.check(
+        "main.a084",
         "the store put back unlocks",
         run.inspect(&worker).await? == binding_cases::replayed(&baseline_state),
     );
     binding_cases::prepare(run, &tab, &mut worker, PASSPHRASE).await?;
-    cases.push(case);
+    case.finish(cases);
 
     // Full end requires unlock; ordinary hide keeps the eligible worker.
-    let mut case = Case::new("reload requires unlock again (twr-ggw.5 AC3, CNF-82)");
+    let mut case = Case::new(
+        "main.c016",
+        "reload requires unlock again (twr-ggw.5 AC3, CNF-82)",
+    );
     let before = run.inspect(&worker).await?;
     let old = worker.clone();
-    worker = run.reload(&tab, &worker).await?;
+    worker = run.reload("main.rs::reload#16", &tab, &worker).await?;
     relocked(
         run,
         &mut case,
@@ -1976,54 +2386,76 @@ async fn run_cases(
         &args("fixture"),
     )
     .await?;
-    cases.push(case);
+    case.finish(cases);
 
-    let mut case =
-        Case::new("explicit lock requires unlock again, and ends its exec (twr-ggw.5 AC3, CNF-82)");
+    let mut case = Case::new(
+        "main.c017",
+        "explicit lock requires unlock again, and ends its exec (twr-ggw.5 AC3, CNF-82)",
+    );
     // Text typed in both fields and never submitted goes with the lock (SEC-5 row 18).
-    let mut left = Value::Null;
-    worker = lock_during_command(run, &mut case, &tab, worker, &args, "Lock", async {
-        left = browser
-            .evaluate(
-                &tab.session,
-                "(() => {
+    let (new_worker, left) = lock_during_command(
+        run,
+        &mut case,
+        &tab,
+        worker,
+        &args,
+        "Lock",
+        "(() => {
                     const $ = (id) => document.getElementById('tau-'+id);
                     $('passphrase').value = 'typed, never submitted';
                     $('confirm').value = 'typed, never submitted';
                     $('lock').click();
                     return [$('passphrase').value, $('confirm').value];
                 })()",
-            )
-            .await?;
-        Ok(())
-    })
+    )
     .await?;
+    worker = new_worker;
     case.check(
+        "main.a085",
         &format!("Lock: text typed but not submitted is gone from both fields: {left}"),
         left == json!(["", ""]),
     );
-    cases.push(case);
+    case.finish(cases);
 
-    worker = settle_unresolved(run, &tab, worker).await?;
-    let mut case =
-        Case::new("ordinary page hide retains its worker and scheduled command (CNF-82)");
+    worker = settle_unresolved("settle.main.002", run, &tab, worker).await?;
+    let mut case = Case::new(
+        "main.c018",
+        "ordinary page hide retains its worker and scheduled command (CNF-82)",
+    );
     browser.evaluate(&tab.session, "window.__tracerVisibility = []; document.addEventListener('visibilitychange', () => window.__tracerVisibility.push(document.visibilityState))").await?;
-    let before_hidden = run.inspect(&worker).await?;
+    let before_hidden = run
+        .inspect_state_at("state.main.hidden.before", &worker)
+        .await?;
     let original_worker = worker.clone();
+    let hidden_operation = operation_windows::Operation::begin("main.hidden", &worker, true);
+    hidden_operation.expect(None, "Target.createTarget", json!({"url":"about:blank"}));
+    hidden_operation.run(
+        &worker,
+        &operation_windows::original_request(run, "fixture"),
+    );
     let other = browser
         .call(None, "Target.createTarget", json!({"url":"about:blank"}))
         .await?;
     tokio::time::sleep(Duration::from_millis(100)).await;
     fresh_pace(relay);
-    let hidden_result = run.harness_run(&worker, args("fixture")).await?;
+    let hidden_result = run
+        .harness_run("main.rs#20", &worker, args("fixture"))
+        .await?;
+    hidden_operation.finish();
     case.check(
+        "main.a086",
         "scheduled command completes while hidden",
         hidden_result["outcome"]["done"] == true,
     );
     case.check(
+        "main.a087",
         "same session bindings and context survive hide",
-        run.inspect(&worker).await?["sessions"] == before_hidden["sessions"]
-            && run.live_workers(&tab) == vec![original_worker],
+        crate::state_inputs::all!(
+            run.inspect_state_at("state.main.hidden.after", &worker)
+                .await?
+                .same_at("main.a087", &before_hidden, &["/sessions"]),
+            run.live_workers(&tab) == vec![original_worker]
+        ),
     );
     browser
         .call(
@@ -2044,37 +2476,50 @@ async fn run_cases(
         .await?;
     println!("   visibility seen by the page: {visibility}");
     case.check(
+        "main.a088",
         "the page saw the browser's own visibilitychange to hidden, then visible",
         visibility == json!(["hidden", "visible"]),
     );
     // A pagehide alone: the browser fires its own only as the page unloads (the reload case), so
     // the event is dispatched on the real window.
-    worker = lock_during_command(run, &mut case, &tab, worker, &args, "pagehide", async {
-        browser
-            .evaluate(
-                &tab.session,
-                "dispatchEvent(new PageTransitionEvent('pagehide', { persisted: false }))",
-            )
-            .await
-            .map(|_| ())
-    })
-    .await?;
-    cases.push(case);
+    worker = lock_during_command(
+        run,
+        &mut case,
+        &tab,
+        worker,
+        &args,
+        "pagehide",
+        "dispatchEvent(new PageTransitionEvent('pagehide', { persisted: false }))",
+    )
+    .await?
+    .0;
+    case.finish(cases);
 
-    worker = settle_unresolved(run, &tab, worker).await?;
+    worker = settle_unresolved("settle.main.003", run, &tab, worker).await?;
     let mut case = Case::new(
+        "main.c019",
         "a killed worker surfaces an unresolved command and requires unlock (twr-ggw.7, CNF-39)",
     );
     take(seen);
     fresh_pace(relay);
     let mut running = args("fixture");
     running["command"] = LOCK_COMMAND.into();
-    run.harness_start(&worker, running).await?;
-    let received = settle_for(seen, 20, |s| exec_command_is(s, LOCK_COMMAND)).await;
+    let exec_input = fixture_inputs::static_wait(run, &worker, &case.id, "exec");
+    fixture_inputs::static_start(&exec_input, None, run, &worker, running).await?;
+    let received = settle_for(
+        "main.crash.running_exec",
+        seen,
+        20,
+        json!({"command":"lock_command"}),
+        |s, observation| fixture_predicates::exec(s, LOCK_COMMAND, &exec_input, observation),
+    )
+    .await;
     case.check(
+        "main.a089",
         "before Page.crash the sshd received the running exec",
         received,
     );
+    drop(exec_input);
     let before = run.inspect(&worker).await?;
     run.collect(&tab).await?;
     // Neither the page nor the worker runs a handler: the renderer stops at once. In headless
@@ -2092,6 +2537,7 @@ async fn run_cases(
     )
     .await;
     case.check(
+        "main.a090",
         "after Page.crash, neither the page nor its harness worker runs anything",
         !matches!(alive, Ok(Ok(_))) && !matches!(worker_alive, Ok(Ok(_))),
     );
@@ -2103,8 +2549,13 @@ async fn run_cases(
         )
         .await?;
     case.check(
+        "main.a091",
         "the killed command's SSH connection ended",
-        sshd.all_ended().await,
+        sshd.all_ended_at(
+            Some("main.crash.connection_end"),
+            json!({"ignored_result":false}),
+        )
+        .await,
     );
     take(seen);
     let old = worker.clone();
@@ -2123,6 +2574,7 @@ async fn run_cases(
     let observed = take(seen);
     let after = run.inspect(&worker).await?;
     case.check(
+        "main.a092",
         "after the crash, the running call is surfaced as unresolved without another exec",
         after["calls"]
             .as_array()
@@ -2133,36 +2585,46 @@ async fn run_cases(
             && observed.ssh_exec.is_empty()
             && observed.relay_accepted == 0,
     );
-    cases.push(case);
+    case.finish(cases);
 
     // Opening another tab hides the first without releasing its writer ownership.
-    let mut case = Case::new("one writer (twr-ggw.5, STA-1, STA-7)");
+    let mut case = Case::new("main.c020", "one writer (twr-ggw.5, STA-1, STA-7)");
     let first = tab;
+    observer::holder_source(&worker);
     let (second, _) = run.open(tracer_origin, true).await?;
     let one = |tab: &Tab| match run.live_workers(tab).as_slice() {
         [w] => Some(w.clone()),
         _ => None,
     };
-    let mut views = (Value::Null, Value::Null);
+    let mut views = (view_inputs::View::empty(), view_inputs::View::empty());
     let mut settled = false;
-    for _ in 0..300 {
-        views = (run.view(&first).await?, run.view(&second).await?);
-        let states = [views.0["store"].as_str(), views.1["store"].as_str()];
-        settled = one(&first).is_some_and(|w| w == worker)
-            && one(&second).is_some()
-            && views.0["status"] == "ready"
-            && views.1["status"] == "ready"
-            && states == [Some("unlocked"), Some("in-use")];
-        if settled {
-            break;
+    {
+        let observation = observer::Call::begin(
+            "main.writer.holder_and_waiter",
+            "serial.observation",
+            Some(&first.session),
+            json!({"bound":300,"false_sleep_ms":100,"requires_ready":true,"pages":"holder_and_waiter"}),
+        );
+        for poll in 0..300 {
+            observation.attempt(poll + 1);
+            views = (
+                observation.view(run, &first, "first").await?,
+                observation.view(run, &second, "second").await?,
+            );
+            let states = [views.0["store"].as_str(), views.1["store"].as_str()];
+            settled =
+                observation.holder_and_waiter(&one, (&first, &second), &worker, &views, states);
+            if observation.poll(poll + 1, settled) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
     }
     println!(
         "   the first tab: {}\n   the second tab: {}",
         views.0, views.1
     );
-    if !settled {
+    if completion::rejects("main.writer.original_holder_and_waiter", !settled) {
         return Err(format!(
             "one writer: the surviving unlocked holder and waiting instance did not remain distinct: {views:?}"
         ));
@@ -2174,19 +2636,26 @@ async fn run_cases(
         println!("   the second tab holds the store");
         (second, first, views.0)
     };
-    let holder_worker = one(&holder).ok_or("no worker")?;
-    let other_worker = one(&other).ok_or("no worker")?;
+    let holder_worker = one(&holder)
+        .ok_or("no worker")
+        .checked("main.writer.holder")?;
+    let other_worker = one(&other)
+        .ok_or("no worker")
+        .checked("main.writer.waiter")?;
     for w in [&holder_worker, &other_worker] {
         browser
             .call(Some(&w.session), "Runtime.enable", json!({}))
             .await?;
     }
+    let holder_current = run.view_at("view.main.holder_current", &holder).await?;
     case.check(
+        "main.a093",
         "the original hidden holder remains unlocked without another passphrase",
-        run.view(&holder).await?["store"] == "unlocked",
+        holder_current.primary("main.a093"),
     );
     let held_by_holder = run.inspect(&holder_worker).await?;
     case.check(
+        "main.a094",
         "the other tab says it is waiting for the store, and offers neither Create nor Unlock",
         other_view["store"] == "in-use"
             && other_view["text"].as_str().is_some_and(|t| {
@@ -2194,16 +2663,20 @@ async fn run_cases(
             })
             && other_view["create"] == false
             && other_view["unlock"] == false
-            && run.view(&other).await? == other_view,
+            && run.view_at("view.main.waiter_current", &other).await? == other_view,
     );
     case.check(
+        "main.a095",
         "the other tab's worker has not read the store",
         run.inspect(&other_worker).await?["state"] == "unopened",
     );
     take(seen);
     case.check(
+        "main.a096",
         "the other tab's worker runs nothing, and appends nothing",
-        run.harness_run(&other_worker, args("fixture")).await? == locked
+        run.harness_run("main.rs#21", &other_worker, args("fixture"))
+            .await?
+            == locked
             && take(seen).relay_accepted == 0
             && run.inspect(&holder_worker).await? == held_by_holder,
     );
@@ -2222,19 +2695,31 @@ async fn run_cases(
             json!({ "targetId": other.target }),
         )
         .await?;
-    let mut view = run.view(&other).await?;
-    for _ in 0..100 {
-        if view["store"] == "locked" {
-            break;
+    let mut view = observer::original_view("main.writer.waiter_unlocked", run, &other).await?;
+    {
+        let observation = observer::Call::begin(
+            "main.writer.waiter_unlocked",
+            "serial.observation",
+            Some(&other.session),
+            json!({"bound":100,"false_sleep_ms":100,"requires_ready":false,"page":"waiter_successor"}),
+        );
+        for poll in 0..100 {
+            observation.attempt(poll + 1);
+            if observation.view_poll(poll + 1, &view) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            view = observation.view(run, &other, "source").await?;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        view = run.view(&other).await?;
     }
     case.check(
+        "main.a097",
         "once the holding tab closes, the other offers Unlock",
-        view["store"] == "locked" && view["unlock"] == true,
+        view.primary("main.a097"),
     );
-    let other_worker = one(&other).ok_or("no worker")?;
+    let other_worker = one(&other)
+        .ok_or("no worker")
+        .checked("main.writer.successor")?;
     browser
         .call(Some(&other_worker.session), "Runtime.enable", json!({}))
         .await?;
@@ -2243,15 +2728,16 @@ async fn run_cases(
     let mut durable = held_by_holder.clone();
     durable["sessions"] = json!([]);
     case.check(
+        "main.a098",
         "and unlocks the same durable store without inheriting runtime session authority",
         successor == durable && successor["sessions"] == json!([]),
     );
     (tab, worker) = (other, other_worker);
-    cases.push(case);
+    case.finish(cases);
 
     // twr-ggw.5 AC6: the persistent-storage request, refused; then the permission granted, where
     // `persisted()` already reads true and the page makes no request.
-    let mut case = Case::new("persistent storage (twr-ggw.5 AC6, STA-23)");
+    let mut case = Case::new("main.c021", "persistent storage (twr-ggw.5 AC6, STA-23)");
     let statement = "This is a request, not a guarantee: eviction, device loss or corruption can still lose the local store, so the seed backup and recovery remain necessary.";
     for (setting, state, says) in [
         (
@@ -2268,33 +2754,42 @@ async fn run_cases(
                 json!({ "permission": { "name": "persistent-storage" }, "setting": setting, "origin": tab.origin }),
             )
             .await?;
-        worker = run.reload(&tab, &worker).await?;
-        let mut view = run.view(&tab).await?;
-        for _ in 0..50 {
-            if view["persist"] != "" {
-                break;
+        worker = run.reload("main.rs::reload#17", &tab, &worker).await?;
+        let mut view = observer::original_view("main.persistence.shown", run, &tab).await?;
+        {
+            let observation = observer::Call::begin(
+                "main.persistence.shown",
+                "serial.observation",
+                Some(&tab.session),
+                json!({"bound":50,"false_sleep_ms":100,"requires_ready":false,"setting":setting}),
+            );
+            for poll in 0..50 {
+                observation.attempt(poll + 1);
+                if observation.view_poll(poll + 1, &view) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                view = observation.view(run, &tab, "source").await?;
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            view = run.view(&tab).await?;
         }
         println!("   {setting}: {}", view["persist_text"]);
         let persisted = browser
             .evaluate(&tab.session, "navigator.storage.persisted()")
             .await?;
         case.check(
+            "main.a099",
             &format!("permission {setting}: the browser holds the store persisted: {persisted}"),
             persisted == (setting == "granted"),
         );
-        case.check(
+        case.check("main.a100",
             &format!("permission {setting}: the page shows that {says}, and that this is a request, not a guarantee"),
-            view["persist"] == state
-                && view["persist_text"].as_str().is_some_and(|t| t.contains(says) && t.contains(statement)),
+            view.persistence(state,says,statement),
         );
     }
     browser
         .call(None, "Browser.resetPermissions", json!({}))
         .await?;
-    cases.push(case);
+    case.finish(cases);
 
     worker = typed_cases::run(run, &tab, worker, &args, cases).await?;
     job_cases::run(run, &tab, worker, &args, cases).await?;
@@ -2308,7 +2803,7 @@ async fn run_cases(
         cases,
     )
     .await?;
-    if std::env::var("TAU_TRACER_SETUP_CASE").as_deref() == Ok("existing") {
+    if selection::value("TAU_TRACER_SETUP_CASE").as_deref() == Ok("existing") {
         return Ok(());
     }
     worker = run.worker(&tab, None, false).await?;
@@ -2338,7 +2833,7 @@ async fn run_cases(
     // twr-ggw.5 AC4, AC5: no plaintext secret in any storage, message, request or log, in both builds.
     run.collect(&tab).await?;
     run.collect(&served_tab).await?;
-    let all_messages = run.messages.borrow().clone();
+    let all_messages = auxiliary::leakage_messages(run);
     let console: Vec<String> = browser
         .events
         .lock()
@@ -2355,10 +2850,21 @@ async fn run_cases(
                 .map(str::to_string)
         })
         .collect();
+    let displayed_inputs =
+        semantic_domains::auxiliary::AuxiliaryDisplayedInputs::from_messages(&all_messages);
+    let displayed_call = auxiliary::standalone(
+        "reader.aux.main_displayed",
+        displayed_inputs.preview_domain(),
+    );
     let displayed_mnemonics: Vec<_> = displayed
         .iter()
-        .flat_map(|p| reader::mnemonic_needles(p))
+        .enumerate()
+        .flat_map(|(source_index, p)| {
+            let _source_slot = semantic::Slot::new("reader.aux.main_displayed_row", source_index);
+            reader::mnemonic_needles_at("reader.aux.call.main.displayed.mnemonic_needles", 0, p)
+        })
         .collect();
+    drop(displayed_call);
     let requests: Vec<Vec<u8>> = requests
         .iter()
         .flat_map(|r| r.lock().expect("requests lock").clone())
@@ -2377,13 +2883,26 @@ async fn run_cases(
             true,
         ),
     ] {
-        let mut case = Case::new(name);
-        let dumped = run.dump(page).await?;
-        let opened = reader::read(&store_files(&dumped), passphrase)?;
-        let mut needles = reader::needles(passphrase, &opened)?;
+        let mut case = Case::new("main.c022", name);
+        let dumped = run.dump_at("file.main.dump.016", page).await?;
+        let opened = reader::read_at(
+            "reader.call.main.leakage",
+            &store_files(&dumped),
+            passphrase,
+        )?;
+        reader_checks::set_auxiliary_inputs(
+            opened.origin(),
+            semantic_domains::auxiliary::auxiliary_raw_root(
+                &opened.records,
+                Some(&displayed_inputs),
+            ),
+        );
+        let mut needles =
+            reader::needles_at("reader.aux.call.main.leakage.needles", passphrase, &opened)?;
         add_inference_needles(run, &mut needles);
         // Independent of the helper: removing its call must break this search's control.
         case.check(
+            "main.a101",
             "per-build search includes every aggregator needle",
             run.aggregator
                 .needles()
@@ -2391,13 +2910,24 @@ async fn run_cases(
                 .all(|needle| needles.contains(needle)),
         );
         // Include seeds from earlier interrupted/replaced fixture stores, not only the final one.
-        for phrase in &displayed {
-            needles.extend(reader::seed_needles(phrase)?);
+        for (source_index, phrase) in displayed.iter().enumerate() {
+            let _source_slot = semantic::Slot::new("reader.aux.main_displayed_seed", source_index);
+            needles.extend(reader::seed_needles_at(
+                "reader.aux.call.main.leakage.displayed_seed_needles",
+                opened.origin(),
+                phrase,
+            )?);
         }
         if test_keys {
             needles.extend(reader::encodings(
                 "SSH client key, private half",
-                &reader::role_key(&opened.mnemonic()?, 0, 0)?,
+                &reader::role_key_at(
+                    "reader.aux.call.main.leakage.private_key_role_key",
+                    opened.origin(),
+                    &opened.mnemonic_at("reader.aux.call.main.leakage.private_key_mnemonic")?,
+                    0,
+                    0,
+                )?,
             ));
         }
         needles.sort();
@@ -2417,6 +2947,7 @@ async fn run_cases(
             })
             .collect();
         case.check(
+            "main.a102",
             &format!("no OPFS file holds one: {in_files:?}"),
             in_files.is_empty() && !dumped.is_empty(),
         );
@@ -2424,19 +2955,28 @@ async fn run_cases(
             .records
             .iter()
             .skip(1)
-            .flat_map(|(n, bytes)| {
-                reader::record_findings(&needles, bytes, &opened.seed_id().expect("reader seed"))
-                    .into_iter()
-                    .map(move |what| format!("record {n}: {what}"))
+            .enumerate()
+            .flat_map(|(source_index, (n, bytes))| {
+                let _source_slot = semantic::Slot::new("reader.aux.main_record", source_index);
+                reader::record_findings(
+                    &needles,
+                    bytes,
+                    &opened
+                        .seed_id_at("reader.aux.call.main.leakage.record_seed_id")
+                        .expect("reader seed"),
+                )
+                .into_iter()
+                .map(move |what| format!("record {n}: {what}"))
             })
             .collect();
         case.check(
+            "main.a103",
             &format!("non-seed decrypted records carry no forbidden plaintext: {record_leaks:?}"),
             record_leaks.is_empty(),
         );
         let other = browser.evaluate(&page.session, OTHER_STORAGE).await?;
         println!("   other storage: {other}");
-        case.check(
+        case.check("main.a104",
             "local storage, session storage, IndexedDB and Cache Storage hold nothing, and no service worker is registered",
             other == json!({ "local": [], "session": [], "databases": [], "caches": [], "service_workers": 0 }),
         );
@@ -2553,14 +3093,14 @@ async fn run_cases(
                             ].map(each));
                             return log.splice(start);
                         }})()",
-                        STANDARD.encode(reader::role_key(&opened.mnemonic()?, 0, 0)?),
+                        STANDARD.encode(reader::role_key_at("reader.aux.call.main.leakage.serializer_role_key", opened.origin(), &opened.mnemonic_at("reader.aux.call.main.leakage.serializer_mnemonic")?, 0, 0)?),
                         serde_json::to_string(passphrase).expect("a JSON string"),
                     ),
                 )
                 .await?;
             let planted = planted.as_array().cloned().unwrap_or_default();
             println!("   planted messages: {planted:?}");
-            case.check(
+            case.check("main.a105",
                 "the __proto__ control comes back from __tracerMessages through the DevTools protocol as a member named __proto__",
                 planted
                     .get(11)
@@ -2574,6 +3114,7 @@ async fn run_cases(
                     .unwrap_or_default();
                 println!("   {control}: reported {reported:?}");
                 case.check(
+                    "main.a106",
                     &format!("negative control, {control}: reported {expected}"),
                     reported.contains(expected),
                 );
@@ -2581,11 +3122,14 @@ async fn run_cases(
         }
         // The same guarded serializer and check handle control mnemonics and the final seed.
         // Sessions end with the harness worker; goals and tools run in it.
-        for mnemonic in std::iter::once(opened.mnemonic()?).chain(
-            include_str!("../../tests/vectors/seed-backup-collisions.txt")
-                .lines()
-                .map(str::to_string),
-        ) {
+        for mnemonic in
+            std::iter::once(opened.mnemonic_at("reader.aux.call.main.leakage.custody_mnemonic")?)
+                .chain(
+                    include_str!("../../tests/vectors/seed-backup-collisions.txt")
+                        .lines()
+                        .map(str::to_string),
+                )
+        {
             let planted = browser
                 .evaluate(
                     &page.session,
@@ -2614,6 +3158,7 @@ async fn run_cases(
                     _ => "binary: the mnemonic, raw",
                 };
                 case.check(
+                    "main.a107",
                     &format!("seed custody negative control {index}: {expected}"),
                     findings(message, &needles, &passphrases, &displayed_mnemonics)
                         .1
@@ -2635,10 +3180,20 @@ async fn run_cases(
             ),
             (
                 "earlier store seed id hex",
-                reader::seed_id(
+                reader::seed_id_at(
+                    "reader.aux.call.main.leakage.earlier_seed_id",
+                    opened.origin(),
                     displayed
                         .iter()
-                        .find(|p| **p != opened.mnemonic().unwrap())
+                        .enumerate()
+                        .find(|(source_index, p)| {
+                            let _source_slot =
+                                semantic::Slot::new("reader.aux.main_search", *source_index);
+                            ***p != opened
+                                .mnemonic_at("reader.aux.call.main.leakage.earlier_search_mnemonic")
+                                .unwrap()
+                        })
+                        .map(|(_, phrase)| phrase)
                         .ok_or("no earlier seed")?,
                 )?
                 .into_bytes(),
@@ -2665,6 +3220,7 @@ async fn run_cases(
                 )
                 .await?;
             case.check(
+                "main.a108",
                 &format!("negative control: {name} is reported"),
                 findings(&planted, &needles, &passphrases, &displayed_mnemonics)
                     .1
@@ -2673,7 +3229,10 @@ async fn run_cases(
             );
         }
         for (name, secret) in [
-            ("mnemonic", opened.mnemonic()?),
+            (
+                "mnemonic",
+                opened.mnemonic_at("reader.aux.call.main.leakage.console_mnemonic")?,
+            ),
             ("passphrase", passphrase.to_string()),
         ] {
             let start = browser.events.lock().expect("events lock").len();
@@ -2689,6 +3248,7 @@ async fn run_cases(
                 .filter_map(console_params)
                 .any(|p| !reader::found(&needles, p.to_string().as_bytes()).is_empty());
             case.check(
+                "main.a109",
                 &format!(
                     "negative control: console object property name holding {name} is reported"
                 ),
@@ -2706,7 +3266,7 @@ async fn run_cases(
                 _ => {}
             }
         }
-        case.check(
+        case.check("main.a110",
             &format!("the passphrase reaches the worker only in create, unlock or re-display messages: {} such messages", carrying.len()),
             carrying.iter().any(|p| p == passphrase) && leaking.is_empty(),
         );
@@ -2714,6 +3274,7 @@ async fn run_cases(
             println!("   messages carrying a secret: {leaking:?}");
         }
         case.check(
+            "main.a111",
             "outside the exact seed-backup display, no worker message carries secret plaintext",
             all_messages
                 .iter()
@@ -2725,6 +3286,7 @@ async fn run_cases(
                 }),
         );
         case.check(
+            "main.a112",
             &format!(
                 "the passphrase fields were empty after every submit: {:?}",
                 run.uncleared.borrow()
@@ -2735,7 +3297,7 @@ async fn run_cases(
             .iter()
             .flat_map(|r| reader::found(&needles, r))
             .collect();
-        case.check(
+        case.check("main.a113",
             &format!("the HTTPS fixtures' request lines and bodies hold none ({} requests): {in_requests:?}", requests.len()),
             in_requests.is_empty() && !requests.is_empty(),
         );
@@ -2744,17 +3306,19 @@ async fn run_cases(
             .flat_map(|c| reader::found(&needles, c.as_bytes()))
             .collect();
         case.check(
+            "main.a114",
             &format!("the console and log messages hold none: {in_console:?}"),
             in_console.is_empty()
                 && console
                     .iter()
                     .all(|c| !passphrases.iter().any(|p| c.contains(p))),
         );
-        cases.push(case);
+        case.finish(cases);
     }
 
-    let both =
-        cases[case_4].failures.is_empty() && cases[case_1_in_this_session].failures.is_empty();
+    let both = cases[case_4].failures.is_empty()
+        && cases[case_1_in_this_session].failures.is_empty()
+        && *run.same_browser.borrow();
     println!(
         "\ncase 4 and case 1 in the same browser session: {}",
         if both {
@@ -2763,6 +3327,10 @@ async fn run_cases(
             "not both passed"
         }
     );
+    *run.same_browser.borrow_mut() = both;
+    if completion::rejects("main.same_browser.policy_and_command", !both) {
+        return Err("required same-browser policy/command relation failed".into());
+    }
     Ok(())
 }
 
@@ -2950,15 +3518,18 @@ async fn relocked(
 ) -> Result<(), String> {
     let targets = run.harness_targets(&tab.origin).await?;
     println!(
-        "   harness workers now: {targets:?}, the old one {}",
-        old.target
+        "   harness worker count: {}, old target present: {}",
+        targets.len(),
+        targets.contains(&old.target)
     );
     case.check(
+        "main.a115",
         "the old worker target is gone, and one new harness worker exists",
         targets.len() == 1 && !targets.contains(&old.target) && targets.contains(&worker.target),
     );
     let view = run.settled(tab, false).await?;
     case.check(
+        "main.a116",
         "the page offers Unlock, and nothing else",
         view["store"] == "locked"
             && view["unlock"] == true
@@ -2966,15 +3537,21 @@ async fn relocked(
             && view["lock"] == false,
     );
     take(run.seen);
-    let report = run.harness_run(worker, request.clone()).await?;
+    let report = run
+        .harness_run("main.rs#22", worker, request.clone())
+        .await?;
     let observed = take(run.seen);
     case.check(
+        "main.a117",
         "a command is refused while locked, with no TCP connection at the relay",
         report == json!({ "outcome": { "refused": "locked" } }) && observed.relay_accepted == 0,
     );
-    let report = run.harness_collect(worker, request.clone()).await?;
+    let report = run
+        .harness_collect("main.rs#23", worker, request.clone())
+        .await?;
     let observed = take(run.seen);
     case.check(
+        "main.a118",
         "collection is refused after lock without contact or evidence",
         report == json!({"outcome":{"refused":"locked"}})
             && observed.relay_accepted == 0
@@ -2985,6 +3562,7 @@ async fn relocked(
     let replayed = run.inspect(worker).await?;
     println!("   replayed: {replayed}");
     case.check(
+        "main.a119",
         "after unlock, the replayed state lists every command recorded before",
         view["store"] == "unlocked"
             && replayed == {
@@ -2998,29 +3576,34 @@ async fn relocked(
 }
 
 /// Explicit continuing disposition between independent browser fixtures.
-async fn settle_unresolved(run: &Run<'_>, tab: &Tab, worker: Worker) -> Result<Worker, String> {
-    let state = run.inspect(&worker).await?;
-    let calls: Vec<_> = state["calls"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|call| call["machine"] == "fixture" && call["state"] == "unresolved")
-        .map(|call| call["call"].clone())
-        .collect();
+async fn settle_unresolved(
+    site: &'static str,
+    run: &Run<'_>,
+    tab: &Tab,
+    worker: Worker,
+) -> Result<Worker, String> {
+    let calls = settle_inputs::inspect(site, run, tab, &worker).await?;
     if calls.is_empty() {
         return Ok(worker);
     }
-    let files = store_files(&run.dump(tab).await?);
-    let opened = reader::read(&files, PASSPHRASE)?;
+    let files = store_files(&run.dump_at("file.main.dump.017", tab).await?);
+    let opened = reader::read_at(
+        "reader.call.settle_unresolved.disposition_source",
+        &files,
+        PASSPHRASE,
+    )?;
     let mut events: Vec<Value> = opened
         .records
         .iter()
         .map(|(_, p)| serde_json::from_slice(p).map_err(|e| e.to_string()))
         .collect::<Result<_, _>>()?;
-    events.push(json!({"disposition":{"machine":"fixture","calls":calls,
-        "continuation":"as_if_not_done","uncertainty":"the command outcome is unknown"}}));
-    run.put(tab, &reader::build(PASSPHRASE, &events)).await?;
-    let mut worker = run.reload(tab, &worker).await?;
+    events.push(calls.disposition());
+    run.put(
+        tab,
+        &reader::build_at("file.main.build.008", PASSPHRASE, &events),
+    )
+    .await?;
+    let mut worker = run.reload("main.rs::reload#18", tab, &worker).await?;
     run.submit(tab, "unlock", PASSPHRASE).await?;
     binding_cases::prepare(run, tab, &mut worker, PASSPHRASE).await?;
     Ok(worker)
@@ -3036,22 +3619,46 @@ async fn lock_during_command(
     worker: Worker,
     args: &dyn Fn(&str) -> Value,
     how: &str,
-    lock: impl std::future::Future<Output = Result<(), String>>,
-) -> Result<Worker, String> {
-    let worker = settle_unresolved(run, tab, worker).await?;
+    lock_expression: &str,
+) -> Result<(Worker, Value), String> {
+    let _observation = observer::Call::begin(
+        "main.lock.command",
+        "main.lock_command",
+        Some(&tab.session),
+        json!({"transition":how}),
+    );
+    let worker = settle_unresolved("settle.main.004", run, tab, worker).await?;
     take(run.seen);
     fresh_pace(run.relay);
     let mut running = args("fixture");
     running["command"] = LOCK_COMMAND.into();
-    run.harness_start(&worker, running.clone()).await?;
-    let received = settle_for(run.seen, 20, |s| exec_command_is(s, LOCK_COMMAND)).await;
+    let exec_input = fixture_inputs::static_wait(run, &worker, &case.id, "exec");
+    let socket_input = fixture_inputs::static_wait(run, &worker, &case.id, "socket");
+    fixture_inputs::static_start(
+        &exec_input,
+        Some(&socket_input),
+        run,
+        &worker,
+        running.clone(),
+    )
+    .await?;
+    let received = settle_for(
+        "main.lock_command.exec",
+        run.seen,
+        20,
+        json!({"command":"lock_command"}),
+        |s, observation| fixture_predicates::exec(s, LOCK_COMMAND, &exec_input, observation),
+    )
+    .await;
     case.check(
+        "main.a120",
         &format!("{how}: the sshd received the running command's exec"),
         received,
     );
     let before = run.inspect(&worker).await?;
     let numbers = before["commands"].as_array().cloned().unwrap_or_default();
     case.check(
+        "main.a121",
         &format!("{how}: it was recorded before it was sent"),
         numbers
             .last()
@@ -3061,38 +3668,45 @@ async fn lock_during_command(
                 .and_then(|calls| calls.last())
                 .is_some_and(|c| c["state"] == "unresolved"),
     );
-    lock.await?;
+    let lock_result =
+        fixture_inputs::page_transition(&socket_input, run, tab, &worker, lock_expression).await?;
     let mut new = match run.worker(tab, Some(&worker), false).await {
         Ok(new) => new,
         Err(e) => {
             case.check(
+                "main.a122",
                 &format!("{how}: the page ended the harness worker and started a new one ({e})"),
                 false,
             );
-            return Ok(worker);
+            return Ok((worker, lock_result));
         }
     };
-    let gone = settle_for(run.seen, 20, |s| {
-        s.relay_log
-            .iter()
-            .any(|(_, e)| matches!(e, Event::Frame("close") | Event::Ended))
-    })
+    let gone = settle_for(
+        "main.lock_command.socket_closed",
+        run.seen,
+        20,
+        json!({}),
+        |s, observation| fixture_predicates::socket(s, true, &socket_input, observation),
+    )
     .await;
-    let ended = run.sshd.all_ended().await;
+    let ended = run
+        .sshd
+        .all_ended_at(Some("main.lock_command.ssh_closed"), json!({}))
+        .await;
     let observed = take(run.seen);
     show(&observed);
-    case.check(
+    case.check("main.a123",
         &format!("{how}: the relay fixture saw the client's WebSocket close, and the sshd its connection end"),
         gone && ended,
     );
     relocked(run, case, tab, &worker, &mut new, &before, &args("fixture")).await?;
     tokio::time::sleep(Duration::from_secs(1)).await;
     let observed = take(run.seen);
-    case.check(
+    case.check("main.a124",
         &format!(
             "{how}: the running command is in the replayed state, and the sshd received no second exec"
         ),
         observed.ssh_exec.is_empty() && observed.relay_accepted == 0,
     );
-    Ok(new)
+    Ok((new, lock_result))
 }
