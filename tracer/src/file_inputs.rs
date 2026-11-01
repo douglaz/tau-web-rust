@@ -1663,6 +1663,26 @@ mod tests {
     }
     #[test]
     fn reader_consumes_the_original_browser_bytes_and_origin() {
+        // Validate only this fixture's captures, independent of other tests' stores.
+        if std::env::var_os("TAU_FILE_PROVENANCE_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "file_inputs::tests::reader_consumes_the_original_browser_bytes_and_origin",
+                    "--test-threads=1",
+                ])
+                .env("TAU_FILE_PROVENANCE_CHILD", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated provenance test failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+            return;
+        }
         let dumped = Files::capture(
             BTreeMap::from([("tau-web-store/0".into(), vec![1, 2, 3])]),
             "browser.dump",
