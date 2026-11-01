@@ -2078,7 +2078,7 @@ impl Validation<'_> {
             if matches.len() != polls.len() * 2 {
                 return Err("original SSH counter multiplicity mismatch".into());
             }
-            for (pair, poll) in matches.chunks_exact(2).zip(polls) {
+            for (pair, poll) in matches.as_chunks::<2>().0.iter().zip(polls) {
                 let mut prior = poll["start_ns"].as_u64().unwrap();
                 let mut values = Vec::new();
                 let fields = if kind == "fixture.ssh_ended" {
