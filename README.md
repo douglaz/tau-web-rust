@@ -257,10 +257,10 @@ releases append and observes no GET. The TLS fixture reuses the tracer's certifi
 | Document GET | Post-source-append and immediate pre-send ending checks; AbortController; pending-fetch guard never delays end | `document source commits before fetch and session end prevents a late send`; `session end aborts an active document request without waiting for it` |
 | `done` | Bound-set check, no send | `scripted exec and done preserve untrusted typing and keep credentials off the machine` |
 
-The focused browser selector is `TAU_TRACER_GOALS=1`; optional `TAU_TRACER_GOAL_CASE`
+In `targeted` mode, the focused browser selector is `TAU_TRACER_GOALS=1`; optional `TAU_TRACER_GOAL_CASE`
 ends that focused run after `card`, `context`, `outcome`, `hold`, `barrier`, `credential`,
-`document_pending` or `document_end`. Leave both unset
-for the full gate. **Implementation reading: loop outcome.** When the page starts a loop,
+`document_pending` or `document_end`; `declaration` and `admission` select their groups. The full gate
+requires every inherited `TAU_TRACER_` name to be absent. **Implementation reading: loop outcome.** When the page starts a loop,
 the worker reports its outcome in a fresh
 store report after it ends; the goal card shows the outcome. **Implementation reading:
 outcome members.** An inference stop reports only numeric `call` and `status`, boolean
@@ -423,8 +423,8 @@ unknown intent references, repeated terminals and selections inconsistent with t
 Old journals continue to replay. Host tests exercise each storage kill boundary, metadata,
 redaction, top-up and routing refusals, unresolved spend and the disposition matrix.
 
-The focused browser selectors are `TAU_TRACER_INFERENCE`, `TAU_TRACER_INFERENCE_PHASE` and
-`TAU_TRACER_INFERENCE_END`; unset all three for the full gate. The full browser gate covers
+In `targeted` mode, the focused browser selectors are `TAU_TRACER_INFERENCE`, `TAU_TRACER_INFERENCE_PHASE` and
+`TAU_TRACER_INFERENCE_END`; the full gate requires every inherited `TAU_TRACER_` name to be absent. The full browser gate covers
 request order and bodies, header separation, held responses, crash/reload recovery, bounded
 revocation, expiry and both builds' planted no-plaintext controls. The mutation evidence below
 records each required production break and its restored rerun.
@@ -1137,7 +1137,7 @@ parsed once. Browser cases seed a store independently, bind through the page in 
 exact rendered phrases and artifact absence, and refuse harmless printf commands before any
 relay or SSH connection. Tracer controls complete the same printf bytes on `fixture-other`
 without the mode and `echo ok; exit 7` on `fixture`; a wrong host key leaves existing modes and
-acceptance records unchanged. Set `TAU_TRACER_MODE_CASE=all` for just these cases; unset every
+acceptance records unchanged. Use `targeted TAU_TRACER_MODE_CASE=all` for these cases and their support; unset every
 selector for the full gate. The mutation evidence below records the boundary checks.
 
 ### The seed
@@ -1903,7 +1903,7 @@ the signed TCP/22/from-any entry. Other permitted empty/unspecified values retai
 representation through approval and replay. The independent encrypted reader has its own
 minimum and grammar checks; it calls no production validator.
 
-Exact command templates (the selector in each row is the literal test substring):
+Historical command templates for the recorded declaration controls, before explicit tracer modes (the selector in each row is the literal test substring):
 
 ```sh
 # H(selector), for D01–D26:
@@ -2272,7 +2272,113 @@ browser holds:
 In headless Chromium 154 a new tab hides the one before it. Ordinary visibility-only hide
 retains its worker and exclusive store lease; the cases account for it.
 
-The full run defines 194 cases.
+The code owns executable names, immutable parameter slots and full/focused selection in
+[`tracer/src/catalogue.rs`](tracer/src/catalogue.rs). `scripts/tracer.sh list` prints that catalogue.
+The independent completion key, [`tracer/inventory.json`](tracer/inventory.json), holds case names
+and identities, ordered run-length predicate expectations, ordered scenario invocations and mandatory
+source placements, including repeated scenario invocation identity. Each preparation root retains
+its original applicability, class, contract, pass, binding and page inputs. Closed predicate/type
+rules expand required nested checks from original input domains. Source call definitions are shared
+by their placements; expanded targeted
+plans and aggregate prerequisite/helper/reader totals are not stored. The following table describes
+the cases; neither list output nor a scheduler's proposed subset defines required completion.
+
+The inventory includes nested journal predicates, auxiliary reader calls, serial helpers and
+fixture waits. Fixture predicates record finite operands from their original reads, including
+iterator short circuits, slice cursors and ordered SSH counter loads. Private handles bind
+dynamic fixture operands to their original captures, dispatch payloads, callers, workers, uses
+and retirement; raw commands and key identities stay private. Native and Python consumers
+independently replay these observations against source-derived expectations. Reader file operands
+retain private copies of the original browser-returned bytes through filtering and cloning; public
+records identify their captures without exposing the bytes. Closed source rules require original
+dump, store-extraction and constructor invocations. Reader and comparison operands identify their
+source checkpoints, pages, scenario invocations and saved or fresh observation windows. Finite
+primary State, view, file, blob and displayed-word comparisons carry private results into their
+original assertion boundary. Source rules also link command, collection and goal operations to
+original checkpoints, and reloads to their original helper source slots. Conditional
+fixture dispositions record the original inspected applicability before testing the empty branch.
+Independent reconciliation of these rules remains pending.
+Finite DOM readiness queries also bind the original query and returned value to the consumed
+poll predicate. The finite query wrappers retain the actual DevTools request and returned value.
+General worker, module, page and scalar input correspondence remains incomplete.
+
+The current inventory remains incomplete until independent source/history reconciliation is
+certified. Successful execution and independent validation of the entire original serial suite
+print `TRACER PARTIAL PASS (coverage.complete=false)` while the coverage key remains incomplete.
+This supplies execution evidence only, with no complete-coverage, complete-bound-control or stage-completion
+credit. Coverage certification precedes eligible complete-coverage positives and production controls;
+it does not establish their results or task acceptance.
+Targeted passes qualify only the declared diagnostic subset. Whole-source identities detect changed
+inputs; they do not prove predicate execution. Full qualification also requires its prescribed
+gates and bound execution evidence.
+
+The tracer has three public modes:
+
+```sh
+scripts/tracer.sh list
+CHROME=/path/to/chrome scripts/tracer.sh full
+CHROME=/path/to/chrome scripts/tracer.sh targeted TAU_TRACER_GOALS=1 TAU_TRACER_GOAL_CASE=admission
+```
+
+`full` is the default. Both the script and executable refuse explicit filters and every inherited
+`TAU_TRACER_` name, including empty or unknown names, before preparation or fixture work. Refusals
+name the variable and omit its value. `targeted` accepts the existing coarse selectors below,
+including their parent selectors. Unknown, empty, duplicate and conflicting selections fail.
+Targeted plans list selected and support identities before their completion is checked; support
+cases retain their real prerequisites and observation history. They print `TARGETED PASS` or
+`TARGETED FAIL` and supply diagnostic evidence only.
+
+Only a full run with certified complete coverage prints `TRACER PASS`. The executable supervises a child, records its actual
+exit and checks its report against the expected inventory, order, assertion multiplicity,
+prerequisites, same-page policy/command relation, cleanup and actual source/artifact/browser
+identities. The shell driver independently checks those observations before publishing its verdict.
+The inventory hash and expected/completed counts accompany success. A PASS line alone cannot qualify.
+Source and artifact identities are checked again after execution; changed input bytes require a new
+run. The source hash excludes tracker lifecycle data, and includes tracked and unignored source files
+plus the pinned specification checkout. The compiled identity binds those source bytes. Separate source-enumerated contract hashes bind
+the native producer/validator and shell driver/validator, including new files and tracked absences.
+Normal Cargo invocations re-enumerate the complete source set, including additions and tracked
+deletions. `python3 scripts/check-tracer-rebuild.py` checks stale-binary refusal and normal rebuilds.
+
+`TRACER_EVIDENCE` contains the machine-readable completion report. `TRACER_TIMING`,
+`TRACER_CASE_TIMING`, `TRACER_GROUP_TIMING`, `TRACER_BUILD_TIMING` and `TRACER_PREPARATION` contain monotonic nanosecond
+intervals for preparation, fixtures, browser, groups, cases and cleanup. Identifiers and timing fields
+contain no credential values, value-derived credential identities or selector values. Failed paths
+retain available timings and never earn completion credit. Fixture mint/request observations bind
+the one data-dependent credential-search domain independently of its completed checks.
+
+Encrypted reader inputs retain their original bytes privately. The report records nonsecret
+capture relationships; the hold baseline and failed-append baseline have named source checkpoints.
+Seed-gate checks separately require the original three allocation families and each refusal's
+inspection, command and collection operations, bound to their source case and page. Reader,
+auxiliary and observer requirements distinguish repeated scenario invocations. Original-file
+invocation and comparison rules are checked independently at both validation boundaries; their
+source correspondence still needs independent reconciliation before coverage can be declared complete.
+Direct constructor installations retain their actual input source and reload window. Conditional
+dispositions require the rebuilt journal as the installed operand. Authentication reads and
+goal refusal comparisons bracket the original operation; immutable page views retain the query,
+page, attempt and covered predicate uses. General constructor recipes and broader source windows
+remain unverified while the coverage flag is false.
+
+The executable also supports `list`, `full <served-dir> <tracer-dir>` (legacy `run` is a full-mode
+alias), and `targeted <served-dir> <tracer-dir> NAME=VALUE ...`. It saves an execution log, supervisor
+exit receipt and input identity beneath `target/tracer-evidence/`, naming the exact capture directory.
+Recheck a successful full-execution capture, including one with incomplete coverage, with:
+
+```sh
+cargo run --locked -p tracer -- verify <capture-dir> dist/served dist/tracer
+```
+
+Saved verification checks the printed timing stream's schema, multiplicity, order, bounds and
+evidence placement. Success retains the explicit partial-pass label when coverage is incomplete.
+The supervisor's actual child exit receipt remains unchanged when validation fails.
+
+Capture verification needs the same executable, source, artifacts and browser prerequisites. Preserve
+the supervisor-owned log and exit receipt together; verification checks their digest and current
+inputs, and rejects targeted, failed or interrupted executions. These local receipts do not
+authenticate arbitrary externally supplied files or replace the repository's other mandatory gates.
+When changing a case, update its literal identities, source-derived inventory, parameter/branch rules,
+scenario history and independent placement rules together; never learn expectations from completions.
 
 The cases:
 
@@ -2604,13 +2710,11 @@ observe completed reads. The `test_no_credentials` switch exercises a held reque
 credentials. The served-build absence check covers all three.
 
 For focused seed-backup checks, set `TAU_TRACER_SEED_CASE` to `create`, `mismatch`,
-`failed-append` or `all`. These selectors are test-only; unset both tracer selectors for the
-full gate. `test_allocate` and `test_seed_backup_fail_append` exist only under `tracer` and
+`failed-append` or `all`. Use them only in `targeted` mode; the full gate refuses inherited selectors. `test_allocate` and `test_seed_backup_fail_append` exist only under `tracer` and
 are included in `check-absence`.
 
 For focused setup checks, set `TAU_TRACER_SETUP_CASE=all`. The `existing` value runs the existing
-dispatch/job cases without seed-display-dependent custody controls. The full gate leaves
-`TAU_TRACER_SETUP_CASE`, `TAU_TRACER_SEED_CASE` and `TAU_TRACER_HOLD_CASE` unset and runs all 194 cases. `TAU_TRACER_GOALS`, `TAU_TRACER_GOAL_CASE`, `TAU_TRACER_MODE_CASE`, `TAU_TRACER_INFERENCE`, `TAU_TRACER_INFERENCE_PHASE`,
+dispatch/job cases without seed-display-dependent custody controls. The full gate runs the complete expected inventory and requires every `TAU_TRACER_` name to be absent. `TAU_TRACER_GOALS`, `TAU_TRACER_GOAL_CASE`, `TAU_TRACER_MODE_CASE`, `TAU_TRACER_INFERENCE`, `TAU_TRACER_INFERENCE_PHASE`,
 `TAU_TRACER_INFERENCE_END` and `TAU_TRACER_SESSION_END` must also be unset. The focused
 `session-end`, `sent-reads` and `command-intent` inference phases exercise the corresponding
 session-end boundaries. `TAU_TRACER_SESSION_END` selects comma-separated case-name fragments

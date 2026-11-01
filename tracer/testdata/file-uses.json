@@ -1,0 +1,207 @@
+{
+  "report": {
+    "mode": "targeted",
+    "duration_ns": 20,
+    "plan": {
+      "expected_execution": [],
+      "helper_owner_sequences": [
+        {
+          "scenario": "goal_cases.run",
+          "owner": "after",
+          "case": null,
+          "page_operations": [
+            "new:tracer"
+          ]
+        },
+        {
+          "scenario": "goal_cases.run",
+          "owner": "inside",
+          "case": "goal_cases.c004.p001",
+          "page_operations": [
+            "tracer",
+            "tracer"
+          ]
+        }
+      ],
+      "invocation_root_sequences": [],
+      "name": "component"
+    },
+    "helper_history": [
+      {
+        "event": "scenario_start",
+        "id": "goal_cases.run",
+        "invocation": 1,
+        "at_ns": 0
+      },
+      {
+        "event": "call_start",
+        "kind": "runtime.worker",
+        "call": 1,
+        "page": 7,
+        "at_ns": 1
+      },
+      {
+        "event": "call_end",
+        "call": 1,
+        "at_ns": 2
+      },
+      {
+        "event": "case_start",
+        "id": "goal_cases.c004.p001",
+        "at_ns": 3
+      },
+      {
+        "event": "call_start",
+        "kind": "runtime.worker",
+        "call": 2,
+        "page": 7,
+        "at_ns": 8
+      },
+      {
+        "event": "call_end",
+        "call": 2,
+        "at_ns": 9
+      },
+      {
+        "event": "call_start",
+        "kind": "runtime.worker",
+        "call": 3,
+        "page": 7,
+        "at_ns": 12
+      },
+      {
+        "event": "call_end",
+        "call": 3,
+        "at_ns": 13
+      },
+      {
+        "event": "case_end",
+        "id": "goal_cases.c004.p001",
+        "at_ns": 14
+      },
+      {
+        "event": "scenario_end",
+        "id": "goal_cases.run",
+        "at_ns": 15
+      }
+    ],
+    "file_captures": [
+      {
+        "source": 1,
+        "site": "file.goal_cases.build.001",
+        "kind": "constructor",
+        "page": 0,
+        "parent": null,
+        "ok": true,
+        "case": "goal_cases.c004.p001",
+        "at_ns": 4,
+        "history_cursor": 4
+      },
+      {
+        "source": 2,
+        "site": "file.goal_cases.build.001",
+        "kind": "constructor",
+        "page": 0,
+        "parent": null,
+        "ok": true,
+        "case": "goal_cases.c004.p001",
+        "at_ns": 10,
+        "history_cursor": 6
+      }
+    ],
+    "file_uses": {
+      "puts": [
+        {
+          "input": {
+            "source": 1,
+            "site": "file.goal_cases.build.001",
+            "kind": "constructor",
+            "page": 0,
+            "ok": true
+          },
+          "page": 7,
+          "case": "goal_cases.c004.p001",
+          "at_ns": 6,
+          "history_cursor": 4,
+          "provenance": {
+            "empty": false,
+            "control": null,
+            "contracts": null
+          },
+          "end_ns": 6,
+          "end_cursor": 4,
+          "operation": {
+            "recipe_ok": true,
+            "completed": true
+          }
+        },
+        {
+          "input": {
+            "source": 2,
+            "site": "file.goal_cases.build.001",
+            "kind": "constructor",
+            "page": 0,
+            "ok": true
+          },
+          "page": 7,
+          "case": "goal_cases.c004.p001",
+          "at_ns": 11,
+          "history_cursor": 6,
+          "provenance": {
+            "empty": false,
+            "control": null,
+            "contracts": null
+          },
+          "end_ns": 11,
+          "end_cursor": 6,
+          "operation": {
+            "recipe_ok": true,
+            "completed": true
+          }
+        }
+      ],
+      "operations": [],
+      "binding": []
+    },
+    "settle_inputs": [],
+    "state_inputs": {
+      "operations": [
+        {
+          "kind": "reload",
+          "page": 7,
+          "worker": 1,
+          "start_ns": 6,
+          "end_ns": 9,
+          "start_cursor": 4,
+          "end_cursor": 6,
+          "receiver_ok": true
+        },
+        {
+          "kind": "reload",
+          "page": 7,
+          "worker": 1,
+          "start_ns": 11,
+          "end_ns": 13,
+          "start_cursor": 6,
+          "end_cursor": 8,
+          "receiver_ok": true
+        }
+      ]
+    },
+    "file_dump_queries": []
+  },
+  "inventory": {
+    "cases": [],
+    "file_put_windows": {
+      "file.goal_cases.build.001": "tracer"
+    },
+    "file_operation_sources": {
+      "goal.harness_job_refusal": 3,
+      "binding.authentication": [
+        2,
+        1
+      ]
+    },
+    "file_installation_rules": []
+  }
+}

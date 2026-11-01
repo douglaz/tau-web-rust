@@ -23,9 +23,13 @@ async fn event(run: &Run<'_>, tab: &Tab, name: &str) -> Result<(), String> {
 async fn reset(run: &Run<'_>, tab: &Tab, worker: &mut Worker, saved: &Files) -> Result<(), String> {
     run.aggregator.state.lock().unwrap().hold_completion = false;
     run.aggregator.state.lock().unwrap().hold_revoke = false;
-    *worker = run.reload(tab, worker).await?;
+    *worker = run
+        .reload("lifecycle_cases.rs::reload#1", tab, worker)
+        .await?;
     run.put(tab, saved).await?;
-    *worker = run.reload(tab, worker).await?;
+    *worker = run
+        .reload("lifecycle_cases.rs::reload#2", tab, worker)
+        .await?;
     resume(run, tab, worker).await?;
     module(run, worker, "return await m.test_confirm_inference();").await?;
     Ok(())
@@ -37,12 +41,15 @@ pub(super) async fn run(
     worker: &mut Worker,
     cases: &mut Vec<Case>,
 ) -> Result<(), String> {
+    let _scenario_span = completion::scenario("lifecycle_cases.run");
     // Each phase owns an isolated truthful fixture journal. Predecessor phases deliberately
     // leave possibly-sent calls unresolved; those holds must not bar this phase's positives.
-    let previous = store_files(&run.dump(tab).await?);
-    let mnemonic = reader::read(&previous, PASSPHRASE)?.mnemonic()?;
+    let previous = store_files(&run.dump_at("file.lifecycle_cases.dump.001", tab).await?);
+    let mnemonic = reader::read_at("reader.call.lifecycle.original", &previous, PASSPHRASE)?
+        .mnemonic_at("reader.aux.call.lifecycle.original.mnemonic")?;
     let mut events = vec![json!({"seed":{"mnemonic":mnemonic}})];
-    events.extend(reader::setup_events(
+    events.extend(reader::setup_events_at(
+        "reader.aux.call.lifecycle.setup",
         &mnemonic,
         &["fixture", "fixture-other", "unpinned"],
     ));
@@ -52,31 +59,25 @@ pub(super) async fn run(
         );
     }
     events.push(json!({"inference_account":{"credential":run.aggregator.state.lock().unwrap().account.clone()}}));
-    let saved = reader::build(PASSPHRASE, &events);
+    let saved = reader::build_at("file.lifecycle_cases.build.001", PASSPHRASE, &events);
     locked_freeze(run, tab, worker, cases).await?;
     dedicated_approvals(run, tab, worker, &saved, cases).await?;
     aggregate_cap(run, tab, worker, &saved, cases).await?;
     unsent_mint(run, tab, worker, &saved, cases).await?;
     reset(run, tab, worker, &saved).await?;
     let mut case = Case::new(
+        "lifecycle_cases.c001",
         "hidden scheduled work retains original session limits and scan reference (CNF-7/69/82/95/102)",
     );
     let secret = "original-lifecycle-reference-123456";
     // The isolated machine owns these fixture bytes; the ordinary exec only reads them.
     let secret_path = run.sshd.machine.root.join("lifecycle-value");
     std::fs::write(&secret_path, secret).map_err(|e| e.to_string())?;
-    let scan_id = module(
-        run,
-        worker,
-        &format!(
-            "return await m.test_scan_fixture('service access',new TextEncoder().encode({}));",
-            json!(secret)
-        ),
-    )
-    .await?;
+    let scan_id = file_inputs::scan_reference(run, worker, secret).await?;
     let session = run.inspect(worker).await?["sessions"][0]["identity"]
         .as_str()
-        .ok_or("missing session")?
+        .ok_or("missing session")
+        .checked("lifecycle.initial.session")?
         .to_string();
     module(run,worker,&format!("return m.test_model_target({});",json!(json!({"machine":"fixture","relay":run.relay.url,"host":"127.0.0.1","port":run.sshd.port,"user":SSH_USER}).to_string()))).await?;
     module(
@@ -94,21 +95,31 @@ pub(super) async fn run(
     .await?;
     let initial = infer(run, worker).await?;
     case.check(
+        "lifecycle_cases.a001",
         "eligible initial inference establishes one original key",
         initial["finished"] == true,
     );
     let before = run.inspect(worker).await?;
-    let blob_name = format!("scan-{}", scan_id.as_str().ok_or("scan identity")?);
-    let blob = store_files(&run.dump(tab).await?)[&blob_name].clone();
+    let blob_name = scan_id.name()?;
+    let blob = file_inputs::blob(
+        &store_files(&run.dump_at("file.lifecycle_cases.dump.002", tab).await?),
+        &blob_name,
+    );
     let mints = run.aggregator.count("/keys");
     let revokes = run.aggregator.count("/revoke");
     for iteration in 0..2 {
+        let hidden_operation =
+            operation_windows::Operation::begin("lifecycle.hidden", worker, true);
+        hidden_operation.expect(None, "Target.createTarget", json!({"url":"about:blank"}));
+        hidden_operation.module(worker, &format!("return await new Promise(resolve=>setTimeout(async()=>resolve(JSON.parse(await m.inference_request({}))),30));", json!(json!({"machine":"fixture","messages":[{"role":"user","content":"scheduled fixture turn"}]}).to_string())));
+        hidden_operation.module(worker, &format!("return JSON.parse(await m.test_model_tool({},{}));",json!(session),json!(json!({"name":"exec","arguments":{"machine":"fixture","command":format!("head -c 7 '{}'; tail -c +8 '{}'; cat '{}' >&2",secret_path.display(),secret_path.display(),secret_path.display())}}).to_string())));
         let other = run
             .browser
             .call(None, "Target.createTarget", json!({"url":"about:blank"}))
             .await?;
         tokio::time::sleep(Duration::from_millis(100)).await;
         case.check(
+            "lifecycle_cases.a002",
             "actual page is hidden",
             run.browser
                 .evaluate(&tab.session, "document.visibilityState")
@@ -117,6 +128,7 @@ pub(super) async fn run(
         );
         let reply = module(run,worker,&format!("return await new Promise(resolve=>setTimeout(async()=>resolve(JSON.parse(await m.inference_request({}))),30));", json!(json!({"machine":"fixture","messages":[{"role":"user","content":"scheduled fixture turn"}]}).to_string()))).await?;
         case.check(
+            "lifecycle_cases.a003",
             "scheduled model work completes hidden",
             reply["finished"] == true && reply.get("body").is_some(),
         );
@@ -129,13 +141,16 @@ pub(super) async fn run(
                 .is_some_and(|s| s.contains(secret))
         );
         case.check(
+            "lifecycle_cases.a004",
             "real tool scan protects both stdout and stderr",
             output["stdout"] == "<redacted secret: service access>"
                 && output["stderr"] == "<redacted secret: service access>"
                 && !output.to_string().contains(secret),
         );
+        hidden_operation.finish();
         let after = run.inspect(worker).await?;
         case.check(
+            "lifecycle_cases.a005",
             "same session, binding, context and original expiry",
             after["sessions"][0]["identity"] == before["sessions"][0]["identity"]
                 && after["sessions"][0]["bound_set"] == before["sessions"][0]["bound_set"]
@@ -144,19 +159,31 @@ pub(super) async fn run(
                     == before["sessions"][0]["inference_limits"]["original_expiry"],
         );
         case.check(
+            "lifecycle_cases.a006",
             "no replacement mint, revoke or encrypted scan write on hide",
-            run.aggregator.count("/keys") == mints
-                && run.aggregator.count("/revoke") == revokes
-                && store_files(&run.dump(tab).await?)[&blob_name] == blob,
+            crate::state_inputs::all!(
+                run.aggregator.count("/keys") == mints,
+                run.aggregator.count("/revoke") == revokes,
+                file_inputs::equal_blob_at(
+                    "lifecycle_cases.a006.1",
+                    "lifecycle_cases.a006",
+                    &file_inputs::blob(
+                        &store_files(&run.dump_at("file.lifecycle_cases.dump.003", tab).await?),
+                        &blob_name,
+                    ),
+                    &blob,
+                )
+            ),
         );
         let original_limits = after["sessions"][0]["inference_limits"].clone();
         run.aggregator.state.lock().unwrap().credit_hundredths += 100;
-        case.check("synthetic account credit neither changes the original tuple nor replenishes observed consumption",run.inspect(worker).await?["sessions"][0]["inference_limits"]==original_limits);
+        case.check("lifecycle_cases.a007", "synthetic account credit neither changes the original tuple nor replenishes observed consumption",run.inspect(worker).await?["sessions"][0]["inference_limits"]==original_limits);
         if iteration == 0 {
             event(run, tab, "freeze").await?;
-            case.check("actual page shows processed reconciliation while retaining Lock",run.browser.evaluate(&tab.session,"document.getElementById('tau-store-state').textContent.includes('reconciling') && !document.getElementById('tau-lock').hidden").await?==true);
+            case.check("lifecycle_cases.a008", "actual page shows processed reconciliation while retaining Lock",run.browser.evaluate(&tab.session,"document.getElementById('tau-store-state').textContent.includes('reconciling') && !document.getElementById('tau-lock').hidden").await?==true);
             let withheld = infer(run, worker).await?;
             case.check(
+                "lifecycle_cases.a009",
                 "processed freeze withholds ordinary work while retaining writer",
                 withheld.get("refused").is_some() && run.live_workers(tab) == vec![worker.clone()],
             );
@@ -169,15 +196,17 @@ pub(super) async fn run(
                 ),
             )
             .await?;
-            case.check("narrow authenticated time read succeeds hidden while ordinary authority is withheld",verified["finished"]==true && run.aggregator.count_method("GET","/time")>0);
+            case.check("lifecycle_cases.a010", "narrow authenticated time read succeeds hidden while ordinary authority is withheld",verified["finished"]==true && run.aggregator.count_method("GET","/time")>0);
             event(run, tab, "resume").await?;
             case.check(
+                "lifecycle_cases.a011",
                 "hidden freeze return retains eligible key",
                 infer(run, worker).await?["finished"] == true,
             );
             fresh_pace(run.relay);
-            let output=run.harness_run(worker,json!({"machine":"fixture","relay":run.relay.url,"host":"127.0.0.1","port":run.sshd.port,"user":SSH_USER,"command":format!("cat '{}'",secret_path.display())})).await?;
+            let output=run.harness_run("lifecycle_cases.rs#1", worker,json!({"machine":"fixture","relay":run.relay.url,"host":"127.0.0.1","port":run.sshd.port,"user":SSH_USER,"command":format!("cat '{}'",secret_path.display())})).await?;
             case.check(
+                "lifecycle_cases.a012",
                 "same material scans actual normal dispatch after authenticated reload",
                 output["outcome"]["stdout"] == "<redacted secret: service access>"
                     && output["outcome"]["job_record"]["record"]["stdout"]
@@ -201,11 +230,17 @@ pub(super) async fn run(
     }
     let (second_tab, second_worker) = run.open(&tab.origin, true).await?;
     case.check(
+        "lifecycle_cases.a013",
         "second page waits in-use without taking over hidden writer",
         run.inspect(&second_worker).await?["state"] == "unopened"
             && run.live_workers(tab) == vec![worker.clone()],
     );
-    if run.inspect(&second_worker).await?["state"] == "locked" {
+    let second_locked = observer::second_worker_locked(run, &second_worker).await?;
+    case.branch(
+        "second-worker",
+        if second_locked { "locked" } else { "unopened" },
+    );
+    if second_locked {
         let result = module(
             run,
             &second_worker,
@@ -216,6 +251,7 @@ pub(super) async fn run(
         )
         .await?;
         case.check(
+            "lifecycle_cases.a014",
             "a second instance cannot unwrap the store while the original writer can act",
             result["state"] != "unlocked",
         );
@@ -241,23 +277,40 @@ pub(super) async fn run(
         run.aggregator.count("/completion")
     );
     case.check(
+        "lifecycle_cases.a015",
         "working copy loss withholds output rather than arming empty set",
         missing.get("refused").is_some()
             && run.aggregator.count("/completion") == completions_before_missing,
     );
+    let operation = operation_windows::Operation::begin("lifecycle.scan_reload", worker, true);
+    operation.module(worker, "return await m.test_scan_reload(false);");
+    let reloaded = module(run, worker, "return await m.test_scan_reload(false);").await?;
+    operation.finish();
     case.check(
+        "lifecycle_cases.a016",
         "read-only reload restores the original reference",
-        module(run, worker, "return await m.test_scan_reload(false);").await? == true
-            && store_files(&run.dump(tab).await?)[&blob_name] == blob,
+        crate::state_inputs::all!(
+            reloaded == true,
+            file_inputs::equal_blob_at(
+                "lifecycle_cases.a016.1",
+                "lifecycle_cases.a016",
+                &file_inputs::blob(
+                    &store_files(&run.dump_at("file.lifecycle_cases.dump.004", tab).await?),
+                    &blob_name,
+                ),
+                &blob,
+            )
+        ),
     );
     let other = run
         .browser
         .call(None, "Target.createTarget", json!({"url":"about:blank"}))
         .await?;
-    let command = format!("sleep 2; cat '{}'", secret_path.display());
+    let (command_input, command) = fixture_inputs::command(run, worker, &case.id, &secret_path);
     fresh_pace(run.relay);
     let request = json!({"machine":"fixture","relay":run.relay.url,"host":"127.0.0.1","port":run.sshd.port,"user":SSH_USER,"command":command});
-    module(
+    fixture_inputs::command_module(
+        &command_input,
         run,
         worker,
         &format!(
@@ -267,19 +320,23 @@ pub(super) async fn run(
     )
     .await?;
     case.check(
+        "lifecycle_cases.a017",
         "independent machine observes the original detached job before processed freeze",
-        settle_for(run.seen, 5, |_| {
-            run.sshd
-                .machine
-                .launches()
-                .iter()
-                .any(|(_, job)| job.command == command.as_bytes())
-        })
+        settle_for(
+            "lifecycle.hidden.job_launched",
+            run.seen,
+            5,
+            json!({"command":"source hidden lifecycle detached command"}),
+            |_, observation| {
+                fixture_predicates::launched(run, &command_input, &command, observation)
+            },
+        )
         .await,
     );
     event(run, tab, "freeze").await?;
     let interrupted = module(run, worker, "return JSON.parse(await self.interruptedJob);").await?;
     case.check(
+        "lifecycle_cases.a018",
         "possibly sent job remains unresolved without a replacement launch",
         interrupted["outcome"]["unresolved"] == true,
     );
@@ -320,19 +377,22 @@ pub(super) async fn run(
     .await?;
     let records = collected["outcome"]["collected"]
         .as_array()
-        .ok_or("missing collection")?;
+        .ok_or("missing collection")
+        .checked("lifecycle.collection.array")?;
     let record = records
         .iter()
         .find(|r| r["call"] == original_call)
-        .ok_or_else(|| format!("original lifecycle job {original_call} not collected: interrupted={interrupted}; collection={collected}"))?;
+        .ok_or_else(|| format!("original lifecycle job {original_call} not collected: interrupted={interrupted}; collection={collected}")).checked("lifecycle.collection.original")?;
     println!("   collected original lifecycle job: {record}");
     case.check(
+        "lifecycle_cases.a019",
         "hidden freeze to visible return collects original job and scans both nested copies",
         record["stdout"] == "<redacted secret: service access>"
             && record["record"]["stdout"] == hex::encode("<redacted secret: service access>")
             && record["state"] == "finished",
     );
     case.check(
+        "lifecycle_cases.a020",
         "collection does not replay the mutation",
         run.sshd
             .machine
@@ -342,34 +402,52 @@ pub(super) async fn run(
             .count()
             == 1,
     );
-    let original_job = record["job"].as_str().ok_or("job identity")?;
+    let original_job = record["job"]
+        .as_str()
+        .ok_or("job identity")
+        .checked("lifecycle.collection.job")?;
     case.check(
+        "lifecycle_cases.a021",
         "machine output artifact retains original bytes outside browser scanning",
         std::fs::read(run.sshd.machine.path(original_job, "stdout")).map_err(|e| e.to_string())?
             == secret.as_bytes(),
     );
-    cases.push(case);
+    drop(command_input);
+    case.finish(cases);
 
     expiry_case(run, tab, worker, &saved, cases).await?;
 
     reset(run, tab, worker, &saved).await?;
     let mut case = Case::new(
+        "lifecycle_cases.c002",
         "page-started goal keeps scheduled hidden context and scans actual model input (CNF-82/95/102)",
     );
-    let session = run.inspect(worker).await?["sessions"][0]["identity"]
+    let session = session_operands::state("lifecycle.hidden_goal.done",run,worker).await?["sessions"][0]["identity"]
         .as_str()
         .ok_or("session")?
         .to_string();
+    let session = session_operands::selected("lifecycle.hidden_goal.done", session);
     module(run,worker,&format!("await m.test_scan_fixture('service access',new TextEncoder().encode({}));return m.test_model_target({});",json!(secret),json!(json!({"machine":"fixture","relay":run.relay.url,"host":"127.0.0.1","port":run.sshd.port,"user":SSH_USER}).to_string()))).await?;
-    run.browser.evaluate(&tab.session,&format!("(()=>{{const card=document.querySelector('[data-goal-card=\"{}\"]');card.querySelector('[data-goal-text]').value='Read the fixture service output';card.querySelector('[data-goal-enter]').click();return true;}})()",session)).await?;
-    for _ in 0..100 {
-        if run.inspect(worker).await?["goals"]
-            .as_array()
-            .is_some_and(|g| !g.is_empty())
-        {
-            break;
+    session_operands::entry("lifecycle.hidden_goal.done",run,tab,&format!("(()=>{{const card=document.querySelector('[data-goal-card=\"{}\"]');card.querySelector('[data-goal-text]').value='Read the fixture service output';card.querySelector('[data-goal-enter]').click();return true;}})()",session)).await?;
+    {
+        let observation = observer::Call::begin(
+            "lifecycle.hidden_goal.recorded",
+            "serial.observation",
+            Some(&tab.session),
+            json!({"bound":100,"false_sleep_ms":10,"requires_ready":false,"machine":"first"}),
+        );
+        for poll in 0..100 {
+            observation.attempt(poll + 1);
+            if observation.poll(
+                poll + 1,
+                observation.inspect(run, worker).await?["goals"]
+                    .as_array()
+                    .is_some_and(|g| !g.is_empty()),
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
     }
     let command = format!("cat '{}'", secret_path.display());
     run.aggregator.state.lock().unwrap().script = vec![
@@ -399,14 +477,26 @@ pub(super) async fn run(
     fresh_pace(run.relay);
     module(run, worker, "self.releaseHiddenGoal();return true;").await?;
     let mut done = false;
-    for _ in 0..300 {
-        done=run.browser.evaluate(&tab.session,&format!("document.querySelector('[data-goal-outcome=\"{}\"]')?.textContent.includes('done')??false",session)).await?==true;
-        if done {
-            break;
+    {
+        let observation = observer::Call::begin(
+            "lifecycle.hidden_goal.done",
+            "serial.observation",
+            Some(&tab.session),
+            json!({"bound":300,"false_sleep_ms":20,"requires_ready":false,"machine":"first"}),
+        );
+        for poll in 0..300 {
+            observation.attempt(poll + 1);
+            done = observation
+                .session_hidden_done(run, &tab.session, &session)
+                .await?;
+            if observation.poll(poll + 1, done) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
     }
     case.check(
+        "lifecycle_cases.a022",
         "real page-to-worker goal loop reaches done while hidden without new consent",
         done && run
             .browser
@@ -431,6 +521,7 @@ pub(super) async fn run(
             .is_some_and(|b| b.to_string().contains(secret))
     );
     case.check(
+        "lifecycle_cases.a023",
         "actual next model input contains the named marker and no exact value",
         bodies.len() == 2
             && bodies[1]
@@ -446,6 +537,7 @@ pub(super) async fn run(
         )
         .await?;
     case.check(
+        "lifecycle_cases.a024",
         "page publication retains the safe final outcome",
         posted
             .as_str()
@@ -465,16 +557,19 @@ pub(super) async fn run(
             json!({"targetId":other["targetId"]}),
         )
         .await?;
-    cases.push(case);
+    case.finish(cases);
 
     for begun in [false, true] {
         reset(run, tab, worker, &saved).await?;
         infer(run, worker).await?;
-        let mut case = Case::new(if begun {
-            "freeze finishes a begun command append whole and fences its send (CNF-29/40/82)"
-        } else {
-            "freeze refuses a queued command append before it begins (CNF-29/40/82)"
-        });
+        let mut case = Case::new(
+            "lifecycle_cases.c003",
+            if begun {
+                "freeze finishes a begun command append whole and fences its send (CNF-29/40/82)"
+            } else {
+                "freeze refuses a queued command append before it begins (CNF-29/40/82)"
+            },
+        );
         let before = run.inspect(worker).await?;
         let request = json!({"machine":"fixture","relay":run.relay.url,"host":"127.0.0.1","port":run.sshd.port,"user":SSH_USER,"command":"printf lifecycle-append"});
         if begun {
@@ -515,6 +610,7 @@ pub(super) async fn run(
         )
         .await?;
         case.check(
+            "lifecycle_cases.a025",
             "no command exec crosses the processed freeze",
             run.seen.lock().unwrap().ssh_exec.len() == execs
                 && result["outcome"].get("done").is_none(),
@@ -522,23 +618,25 @@ pub(super) async fn run(
         event(run, tab, "resume").await?;
         let after = run.inspect(worker).await?;
         case.check(
+            "lifecycle_cases.a026",
             "only an already begun durable append can add its original intent",
             after["commands"].as_array().unwrap().len()
                 == before["commands"].as_array().unwrap().len() + usize::from(begun),
         );
         if begun {
             case.check(
+                "lifecycle_cases.a027",
                 "committed original command remains unresolved",
                 after["calls"].as_array().unwrap().last().is_some_and(|c| {
                     c["state"] == "unresolved" && c["call"] == result["outcome"]["call"]
                 }),
             );
         }
-        cases.push(case);
+        case.finish(cases);
     }
 
     boundaries(run, tab, worker, &saved, cases).await?;
-    if std::env::var("TAU_TRACER_INFERENCE_PHASE").as_deref() != Ok("lifecycle-core") {
+    if selection::value("TAU_TRACER_INFERENCE_PHASE").as_deref() != Ok("lifecycle-core") {
         repairs::run(run, tab, worker, &saved, cases).await?;
     }
     Ok(())
@@ -553,13 +651,26 @@ async fn boundaries(
 ) -> Result<(), String> {
     reset(run, tab, worker, saved).await?;
     let mut case = Case::new(
+        "lifecycle_cases.c004",
         "freeze fences stale model and publication results without replacing their intent (CNF-29/69/82/102)",
     );
     infer(run, worker).await?;
     run.aggregator.state.lock().unwrap().hold_completion = true;
-    let completions = run.aggregator.count("/completion");
-    module(run,worker,"self.pendingLifecycle=m.inference_request(JSON.stringify({machine:'fixture',messages:[{role:'user',content:'late fixture turn'}]}));self.oldGeneration=m.publication_generation();return true;").await?;
-    wait_count(run, "/completion", completions + 1).await?;
+    let completions =
+        counter_inputs::baseline("lifecycle.boundaries.wait_completion", run, "/completion");
+    observer::counter_input(
+        "lifecycle.boundaries.wait_completion",
+        "/completion",
+        completions + 1,
+    );
+    counter_inputs::module("lifecycle.boundaries.wait_completion", run,worker,"self.pendingLifecycle=m.inference_request(JSON.stringify({machine:'fixture',messages:[{role:'user',content:'late fixture turn'}]}));self.oldGeneration=m.publication_generation();return true;").await?;
+    wait_count(
+        "lifecycle.boundaries.wait_completion",
+        run,
+        "/completion",
+        completions + 1,
+    )
+    .await?;
     event(run, tab, "freeze").await?;
     let result = module(
         run,
@@ -568,6 +679,7 @@ async fn boundaries(
     )
     .await?;
     case.check(
+        "lifecycle_cases.a028",
         "possibly sent completion remains unresolved and supplies no actionable body",
         result["unresolved"] == true && result.get("body").is_none(),
     );
@@ -575,7 +687,8 @@ async fn boundaries(
     event(run, tab, "resume").await?;
     let session = run.inspect(worker).await?["sessions"][0]["identity"]
         .as_str()
-        .ok_or("session")?
+        .ok_or("session")
+        .checked("lifecycle.boundaries.session")?
         .to_string();
     println!(
         "   actual completion count before clock repair: {} (expected {})",
@@ -589,6 +702,7 @@ async fn boundaries(
         completions + 1
     );
     case.check(
+        "lifecycle_cases.a029",
         "clock remains withheld until justified observation",
         uncertain.get("refused").is_some()
             && run.aggregator.count("/completion") == completions + 1,
@@ -604,27 +718,32 @@ async fn boundaries(
     .await?;
     let stale=module(run,worker,&format!("return JSON.parse(await m.protect_publication(self.oldGeneration,{},JSON.stringify({{state:'unlocked',goal_outcome:{{done:true}}}})));",json!(session))).await?;
     case.check(
+        "lifecycle_cases.a030",
         "an old scanned publication cannot become actionable after repair",
         stale["state"] == "unlocked"
             && stale.get("goal_outcome").is_none()
             && stale.get("error").is_some(),
     );
     module(run,worker,&format!("const current=JSON.parse(await m.open());current.goal_outcome={{session:{},outcome:{{done:true}}}};await m.publish_report(self.oldGeneration,{},JSON.stringify(current));return true;",json!(session),json!(session))).await?;
-    case.check("actual posted store message cannot render a stale done result",!run.browser.evaluate(&tab.session,"document.getElementById('tau-setup').textContent.includes('Goal loop ended: done.')").await?.as_bool().unwrap_or(true));
+    case.check("lifecycle_cases.a031", "actual posted store message cannot render a stale done result",!run.browser.evaluate(&tab.session,"document.getElementById('tau-setup').textContent.includes('Goal loop ended: done.')").await?.as_bool().unwrap_or(true));
     case.check(
+        "lifecycle_cases.a032",
         "next eligible inference uses the original key without retrying lost request",
         infer(run, worker).await?["finished"] == true
             && run.aggregator.count("/completion") == completions + 2,
     );
-    cases.push(case);
+    case.finish(cases);
     for frozen in [false, true] {
         reset(run, tab, worker, saved).await?;
         infer(run, worker).await?;
-        let mut case = Case::new(if frozen {
-            "actual transport rechecks authority after a queued send boundary (CNF-69/82)"
-        } else {
-            "actual transport allows the nearest eligible queued send (CNF-69/82)"
-        });
+        let mut case = Case::new(
+            "lifecycle_cases.c005",
+            if frozen {
+                "actual transport rechecks authority after a queued send boundary (CNF-69/82)"
+            } else {
+                "actual transport allows the nearest eligible queued send (CNF-69/82)"
+            },
+        );
         module(run,worker,"self.sendReady=new Promise(ready=>m.test_hold_session_point('transport_send',new Promise(release=>self.releaseSend=release),ready));self.sendResult=m.inference_request(JSON.stringify({machine:'fixture',messages:[{role:'user',content:'original queued operation'}]}));await self.sendReady;return true;").await?;
         let before = run.aggregator.count("/completion");
         if frozen {
@@ -638,6 +757,7 @@ async fn boundaries(
                 run.aggregator.count("/completion")
             );
             case.check(
+                "lifecycle_cases.a033",
                 "processed suspension sends no completion at the actual fetch boundary",
                 run.aggregator.count("/completion") == before
                     && result["unresolved"] == true
@@ -645,17 +765,19 @@ async fn boundaries(
             );
         } else {
             case.check(
+                "lifecycle_cases.a034",
                 "eligible original request actually reaches the fixture and returns its body",
                 run.aggregator.count("/completion") == before + 1
                     && result["finished"] == true
                     && result.get("body").is_some(),
             );
         }
-        cases.push(case);
+        case.finish(cases);
     }
     reset(run, tab, worker, saved).await?;
     infer(run, worker).await?;
     let mut case = Case::new(
+        "lifecycle_cases.c006",
         "actual transport refuses carried bytes introduced after request protection (CNF-69/95)",
     );
     let before = run.aggregator.count("/completion");
@@ -674,6 +796,7 @@ async fn boundaries(
             .any(|w| w == b"post-scan-carried-fixture-bytes"))
     );
     case.check(
+        "lifecycle_cases.a035",
         "changed actual request bytes reach no completion endpoint",
         result["unresolved"] == true
             && run.aggregator.count("/completion") == before
@@ -682,7 +805,7 @@ async fn boundaries(
                     .any(|w| w == b"post-scan-carried-fixture-bytes")
             }),
     );
-    cases.push(case);
+    case.finish(cases);
     reset(run, tab, worker, saved).await?;
     reference_revision(run, tab, worker, saved, cases).await?;
     Ok(())
@@ -714,12 +837,14 @@ async fn dedicated_approvals(
 ) -> Result<(), String> {
     reset(run, tab, worker, saved).await?;
     let mut case = Case::new(
+        "lifecycle_cases.c007",
         "dedicated standing approvals survive hide with original prerequisites and independent withdrawal (CNF-86)",
     );
     let a = dedicated(run, worker, "approve", json!({"reset":"synthetic-reset-a"})).await?;
     let b = dedicated(run, worker, "approve", json!({"reset":"synthetic-reset-b"})).await?;
     let mut aa = json!({"approval":a["approval"],"reset":"synthetic-reset-a","read":0});
     case.check(
+        "lifecycle_cases.a036",
         "no activation/read is supplied by hide",
         dedicated(run, worker, "dispatch", aa.clone())
             .await?
@@ -729,6 +854,7 @@ async fn dedicated_approvals(
     visibility(run, tab, "hidden").await?;
     let before = run.inspect(worker).await?["reinstall_approvals"].clone();
     case.check(
+        "lifecycle_cases.a037",
         "independent original approvals remain standing hidden",
         before
             .as_array()
@@ -744,6 +870,7 @@ async fn dedicated_approvals(
     .await?;
     aa["read"] = no["read"].clone();
     case.check(
+        "lifecycle_cases.a038",
         "non-confirming durable read refuses unseen reset",
         dedicated(run, worker, "dispatch", aa.clone())
             .await?
@@ -762,6 +889,7 @@ async fn dedicated_approvals(
     .await?;
     let view = run.inspect(worker).await?["reinstall_approvals"].clone();
     case.check(
+        "lifecycle_cases.a039",
         "actual page withdrawal names only its approval",
         view[0]["state"] == "standing" && view[1]["state"] == "withdrawn",
     );
@@ -776,12 +904,18 @@ async fn dedicated_approvals(
     aa["read"] = yes["read"].clone();
     let dispatched = dedicated(run, worker, "dispatch", aa).await?;
     case.check(
+        "lifecycle_cases.a040",
         "eligible original separately approved reset dispatches hidden",
         dispatched["dispatched"] == true
             && run.inspect(worker).await?["reinstall_approvals"][0]["state"] == "dispatched",
     );
-    let history = reader::read(&store_files(&run.dump(tab).await?), PASSPHRASE)?;
+    let history = reader::read_at(
+        "reader.call.lifecycle.dedicated_original",
+        &store_files(&run.dump_at("file.lifecycle_cases.dump.005", tab).await?),
+        PASSPHRASE,
+    )?;
     case.check(
+        "lifecycle_cases.a041",
         "independent journal reader sees original approval and actual reset boundary",
         history.records.iter().any(|(_, bytes)| {
             serde_json::from_slice::<Value>(bytes)
@@ -792,23 +926,29 @@ async fn dedicated_approvals(
                 })
         }),
     );
-    cases.push(case);
+    case.finish(cases);
 
     for how in ["Lock", "worker restart"] {
         reset(run, tab, worker, saved).await?;
-        let mut case = Case::new(&format!(
-            "dedicated {how} ends old approval; a separately admitted successor alone can reset (CNF-86)"
-        ));
+        let mut case = Case::new(
+            "lifecycle_cases.c008",
+            &format!(
+                "dedicated {how} ends old approval; a separately admitted successor alone can reset (CNF-86)"
+            ),
+        );
         let a = dedicated(run, worker, "approve", json!({"reset":"ended-reset"})).await?;
         if how == "Lock" {
             setup_cases::click(run, tab, "#tau-lock").await?;
             *worker = run.worker(tab, Some(worker), false).await?;
         } else {
-            *worker = run.reload(tab, worker).await?;
+            *worker = run
+                .reload("lifecycle_cases.rs::reload#3", tab, worker)
+                .await?;
         }
         resume(run, tab, worker).await?;
         let view = run.inspect(worker).await?["reinstall_approvals"].clone();
         case.check(
+            "lifecycle_cases.a042",
             "actual successor shows no longer usable with no withdrawal offer",
             view[0]["state"] == "no longer usable"
                 && view[0]["withdrawal_offer"] == false
@@ -843,7 +983,7 @@ async fn dedicated_approvals(
             json!({"approval":a["approval"],"reset":"ended-reset","read":read["read"]}),
         )
         .await?;
-        case.check("old rendering-session approval cannot dispatch despite otherwise valid current prerequisites",old.get("refused").is_some());
+        case.check("lifecycle_cases.a043", "old rendering-session approval cannot dispatch despite otherwise valid current prerequisites",old.get("refused").is_some());
         let new = dedicated(
             run,
             worker,
@@ -852,13 +992,18 @@ async fn dedicated_approvals(
         )
         .await?;
         case.check(
+            "lifecycle_cases.a044",
             "only new separately admitted approval dispatches under its newer confirmed activation",
             new["dispatched"] == true
                 && run.inspect(worker).await?["reinstall_approvals"][0]["state"]
                     == "no longer usable",
         );
-        reader::read(&store_files(&run.dump(tab).await?), PASSPHRASE)?;
-        cases.push(case);
+        reader::read_at(
+            "reader.call.lifecycle.dedicated_successor",
+            &store_files(&run.dump_at("file.lifecycle_cases.dump.006", tab).await?),
+            PASSPHRASE,
+        )?;
+        case.finish(cases);
     }
     Ok(())
 }
@@ -878,12 +1023,13 @@ async fn visibility(run: &Run<'_>, tab: &Tab, state: &str) -> Result<(), String>
             .await?;
     }
     tokio::time::sleep(Duration::from_millis(100)).await;
-    if run
-        .browser
-        .evaluate(&tab.session, "document.visibilityState")
-        .await?
-        != state
-    {
+    if completion::rejects(
+        "lifecycle.page.visibility_matches",
+        run.browser
+            .evaluate(&tab.session, "document.visibilityState")
+            .await?
+            != state,
+    ) {
         return Err("fixture page visibility did not change".into());
     }
     Ok(())
@@ -898,17 +1044,34 @@ async fn aggregate_cap(
 ) -> Result<(), String> {
     reset(run, tab, worker, saved).await?;
     let mut case = Case::new(
+        "lifecycle_cases.c009",
         "original fixture aggregate cap includes an in-flight lost reply and never renews (CNF-69/82)",
     );
     infer(run, worker).await?;
     let mints = run.aggregator.count("/keys");
-    let before = run.aggregator.count("/completion");
+    let before = counter_inputs::baseline(
+        "lifecycle.aggregate_cap.wait_completion",
+        run,
+        "/completion",
+    );
+    observer::counter_input(
+        "lifecycle.aggregate_cap.wait_completion",
+        "/completion",
+        before + 1,
+    );
     // The first settled charge was 0.01; admit a second charge and hold its reply in flight.
     run.aggregator.state.lock().unwrap().hold_completion = true;
-    module(run,worker,"self.capInFlight=m.inference_request(JSON.stringify({machine:'fixture',messages:[{role:'user',content:'in flight charge'}]}));return true;").await?;
-    wait_count(run, "/completion", before + 1).await?;
+    counter_inputs::module("lifecycle.aggregate_cap.wait_completion", run,worker,"self.capInFlight=m.inference_request(JSON.stringify({machine:'fixture',messages:[{role:'user',content:'in flight charge'}]}));return true;").await?;
+    wait_count(
+        "lifecycle.aggregate_cap.wait_completion",
+        run,
+        "/completion",
+        before + 1,
+    )
+    .await?;
     for _ in 0..8 {
         case.check(
+            "lifecycle_cases.a045",
             "remaining eligible charge uses the same original key",
             infer(run, worker).await?["finished"] == true,
         );
@@ -918,7 +1081,8 @@ async fn aggregate_cap(
     let view = run.inspect(worker).await?;
     let session = view["sessions"][0]["identity"]
         .as_str()
-        .ok_or("session")?
+        .ok_or("session")
+        .checked("lifecycle.aggregate_cap.session")?
         .to_owned();
     let (key_id, cap, spent) = {
         let state = run.aggregator.state.lock().unwrap();
@@ -926,6 +1090,7 @@ async fn aggregate_cap(
         (key.id.clone(), key.cap, key.spent)
     };
     case.check(
+        "lifecycle_cases.a046",
         "issuer total includes the in-flight charge at the hard original aggregate cap",
         cap == Some(10)
             && spent == 10
@@ -934,6 +1099,7 @@ async fn aggregate_cap(
             && refusal.get("body").is_none(),
     );
     case.check(
+        "lifecycle_cases.a047",
         "lost reply remains unaccounted and evidenced key exhaustion ends only its session",
         view["sessions"][0]["unaccounted_spend"]["count"]
             .as_u64()
@@ -953,6 +1119,7 @@ async fn aggregate_cap(
     .await?;
     let _ = infer(run, worker).await?;
     case.check(
+        "lifecycle_cases.a048",
         "credit or clock repair supplies no replacement attempt or refunded cap",
         run.aggregator.count("/keys") == mints
             && run.aggregator.count("/completion") == before_refusal + 1
@@ -966,7 +1133,7 @@ async fn aggregate_cap(
                 .find(|k| k.id == key_id)
                 .is_some_and(|k| k.spent == 10),
     );
-    cases.push(case);
+    case.finish(cases);
     Ok(())
 }
 
@@ -979,6 +1146,7 @@ async fn expiry_case(
 ) -> Result<(), String> {
     reset(run, tab, worker, saved).await?;
     let mut case = Case::new(
+        "lifecycle_cases.c010",
         "original expiry equality fences actual hidden sends and cannot be renewed by credit (CNF-69/82)",
     );
     infer(run, worker).await?;
@@ -989,17 +1157,31 @@ async fn expiry_case(
         .iter()
         .rev()
         .find(|c| c["kind"] == "mint")
-        .ok_or("mint")?;
+        .ok_or("mint")
+        .checked("lifecycle.expiry.mint")?;
     let bounds = &mint["intent"]["mint"];
     let clock = &bounds["evidence"]["clock"];
-    let expires = bounds["expires"].as_u64().ok_or("expiry")?;
+    let expires = bounds["expires"]
+        .as_u64()
+        .ok_or("expiry")
+        .checked("lifecycle.expiry.expires")?;
     let delta = expires
-        .checked_sub(clock["latest"].as_u64().ok_or("issuer anchor")?)
-        .ok_or("expiry before anchor")?;
+        .checked_sub(
+            clock["latest"]
+                .as_u64()
+                .ok_or("issuer anchor")
+                .checked("lifecycle.expiry.issuer_anchor")?,
+        )
+        .ok_or("expiry before anchor")
+        .checked("lifecycle.expiry.interval")?;
     let base_m = clock["sent"]["monotonic"]
         .as_u64()
-        .ok_or("monotonic anchor")?;
-    let base_w = clock["sent"]["wall"].as_u64().ok_or("wall anchor")?;
+        .ok_or("monotonic anchor")
+        .checked("lifecycle.expiry.monotonic")?;
+    let base_w = clock["sent"]["wall"]
+        .as_u64()
+        .ok_or("wall anchor")
+        .checked("lifecycle.expiry.wall")?;
     let other = run
         .browser
         .call(None, "Target.createTarget", json!({"url":"about:blank"}))
@@ -1015,6 +1197,7 @@ async fn expiry_case(
     )
     .await?;
     case.check(
+        "lifecycle_cases.a049",
         "nearest current upper bound below expiry still sends hidden",
         infer(run, worker).await?["finished"] == true,
     );
@@ -1036,6 +1219,7 @@ async fn expiry_case(
         run.aggregator.count("/completion")
     );
     case.check(
+        "lifecycle_cases.a050",
         "expiry equality refuses before actual next completion or replacement mint",
         expired.get("refused").is_some()
             && run.aggregator.count("/completion") == completions
@@ -1044,6 +1228,7 @@ async fn expiry_case(
     run.aggregator.state.lock().unwrap().credit_hundredths += 100;
     module(run, worker, "m.test_clock_sample('','');return true;").await?;
     case.check(
+        "lifecycle_cases.a051",
         "clock refresh and synthetic credit cannot revive the ended session",
         infer(run, worker).await?.get("refused").is_some()
             && run.aggregator.count("/keys") == mints,
@@ -1062,7 +1247,7 @@ async fn expiry_case(
             json!({"targetId":other["targetId"]}),
         )
         .await?;
-    cases.push(case);
+    case.finish(cases);
 
     Ok(())
 }
@@ -1074,7 +1259,8 @@ pub(super) async fn selected(
     cases: &mut Vec<Case>,
     expiry: bool,
 ) -> Result<(), String> {
-    let saved = store_files(&run.dump(tab).await?);
+    let _scenario_span = completion::scenario("lifecycle_cases.selected");
+    let saved = store_files(&run.dump_at("file.lifecycle_cases.dump.007", tab).await?);
     if expiry {
         expiry_case(run, tab, worker, &saved, cases).await
     } else {
@@ -1092,6 +1278,7 @@ async fn reference_revision(
     reset(run, tab, worker, saved).await?;
     infer(run, worker).await?;
     let mut case = Case::new(
+        "lifecycle_cases.c011",
         "actual send rejects a reference revision changed after earlier request protection (CNF-95)",
     );
     let secret = "later-armed-fixture-value-123456";
@@ -1120,6 +1307,7 @@ async fn reference_revision(
         run.aggregator.count("/completion")
     );
     case.check(
+        "lifecycle_cases.a052",
         "changed reference revision sends no old scanned bytes",
         run.aggregator.count("/completion") == before && !leaked && result["unresolved"] == true,
     );
@@ -1133,6 +1321,7 @@ async fn reference_revision(
         .filter_map(|r| request_body(r))
         .collect::<Vec<_>>();
     case.check(
+        "lifecycle_cases.a053",
         "nearest fresh operation scans the same actual value with the now-armed reference",
         eligible["finished"] == true
             && run.aggregator.count("/completion") == before + 1
@@ -1140,7 +1329,7 @@ async fn reference_revision(
                 .iter()
                 .any(|b| b.to_string().contains("<redacted secret: later service>")),
     );
-    cases.push(case);
+    case.finish(cases);
     reset(run, tab, worker, saved).await?;
     Ok(())
 }
@@ -1154,6 +1343,7 @@ async fn unsent_mint(
 ) -> Result<(), String> {
     reset(run, tab, worker, saved).await?;
     let mut case = Case::new(
+        "lifecycle_cases.c012",
         "never-transmitted original mint continues unchanged once after real clock repair (CNF-69/82)",
     );
     let mints = run.aggregator.count("/keys");
@@ -1170,16 +1360,22 @@ async fn unsent_mint(
     let state = run.inspect(worker).await?;
     let original = state["inference_calls"]
         .as_array()
-        .ok_or("calls")?
+        .ok_or("calls")
+        .checked("lifecycle.unsent.initial_calls")?
         .iter()
         .rev()
         .find(|c| c["kind"] == "mint")
-        .ok_or("original mint")?
+        .ok_or("original mint")
+        .checked("lifecycle.unsent.original_mint")?
         .clone();
-    let call = original["call"].as_u64().ok_or("call")?;
+    let call = original["call"]
+        .as_u64()
+        .ok_or("call")
+        .checked("lifecycle.unsent.call")?;
     let session = original["intent"]["mint"]["session"]
         .as_str()
-        .ok_or("session")?
+        .ok_or("session")
+        .checked("lifecycle.unsent.session")?
         .to_owned();
     let refused = module(
         run,
@@ -1187,7 +1383,7 @@ async fn unsent_mint(
         &format!("return JSON.parse(await m.continue_inference(BigInt({call})));"),
     )
     .await?;
-    case.check("processed freeze retained one durable never-sent mint and uncertain clock refuses its send",original["state"]=="unresolved"&&run.aggregator.count("/keys")==mints&&refused.get("refused").is_some());
+    case.check("lifecycle_cases.a054", "processed freeze retained one durable never-sent mint and uncertain clock refuses its send",original["state"]=="unresolved"&&run.aggregator.count("/keys")==mints&&refused.get("refused").is_some());
     let verified = module(
         run,
         worker,
@@ -1198,6 +1394,7 @@ async fn unsent_mint(
     )
     .await?;
     case.check(
+        "lifecycle_cases.a055",
         "actual narrow time exchange repairs the same non-ended session",
         verified["finished"] == true,
     );
@@ -1208,8 +1405,12 @@ async fn unsent_mint(
     )
     .await?;
     let state = run.inspect(worker).await?;
-    let calls = state["inference_calls"].as_array().ok_or("calls")?;
+    let calls = state["inference_calls"]
+        .as_array()
+        .ok_or("calls")
+        .checked("lifecycle.unsent.final_calls")?;
     case.check(
+        "lifecycle_cases.a056",
         "actual original mint is sent once without another intent or changed origin/expiry/cap",
         continued["finished"] == true
             && continued.get("refused").is_none()
@@ -1231,13 +1432,18 @@ async fn unsent_mint(
     )
     .await?;
     case.check(
+        "lifecycle_cases.a057",
         "transmitted original cannot be retried and next ordinary completion keeps its key",
         again.get("refused").is_some()
             && infer(run, worker).await?["finished"] == true
             && run.aggregator.count("/keys") == mints + 1,
     );
-    reader::read(&store_files(&run.dump(tab).await?), PASSPHRASE)?;
-    cases.push(case);
+    reader::read_at(
+        "reader.call.lifecycle.original_mint",
+        &store_files(&run.dump_at("file.lifecycle_cases.dump.008", tab).await?),
+        PASSPHRASE,
+    )?;
+    case.finish(cases);
     Ok(())
 }
 
@@ -1247,26 +1453,32 @@ pub(super) async fn locked_freeze(
     worker: &mut Worker,
     cases: &mut Vec<Case>,
 ) -> Result<(), String> {
-    *worker = run.reload(tab, worker).await?;
+    let _scenario_span = completion::scenario("lifecycle_cases.locked_freeze");
+    *worker = run
+        .reload("lifecycle_cases.rs::reload#4", tab, worker)
+        .await?;
     let mut case = Case::new(
+        "lifecycle_cases.c013",
         "processed freeze and return preserve a locked store and allow later explicit unlock (CNF-7/82)",
     );
     event(run, tab, "freeze").await?;
-    case.check("actual frozen page still says locked and offers only explicit unlock",run.inspect(worker).await?["state"]=="locked"&&run.browser.evaluate(&tab.session,"document.getElementById('tau-store').dataset.state==='locked' && !document.getElementById('tau-unlock').hidden && document.getElementById('tau-lock').hidden").await?==true);
+    case.check("lifecycle_cases.a058", "actual frozen page still says locked and offers only explicit unlock",run.inspect(worker).await?["state"]=="locked"&&run.browser.evaluate(&tab.session,"document.getElementById('tau-store').dataset.state==='locked' && !document.getElementById('tau-unlock').hidden && document.getElementById('tau-lock').hidden").await?==true);
     event(run, tab, "resume").await?;
     case.check(
+        "lifecycle_cases.a059",
         "actual return does not unwrap or invent unlocked authority",
         run.inspect(worker).await?["state"] == "locked",
     );
     resume(run, tab, worker).await?;
     let view = run.inspect(worker).await?;
     case.check(
+        "lifecycle_cases.a060",
         "subsequent explicit unlock and admission use the retained worker normally",
         view["state"] == "unlocked"
             && view["lifecycle_state"] != "reconciling"
             && view["sessions"].as_array().is_some_and(|s| !s.is_empty()),
     );
-    cases.push(case);
+    case.finish(cases);
     Ok(())
 }
 
@@ -1276,6 +1488,7 @@ pub(super) async fn repair_cases(
     worker: &mut Worker,
     cases: &mut Vec<Case>,
 ) -> Result<(), String> {
-    let saved = store_files(&run.dump(tab).await?);
+    let _scenario_span = completion::scenario("lifecycle_cases.repair_cases");
+    let saved = store_files(&run.dump_at("file.lifecycle_cases.dump.009", tab).await?);
     repairs::run(run, tab, worker, &saved, cases).await
 }

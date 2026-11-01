@@ -10,6 +10,7 @@ pub(super) async fn run(
     args: &dyn Fn(&str) -> Value,
     cases: &mut Vec<Case>,
 ) -> Result<(), String> {
+    let _scenario_span = completion::scenario("mode_cases.run");
     run.browser
         .call(
             None,
@@ -18,10 +19,12 @@ pub(super) async fn run(
         )
         .await?;
     *worker = run.worker(tab, None, false).await?;
-    let original = store_files(&run.dump(tab).await?);
-    let mnemonic = reader::read(&original, pass)?.mnemonic()?;
+    let original = store_files(&run.dump_at("file.mode_cases.dump.001", tab).await?);
+    let mnemonic = reader::read_at("reader.call.mode.original", &original, pass)?
+        .mnemonic_at("reader.aux.call.mode.original.mnemonic")?;
     let mut events = vec![json!({"seed":{"mnemonic":mnemonic}})];
-    events.extend(reader::setup_events(
+    events.extend(reader::setup_events_at(
+        "reader.aux.call.mode.setup",
         &mnemonic,
         &["fixture", "fixture-other"],
     ));
@@ -33,17 +36,23 @@ pub(super) async fn run(
     let identity = events[2]["setup"]["approval"]["entries"][0]["identity"].clone();
     let session = format!("session-{}", events.len());
     events.push(json!({"exposure":{"session":session,"bound_set":[{"machine":"fixture","identity":identity}],"accepted_modes":["no_artifact_pin"]}}));
-    run.put(tab, &reader::build(pass, &events)).await?;
-    *worker = run.reload(tab, worker).await?;
+    run.put(
+        tab,
+        &reader::build_at("file.mode_cases.build.001", pass, &events),
+    )
+    .await?;
+    *worker = run.reload("mode_cases.rs::reload#1", tab, worker).await?;
     run.submit(tab, "unlock", pass).await?;
     binding_cases::prepare(run, tab, worker, pass).await?;
     let build = if tracer { "tracer" } else { "served" };
-    let mut case = Case::new(&format!(
-        "acceptable weaker modes and pre-contact signature refusal: {build}"
-    ));
+    let mut case = Case::new(
+        "mode_cases.c001",
+        &format!("acceptable weaker modes and pre-contact signature refusal: {build}"),
+    );
     let before = run.inspect(worker).await?;
     let labels = json!(["An installation with no artifact pin"]);
     case.check(
+        "mode_cases.a001",
         "the rebound session lists exactly the installation mode",
         before["sessions"]
             .as_array()
@@ -52,6 +61,7 @@ pub(super) async fn run(
             .any(|s| s["bound_set"] == json!(["fixture"]) && s["standing_modes"] == labels),
     );
     case.check(
+        "mode_cases.a002",
         "inspection records the installation as unpinned",
         before["installations"] == json!([{"machine":"fixture","installation":"unpinned"}]),
     );
@@ -63,6 +73,7 @@ pub(super) async fn run(
         )
         .await?;
     case.check(
+        "mode_cases.a003",
         "fixture's section renders the exact installation and standing label",
         rendered.as_str().is_some_and(|s| {
             s.lines().any(|line| line == "Installation: unpinned.")
@@ -95,6 +106,7 @@ pub(super) async fn run(
     let report = run.browser.evaluate(&worker.session, "(async()=>{const m=await import(new URL('./pkg/tau_web.js',self.location.href).href);return JSON.parse(await m.open());})()").await?;
     for surface in [page.to_string(), before.to_string(), report.to_string()] {
         case.check(
+            "mode_cases.a004",
             "no artifact pin or package signer is claimed",
             needles.iter().all(|n| !surface.contains(n))
                 && !["\"hash\"", "\"signer\"", "\"sha256\""]
@@ -114,10 +126,16 @@ pub(super) async fn run(
         let before = run.inspect(worker).await?;
         let mut request = args("fixture");
         request["command"] = bytes.into();
-        let report = run.harness_run(worker, request).await?;
-        run.sshd.all_ended().await;
+        let report = run.harness_run("mode_cases.rs#1", worker, request).await?;
+        run.sshd
+            .all_ended_at(
+                Some("mode.signature.connection_end"),
+                json!({"ignored_result":true,"form":form}),
+            )
+            .await;
         let seen = take(run.seen);
         case.check(
+            "mode_cases.a005",
             "lowering refused before relay or SSH contact and exec",
             report["outcome"]
                 == json!({"refused":"signature-lowering","machine":"fixture","form":form})
@@ -127,6 +145,7 @@ pub(super) async fn run(
         );
         let after = run.inspect(worker).await?;
         case.check(
+            "mode_cases.a006",
             "exactly one refusal, no intent, unchanged modes",
             after["records"].as_array().unwrap().len()
                 == before["records"].as_array().unwrap().len() + 1
@@ -137,10 +156,15 @@ pub(super) async fn run(
                 && after["signature_refusals"].as_array().unwrap().last()
                     == Some(&json!({"machine":"fixture","form":form})),
         );
-        let opened = reader::read(&store_files(&run.dump(tab).await?), pass)?;
+        let opened = reader::read_at(
+            "reader.call.mode.signature_refusal",
+            &store_files(&run.dump_at("file.mode_cases.dump.002", tab).await?),
+            pass,
+        )?;
         let event: Value =
             serde_json::from_slice(&opened.records.last().unwrap().1).map_err(|e| e.to_string())?;
         case.check(
+            "mode_cases.a007",
             "independent reader reads the exact refusal record",
             event == json!({"signature_refusal":{"machine":"fixture","form":form}}),
         );
@@ -154,10 +178,11 @@ pub(super) async fn run(
             take(run.seen);
             let mut request = args(machine);
             request["command"] = bytes.into();
-            let report = run.harness_run(worker, request).await?;
+            let report = run.harness_run("mode_cases.rs#2", worker, request).await?;
             let observed = take(run.seen);
             let after = run.inspect(worker).await?;
             case.check(
+                "mode_cases.a008",
                 "controls complete with a journaled terminal",
                 report["outcome"]["done"] == true
                     && report["outcome"]["exit_status"] == status
@@ -179,12 +204,20 @@ pub(super) async fn run(
         run.sshd.present_other.store(true, Ordering::SeqCst);
         fresh_pace(run.relay);
         take(run.seen);
-        let report = run.harness_run(worker, args("fixture")).await?;
+        let report = run
+            .harness_run("mode_cases.rs#3", worker, args("fixture"))
+            .await?;
         run.sshd.present_other.store(false, Ordering::SeqCst);
-        run.sshd.all_ended().await;
+        run.sshd
+            .all_ended_at(
+                Some("mode.host_key.connection_end"),
+                json!({"ignored_result":true}),
+            )
+            .await;
         let observed = take(run.seen);
         let after = run.inspect(worker).await?;
         case.check(
+            "mode_cases.a009",
             "wrong host key halts without entering any mode",
             report["outcome"]["refused"] == "host-key"
                 && before["mode_acceptances"] == after["mode_acceptances"]
@@ -194,9 +227,9 @@ pub(super) async fn run(
                 && observed.ssh_auth.is_empty(),
         );
     }
-    cases.push(case);
+    case.finish(cases);
     run.put(tab, &original).await?;
-    *worker = run.reload(tab, worker).await?;
+    *worker = run.reload("mode_cases.rs::reload#2", tab, worker).await?;
     run.submit(tab, "unlock", pass).await?;
     Ok(())
 }

@@ -4,6 +4,4 @@
 # every case. CHROME names the Chrome or Chromium binary; without it the tracer fails.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-scripts/build-web.sh served
-scripts/build-web.sh tracer
-cargo run --locked -p tracer -- run dist/served dist/tracer
+exec python3 scripts/tracer-driver.py "$@"

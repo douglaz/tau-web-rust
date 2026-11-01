@@ -1,0 +1,83 @@
+{
+  "mode": "targeted",
+  "duration_ns": 10,
+  "cases": [
+    {
+      "id": "seed_cases.c001.p004",
+      "site_id": "seed_cases.c001",
+      "start_ns": 3,
+      "end_ns": 4
+    },
+    {
+      "id": "seed_cases.c001.p005",
+      "site_id": "seed_cases.c001",
+      "start_ns": 7,
+      "end_ns": 8
+    }
+  ],
+  "helper_history": [
+    {
+      "event": "scenario_start",
+      "id": "seed_cases.run",
+      "invocation": 1,
+      "at_ns": 2
+    },
+    {
+      "event": "case_start",
+      "id": "seed_cases.c001.p004",
+      "at_ns": 3
+    },
+    {
+      "event": "case_end",
+      "id": "seed_cases.c001.p004",
+      "at_ns": 4
+    },
+    {
+      "event": "scenario_end",
+      "id": "seed_cases.run",
+      "invocation": 1,
+      "at_ns": 5
+    },
+    {
+      "event": "scenario_start",
+      "id": "seed_cases.run",
+      "invocation": 2,
+      "at_ns": 6
+    },
+    {
+      "event": "case_start",
+      "id": "seed_cases.c001.p005",
+      "at_ns": 7
+    },
+    {
+      "event": "case_end",
+      "id": "seed_cases.c001.p005",
+      "at_ns": 8
+    },
+    {
+      "event": "scenario_end",
+      "id": "seed_cases.run",
+      "invocation": 2,
+      "at_ns": 9
+    }
+  ],
+  "scenario_spans": [
+    {
+      "id": "seed_cases.run",
+      "invocation": 1,
+      "start_ns": 2,
+      "end_ns": 5
+    },
+    {
+      "id": "seed_cases.run",
+      "invocation": 2,
+      "start_ns": 6,
+      "end_ns": 9
+    }
+  ],
+  "prerequisites": [],
+  "prerequisite_requests": {},
+  "plan": {
+    "invocation_root_sequences": []
+  }
+}

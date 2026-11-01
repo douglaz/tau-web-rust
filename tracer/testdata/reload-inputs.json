@@ -1,0 +1,168 @@
+{
+  "report": {
+    "mode": "targeted",
+    "plan": {
+      "invocation_root_sequences": [
+        {
+          "scenario": "main.run",
+          "owner": "after",
+          "case": "",
+          "invocation": 1,
+          "tokens": [
+            "call:runtime.worker"
+          ],
+          "reload_sources": [
+            null
+          ],
+          "prepare_domains": [],
+          "page_operations": [
+            "new:tracer"
+          ]
+        },
+        {
+          "scenario": "main.run",
+          "owner": "inside",
+          "case": "main.c002.p001",
+          "invocation": 1,
+          "tokens": [
+            "call:runtime.worker"
+          ],
+          "reload_sources": [
+            "main.rs::reload#1"
+          ],
+          "prepare_domains": [],
+          "page_operations": [
+            "tracer"
+          ]
+        }
+      ],
+      "helper_owner_sequences": [
+        {
+          "scenario": "main.run",
+          "owner": "after",
+          "case": "",
+          "invocation": 1,
+          "tokens": [
+            "call:runtime.worker"
+          ],
+          "reload_sources": [
+            null
+          ],
+          "prepare_domains": [],
+          "page_operations": [
+            "new:tracer"
+          ]
+        },
+        {
+          "scenario": "main.run",
+          "owner": "inside",
+          "case": "main.c002.p001",
+          "invocation": 1,
+          "tokens": [
+            "call:runtime.worker"
+          ],
+          "reload_sources": [
+            "main.rs::reload#1"
+          ],
+          "prepare_domains": [],
+          "page_operations": [
+            "tracer"
+          ]
+        }
+      ]
+    },
+    "helper_history": [
+      {
+        "event": "scenario_start",
+        "id": "main.run",
+        "invocation": 1,
+        "at_ns": 0
+      },
+      {
+        "event": "call_start",
+        "call": 1,
+        "kind": "runtime.worker",
+        "page": 1,
+        "worker": 0,
+        "at_ns": 10
+      },
+      {
+        "event": "worker_selected",
+        "call": 1,
+        "worker": 1,
+        "at_ns": 20
+      },
+      {
+        "event": "call_end",
+        "call": 1,
+        "at_ns": 30
+      },
+      {
+        "event": "case_start",
+        "id": "main.c002.p001",
+        "at_ns": 40
+      },
+      {
+        "event": "call_start",
+        "call": 2,
+        "kind": "runtime.worker",
+        "page": 1,
+        "worker": 0,
+        "at_ns": 50
+      },
+      {
+        "event": "worker_selected",
+        "call": 2,
+        "worker": 2,
+        "at_ns": 60
+      },
+      {
+        "event": "call_end",
+        "call": 2,
+        "at_ns": 70
+      },
+      {
+        "event": "case_end",
+        "id": "main.c002.p001",
+        "at_ns": 90
+      },
+      {
+        "event": "scenario_end",
+        "id": "main.run",
+        "invocation": 1,
+        "at_ns": 100
+      }
+    ],
+    "observer_calls": [],
+    "settle_inputs": [],
+    "state_inputs": {
+      "operations": [
+        {
+          "source": 1,
+          "site": "main.rs::reload#1",
+          "kind": "reload",
+          "page": 1,
+          "worker": 1,
+          "case": "main.c002.p001",
+          "start_ns": 49,
+          "end_ns": 71,
+          "start_cursor": 5,
+          "end_cursor": 8,
+          "receiver_ok": true,
+          "input_ok": true,
+          "completed": true,
+          "dispatches": 1,
+          "successor": 2,
+          "session": null,
+          "script_items": 0
+        }
+      ]
+    }
+  },
+  "inventory": {
+    "state_reload_sites": [
+      "main.rs::reload#1"
+    ],
+    "state_prepare_reload_site": "binding_cases.rs::reload#1"
+  }
+}

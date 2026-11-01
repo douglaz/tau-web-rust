@@ -1,0 +1,319 @@
+{
+  "key": {
+    "cases": [
+      {
+        "id": "main.c009.p001",
+        "site_id": "main.c009",
+        "invocation": 1
+      }
+    ],
+    "settle_call_rules": [
+      [
+        "settle.main.001",
+        "main.c009",
+        "inside"
+      ]
+    ]
+  },
+  "empty": {
+    "mode": "targeted",
+    "plan": {
+      "expected_execution": [
+        "main.c009.p001"
+      ],
+      "helper_owner_sequences": [
+        {
+          "scenario": "main.run",
+          "owner": "inside",
+          "case": "main.c009.p001",
+          "tokens": [
+            "call:runtime.worker"
+          ],
+          "page_operations": [
+            "new:tracer"
+          ],
+          "prepare_domains": []
+        }
+      ]
+    },
+    "duration_ns": 42,
+    "helper_history": [
+      {
+        "event": "scenario_start",
+        "id": "main.run",
+        "invocation": 1,
+        "at_ns": 0
+      },
+      {
+        "event": "case_start",
+        "id": "main.c009.p001",
+        "at_ns": 1
+      },
+      {
+        "event": "call_start",
+        "call": 1,
+        "kind": "runtime.worker",
+        "page": 1,
+        "worker": 0,
+        "at_ns": 2
+      },
+      {
+        "event": "worker_selected",
+        "call": 1,
+        "worker": 1,
+        "operand_ok": true,
+        "at_ns": 3
+      },
+      {
+        "event": "call_end",
+        "call": 1,
+        "at_ns": 4
+      },
+      {
+        "event": "case_end",
+        "id": "main.c009.p001",
+        "at_ns": 40
+      },
+      {
+        "event": "scenario_end",
+        "id": "main.run",
+        "invocation": 1,
+        "at_ns": 41
+      }
+    ],
+    "file_captures": [],
+    "reader_roots": [],
+    "settle_inputs": [
+      {
+        "source": 1,
+        "site": "settle.main.001",
+        "page": 1,
+        "worker": 1,
+        "input": [
+          [
+            true,
+            false
+          ],
+          [
+            false,
+            true
+          ]
+        ],
+        "empty_tests": 1,
+        "empty": true,
+        "dispositions": 0,
+        "constructor_uses": 0,
+        "start_ns": 10,
+        "end_ns": 11,
+        "start_cursor": 5,
+        "end_cursor": 5,
+        "ok": true,
+        "reader_origin": null,
+        "puts": []
+      }
+    ]
+  },
+  "nonempty": {
+    "mode": "targeted",
+    "plan": {
+      "expected_execution": [
+        "main.c009.p001"
+      ],
+      "helper_owner_sequences": [
+        {
+          "scenario": "main.run",
+          "owner": "inside",
+          "case": "main.c009.p001",
+          "tokens": [
+            "call:runtime.worker",
+            "call:runtime.worker",
+            "call:runtime.submit",
+            "call:binding.prepare"
+          ],
+          "page_operations": [
+            "new:tracer",
+            "tracer",
+            "tracer",
+            "tracer"
+          ],
+          "prepare_domains": []
+        }
+      ]
+    },
+    "duration_ns": 42,
+    "helper_history": [
+      {
+        "event": "scenario_start",
+        "id": "main.run",
+        "invocation": 1,
+        "at_ns": 0
+      },
+      {
+        "event": "case_start",
+        "id": "main.c009.p001",
+        "at_ns": 1
+      },
+      {
+        "event": "call_start",
+        "call": 1,
+        "kind": "runtime.worker",
+        "page": 1,
+        "worker": 0,
+        "at_ns": 2
+      },
+      {
+        "event": "worker_selected",
+        "call": 1,
+        "worker": 1,
+        "operand_ok": true,
+        "at_ns": 3
+      },
+      {
+        "event": "call_end",
+        "call": 1,
+        "at_ns": 4
+      },
+      {
+        "event": "call_start",
+        "call": 2,
+        "kind": "runtime.worker",
+        "page": 1,
+        "worker": 0,
+        "at_ns": 19
+      },
+      {
+        "event": "worker_selected",
+        "call": 2,
+        "worker": 2,
+        "operand_ok": true,
+        "at_ns": 20
+      },
+      {
+        "event": "call_end",
+        "call": 2,
+        "at_ns": 21
+      },
+      {
+        "event": "call_start",
+        "call": 3,
+        "kind": "runtime.submit",
+        "page": 1,
+        "worker": 2,
+        "at_ns": 24
+      },
+      {
+        "event": "call_end",
+        "call": 3,
+        "at_ns": 25
+      },
+      {
+        "event": "call_start",
+        "call": 4,
+        "kind": "binding.prepare",
+        "page": 1,
+        "worker": 2,
+        "at_ns": 28
+      },
+      {
+        "event": "call_end",
+        "call": 4,
+        "at_ns": 32
+      },
+      {
+        "event": "case_end",
+        "id": "main.c009.p001",
+        "at_ns": 40
+      },
+      {
+        "event": "scenario_end",
+        "id": "main.run",
+        "invocation": 1,
+        "at_ns": 41
+      }
+    ],
+    "file_captures": [
+      {
+        "source": 1,
+        "kind": "browser.dump",
+        "site": "file.main.dump.017",
+        "page": 1,
+        "parent": null,
+        "ok": true,
+        "case": "main.c009.p001",
+        "at_ns": 12,
+        "history_cursor": 5
+      },
+      {
+        "source": 2,
+        "kind": "browser.store",
+        "site": "file.main.dump.017",
+        "page": 1,
+        "parent": 1,
+        "ok": true,
+        "case": "main.c009.p001",
+        "at_ns": 13,
+        "history_cursor": 5
+      },
+      {
+        "source": 3,
+        "kind": "constructor",
+        "site": "file.main.build.008",
+        "page": 0,
+        "parent": null,
+        "ok": true,
+        "case": "main.c009.p001",
+        "at_ns": 18,
+        "history_cursor": 5
+      }
+    ],
+    "reader_roots": [
+      {
+        "site": "reader.call.settle_unresolved.disposition_source",
+        "start_ns": 14,
+        "end_ns": 17,
+        "file_input": {
+          "source": 2
+        },
+        "instance": "reader.read.i001"
+      }
+    ],
+    "settle_inputs": [
+      {
+        "source": 1,
+        "site": "settle.main.001",
+        "page": 1,
+        "worker": 1,
+        "input": [
+          [
+            true,
+            true
+          ]
+        ],
+        "empty_tests": 1,
+        "empty": false,
+        "dispositions": 1,
+        "constructor_uses": 1,
+        "start_ns": 10,
+        "end_ns": 33,
+        "start_cursor": 5,
+        "end_cursor": 12,
+        "ok": true,
+        "reader_origin": 1,
+        "puts": [
+          {
+            "input": {
+              "site": "file.main.build.008",
+              "source": 3,
+              "kind": "constructor",
+              "page": 0,
+              "ok": true
+            },
+            "page": 1,
+            "at_ns": 18,
+            "history_cursor": 5
+          }
+        ]
+      }
+    ]
+  }
+}

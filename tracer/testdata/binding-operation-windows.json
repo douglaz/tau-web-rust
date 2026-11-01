@@ -1,0 +1,297 @@
+{
+  "report": {
+    "mode": "targeted",
+    "duration_ns": 45,
+    "plan": {
+      "expected_execution": [
+        "binding_cases.c002.p001"
+      ],
+      "helper_owner_sequences": [
+        {
+          "scenario": "binding_cases.run",
+          "owner": "after",
+          "case": null,
+          "page_operations": [
+            "new:tracer"
+          ]
+        }
+      ],
+      "invocation_root_sequences": [],
+      "name": "component"
+    },
+    "cases": [
+      {
+        "id": "binding_cases.c002.p001",
+        "start_ns": 4
+      }
+    ],
+    "helper_history": [
+      {
+        "event": "scenario_start",
+        "id": "binding_cases.run",
+        "invocation": 1,
+        "at_ns": 0
+      },
+      {
+        "event": "call_start",
+        "call": 1,
+        "kind": "runtime.worker",
+        "page": 7,
+        "at_ns": 1
+      },
+      {
+        "event": "worker_selected",
+        "call": 1,
+        "worker": 3,
+        "at_ns": 2
+      },
+      {
+        "event": "call_end",
+        "call": 1,
+        "at_ns": 3
+      },
+      {
+        "event": "case_start",
+        "id": "binding_cases.c002.p001",
+        "at_ns": 4
+      },
+      {
+        "event": "check",
+        "id": "binding.machine_identity.schema",
+        "at_ns": 15
+      },
+      {
+        "event": "check",
+        "id": "binding.machine_identity.schema",
+        "at_ns": 35
+      },
+      {
+        "event": "case_end",
+        "id": "binding_cases.c002.p001",
+        "at_ns": 40
+      },
+      {
+        "event": "scenario_end",
+        "id": "binding_cases.run",
+        "at_ns": 41
+      }
+    ],
+    "file_captures": [
+      {
+        "source": 1,
+        "kind": "browser.dump",
+        "parent": null,
+        "page": 7,
+        "history_cursor": 5,
+        "at_ns": 12,
+        "site": "file.binding_cases.dump.010"
+      },
+      {
+        "source": 2,
+        "kind": "browser.store",
+        "parent": 1,
+        "page": 7,
+        "history_cursor": 5,
+        "at_ns": 13,
+        "site": "file.binding_cases.dump.010"
+      },
+      {
+        "source": 3,
+        "kind": "browser.dump",
+        "parent": null,
+        "page": 7,
+        "history_cursor": 6,
+        "at_ns": 16,
+        "site": "file.binding_cases.dump.011"
+      },
+      {
+        "source": 4,
+        "kind": "browser.store",
+        "parent": 3,
+        "page": 7,
+        "history_cursor": 6,
+        "at_ns": 17,
+        "site": "file.binding_cases.dump.011"
+      },
+      {
+        "source": 5,
+        "kind": "browser.dump",
+        "parent": null,
+        "page": 7,
+        "history_cursor": 6,
+        "at_ns": 32,
+        "site": "file.binding_cases.dump.010"
+      },
+      {
+        "source": 6,
+        "kind": "browser.store",
+        "parent": 5,
+        "page": 7,
+        "history_cursor": 6,
+        "at_ns": 33,
+        "site": "file.binding_cases.dump.010"
+      },
+      {
+        "source": 7,
+        "kind": "browser.dump",
+        "parent": null,
+        "page": 7,
+        "history_cursor": 7,
+        "at_ns": 36,
+        "site": "file.binding_cases.dump.011"
+      },
+      {
+        "source": 8,
+        "kind": "browser.store",
+        "parent": 7,
+        "page": 7,
+        "history_cursor": 7,
+        "at_ns": 37,
+        "site": "file.binding_cases.dump.011"
+      }
+    ],
+    "file_comparisons": [],
+    "reader_roots": [
+      {
+        "site": "reader.call.binding.authentication_index",
+        "history_cursor": 5,
+        "end_ns": 14,
+        "file_input": {
+          "source": 2
+        }
+      },
+      {
+        "site": "reader.call.binding.authentication_journal",
+        "history_cursor": 6,
+        "end_ns": 18,
+        "file_input": {
+          "source": 4
+        }
+      },
+      {
+        "site": "reader.call.binding.authentication_index",
+        "history_cursor": 6,
+        "end_ns": 34,
+        "file_input": {
+          "source": 6
+        }
+      },
+      {
+        "site": "reader.call.binding.authentication_journal",
+        "history_cursor": 7,
+        "end_ns": 38,
+        "file_input": {
+          "source": 8
+        }
+      }
+    ],
+    "primary_history": [
+      {
+        "case": "binding_cases.c002.p001",
+        "id": "binding_cases.a007.i001",
+        "at_ns": 19,
+        "history_cursor": 6
+      },
+      {
+        "case": "binding_cases.c002.p001",
+        "id": "binding_cases.a007.i002",
+        "at_ns": 39,
+        "history_cursor": 7
+      }
+    ],
+    "file_uses": {
+      "puts": [],
+      "operations": [],
+      "binding": [
+        {
+          "source": 1,
+          "ordinal": 1,
+          "page": 7,
+          "worker": 3,
+          "case": "binding_cases.c002.p001",
+          "start_ns": 8,
+          "end_ns": 10,
+          "start_cursor": 5,
+          "end_cursor": 5,
+          "ok": true
+        },
+        {
+          "source": 2,
+          "ordinal": 2,
+          "page": 7,
+          "worker": 3,
+          "case": "binding_cases.c002.p001",
+          "start_ns": 28,
+          "end_ns": 30,
+          "start_cursor": 6,
+          "end_cursor": 6,
+          "ok": true
+        }
+      ]
+    },
+    "settle_inputs": [],
+    "state_inputs": {
+      "operations": []
+    },
+    "file_dump_queries": [
+      {
+        "source": 1,
+        "page": 7,
+        "start_ns": 11,
+        "end_ns": 12,
+        "start_cursor": 5,
+        "end_cursor": 5,
+        "query_ok": true,
+        "completed": true
+      },
+      {
+        "source": 3,
+        "page": 7,
+        "start_ns": 15,
+        "end_ns": 16,
+        "start_cursor": 6,
+        "end_cursor": 6,
+        "query_ok": true,
+        "completed": true
+      },
+      {
+        "source": 5,
+        "page": 7,
+        "start_ns": 31,
+        "end_ns": 32,
+        "start_cursor": 6,
+        "end_cursor": 6,
+        "query_ok": true,
+        "completed": true
+      },
+      {
+        "source": 7,
+        "page": 7,
+        "start_ns": 35,
+        "end_ns": 36,
+        "start_cursor": 7,
+        "end_cursor": 7,
+        "query_ok": true,
+        "completed": true
+      }
+    ]
+  },
+  "inventory": {
+    "cases": [
+      {
+        "id": "binding_cases.c002.p001",
+        "site_id": "binding_cases.c002",
+        "invocation": 1
+      }
+    ],
+    "file_put_windows": {},
+    "file_operation_sources": {
+      "goal.harness_job_refusal": 3,
+      "binding.authentication": [
+        2,
+        1
+      ]
+    },
+    "file_installation_rules": []
+  }
+}

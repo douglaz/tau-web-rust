@@ -12,6 +12,49 @@ use tokio_tungstenite::tungstenite::Message;
 
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>;
 
+/// The actual DevTools query and its immutable returned value travel together.
+/// Only this transport boundary can construct an original evaluation.
+pub struct OriginalEvaluation {
+    value: Value,
+    session: String,
+    expression: String,
+    start_ns: u64,
+    end_ns: u64,
+    start_cursor: usize,
+    end_cursor: usize,
+}
+impl OriginalEvaluation {
+    pub fn encloses(&self, start: u64, end: u64, cursor: usize) -> bool {
+        self.start_ns <= start
+            && start <= end
+            && end <= self.end_ns
+            && self.start_cursor == cursor
+            && self.end_cursor == cursor
+    }
+    pub fn within(&self, start: u64, cursor: usize) -> bool {
+        self.start_ns >= start
+            && self.end_ns >= self.start_ns
+            && self.end_ns <= crate::completion::now()
+            && self.start_cursor == cursor
+            && self.end_cursor == cursor
+    }
+    pub fn matches(&self, session: &str, expression: &str) -> bool {
+        self.session == session && self.expression == expression
+    }
+    pub fn matches_hash(&self, session: &str, hash: &str) -> bool {
+        self.session == session
+            && hex::encode(
+                ring::digest::digest(&ring::digest::SHA256, self.expression.as_bytes()).as_ref(),
+            ) == hash
+    }
+}
+impl std::ops::Deref for OriginalEvaluation {
+    type Target = Value;
+    fn deref(&self) -> &Value {
+        &self.value
+    }
+}
+
 pub struct Browser {
     child: tokio::process::Child,
     profile: PathBuf,
@@ -172,6 +215,8 @@ impl Browser {
         method: &str,
         params: Value,
     ) -> Result<Value, String> {
+        let _original_call = crate::operation_windows::call(session, method, &params);
+        crate::state_inputs::dispatch(session, method, &params);
         let id = {
             let mut next = self.next.lock().expect("id lock");
             *next += 1;
@@ -206,14 +251,32 @@ impl Browser {
                 json!({ "expression": expression, "awaitPromise": true, "returnByValue": true }),
             )
             .await?;
-        match result.get("exceptionDetails") {
-            Some(details) => Err(details["exception"]["description"]
-                .as_str()
-                .or(details["exception"]["value"].as_str())
-                .unwrap_or(&details.to_string())
-                .to_string()),
-            None => Ok(result["result"]["value"].clone()),
-        }
+        evaluated(result)
+    }
+
+    pub async fn evaluate_original(
+        &self,
+        session: &str,
+        expression: &str,
+    ) -> Result<OriginalEvaluation, String> {
+        let start_ns = crate::completion::now();
+        let start_cursor = crate::history::cursor();
+        let result = self
+            .call(
+                Some(session),
+                "Runtime.evaluate",
+                json!({"expression":expression,"awaitPromise":true,"returnByValue":true}),
+            )
+            .await?;
+        Ok(OriginalEvaluation {
+            value: evaluated(result)?,
+            session: session.into(),
+            expression: expression.into(),
+            start_ns,
+            end_ns: crate::completion::now(),
+            start_cursor,
+            end_cursor: crate::history::cursor(),
+        })
     }
 
     pub fn event_count(&self) -> usize {
@@ -222,29 +285,33 @@ impl Browser {
 
     /// Closes the browser, kills the process it started if it has not exited, and deletes the
     /// profile it was given, by that exact path.
-    pub async fn close(mut self) {
+    pub async fn close(mut self) -> bool {
         let _ = tokio::time::timeout(
             Duration::from_secs(5),
             self.call(None, "Browser.close", json!({})),
         )
         .await;
-        if tokio::time::timeout(Duration::from_secs(10), self.child.wait())
-            .await
-            .is_err()
-        {
-            let _ = self.child.kill().await;
-        }
-        remove_profile(&self.profile);
+        let reaped = match tokio::time::timeout(Duration::from_secs(10), self.child.wait()).await {
+            Ok(Ok(_)) => true,
+            Ok(Err(_)) => false,
+            Err(_) => {
+                let _ = self.child.kill().await;
+                self.child.wait().await.is_ok()
+            }
+        };
+        let removed = remove_profile(&self.profile);
+        reaped && removed
     }
 }
 
-fn remove_profile(profile: &Path) {
+fn remove_profile(profile: &Path) -> bool {
     if let Err(e) = std::fs::remove_dir_all(profile) {
         eprintln!(
             "could not delete the Chrome profile {}: {e}",
             profile.display()
         );
     }
+    !profile.exists()
 }
 
 /// Exact loopback origins only; rejecting an unknown spelling happens before transmission.
@@ -263,4 +330,41 @@ pub fn loopback_url(url: &str) -> bool {
                 .and_then(|p| p.strip_prefix(':'))
                 .is_some_and(|p| !p.is_empty() && p.parse::<u16>().is_ok())
     })
+}
+
+fn evaluated(result: Value) -> Result<Value, String> {
+    match result.get("exceptionDetails") {
+        Some(details) => Err(details["exception"]["description"]
+            .as_str()
+            .or(details["exception"]["value"].as_str())
+            .unwrap_or(&details.to_string())
+            .to_string()),
+        None => Ok(result["result"]["value"].clone()),
+    }
+}
+
+#[cfg(test)]
+pub fn test_original(value: Value) -> OriginalEvaluation {
+    OriginalEvaluation {
+        value,
+        session: "fixture".into(),
+        expression: "fixture".into(),
+        start_ns: 0,
+        end_ns: 0,
+        start_cursor: 0,
+        end_cursor: 0,
+    }
+}
+
+#[cfg(test)]
+pub fn test_dump_original(value: Value) -> OriginalEvaluation {
+    OriginalEvaluation {
+        value,
+        session: "fixture".into(),
+        expression: crate::DUMP.into(),
+        start_ns: 0,
+        end_ns: 0,
+        start_cursor: 0,
+        end_cursor: 0,
+    }
 }

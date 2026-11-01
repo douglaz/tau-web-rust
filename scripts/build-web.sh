@@ -16,6 +16,21 @@ case "${1:-}" in
   *) echo "usage: scripts/build-web.sh served|tracer" >&2; exit 2 ;;
 esac
 out="dist/$1"
+build_variant=$1
+build_started=$(python3 -c 'import time; print(time.monotonic_ns())')
+build_timing() {
+  build_status=$?
+  python3 - "$build_variant" "$build_started" "$build_status" <<'PY'
+import json, sys, time
+print('TRACER_BUILD_TIMING ' + json.dumps({
+    'schema': 1, 'phase': 'prepare_' + sys.argv[1],
+    'start_ns': int(sys.argv[2]), 'end_ns': time.monotonic_ns(),
+    'exit': int(sys.argv[3]),
+}))
+PY
+  return "$build_status"
+}
+trap build_timing EXIT
 
 # The CLI must equal the wasm-bindgen crate exactly, or the glue it writes does not match.
 locked=$(sed -n '/^name = "wasm-bindgen"$/{n;s/^version = "\(.*\)"$/\1/p;}' Cargo.lock)

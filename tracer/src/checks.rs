@@ -1,6 +1,7 @@
 //! The served build's checks (twr-ggw.2, AC5 and AC6): nothing test-only in its bytes, and the
 //! page's Content-Security-Policy exactly `ARC-33`'s.
 
+use super::{json, served_checks};
 use crate::keys::relay_public;
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
@@ -34,14 +35,27 @@ pub const ARC_33: &[(&str, &[&str])] = &[
 /// test switches a request can set (`fail_append` among them, which makes the store's append
 /// fail).
 pub fn needles() -> Vec<(String, Vec<u8>)> {
+    let _standalone = crate::auxiliary::standalone(
+        "reader.aux.absence",
+        crate::semantic_domains::auxiliary::auxiliary_absence(),
+    );
     let mut needles = Vec::new();
     let phrases = std::iter::once("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about")
         .chain(include_str!("../../tests/vectors/seed-backup-collisions.txt").lines());
     for (fixture, mnemonic) in phrases.enumerate() {
-        for role in [0, 3] {
-            for index in [0, 1] {
-                let private =
-                    crate::reader::role_key(mnemonic, role, index).expect("fixture derivation");
+        let _phrase_slot = crate::semantic::Slot::new("reader.aux.absence_phrase", fixture);
+        for (role_slot, role) in [0, 3].into_iter().enumerate() {
+            let _role_slot = crate::semantic::Slot::new("reader.aux.absence_role", role_slot);
+            for (index_slot, index) in [0, 1].into_iter().enumerate() {
+                let _index_slot = crate::semantic::Slot::new("reader.aux.absence_key", index_slot);
+                let private = crate::reader::role_key_at(
+                    "reader.aux.call.absence.fixture.role_key",
+                    0,
+                    mnemonic,
+                    role,
+                    index,
+                )
+                .expect("fixture derivation");
                 let public = if role == 0 {
                     crate::keys::ed25519(&private)
                         .public_key()
@@ -154,23 +168,39 @@ pub fn needles() -> Vec<(String, Vec<u8>)> {
 }
 
 fn files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    if !std::fs::symlink_metadata(dir)
+        .map_err(|e| e.to_string())?
+        .file_type()
+        .is_dir()
+    {
+        return Err("nonregular artifact identity input".into());
+    }
     for entry in std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))? {
-        let path = entry.map_err(|e| format!("{}: {e}", dir.display()))?.path();
-        if path.is_dir() {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        let kind = entry.file_type().map_err(|e| e.to_string())?;
+        if kind.is_dir() {
             files(&path, out)?;
-        } else {
+        } else if kind.is_file() {
             out.push(path);
+        } else {
+            return Err("nonregular artifact identity input".into());
         }
     }
     Ok(())
 }
 
 fn require_served_files(dir: &Path) -> Result<(), String> {
+    files(dir, &mut Vec::new())?;
     let missing: Vec<_> = SERVED_FILES
         .iter()
         .filter(|f| !dir.join(f).is_file())
         .collect();
-    if missing.is_empty() {
+    if served_checks::holds(
+        "checks.served.required_files",
+        json!({}),
+        missing.is_empty(),
+    ) {
         Ok(())
     } else {
         Err(format!(
@@ -183,26 +213,24 @@ fn require_served_files(dir: &Path) -> Result<(), String> {
 /// AC5: fixture-derived keys, the pin source and the test switches are absent
 /// from every file under `dir`. Each finding names the file and what was found.
 pub fn absence(dir: &Path) -> Result<(), String> {
+    let _check = served_checks::begin("absence", dir);
     require_served_files(dir)?;
     let mut paths = Vec::new();
     files(dir, &mut paths)?;
     paths.sort();
-    let needles = needles();
+    let needles = served_checks::absence_needles();
     let mut found = Vec::new();
-    for path in &paths {
-        let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        for (what, needle) in &needles {
-            if bytes.windows(needle.len()).any(|w| w == needle.as_slice()) {
-                found.push(format!("{}: {what}", path.display()));
-            }
+    for (file, path) in paths.iter().enumerate() {
+        for what in served_checks::scan_file(&needles, path, file)? {
+            found.push(format!("{}: {what}", path.display()));
         }
     }
     println!(
         "absence: {} files, {} needles checked",
         paths.len(),
-        needles.len()
+        needles.needle_count()
     );
-    if found.is_empty() {
+    if served_checks::holds("checks.absence.clear", json!({}), found.is_empty()) {
         Ok(())
     } else {
         Err(format!("test-only parts found:\n  {}", found.join("\n  ")))
@@ -215,31 +243,45 @@ pub fn page_policy(html: &str) -> Result<String, String> {
     let lower = html.to_ascii_lowercase();
     let mut policies = Vec::new();
     let mut at = 0;
+    let mut meta = 0;
     while let Some(start) = lower[at..].find("<meta").map(|i| at + i) {
-        let end = lower[start..]
-            .find('>')
-            .map(|i| start + i)
-            .ok_or("an unclosed <meta")?;
+        let end = served_checks::result(
+            "checks.csp.meta_closed",
+            json!({"meta":meta}),
+            lower[start..]
+                .find('>')
+                .map(|i| start + i)
+                .ok_or("an unclosed <meta"),
+        )?;
         let attrs = attributes(&html[start + "<meta".len()..end]);
         if attrs
             .get("http-equiv")
             .is_some_and(|v| v.eq_ignore_ascii_case("content-security-policy"))
         {
-            let content = attrs.get("content").ok_or("a CSP <meta> with no content")?;
+            let content = served_checks::result(
+                "checks.csp.meta_content",
+                json!({"meta":meta}),
+                attrs.get("content").ok_or("a CSP <meta> with no content"),
+            )?;
             policies.push((start, content.clone()));
         }
         at = end;
+        meta += 1;
     }
+    served_checks::holds("checks.csp.single_policy", json!({}), policies.len() == 1);
     let [(position, policy)] = policies.as_slice() else {
         return Err(format!(
             "the page carries {} CSP <meta> elements, not exactly one",
             policies.len()
         ));
     };
-    if lower
-        .find("<script")
-        .is_some_and(|script| script < *position)
-    {
+    if !served_checks::holds(
+        "checks.csp.before_script",
+        json!({}),
+        !lower
+            .find("<script")
+            .is_some_and(|script| script < *position),
+    ) {
         return Err("a <script> precedes the CSP <meta>, so the policy does not bind it".into());
     }
     Ok(policy.clone())
@@ -268,14 +310,20 @@ fn attributes(tag: &str) -> BTreeMap<String, String> {
 /// browsers ignore the second, so it would read as stricter than it is.
 pub fn parse_policy(policy: &str) -> Result<BTreeMap<String, BTreeSet<String>>, String> {
     let mut directives = BTreeMap::new();
+    let mut ordinal = 0;
     for directive in policy.split(';') {
         let mut tokens = directive.split_ascii_whitespace();
         let Some(name) = tokens.next() else { continue };
         let name = name.to_ascii_lowercase();
         let sources = tokens.map(str::to_string).collect();
-        if directives.insert(name.clone(), sources).is_some() {
+        if !served_checks::holds(
+            "checks.csp.unique_directive",
+            json!({"directive":ordinal}),
+            directives.insert(name.clone(), sources).is_none(),
+        ) {
             return Err(format!("`{name}` is given twice"));
         }
+        ordinal += 1;
     }
     Ok(directives)
 }
@@ -309,7 +357,7 @@ pub fn policy_differences(policy: &str) -> Result<(), String> {
     for name in actual.keys().filter(|name| !expected.contains_key(*name)) {
         differences.push(format!("`{name}` is not ARC-33's"));
     }
-    if differences.is_empty() {
+    if served_checks::holds("checks.csp.exact_policy", json!({}), differences.is_empty()) {
         Ok(())
     } else {
         Err(format!(
@@ -321,11 +369,11 @@ pub fn policy_differences(policy: &str) -> Result<(), String> {
 
 /// `check-csp`: the served page's policy, parsed, equals `ARC-33`'s.
 pub fn csp(dir: &Path) -> Result<(), String> {
+    let _check = served_checks::begin("csp", dir);
     require_served_files(dir)?;
     let page = dir.join("index.html");
-    let html = std::fs::read_to_string(&page).map_err(|e| format!("{}: {e}", page.display()))?;
-    let policy = page_policy(&html)?;
-    policy_differences(&policy)?;
+    let policy = served_checks::csp_policy(dir)?;
+    served_checks::policy_differences(&policy)?;
     println!("csp: {} carries ARC-33's policy: {policy}", page.display());
     Ok(())
 }

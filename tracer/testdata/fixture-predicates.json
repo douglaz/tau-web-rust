@@ -1,0 +1,738 @@
+[
+  {
+    "name": "empty original relay",
+    "site": "fixture.settle.wait",
+    "operands": {
+      "receiver_ok": true,
+      "ended": false,
+      "visits": [],
+      "length": 0
+    },
+    "result": false
+  },
+  {
+    "name": "refusal needs close frame",
+    "site": "fixture.settle.wait",
+    "operands": {
+      "receiver_ok": true,
+      "ended": false,
+      "visits": [
+        "ended"
+      ],
+      "length": 1
+    },
+    "result": false
+  },
+  {
+    "name": "socket accepts EOF",
+    "site": "main.lock_command.socket_closed",
+    "operands": {
+      "receiver_ok": true,
+      "ended": true,
+      "visits": [
+        "ended"
+      ],
+      "length": 1
+    },
+    "result": true
+  },
+  {
+    "name": "any stops at first close",
+    "site": "fixture.settle.wait",
+    "operands": {
+      "receiver_ok": true,
+      "ended": false,
+      "visits": [
+        "other",
+        "close"
+      ],
+      "length": 3
+    },
+    "result": true
+  },
+  {
+    "name": "missing false tail",
+    "site": "fixture.settle.wait",
+    "operands": {
+      "receiver_ok": true,
+      "ended": false,
+      "visits": [
+        "other"
+      ],
+      "length": 2
+    },
+    "result": null
+  },
+  {
+    "name": "visited after short circuit",
+    "site": "fixture.settle.wait",
+    "operands": {
+      "receiver_ok": true,
+      "ended": false,
+      "visits": [
+        "close",
+        "other"
+      ],
+      "length": 2
+    },
+    "result": null
+  },
+  {
+    "name": "Boolean count is forbidden",
+    "site": "fixture.settle.wait",
+    "operands": {
+      "receiver_ok": true,
+      "ended": false,
+      "visits": [],
+      "length": true
+    },
+    "result": null
+  },
+  {
+    "name": "equal-value foreign Seen",
+    "site": "fixture.settle.wait",
+    "operands": {
+      "receiver_ok": false,
+      "ended": false,
+      "length": 0,
+      "visits": []
+    },
+    "result": null
+  },
+  {
+    "name": "wrong socket predicate parameter",
+    "site": "fixture.settle.wait",
+    "operands": {
+      "receiver_ok": true,
+      "ended": true,
+      "length": 1,
+      "visits": [
+        "close"
+      ]
+    },
+    "result": null
+  },
+  {
+    "name": "no exec",
+    "site": "main.lock_command.exec",
+    "operands": {
+      "receiver_ok": true,
+      "length": 0,
+      "steps": [
+        null,
+        null,
+        null,
+        null,
+        null
+      ],
+      "command_ok": true
+    },
+    "result": false
+  },
+  {
+    "name": "bad UTF8",
+    "site": "main.lock_command.exec",
+    "operands": {
+      "receiver_ok": true,
+      "length": 1,
+      "steps": [
+        false,
+        null,
+        null,
+        null,
+        null
+      ],
+      "command_ok": true
+    },
+    "result": false
+  },
+  {
+    "name": "missing line",
+    "site": "main.lock_command.exec",
+    "operands": {
+      "receiver_ok": true,
+      "length": 1,
+      "steps": [
+        true,
+        false,
+        null,
+        null,
+        null
+      ],
+      "command_ok": true
+    },
+    "result": false
+  },
+  {
+    "name": "missing prefix",
+    "site": "main.lock_command.exec",
+    "operands": {
+      "receiver_ok": true,
+      "length": 1,
+      "steps": [
+        true,
+        true,
+        false,
+        null,
+        null
+      ],
+      "command_ok": true
+    },
+    "result": false
+  },
+  {
+    "name": "invalid job id",
+    "site": "main.lock_command.exec",
+    "operands": {
+      "receiver_ok": true,
+      "length": 1,
+      "steps": [
+        true,
+        true,
+        true,
+        false,
+        null
+      ],
+      "command_ok": true
+    },
+    "result": false
+  },
+  {
+    "name": "different launch bytes",
+    "site": "main.lock_command.exec",
+    "operands": {
+      "receiver_ok": true,
+      "length": 1,
+      "steps": [
+        true,
+        true,
+        true,
+        true,
+        false
+      ],
+      "command_ok": true
+    },
+    "result": false
+  },
+  {
+    "name": "exact launch",
+    "site": "main.lock_command.exec",
+    "operands": {
+      "receiver_ok": true,
+      "length": 1,
+      "steps": [
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "command_ok": true
+    },
+    "result": true
+  },
+  {
+    "name": "parse after failed prefix",
+    "site": "main.lock_command.exec",
+    "operands": {
+      "receiver_ok": true,
+      "length": 1,
+      "steps": [
+        true,
+        true,
+        false,
+        true,
+        null
+      ],
+      "command_ok": true
+    },
+    "result": null
+  },
+  {
+    "name": "missing parse stage",
+    "site": "main.lock_command.exec",
+    "operands": {
+      "receiver_ok": true,
+      "length": 1,
+      "steps": [
+        true,
+        true,
+        null,
+        null,
+        null
+      ],
+      "command_ok": true
+    },
+    "result": null
+  },
+  {
+    "name": "no holding read",
+    "site": "hold.evidence.actual_read",
+    "operands": {
+      "receiver_ok": true,
+      "required": 1,
+      "total": 0,
+      "prefixes": [],
+      "length": null
+    },
+    "result": false
+  },
+  {
+    "name": "one original read",
+    "site": "hold.evidence.actual_read",
+    "operands": {
+      "receiver_ok": true,
+      "required": 1,
+      "total": 1,
+      "prefixes": [
+        true
+      ],
+      "length": 1
+    },
+    "result": true
+  },
+  {
+    "name": "two reads where one required",
+    "site": "hold.evidence.actual_read",
+    "operands": {
+      "receiver_ok": true,
+      "required": 1,
+      "total": 2,
+      "prefixes": [
+        true,
+        true
+      ],
+      "length": 2
+    },
+    "result": false
+  },
+  {
+    "name": "first non-read",
+    "site": "hold.evidence.actual_read",
+    "operands": {
+      "receiver_ok": true,
+      "required": 1,
+      "total": 2,
+      "prefixes": [
+        false
+      ],
+      "length": null
+    },
+    "result": false
+  },
+  {
+    "name": "lost prefix iteration",
+    "site": "hold.evidence.actual_read",
+    "operands": {
+      "receiver_ok": true,
+      "required": 1,
+      "total": 2,
+      "prefixes": [
+        true
+      ],
+      "length": null
+    },
+    "result": null
+  },
+  {
+    "name": "count after prefix failure",
+    "site": "hold.evidence.actual_read",
+    "operands": {
+      "receiver_ok": true,
+      "required": 1,
+      "total": 2,
+      "prefixes": [
+        false
+      ],
+      "length": 2
+    },
+    "result": null
+  },
+  {
+    "name": "inconsistent locked length",
+    "site": "hold.evidence.actual_read",
+    "operands": {
+      "receiver_ok": true,
+      "required": 1,
+      "total": 2,
+      "prefixes": [
+        true,
+        true
+      ],
+      "length": 1
+    },
+    "result": null
+  },
+  {
+    "name": "prefix is numeric",
+    "site": "hold.evidence.actual_read",
+    "operands": {
+      "receiver_ok": true,
+      "required": 1,
+      "total": 1,
+      "prefixes": [
+        1
+      ],
+      "length": 1
+    },
+    "result": null
+  },
+  {
+    "name": "two stop reads",
+    "site": "hold.stop.reading",
+    "operands": {
+      "receiver_ok": true,
+      "required": 2,
+      "total": 2,
+      "prefixes": [
+        true,
+        true
+      ],
+      "length": 2
+    },
+    "result": true
+  },
+  {
+    "name": "packet from original cursor",
+    "site": "session.network.client_packet",
+    "operands": {
+      "total": 3,
+      "from": 1,
+      "length": 2,
+      "visits": [
+        "other",
+        "binary"
+      ]
+    },
+    "result": true
+  },
+  {
+    "name": "packet slice mismatch",
+    "site": "session.network.client_packet",
+    "operands": {
+      "total": 3,
+      "from": 2,
+      "length": 2,
+      "visits": [
+        "other",
+        "binary"
+      ]
+    },
+    "result": null
+  },
+  {
+    "name": "packet lost false visit",
+    "site": "session.network.client_packet",
+    "operands": {
+      "total": 3,
+      "from": 1,
+      "length": 2,
+      "visits": [
+        "other"
+      ]
+    },
+    "result": null
+  },
+  {
+    "name": "terminal belongs to opened connection",
+    "site": "session.closed.relay",
+    "operands": {
+      "total": 3,
+      "from": 1,
+      "length": 2,
+      "events": [
+        [
+          0,
+          "challenge"
+        ],
+        [
+          0,
+          "ended"
+        ]
+      ],
+      "visits": [
+        [
+          true,
+          false
+        ],
+        [
+          true,
+          true
+        ]
+      ]
+    },
+    "result": true
+  },
+  {
+    "name": "terminal on unrelated connection",
+    "site": "session.closed.relay",
+    "operands": {
+      "total": 3,
+      "from": 1,
+      "length": 2,
+      "events": [
+        [
+          0,
+          "challenge"
+        ],
+        [
+          1,
+          "ended"
+        ]
+      ],
+      "visits": [
+        [
+          true,
+          false
+        ],
+        [
+          false,
+          null
+        ]
+      ]
+    },
+    "result": false
+  },
+  {
+    "name": "forged connection membership",
+    "site": "session.closed.relay",
+    "operands": {
+      "total": 3,
+      "from": 1,
+      "length": 2,
+      "events": [
+        [
+          0,
+          "challenge"
+        ],
+        [
+          1,
+          "ended"
+        ]
+      ],
+      "visits": [
+        [
+          true,
+          false
+        ],
+        [
+          true,
+          true
+        ]
+      ]
+    },
+    "result": null
+  },
+  {
+    "name": "missing first-pass event",
+    "site": "session.closed.relay",
+    "operands": {
+      "total": 3,
+      "from": 1,
+      "length": 2,
+      "events": [
+        [
+          0,
+          "challenge"
+        ]
+      ],
+      "visits": [
+        [
+          true,
+          false
+        ]
+      ]
+    },
+    "result": null
+  },
+  {
+    "name": "noncanonical connection class",
+    "site": "session.closed.relay",
+    "operands": {
+      "total": 2,
+      "from": 1,
+      "length": 1,
+      "events": [
+        [
+          1,
+          "close"
+        ]
+      ],
+      "visits": [
+        [
+          false,
+          null
+        ]
+      ]
+    },
+    "result": null
+  },
+  {
+    "name": "no sent read yet",
+    "site": "inference.sent_read.exec",
+    "operands": {
+      "length": 2,
+      "baseline": 2,
+      "last": null
+    },
+    "result": false
+  },
+  {
+    "name": "exact sent read",
+    "site": "inference.sent_read.exec",
+    "operands": {
+      "length": 3,
+      "baseline": 2,
+      "last": true
+    },
+    "result": true
+  },
+  {
+    "name": "read last evaluated too early",
+    "site": "inference.sent_read.exec",
+    "operands": {
+      "length": 2,
+      "baseline": 2,
+      "last": true
+    },
+    "result": null
+  },
+  {
+    "name": "original hidden command",
+    "site": "lifecycle.hidden.job_launched",
+    "operands": {
+      "length": 2,
+      "visits": [
+        false,
+        true
+      ],
+      "fixture": "primary"
+    },
+    "result": true
+  },
+  {
+    "name": "original gate ready",
+    "site": "session.network.stage_reached",
+    "operands": {
+      "value": true
+    },
+    "result": true
+  },
+  {
+    "name": "gate numeric Boolean",
+    "site": "session.rekey.stage_reached",
+    "operands": {
+      "value": 1
+    },
+    "result": null
+  },
+  {
+    "name": "new probe counted",
+    "site": "session.cold_probe.sent",
+    "operands": {
+      "length": 2,
+      "visits": [
+        [
+          false,
+          null
+        ],
+        [
+          true,
+          true
+        ]
+      ],
+      "baseline": 0
+    },
+    "result": true
+  },
+  {
+    "name": "probe header after method failed",
+    "site": "session.cold_probe.sent",
+    "operands": {
+      "length": 1,
+      "visits": [
+        [
+          false,
+          true
+        ]
+      ],
+      "baseline": 0
+    },
+    "result": null
+  },
+  {
+    "name": "probe row cut",
+    "site": "session.cold_probe.sent",
+    "operands": {
+      "length": 2,
+      "visits": [
+        [
+          true,
+          true
+        ]
+      ],
+      "baseline": 0
+    },
+    "result": null
+  },
+  {
+    "name": "revoke wrong method",
+    "site": "session.cold_probe.revoke",
+    "operands": {
+      "length": 1,
+      "visits": [
+        [
+          false,
+          null,
+          null
+        ]
+      ]
+    },
+    "result": false
+  },
+  {
+    "name": "revoke missing body",
+    "site": "session.cold_probe.revoke",
+    "operands": {
+      "length": 1,
+      "visits": [
+        [
+          true,
+          false,
+          null
+        ]
+      ]
+    },
+    "result": false
+  },
+  {
+    "name": "revoke original identity",
+    "site": "session.cold_probe.revoke",
+    "operands": {
+      "length": 1,
+      "visits": [
+        [
+          true,
+          true,
+          true
+        ]
+      ]
+    },
+    "result": true
+  },
+  {
+    "name": "revoke after body failed",
+    "site": "session.cold_probe.revoke",
+    "operands": {
+      "length": 1,
+      "visits": [
+        [
+          true,
+          false,
+          true
+        ]
+      ]
+    },
+    "result": null
+  }
+]

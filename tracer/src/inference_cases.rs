@@ -3,9 +3,9 @@ mod lifecycle_cases;
 #[path = "session_end_cases.rs"]
 mod session_end_cases;
 // Browser evidence uses real fetch against the loopback fixture, then searches its key needles.
+use super::logical_checks::Observe as _;
 use super::*;
 use std::sync::Arc;
-use tau_web::jobs;
 
 pub(super) async fn module(
     run: &Run<'_>,
@@ -15,17 +15,19 @@ pub(super) async fn module(
     run.browser.evaluate(&worker.session,&format!("(async()=>{{const m=await import(new URL('./pkg/tau_web.js',self.location.href).href);{expression}}})()")).await
 }
 async fn origin(run: &Run<'_>, worker: &Worker) -> Result<(), String> {
-    if module(
-        run,
-        worker,
-        &format!(
-            "return await m.test_inference_origin({});",
-            json!(run.aggregator.origin)
-        ),
-    )
-    .await?
-        != true
-    {
+    if completion::rejects(
+        "inference.fixture_origin.accepted",
+        module(
+            run,
+            worker,
+            &format!(
+                "return await m.test_inference_origin({});",
+                json!(run.aggregator.origin)
+            ),
+        )
+        .await?
+            != true,
+    ) {
         return Err("fixture origin was not set before unlock".into());
     }
     Ok(())
@@ -43,7 +45,8 @@ async fn resume(run: &Run<'_>, tab: &Tab, worker: &mut Worker) -> Result<(), Str
     }
     binding_cases::prepare(run, tab, worker, PASSPHRASE).await
 }
-fn last_key(run: &Run<'_>) -> String {
+pub(super) fn last_key(run: &Run<'_>) -> String {
+    run.aggregator.observe_receiver();
     run.aggregator
         .state
         .lock()
@@ -60,11 +63,12 @@ async fn restart(run: &Run<'_>, tab: &Tab, worker: &mut Worker) -> Result<(), St
     resume(run, tab, worker).await
 }
 
-fn request_body(raw: &[u8]) -> Option<Value> {
+pub(super) fn request_body(raw: &[u8]) -> Option<Value> {
     let start = raw.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
     serde_json::from_slice(&raw[start..]).ok()
 }
-fn key_id(run: &Run<'_>, key: &str) -> String {
+pub(super) fn key_id(run: &Run<'_>, key: &str) -> String {
+    run.aggregator.observe_receiver();
     run.aggregator
         .state
         .lock()
@@ -105,33 +109,69 @@ fn check_reload_record<'a>(
                 .is_some_and(|t| t["call"] == r["call"])
         })
     });
+    case.branch(
+        "reload-revoke",
+        if finished {
+            "finished"
+        } else if revoke.is_some() {
+            "pending"
+        } else {
+            "absent"
+        },
+    );
     case.check(
+        "inference_cases.a001",
         "reload key status before unlock matches its recorded revoke",
         reload_status(finished, revoke.is_some() && sent, status),
     );
     (revoke, finished)
 }
 
-async fn wait_count(run: &Run<'_>, path: &str, count: usize) -> Result<(), String> {
-    for _ in 0..100 {
-        if run.aggregator.count(path) >= count {
+async fn wait_count(
+    site: &'static str,
+    run: &Run<'_>,
+    path: &str,
+    count: usize,
+) -> Result<(), String> {
+    let observer = observer::Call::begin(
+        site,
+        "inference.wait_count",
+        None,
+        json!({"path":match path {"/completion"=>"completion","/keys"=>"keys","/revoke"=>"revoke",_=>"unknown"}}),
+    );
+    observer.fact(
+        "counter_input",
+        observer::counter_matches(site, path, count),
+    );
+
+    for poll in 0..100 {
+        observer.attempt(poll + 1);
+        if observer.poll(poll + 1, observer.counter_ready(run, path, count, poll + 1)) {
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     Err(format!("fixture did not receive {count} {path} requests"))
 }
-async fn wait_refused(run: &Run<'_>, key: &str) -> Result<(), String> {
+async fn wait_refused(
+    site: &'static str,
+    run: &Run<'_>,
+    key: &key_inputs::Key,
+) -> Result<(), String> {
+    let observer = observer::Call::begin(site, "inference.wait_refused", None, json!({}));
+    observer.fact("key_input", observer::key_matches(site, key));
+
     // Inspect fixture state without sending paid completion probes while the sweep progresses.
-    for _ in 0..100 {
-        if !run.aggregator.state.lock().unwrap().accepts(key) {
+    for poll in 0..100 {
+        observer.attempt(poll + 1);
+        if observer.poll(poll + 1, observer.key_refused(run, key, poll + 1)) {
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     Err("sweep did not revoke the ended session inference key".into())
 }
-async fn check_expiry(run: &Run<'_>, key: &str, case: &mut Case) -> Result<(), String> {
+pub(super) async fn check_expiry(run: &Run<'_>, key: &str, case: &mut Case) -> Result<(), String> {
     let (now, expires) = {
         let s = run.aggregator.state.lock().unwrap();
         (
@@ -146,13 +186,14 @@ async fn check_expiry(run: &Run<'_>, key: &str, case: &mut Case) -> Result<(), S
     };
     run.aggregator.state.lock().unwrap().now = expires + 1;
     case.check(
+        "inference_cases.a002",
         "fixture refuses the session inference key past expiry",
         run.aggregator.key_status(key).await? == 402,
     );
     run.aggregator.state.lock().unwrap().now = now;
     Ok(())
 }
-async fn crash(run: &Run<'_>, tab: &Tab) -> Result<(), String> {
+pub(super) async fn crash(run: &Run<'_>, tab: &Tab) -> Result<(), String> {
     run.collect(tab).await?;
     let _ = tokio::time::timeout(
         Duration::from_secs(3),
@@ -168,7 +209,7 @@ async fn crash(run: &Run<'_>, tab: &Tab) -> Result<(), String> {
 fn check_request_tiers(run: &Run<'_>, case: &mut Case) {
     let requests = run.aggregator.requests.lock().unwrap().clone();
     let state = run.aggregator.state.lock().unwrap();
-    case.check("every browser completion names fixture-model; credentials occur only in their tier's header, never any URL or body", requests.iter().all(|raw| {
+    case.check("inference_cases.a003", "every browser completion names fixture-model; credentials occur only in their tier's header, never any URL or body", requests.iter().all(|raw| {
         let text = String::from_utf8_lossy(raw);
         let (head, body) = text.split_once("\r\n\r\n").unwrap();
         let line = head.lines().next().unwrap();
@@ -196,21 +237,26 @@ async fn command_during_end(
 ) -> Result<(), String> {
     restart(run, tab, worker).await?;
     infer(run, worker).await?;
-    let mut case = Case::new("session end during box-plane intent commit prevents exec");
+    let mut case = Case::new(
+        "inference_cases.c001",
+        "session end during box-plane intent commit prevents exec",
+    );
     let before = run.seen.lock().unwrap().ssh_exec.len();
-    let log_before = run.seen.lock().unwrap().relay_log.len();
+    let log_before =
+        fixture_inputs::relay(run, worker, &case.id, "relay", &run.seen.lock().unwrap());
     run.aggregator.state.lock().unwrap().hold_revoke = true;
     module(run, worker, "self.moveAcquired=new Promise(ready=>m.test_hold_move(new Promise(release=>self.releaseMove=release),ready));return true;").await?;
     let request = json!({"machine":"fixture", "relay":run.relay.url, "host":"127.0.0.1",
         "port":run.sshd.port, "user":SSH_USER, "command":"printf end-race-command; exit 7"});
-    run.browser
-        .evaluate(
-            &worker.session,
-            &format!("self.endRaceCommand={};void 0", run_expression(&request)),
-        )
-        .await?;
-    module(run, worker, "await self.moveAcquired;self.heldEnd=m.end_sessions();await new Promise(r=>setTimeout(r,0));return true;").await?;
-    session_end_cases::closed(run, log_before, &mut case).await;
+    fixture_inputs::command_page(
+        &log_before,
+        run,
+        worker,
+        &format!("self.endRaceCommand={};void 0", run_expression(&request)),
+    )
+    .await?;
+    fixture_inputs::end_module(&log_before, run, worker, "await self.moveAcquired;self.heldEnd=m.end_sessions();await new Promise(r=>setTimeout(r,0));return true;").await?;
+    session_end_cases::closed("inference.command_end.closed", run, &log_before, &mut case).await;
     let report = module(
         run,
         worker,
@@ -219,10 +265,12 @@ async fn command_during_end(
     .await?;
     let outcome = &report["outcome"];
     case.check(
+        "inference_cases.a004",
         "committed command reports unresolved after end begins",
         outcome["unresolved"] == true,
     );
     case.check(
+        "inference_cases.a005",
         "sshd receives no exec after the held intent commits",
         run.seen.lock().unwrap().ssh_exec.len() == before,
     );
@@ -230,13 +278,14 @@ async fn command_during_end(
     restart(run, tab, worker).await?;
     let state = run.inspect(worker).await?;
     case.check(
+        "inference_cases.a006",
         "unlock recovers the committed command as unresolved",
         state["calls"].as_array().unwrap().iter().any(|c| {
             c["command"] == hex::encode("printf end-race-command; exit 7")
                 && c["state"] == "unresolved"
         }),
     );
-    cases.push(case);
+    case.finish(cases);
     Ok(())
 }
 
@@ -258,13 +307,17 @@ async fn job_read_during_end(
                 c["command"] == hex::encode("printf end-race-command; exit 7")
                     && c["state"] == "unresolved"
             })
-            .ok_or("missing unresolved command for session-end read case")?["call"]
+            .ok_or("missing unresolved command for session-end read case")
+            .checked("inference.read_end.original_command")?["call"]
             .clone();
-        let mut case = Case::new(if collect {
-            "session end before collection read prevents exec"
-        } else {
-            "session end stops held read before acquiring writer"
-        });
+        let mut case = Case::new(
+            "inference_cases.c002",
+            if collect {
+                "session end before collection read prevents exec"
+            } else {
+                "session end stops held read before acquiring writer"
+            },
+        );
         let before = run.seen.lock().unwrap().ssh_exec.len();
         module(run, worker, "self.readAcquired=new Promise(ready=>m.test_hold_job_read(new Promise(release=>self.releaseRead=release),ready));return true;").await?;
         let mut request = json!({"machine":"fixture", "relay":run.relay.url,
@@ -287,6 +340,7 @@ async fn job_read_during_end(
         module(run, worker, "await self.readAcquired;self.writerAcquired=new Promise(ready=>self.heldWriter=m.test_writer(new Promise(release=>self.releaseWriter=release),ready));await self.writerAcquired;self.heldEnd=m.end_sessions();await new Promise(r=>setTimeout(r,0));return true;").await?;
         if !collect {
             case.check(
+                "inference_cases.a007",
                 "held wait is stopped while end-sessions still awaits the writer",
                 module(run, worker, "return m.stop_waits('fixture');").await? == 0,
             );
@@ -298,6 +352,7 @@ async fn job_read_during_end(
             report["outcome"]["calls"].as_array()
         };
         case.check(
+            "inference_cases.a008",
             "unread calls report not_read with session end as the reason",
             reports.is_some_and(|rs| {
                 rs.iter().any(|r| r["call"] == call)
@@ -310,15 +365,17 @@ async fn job_read_during_end(
             }),
         );
         case.check(
+            "inference_cases.a009",
             "sshd receives no read exec after session end begins",
             run.seen.lock().unwrap().ssh_exec.len() == before,
         );
         let after = run.inspect(worker).await?;
         case.check(
+            "inference_cases.a010",
             "session end appends no job evidence and settles no command",
             after["jobs"] == state["jobs"] && after["calls"] == state["calls"],
         );
-        cases.push(case);
+        case.finish(cases);
     }
     Ok(())
 }
@@ -329,24 +386,36 @@ async fn sent_job_read_during_end(
     worker: &mut Worker,
     cases: &mut Vec<Case>,
 ) -> Result<(), String> {
-    let saved = store_files(&run.dump(tab).await?);
-    let opened = reader::read(&saved, PASSPHRASE)?;
+    let saved = store_files(&run.dump_at("file.inference_cases.dump.001", tab).await?);
+    let opened = reader::read_at(
+        "reader.call.inference.sent_read_original",
+        &saved,
+        PASSPHRASE,
+    )?;
     let seed: Value = serde_json::from_slice(&opened.records[0].1).map_err(|e| e.to_string())?;
     let mnemonic = seed["seed"]["mnemonic"].as_str().ok_or("fixture seed")?;
     let mut initial = vec![seed.clone()];
-    initial.extend(reader::setup_events(
+    initial.extend(reader::setup_events_at(
+        "reader.aux.call.inference.sent_read_setup",
         mnemonic,
         &["fixture", "fixture-other", "unpinned"],
     ));
-    let initial = reader::build(PASSPHRASE, &initial);
+    let initial = reader::build_at("file.inference_cases.build.001", PASSPHRASE, &initial);
     for collect in [false, true] {
         run.put(tab, &initial).await?;
-        *worker = run.reload(tab, worker).await?;
+        *worker = run
+            .reload("inference_cases.rs::reload#1", tab, worker)
+            .await?;
         resume(run, tab, worker).await?;
         let request = json!({"machine":"fixture", "relay":run.relay.url,
             "host":"127.0.0.1", "port":run.sshd.port, "user":SSH_USER,
             "command":"printf must-stay-held"});
         let (new, call, job) = job_cases::drop_command(
+            (
+                "inference.sent_read.drop",
+                "inference.sent_read",
+                usize::from(collect),
+            ),
             run,
             tab,
             worker.clone(),
@@ -368,41 +437,65 @@ async fn sent_job_read_during_end(
         infer(run, worker).await?;
         run.aggregator.state.lock().unwrap().hold_revoke = true;
         let before = run.inspect(worker).await?;
-        let execs = run.seen.lock().unwrap().ssh_exec.len();
+        let target_case = catalogue::case_id(
+            "inference_cases.c003",
+            if collect {
+                "session end cancels a sent collection read"
+            } else {
+                "session end cancels a sent held read"
+            },
+        );
+        let execs = fixture_inputs::execs(run, worker, &target_case, &job, usize::from(collect));
         fresh_pace(run.relay);
-        let log_before = run.seen.lock().unwrap().relay_log.len();
+        let log_before = fixture_inputs::relay(
+            run,
+            worker,
+            &target_case,
+            "relay",
+            &run.seen.lock().unwrap(),
+        );
         let expression = run_expression(&request);
         let expression = if collect {
             expression.replace("module.run_command(", "module.collect_jobs(")
         } else {
             expression
         };
-        run.browser
-            .evaluate(
-                &worker.session,
-                &format!("self.sentReadEnd={expression};void 0"),
-            )
-            .await?;
-        let sent = settle_for(run.seen, 5, |seen| {
-            seen.ssh_exec.len() == execs + 1
-                && seen.ssh_exec.last().unwrap() == jobs::collect(&job).as_bytes()
-        })
+        fixture_inputs::sent_page(
+            &execs,
+            &log_before,
+            run,
+            worker,
+            &format!("self.sentReadEnd={expression};void 0"),
+        )
+        .await?;
+        let sent = settle_for(
+            "inference.sent_read.exec",
+            run.seen,
+            5,
+            json!({"job":"source sent-read dispatch","exec_count":"pre-read fixture exec count"}),
+            |seen, observation| fixture_predicates::sent_read(seen, &execs, &job, observation),
+        )
         .await;
-        if !sent {
+        if completion::rejects("inference.sent_read.actual_exec", !sent) {
             return Err("sshd did not receive the job-read exec before session end".into());
         }
-        let mut case = Case::new(if collect {
-            "session end cancels a sent collection read"
-        } else {
-            "session end cancels a sent held read"
-        });
+        let mut case = Case::new(
+            "inference_cases.c003",
+            if collect {
+                "session end cancels a sent collection read"
+            } else {
+                "session end cancels a sent held read"
+            },
+        );
         case.check(
+            "inference_cases.a011",
             "sshd received the read exec while the detached command is still alive",
             machine::alive(run.sshd.machine.observe()[&job].pid),
         );
-        module(run, worker, "self.sentEndDone=false;self.heldEnd=m.end_sessions().then(()=>self.sentEndDone=true);return true;").await?;
-        session_end_cases::closed(run, log_before, &mut case).await;
+        fixture_inputs::end_module(&log_before, run, worker, "self.sentEndDone=false;self.heldEnd=m.end_sessions().then(()=>self.sentEndDone=true);return true;").await?;
+        session_end_cases::closed("inference.sent_read.closed", run, &log_before, &mut case).await;
         case.check(
+            "inference_cases.a012",
             "end step remains open",
             module(run, worker, "return self.sentEndDone;").await? == false,
         );
@@ -410,12 +503,15 @@ async fn sent_job_read_during_end(
         println!("   sent read reported: {report}");
         let reports = report["outcome"][if collect { "collected" } else { "calls" }]
             .as_array()
-            .ok_or("sent read report has no calls")?;
+            .ok_or("sent read report has no calls")
+            .checked("inference.sent_read.report")?;
         let read = reports
             .iter()
             .find(|r| r["call"] == call)
-            .ok_or("sent read report lost its call")?;
+            .ok_or("sent read report lost its call")
+            .checked("inference.sent_read.original_call")?;
         case.check(
+            "inference_cases.a013",
             "sent read names session end and preserves its send history",
             read["why"] == "sessions ended while reading record"
                 && if collect {
@@ -428,18 +524,23 @@ async fn sent_job_read_during_end(
         );
         let after = run.inspect(worker).await?;
         case.check(
+            "inference_cases.a014",
             "session end sends no further exec and appends no job evidence or terminal",
-            run.seen.lock().unwrap().ssh_exec.len() == execs + 1
+            run.seen.lock().unwrap().ssh_exec.len() == fixture_inputs::exec_baseline(&execs) + 1
                 && after["jobs"] == before["jobs"]
                 && after["calls"] == before["calls"],
         );
         run.sshd.machine.reboot();
         run.aggregator.state.lock().unwrap().hold_revoke = false;
-        *worker = run.reload(tab, worker).await?;
-        cases.push(case);
+        *worker = run
+            .reload("inference_cases.rs::reload#2", tab, worker)
+            .await?;
+        case.finish(cases);
     }
     run.put(tab, &saved).await?;
-    *worker = run.reload(tab, worker).await?;
+    *worker = run
+        .reload("inference_cases.rs::reload#3", tab, worker)
+        .await?;
     resume(run, tab, worker).await
 }
 
@@ -449,15 +550,21 @@ pub(super) async fn run(
     worker: &mut Worker,
     cases: &mut Vec<Case>,
 ) -> Result<(), String> {
-    *worker = run.reload(tab, worker).await?;
+    let _scenario_span = completion::scenario("inference_cases.run");
+    *worker = run
+        .reload("inference_cases.rs::reload#4", tab, worker)
+        .await?;
     resume(run, tab, worker).await?;
     let account = run.aggregator.state.lock().unwrap().account.clone();
-    if module(run,worker,&format!("const b=new TextEncoder().encode({}); const ok=await m.test_inference_account(b);return ok&&b.every(v=>v===0);",json!(account))).await? != true {return Err("account credential entry or buffer clearing failed".into())}
-    let mut case =
-        Case::new("procured inference: tiers, metadata, routing, unresolved spend and redirects");
+    if completion::rejects("inference.account.entry_and_buffer_cleared", module(run,worker,&format!("const b=new TextEncoder().encode({}); const ok=await m.test_inference_account(b);return ok&&b.every(v=>v===0);",json!(account))).await? != true) {return Err("account credential entry or buffer clearing failed".into())}
+    let mut case = Case::new(
+        "inference_cases.c004",
+        "procured inference: tiers, metadata, routing, unresolved spend and redirects",
+    );
     // Concurrent first calls exercise one mint attempt and one shared memory-only holding.
     let replies = module(run,worker,&format!("const r={};return await Promise.all([m.inference_request(r),m.inference_request(r)]).then(a=>a.map(JSON.parse));",json!(json!({"machine":"fixture","messages":[{"role":"user","content":"browser prompt never journaled"}]}).to_string()))).await?;
     case.check(
+        "inference_cases.a015",
         "both concurrent first requests finish under exactly one mint",
         replies
             .as_array()
@@ -472,10 +579,15 @@ pub(super) async fn run(
         .find(|s| s["bound_set"] == json!(["fixture"]))
         .unwrap();
     case.check(
+        "inference_cases.a016",
         "the live session is given row 2 beside row 3, never row 14",
         session["given"] == json!([{"row":3,"machine":"fixture"},{"row":2,"machine":null}]),
     );
-    let opened = reader::read(&store_files(&run.dump(tab).await?), PASSPHRASE)?;
+    let opened = reader::read_at(
+        "reader.call.inference.core_terminals",
+        &store_files(&run.dump_at("file.inference_cases.dump.002", tab).await?),
+        PASSPHRASE,
+    )?;
     let terms: Vec<Value> = opened
         .records
         .iter()
@@ -487,8 +599,9 @@ pub(super) async fn run(
         })
         .filter(|t| t.get("model").is_some())
         .collect();
-    case.check("independent reader sees the requested and reported providers, tokens, spend and request id",terms.len()==2 && terms.iter().all(|t| t["model"]=="fixture-model" && t["requested_provider"]=="fixture-provider"&&t["reported_provider"]=="Fixture Provider"&&t["prompt_tokens"]==3&&t["completion_tokens"]==5&&t["total_tokens"]==8&&t["spend"]=="0.01"&&t["request_id"]=="gen-fixture"));
+    case.check("inference_cases.a017", "independent reader sees the requested and reported providers, tokens, spend and request id",terms.len()==2 && terms.iter().all(|t| t["model"]=="fixture-model" && t["requested_provider"]=="fixture-provider"&&t["reported_provider"]=="Fixture Provider"&&t["prompt_tokens"]==3&&t["completion_tokens"]==5&&t["total_tokens"]==8&&t["spend"]=="0.01"&&t["request_id"]=="gen-fixture"));
     case.check(
+        "inference_cases.a018",
         "no prompt appears in any decrypted record",
         opened
             .records
@@ -501,6 +614,7 @@ pub(super) async fn run(
         .filter(|r| String::from_utf8_lossy(r).starts_with("POST /completion "))
         .collect();
     case.check(
+        "inference_cases.a019",
         "every call carries the provider field and retention request",
         actual.len() == 2
             && actual.iter().all(|r| {
@@ -514,7 +628,7 @@ pub(super) async fn run(
         .collect();
     let mint_body = credentialed.get(1).and_then(|r| request_body(r));
     let minted_at = run.aggregator.state.lock().unwrap().now();
-    case.check("fixture order is dedicated probe, account read with top-up off, capped expiring mint, then completions",
+    case.check("inference_cases.a020", "fixture order is dedicated probe, account read with top-up off, capped expiring mint, then completions",
         requests[0].starts_with(b"OPTIONS / ")
         && credentialed.len() == 4
         && credentialed[0].starts_with(b"GET /account ")
@@ -526,18 +640,21 @@ pub(super) async fn run(
     check_request_tiers(run, &mut case);
     run.aggregator.state.lock().unwrap().no_report = true;
     case.check(
+        "inference_cases.a021",
         "case-H response remains readable",
         infer(run, worker).await?["finished"] == true,
     );
     let state = run.inspect(worker).await?;
     let t = &state["inference_calls"].as_array().unwrap().last().unwrap()["terminal"];
     case.check(
+        "inference_cases.a022",
         "absent provider and cost stay absent",
         t.get("reported_provider").is_none() && t.get("spend").is_none(),
     );
     run.aggregator.state.lock().unwrap().no_report = false;
     run.aggregator.state.lock().unwrap().routing_refusal = true;
     case.check(
+        "inference_cases.a023",
         "readable routing refusal gets a 404 terminal",
         infer(run, worker).await?["status"] == 404,
     );
@@ -546,6 +663,7 @@ pub(super) async fn run(
     let lost = module(run,worker,&format!("return JSON.parse(await m.inference_request({}));", json!(json!({"machine":"fixture","messages":[{"role":"user","content":"browser lost completion"}]}).to_string()))).await?;
     let lost_id = lost["call"].clone();
     case.check(
+        "inference_cases.a024",
         "lost completion reports unresolved, never failed",
         lost["unresolved"] == true && lost.get("failed").is_none(),
     );
@@ -568,11 +686,13 @@ pub(super) async fn run(
         );
     }
     case.check(
+        "inference_cases.a025",
         "next inference request dispatches",
         next["finished"] == true,
     );
     let state = run.inspect(worker).await?;
     case.check(
+        "inference_cases.a026",
         "unaccounted spend is shown against the key cap",
         state["inference_calls"]
             .as_array()
@@ -586,6 +706,7 @@ pub(super) async fn run(
     );
     run.aggregator.state.lock().unwrap().fail = true;
     case.check(
+        "inference_cases.a027",
         "readable 5xx gets a terminal",
         infer(run, worker).await?["status"] == 503,
     );
@@ -598,6 +719,7 @@ pub(super) async fn run(
         .filter(|r| String::from_utf8_lossy(r).starts_with("OPTIONS / "))
         .count();
     case.check(
+        "inference_cases.a028",
         "failed real call leaves route chosen",
         infer(run, worker).await?["finished"] == true,
     );
@@ -610,16 +732,19 @@ pub(super) async fn run(
         .filter(|r| String::from_utf8_lossy(r).starts_with("OPTIONS / "))
         .count();
     case.check(
+        "inference_cases.a029",
         "no real-call failure caused a second probe",
         probes_before == probes_after && probes_after > 0,
     );
     run.aggregator.state.lock().unwrap().redirect = true;
     let redirected = infer(run, worker).await?;
     case.check(
+        "inference_cases.a030",
         "manual redirect ends unresolved",
         redirected["unresolved"] == true && redirected.get("failed").is_none(),
     );
     case.check(
+        "inference_cases.a031",
         "redirect target received nothing",
         !run.aggregator
             .requests
@@ -630,14 +755,24 @@ pub(super) async fn run(
     );
     run.aggregator.state.lock().unwrap().redirect = false;
     check_request_tiers(run, &mut case);
-    cases.push(case);
+    case.finish(cases);
 
     // Hold a response open: the second call must record and reach the fixture before it ends.
-    let mut case = Case::new("held completion does not bar the next inference request");
+    let mut case = Case::new(
+        "inference_cases.c005",
+        "held completion does not bar the next inference request",
+    );
     run.aggregator.state.lock().unwrap().hold_completion = true;
-    let before = run.aggregator.count("/completion");
-    module(run, worker, &format!("self.heldCompletion=m.inference_request({});return true;", json!(json!({"machine":"fixture","messages":[{"role":"user","content":"held completion"}]}).to_string()))).await?;
-    wait_count(run, "/completion", before + 1).await?;
+    let before = counter_inputs::baseline("inference.held_completion.wait", run, "/completion");
+    observer::counter_input("inference.held_completion.wait", "/completion", before + 1);
+    counter_inputs::module("inference.held_completion.wait", run, worker, &format!("self.heldCompletion=m.inference_request({});return true;", json!(json!({"machine":"fixture","messages":[{"role":"user","content":"held completion"}]}).to_string()))).await?;
+    wait_count(
+        "inference.held_completion.wait",
+        run,
+        "/completion",
+        before + 1,
+    )
+    .await?;
     let held_id = run.inspect(worker).await?["inference_calls"]
         .as_array()
         .unwrap()
@@ -649,10 +784,12 @@ pub(super) async fn run(
             json!(json!({"machine":"fixture","messages":[{"role":"user","content":"second beside held completion"}]}).to_string())))).await;
     let second = second.ok().and_then(Result::ok);
     case.check(
+        "inference_cases.a032",
         "second completion finishes while the first response is withheld",
         second.as_ref().is_some_and(|v| v["finished"] == true),
     );
     case.check(
+        "inference_cases.a033",
         "both intents committed and both completions reached the fixture",
         run.aggregator.count("/completion") == before + 2
             && ["held completion", "second beside held completion"]
@@ -690,18 +827,23 @@ pub(super) async fn run(
                         && c["state"] == "finished"
                 }),
     );
-    cases.push(case);
+    case.finish(cases);
 
     // Kill the worker with the lost and held intents, then verify replay never resends them.
-    let mut case = Case::new("lost completion survives crash and unlock without replay send");
-    let key = last_key(run);
+    let mut case = Case::new(
+        "inference_cases.c006",
+        "lost completion survives crash and unlock without replay send",
+    );
+    let key = key_inputs::last(Some("inference.core_sweep.wait"), run, worker);
+    observer::key_input("inference.core_sweep.wait", &key);
     let before = run.aggregator.count("/completion");
-    crash(run, tab).await?;
+    key_inputs::crash(run, tab, &key).await?;
     let crash_accepts = run.aggregator.key_status(&key).await? == 200;
     (*tab, *worker) = run.open(&tab.origin, false).await?;
     resume(run, tab, worker).await?;
     let state = run.inspect(worker).await?;
     case.check(
+        "inference_cases.a034",
         "lost local call remains unresolved after crash and unlock",
         state["inference_calls"]
             .as_array()
@@ -710,6 +852,7 @@ pub(super) async fn run(
             .any(|c| c["call"] == lost_id && c["state"] == "unresolved"),
     );
     case.check(
+        "inference_cases.a035",
         "fixture saw the lost completion once and replay sent no completion",
         run.aggregator.count("/completion") == before + 1
             && run
@@ -727,38 +870,44 @@ pub(super) async fn run(
     );
     // key_status above is an explicit tracer request, distinct from a replay send.
     case.check(
+        "inference_cases.a036",
         "new request dispatches after crash",
         infer(run, worker).await?["finished"] == true,
     );
-    wait_refused(run, &key).await?;
-    let id = key_id(run, &key);
+    wait_refused("inference.core_sweep.wait", run, &key).await?;
+    let id = key_inputs::id(run, &key);
     let mut recorded = false;
-    for _ in 0..100 {
-        recorded = run.inspect(worker).await?["inference_calls"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|c| {
-                c["kind"] == "revoke"
-                    && c["intent"]["revoke"]["key_id"] == id
-                    && c["state"] == "finished"
-            });
-        if recorded {
-            break;
+    {
+        let observation = observer::Call::begin(
+            "inference.core.revoke_terminal",
+            "serial.observation",
+            Some(&tab.session),
+            json!({"bound":100,"false_sleep_ms":50,"requires_ready":false,"key":"crashed_original_session"}),
+        );
+        for poll in 0..100 {
+            observation.attempt(poll + 1);
+            let state = observation.inspect(run, worker).await?;
+            recorded = observation.key_terminal(&id, &state);
+            if observation.poll(poll + 1, recorded) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
     }
     case.check(
+        "inference_cases.a037",
         "readable crash-sweep response commits its terminal",
         recorded,
     );
     case.check(
+        "inference_cases.a038",
         "crash accepts before unlock and sweep revokes afterwards",
-        crash_accepts && run.aggregator.key_status(&key).await? == 402,
+        crash_accepts && key_inputs::final_status(run, &key, "core-status").await? == 402,
     );
-    cases.push(case);
+    key_inputs::retire(&key, "used");
+    case.finish(cases);
 
-    let phase = std::env::var("TAU_TRACER_INFERENCE_PHASE").unwrap_or_default();
+    let phase = selection::value("TAU_TRACER_INFERENCE_PHASE").unwrap_or_default();
     if phase == "lifecycle-boundaries" || phase == "lifecycle-expiry" {
         return lifecycle_cases::selected(run, tab, worker, cases, phase == "lifecycle-expiry")
             .await;
@@ -781,7 +930,7 @@ pub(super) async fn run(
     if phase == "session-end" {
         return session_end_cases::run(run, tab, worker, cases).await;
     }
-    let selected_end = std::env::var("TAU_TRACER_INFERENCE_END").ok();
+    let selected_end = selection::value("TAU_TRACER_INFERENCE_END").ok();
     if phase == "core" {
         return Ok(());
     }
@@ -808,14 +957,26 @@ pub(super) async fn run(
         }
         restart(run, tab, worker).await?;
         let reply = infer(run, worker).await?;
-        if reply["finished"] != true {
+        if completion::rejects("inference.end.prior_completion", reply["finished"] != true) {
             return Err(format!("inference before {end}: {reply}"));
         }
-        let key = last_key(run);
-        let mut case = Case::new(&format!("session inference key end at {end}"));
+        let key = key_inputs::last(
+            if end == "reload" {
+                Some("inference.reload_sweep.wait")
+            } else {
+                None
+            },
+            run,
+            worker,
+        );
+        let mut key_retirement = "used";
+        let mut case = Case::new(
+            "inference_cases.c007",
+            &format!("session inference key end at {end}"),
+        );
         let old = worker.clone();
         match end {
-            "reload" => *worker = run.reload(tab, worker).await?,
+            "reload" => *worker = key_inputs::reload(run, tab, worker, &key).await?,
             "hidden" => {
                 let before = run.inspect(worker).await?;
                 let mints = run.aggregator.count("/keys");
@@ -826,11 +987,13 @@ pub(super) async fn run(
                     .await?;
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 case.check(
+                    "inference_cases.a039",
                     "scheduled hidden inference uses original session key",
                     infer(run, worker).await?["finished"] == true,
                 );
                 let after = run.inspect(worker).await?;
                 case.check(
+                    "inference_cases.a040",
                     "hide retains original session and limits without mint/revoke",
                     after["sessions"][0]["identity"] == before["sessions"][0]["identity"]
                         && after["sessions"][0]["inference_limits"]["original_expiry"]
@@ -853,7 +1016,7 @@ pub(super) async fn run(
                         json!({"targetId":other["targetId"]}),
                     )
                     .await?;
-                cases.push(case);
+                case.finish(cases);
                 continue;
             }
             "pagehide" | "bfcache" => {
@@ -880,13 +1043,35 @@ pub(super) async fn run(
             }
         }
         if end == "reload" {
-            let id = key_id(run, &key);
-            let opened = reader::read(&store_files(&run.dump(tab).await?), PASSPHRASE)?;
+            let id = key_inputs::reload_id(run, &key);
+            let opened = reader::read_at(
+                "reader.call.inference.reload_revoke",
+                &store_files(&run.dump_at("file.inference_cases.dump.003", tab).await?),
+                PASSPHRASE,
+            )?;
             let intents: Vec<Value> = opened
                 .records
                 .iter()
                 .filter_map(|(_, b)| serde_json::from_slice::<Value>(b).ok())
                 .collect();
+            let raw_revoke = intents
+                .iter()
+                .filter_map(|record| record.pointer("/inference_intent/revoke"))
+                .find(|revoke| revoke["key_id"] == id);
+            let raw_state = match raw_revoke {
+                None => "absent",
+                Some(revoke)
+                    if intents
+                        .iter()
+                        .filter_map(|record| record.get("inference_terminal"))
+                        .any(|terminal| terminal["call"] == revoke["call"]) =>
+                {
+                    "finished"
+                }
+                Some(_) => "pending",
+            };
+            reader_checks::set_reload_revoke_input(opened.origin(), raw_state);
+            observer::key_input("inference.reload_sweep.wait", &key);
             let (revoke, finished) = check_reload_record(
                 &mut case,
                 &intents,
@@ -897,8 +1082,10 @@ pub(super) async fn run(
             let before = run.aggregator.count("/revoke");
             resume(run, tab, worker).await?;
             if let Some(revoke) = revoke {
+                key_retirement = if finished { "finished" } else { "pending" };
                 let state = run.inspect(worker).await?;
                 case.check(
+                    "inference_cases.a041",
                     "recorded unload revoke is never sent a second time",
                     state["inference_calls"]
                         .as_array()
@@ -912,6 +1099,7 @@ pub(super) async fn run(
                 );
                 if !finished {
                     case.check(
+                        "inference_cases.a042",
                         "cut-off unload key is accepted or its recorded revoke reached the fixture",
                         reload_status(
                             false,
@@ -921,26 +1109,34 @@ pub(super) async fn run(
                     );
                 } else {
                     case.check(
+                        "inference_cases.a043",
                         "completed unload revoke remains refused",
                         run.aggregator.key_status(&key).await? == 402,
                     );
                 }
             } else {
-                wait_refused(run, &key).await?;
+                wait_refused("inference.reload_sweep.wait", run, &key).await?;
                 case.check(
+                    "inference_cases.a044",
                     "next-unlock sweep revokes the reload key",
                     run.aggregator.key_status(&key).await? == 402,
                 );
             }
         } else {
             case.check(
+                "inference_cases.a045",
                 "the tracer uses the ended session's key and the fixture refuses it",
                 run.aggregator.key_status(&key).await? == 402,
             );
             resume(run, tab, worker).await?;
         }
-        check_expiry(run, &key, &mut case).await?;
-        cases.push(case);
+        if end == "reload" {
+            key_inputs::expiry(run, &key, &mut case).await?;
+            key_inputs::retire(&key, key_retirement);
+        } else {
+            check_expiry(run, &key, &mut case).await?;
+        }
+        case.finish(cases);
     }
     if selected_end.is_some() {
         return Ok(());
@@ -952,20 +1148,24 @@ pub(super) async fn run(
         }
         restart(run, tab, worker).await?;
         infer(run, worker).await?;
-        let key = last_key(run);
-        let mut case = Case::new(if unlock {
-            "crash leaves key usable until next-unlock sweep"
-        } else {
-            "crash without unlock leaves key usable until expiry"
-        });
+        let key = key_inputs::last(Some("inference.crash_sweep.wait"), run, worker);
+        observer::key_input("inference.crash_sweep.wait", &key);
+        let mut case = Case::new(
+            "inference_cases.c008",
+            if unlock {
+                "crash leaves key usable until next-unlock sweep"
+            } else {
+                "crash without unlock leaves key usable until expiry"
+            },
+        );
         run.collect(tab).await?;
         let _ = tokio::time::timeout(
             Duration::from_secs(3),
-            run.browser
-                .call(Some(&tab.session), "Page.crash", json!({})),
+            key_inputs::page_crash(run, tab, &key, "Page.crash", json!({})),
         )
         .await;
         case.check(
+            "inference_cases.a046",
             "fixture still accepts key immediately after crash",
             run.aggregator.key_status(&key).await? == 200,
         );
@@ -989,31 +1189,41 @@ pub(super) async fn run(
                 .unwrap_or(now + tau_web::inference::SESSION_LIFETIME_SECONDS);
             run.aggregator.state.lock().unwrap().now = expires + 1;
             case.check(
+                "inference_cases.a047",
                 "fixture refuses past the requested expiry without an unlock",
                 run.aggregator.key_status(&key).await? == 402,
             );
             run.aggregator.state.lock().unwrap().now = now;
             resume(run, tab, worker).await?;
         }
-        wait_refused(run, &key).await?;
+        wait_refused("inference.crash_sweep.wait", run, &key).await?;
         check_expiry(run, &key, &mut case).await?;
         case.check(
+            "inference_cases.a048",
             "fixture refuses key after sweep",
-            run.aggregator.key_status(&key).await? == 402,
+            key_inputs::final_status(run, &key, "crash-status").await? == 402,
         );
-        cases.push(case);
+        key_inputs::retire(&key, "used");
+        case.finish(cases);
     }
     if phase != "cutoff" {
         restart(run, tab, worker).await?;
-        let mut case =
-            Case::new("mint finishing during session end is revoked before the end answers");
-        if module(run, worker, "return await m.test_confirm_inference();").await? != true {
+        let mut case = Case::new(
+            "inference_cases.c009",
+            "mint finishing during session end is revoked before the end answers",
+        );
+        if completion::rejects(
+            "inference.late_mint.confirmed",
+            module(run, worker, "return await m.test_confirm_inference();").await? != true,
+        ) {
             return Err("late mint fixture lacks its fresh synthetic session confirmation".into());
         }
         let release = Arc::new(tokio::sync::Notify::new());
         run.aggregator.state.lock().unwrap().hold_mint = Some(release.clone());
-        let before = run.aggregator.count("/keys");
-        module(
+        let before = counter_inputs::baseline("inference.late_mint.wait", run, "/keys");
+        observer::counter_input("inference.late_mint.wait", "/keys", before + 1);
+        counter_inputs::module(
+            "inference.late_mint.wait",
             run,
             worker,
             &format!(
@@ -1025,20 +1235,30 @@ pub(super) async fn run(
             ),
         )
         .await?;
-        wait_count(run, "/keys", before + 1).await?;
+        wait_count("inference.late_mint.wait", run, "/keys", before + 1).await?;
         module(run, worker, "self.endAnswered=false;self.lateEnd=m.end_sessions().then(()=>{self.endAnswered=true;});return true;").await?;
         let mut cleared = false;
-        for _ in 0..100 {
-            cleared = run.inspect(worker).await?["sessions"]
-                .as_array()
-                .unwrap()
-                .is_empty();
-            if cleared {
-                break;
+        {
+            let observation = observer::Call::begin(
+                "inference.late_mint.sessions_cleared",
+                "serial.observation",
+                Some(&tab.session),
+                json!({"bound":100,"false_sleep_ms":50,"requires_ready":false,"phase":"held_mint_end"}),
+            );
+            for poll in 0..100 {
+                observation.attempt(poll + 1);
+                cleared = observation.inspect(run, worker).await?["sessions"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty();
+                if observation.poll(poll + 1, cleared) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
         }
         case.check(
+            "inference_cases.a049",
             "end drops holdings and waits for the held mint",
             cleared && module(run, worker, "return self.endAnswered;").await? == false,
         );
@@ -1052,6 +1272,7 @@ pub(super) async fn run(
         let key = last_key(run);
         let id = key_id(run, &key);
         case.check(
+            "inference_cases.a050",
             "late identifier has a committed revoke terminal before end answers",
             run.inspect(worker).await?["inference_calls"]
                 .as_array()
@@ -1064,15 +1285,19 @@ pub(super) async fn run(
                 })
                 && run.aggregator.key_status(&key).await? == 402,
         );
-        cases.push(case);
+        case.finish(cases);
         restart(run, tab, worker).await?;
-        let mut case = Case::new("identifier-only mint is revoked at session end");
+        let mut case = Case::new(
+            "inference_cases.c010",
+            "identifier-only mint is revoked at session end",
+        );
         run.aggregator.state.lock().unwrap().identifier_only = true;
         let result = infer(run, worker).await?;
         run.aggregator.state.lock().unwrap().identifier_only = false;
         let key = last_key(run);
         let state = run.inspect(worker).await?;
         case.check(
+            "inference_cases.a051",
             "identifier-only response installs no row-2 holding and ends missing acceptance",
             result.get("refused").is_some()
                 && state["sessions"][0]["session_state"] == "ended"
@@ -1081,31 +1306,45 @@ pub(super) async fn run(
         setup_cases::click(run, tab, "#tau-lock").await?;
         *worker = run.worker(tab, Some(worker), false).await?;
         case.check(
+            "inference_cases.a052",
             "identifier-only key is refused immediately after end, before unlock",
             run.aggregator.key_status(&key).await? == 402,
         );
         resume(run, tab, worker).await?;
-        cases.push(case);
+        case.finish(cases);
 
-        let mut case = Case::new("unlock answers while sweep revoke is withheld");
+        let mut case = Case::new(
+            "inference_cases.c011",
+            "unlock answers while sweep revoke is withheld",
+        );
         infer(run, worker).await?;
         let key = last_key(run);
         crash(run, tab).await?;
         (*tab, *worker) = run.open(&tab.origin, false).await?;
         origin(run, worker).await?;
         run.aggregator.state.lock().unwrap().hold_revoke = true;
-        let before = run.aggregator.count("/revoke");
+        let before = counter_inputs::baseline("inference.withheld_sweep.wait", run, "/revoke");
+        observer::counter_input("inference.withheld_sweep.wait", "/revoke", before + 1);
         let unlocked = tokio::time::timeout(
             Duration::from_secs(8),
-            run.submit(tab, "unlock", PASSPHRASE),
+            counter_inputs::unlock(
+                "inference.withheld_sweep.wait",
+                run,
+                tab,
+                worker,
+                "unlock",
+                PASSPHRASE,
+            ),
         )
         .await;
         case.check(
+            "inference_cases.a053",
             "unlock report arrives while aggregator withholds the revoke response",
             unlocked.is_ok_and(|v| v.is_ok_and(|v| v["store"] == "unlocked")),
         );
-        wait_count(run, "/revoke", before + 1).await?;
+        wait_count("inference.withheld_sweep.wait", run, "/revoke", before + 1).await?;
         case.check(
+            "inference_cases.a054",
             "withheld sweep revoke has an unresolved intent",
             run.inspect(worker).await?["inference_calls"]
                 .as_array()
@@ -1114,12 +1353,14 @@ pub(super) async fn run(
                 .any(|c| c["kind"] == "revoke" && c["state"] == "unresolved"),
         );
         case.check(
+            "inference_cases.a055",
             "withheld revoke did not act",
             run.aggregator.key_status(&key).await? == 200,
         );
         run.aggregator.state.lock().unwrap().hold_revoke = false;
         binding_cases::prepare(run, tab, worker, PASSPHRASE).await?;
         case.check(
+            "inference_cases.a056",
             "new session mints while the recovered revoke is withheld",
             infer(run, worker).await?["finished"] == true,
         );
@@ -1127,16 +1368,20 @@ pub(super) async fn run(
         let before = run.aggregator.count("/revoke");
         module(run, worker, "await m.sweep_inference();return true;").await?;
         case.check(
+            "inference_cases.a057",
             "delayed sweep leaves this worker's minted key usable",
             run.aggregator.count("/revoke") == before
                 && run.aggregator.key_status(&live_key).await? == 200,
         );
-        cases.push(case);
+        case.finish(cases);
     }
     restart(run, tab, worker).await?;
     infer(run, worker).await?;
     let key = last_key(run);
-    let mut case = Case::new("bounded revoke stays unresolved and is never swept twice");
+    let mut case = Case::new(
+        "inference_cases.c012",
+        "bounded revoke stays unresolved and is never swept twice",
+    );
     run.aggregator.state.lock().unwrap().hold_revoke = true;
     let before = run.aggregator.count("/revoke");
     setup_cases::click(run, tab, "#tau-lock").await?;
@@ -1148,11 +1393,13 @@ pub(super) async fn run(
     // If sweeping retries an unresolved revoke, await that transmission before counting it.
     module(run, worker, "await m.sweep_inference();return true;").await?;
     case.check(
+        "inference_cases.a058",
         "exactly one revoke was sent, with no sweep retry",
         run.aggregator.count("/revoke") == before + 1,
     );
     let state = run.inspect(worker).await?;
     case.check(
+        "inference_cases.a059",
         "cut-off revoke remains unresolved",
         state["inference_calls"]
             .as_array()
@@ -1161,6 +1408,7 @@ pub(super) async fn run(
             .any(|c| c["kind"] == "revoke" && c["state"] == "unresolved"),
     );
     case.check(
+        "inference_cases.a060",
         "cut-off key is still accepted before expiry",
         run.aggregator.key_status(&key).await? == 200,
     );
@@ -1177,39 +1425,48 @@ pub(super) async fn run(
         .unwrap_or(now + tau_web::inference::SESSION_LIFETIME_SECONDS);
     run.aggregator.state.lock().unwrap().now = expires + 1;
     case.check(
+        "inference_cases.a061",
         "cut-off key is refused past expiry",
         run.aggregator.key_status(&key).await? == 402,
     );
     run.aggregator.state.lock().unwrap().now = now;
-    cases.push(case);
+    case.finish(cases);
 
     restart(run, tab, worker).await?;
-    let mut case = Case::new("top-up and route refusals send no mint or credentialed request");
+    let mut case = Case::new(
+        "inference_cases.c013",
+        "top-up and route refusals send no mint or credentialed request",
+    );
     run.aggregator.state.lock().unwrap().top_up = true;
     let before = run.aggregator.count("/keys");
     case.check(
+        "inference_cases.a062",
         "top-up on refuses before mint",
         infer(run, worker).await?.get("refused").is_some()
             && run.aggregator.count("/keys") == before,
     );
     run.aggregator.state.lock().unwrap().top_up = false;
     // A new worker has no route table; a refused dedicated probe sends no credential.
-    *worker = run.reload(tab, worker).await?;
+    *worker = run
+        .reload("inference_cases.rs::reload#5", tab, worker)
+        .await?;
     resume(run, tab, worker).await?;
     run.aggregator.state.lock().unwrap().refuse_probe = true;
     let before = run.aggregator.requests.lock().unwrap().len();
     case.check(
+        "inference_cases.a063",
         "refused probe refuses inference",
         infer(run, worker).await?["refused"] == "no route to that origin in this build",
     );
     case.check(
+        "inference_cases.a064",
         "only OPTIONS requests reached fixture",
         run.aggregator.requests.lock().unwrap()[before..]
             .iter()
             .all(|r| r.starts_with(b"OPTIONS ")),
     );
     run.aggregator.state.lock().unwrap().refuse_probe = false;
-    cases.push(case);
+    case.finish(cases);
     // Leave a real key minted for the tracer build's following no-plaintext search.
     infer(run, worker).await?;
     Ok(())
@@ -1221,7 +1478,11 @@ pub(super) async fn no_plaintext(
     worker: &Worker,
     cases: &mut Vec<Case>,
 ) -> Result<(), String> {
-    let mut case = Case::new("inference no-plaintext needles and loopback-only requests");
+    let _scenario_span = completion::scenario("inference_cases.no_plaintext");
+    let mut case = Case::new(
+        "inference_cases.c014",
+        "inference no-plaintext needles and loopback-only requests",
+    );
     let collector = DUMP.replace("navigator.storage.getDirectory()", "fixture");
     let moved = run.browser.evaluate(&tab.session, &format!(r#"(async()=>{{
         let attempts=0;
@@ -1236,6 +1497,7 @@ pub(super) async fn no_plaintext(
         catch(error) {{return {{error:error.name,attempts}};}}
     }})()"#)).await?;
     case.check(
+        "inference_cases.a065",
         "OPFS dump retries a move and discards the partial snapshot",
         moved == json!({"files":{"committed":"bmV3"},"attempts":2}),
     );
@@ -1250,6 +1512,7 @@ pub(super) async fn no_plaintext(
             catch(error) {{return {{error:error.name,attempts}};}}
         }})()"#,error=json!(error))).await?;
         case.check(
+            "inference_cases.a066",
             "OPFS dump bounds move retries and preserves unrelated errors",
             refused == json!({"error":error,"attempts":expected_attempts}),
         );
@@ -1258,6 +1521,7 @@ pub(super) async fn no_plaintext(
     let mut needles = Vec::new();
     add_inference_needles(run, &mut needles);
     case.check(
+        "inference_cases.a067",
         "account and every minted session inference key contribute needles",
         needles.len() > 10,
     );
@@ -1268,33 +1532,67 @@ pub(super) async fn no_plaintext(
             .chain(s.keys.iter().map(|k| k.value.clone()))
             .collect()
     };
+    let mint_requests = run
+        .aggregator
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request.starts_with(b"POST /keys "))
+        .count();
+    completion::domain("inference-credentials", values.len(), mint_requests + 1);
+    println!(
+        "TRACER_FIXTURE {}",
+        json!({"kind":"census","id":"inference-credentials"})
+    );
     for value in &values {
         case.check(
+            "inference_cases.a068",
             "planted credential is detected",
             !reader::found(&needles, value.as_bytes()).is_empty(),
         );
     }
-    let files = run.dump(tab).await?;
-    let opened = reader::read(&store_files(&files), PASSPHRASE)?;
+    let files = run.dump_at("file.inference_cases.dump.004", tab).await?;
+    let opened = reader::read_at(
+        "reader.call.inference.leakage",
+        &store_files(&files),
+        PASSPHRASE,
+    )?;
     case.check(
+        "inference_cases.a069",
         "OPFS holds no credential plaintext",
         files
             .values()
             .all(|b| reader::found(&needles, b).is_empty()),
     );
     case.check(
+        "inference_cases.a070",
         "decrypted records exempt only the account credential field",
-        opened.records.iter().all(|(_, b)| {
-            reader::record_findings(&needles, b, &opened.seed_id().unwrap()).is_empty()
-        }),
+        opened
+            .records
+            .iter()
+            .enumerate()
+            .all(|(source_index, (_, b))| {
+                let _source_slot = semantic::Slot::new("reader.aux.inference_record", source_index);
+                reader::record_findings(
+                    &needles,
+                    b,
+                    &opened
+                        .seed_id_at("reader.aux.call.inference.leakage.seed_id")
+                        .unwrap(),
+                )
+                .is_empty()
+            }),
     );
     let storage = run.browser.evaluate(&tab.session, OTHER_STORAGE).await?;
     case.check(
+        "inference_cases.a071",
         "browser storage empty and no service worker",
         storage == json!({"local":[],"session":[],"databases":[],"caches":[],"service_workers":0}),
     );
     run.collect(tab).await?;
     case.check(
+        "inference_cases.a072",
         "page-worker messages hold no credential",
         run.messages
             .borrow()
@@ -1302,6 +1600,7 @@ pub(super) async fn no_plaintext(
             .all(|m| reader::found(&needles, m.to_string().as_bytes()).is_empty()),
     );
     case.check(
+        "inference_cases.a073",
         "store_state holds no credential",
         reader::found(&needles, run.inspect(worker).await?.to_string().as_bytes()).is_empty(),
     );
@@ -1315,6 +1614,7 @@ pub(super) async fn no_plaintext(
         .map(Value::to_string)
         .collect::<Vec<_>>();
     case.check(
+        "inference_cases.a074",
         "console and logs hold no credential",
         console
             .iter()
@@ -1322,6 +1622,7 @@ pub(super) async fn no_plaintext(
     );
     let requests = run.aggregator.requests.lock().unwrap().clone();
     case.check(
+        "inference_cases.a075",
         "completion bodies hold no credential",
         requests
             .iter()
@@ -1353,6 +1654,7 @@ pub(super) async fn no_plaintext(
                 && e["params"]["blockedReason"] == "inspector"
         });
     case.check(
+        "inference_cases.a076",
         "worker negative control was blocked before transmission",
         blocked == false && worker_blocked,
     );
@@ -1369,10 +1671,12 @@ pub(super) async fn no_plaintext(
         .filter_map(|e| e["params"]["request"]["url"].as_str())
         .collect();
     case.check(
+        "inference_cases.a077",
         "negative control was stopped before transmission",
         paused.contains(&negative),
     );
     case.check(
+        "inference_cases.a078",
         "all page and worker requests were loopback except the blocked negative control",
         paused
             .iter()
@@ -1384,15 +1688,17 @@ pub(super) async fn no_plaintext(
         .filter_map(|e| e["params"]["request"]["url"].as_str())
         .collect();
     case.check(
+        "inference_cases.a079",
         "no request URL carries an inference account credential or session inference key",
         urls.iter()
             .all(|url| reader::found(&needles, url.as_bytes()).is_empty()),
     );
     case.check(
+        "inference_cases.a080",
         "network events cover page and worker requests, all loopback except blocked control",
         !urls.is_empty() && urls.iter().all(|u| cdp::loopback_url(u) || *u == negative),
     );
-    cases.push(case);
+    case.finish(cases);
     Ok(())
 }
 
@@ -1421,7 +1727,7 @@ mod tests {
             ),
             (vec![intent, terminal], true, 200, false, true, true),
         ] {
-            let mut case = Case::new("reload observation");
+            let mut case = Case::new("inference_cases.c015", "reload observation");
             let (revoke, observed_finished) =
                 check_reload_record(&mut case, &records, "ended-key", status, sent);
             assert_eq!(
