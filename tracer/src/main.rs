@@ -27,6 +27,7 @@ mod declaration_cases;
 mod declaration_reader;
 mod delivery_cases;
 mod delivery_reader;
+mod diagnostics;
 mod file_domains;
 mod file_inputs;
 mod file_installations;
@@ -138,10 +139,10 @@ async fn main() {
             tracer,
             rest @ ..,
         ] => {
-            match selection::admit(
+            match diagnostics::child().and_then(|()| selection::admit(
                 mode,
                 &rest.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-            ) {
+            )) {
                 Ok(selected) => match selection::install(selected) {
                     Ok(()) => run(Path::new(served), Path::new(tracer), mode).await,
                     Err(e) => Err(e),
@@ -154,6 +155,19 @@ async fn main() {
                 .into(),
         ),
     };
+    if args.first().is_some_and(|s| s == "execute") {
+        if result.is_err() {
+            diagnostics::execution_error();
+        }
+        diagnostics::terminal(result.is_ok() && diagnostics::healthy());
+    }
+    let result = result.and_then(|()| {
+        if diagnostics::healthy() {
+            Ok(())
+        } else {
+            Err("diagnostic retention failed".into())
+        }
+    });
     if let Err(e) = result {
         if args.first().is_some_and(|s| s == "targeted") {
             eprintln!("TARGETED FAIL");
@@ -200,6 +214,7 @@ impl Case {
     fn new(site: &'static str, name: &str) -> Case {
         println!("\n== {name}");
         let id = catalogue::case_id(site, name);
+        diagnostics::case(&id);
         let start = history::event(json!({"event":"case_start","id":id}));
         Case {
             id,
@@ -233,6 +248,7 @@ impl Case {
 async fn run(served: &Path, tracer: &Path, mode: &str) -> Result<(), String> {
     completion::now();
     let execution_span = completion::Span::start("execution");
+    diagnostics::phase("provenance");
     let provenance = completion::provenance(served, tracer)?;
     let mut timings = Vec::new();
     let chrome = std::env::var("CHROME").map_err(|_| {
@@ -286,10 +302,11 @@ async fn run(served: &Path, tracer: &Path, mode: &str) -> Result<(), String> {
     let browser = match cdp::Browser::launch(&chrome, profile, &tls.spki_sha256).await {
         Ok(browser) => browser,
         Err(error) => {
+            diagnostics::error("setup");
             browser_span.fail();
             let cleanup_span = completion::Span::start("cleanup");
-            sshd.cleanup_at(Some("cleanup.ssh.primary")).await;
-            sshd_other.cleanup_at(Some("cleanup.ssh.other")).await;
+            diagnostics::cleanup_result(sshd.cleanup_at(Some("cleanup.ssh.primary")).await);
+            diagnostics::cleanup_result(sshd_other.cleanup_at(Some("cleanup.ssh.other")).await);
             cleanup_span.finish();
             return Err(error);
         }
@@ -318,14 +335,25 @@ async fn run(served: &Path, tracer: &Path, mode: &str) -> Result<(), String> {
         &mut cases,
     )
     .await;
+    if outcome.is_err() {
+        diagnostics::error("execution");
+    }
     timings.push(groups_span.finish());
     let same_browser = *context.same_browser.borrow();
     drop(context);
     let cleanup_span = completion::Span::start("cleanup");
     let browser_clean = browser.close().await;
-    let sshd_clean = sshd.cleanup_at(Some("cleanup.ssh.primary")).await;
-    let other_clean = sshd_other.cleanup_at(Some("cleanup.ssh.other")).await;
+    if !browser_clean {
+        diagnostics::error("cleanup");
+    }
+    let sshd_clean =
+        diagnostics::cleanup_result(sshd.cleanup_at(Some("cleanup.ssh.primary")).await);
+    let other_clean =
+        diagnostics::cleanup_result(sshd_other.cleanup_at(Some("cleanup.ssh.other")).await);
     let cleanup = browser_clean && sshd_clean && other_clean;
+    if !cleanup {
+        diagnostics::error("cleanup");
+    }
     timings.push(cleanup_span.finish());
 
     // The summary names every case that ran, even when one stopped the run.
@@ -342,6 +370,7 @@ async fn run(served: &Path, tracer: &Path, mode: &str) -> Result<(), String> {
         .map(|c| c.name.as_str())
         .collect();
     inputs::finish();
+    diagnostics::phase("report");
     let report = completion::report(
         mode,
         &provenance,

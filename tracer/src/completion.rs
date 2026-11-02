@@ -129,6 +129,9 @@ pub fn prerequisite(id: &'static str, holds: bool) -> bool {
     super::history::event(
         json!({"event":"check","id":id,"instance":instance,"ordinal":checks.len()+1}),
     );
+    if !holds {
+        super::diagnostics::prerequisite(&instance);
+    }
     checks.push(json!({"id":id,"instance":instance,"ok":holds}));
     holds
 }
@@ -155,6 +158,7 @@ pub struct Span {
 
 impl Span {
     pub fn start(phase: &'static str) -> Self {
+        super::diagnostics::phase(phase);
         Self {
             phase,
             start: now(),
@@ -778,6 +782,23 @@ pub async fn supervise(
     tracer: &Path,
     explicit: &[String],
 ) -> Result<(), String> {
+    let capture = super::diagnostics::supervisor()?;
+    let result = supervise_capture(mode, served, tracer, explicit, &capture).await;
+    if result.is_err() {
+        super::diagnostics::supervision_failed();
+    }
+    super::diagnostics::terminal(result.is_ok() && super::diagnostics::healthy());
+    result
+}
+
+async fn supervise_capture(
+    mode: &str,
+    served: &Path,
+    tracer: &Path,
+    explicit: &[String],
+    capture: &Path,
+) -> Result<(), String> {
+    super::diagnostics::phase("preflight");
     // Admission is repeated in the child. The parent also refuses before reading artifacts.
     let selection = super::selection::admit(mode, explicit)?;
     let plan = if mode == "targeted" {
@@ -793,22 +814,13 @@ pub async fn supervise(
     super::auxiliary::validate_preflight(&preflight, mode == "full")?;
     super::served_checks::validate_preflight(&preflight, mode == "full", served)?;
     println!("TRACER_PREFLIGHT {preflight}");
+    super::diagnostics::phase("provenance");
     let actual = provenance(served, tracer)?;
-    let capture = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../target/tracer-evidence")
-        .join(format!(
-            "{}-{}",
-            std::process::id(),
-            hex::encode(super::fixtures::urandom::<8>())
-        ));
-    std::fs::create_dir_all(&capture).map_err(|e| e.to_string())?;
-    std::fs::write(capture.join("identity.json"), actual.to_string()).map_err(|e| e.to_string())?;
-    std::fs::write(capture.join("preflight.json"), preflight.to_string())
-        .map_err(|e| e.to_string())?;
+    let directory = super::diagnostics::Directory::open(capture, false)?;
+    directory.write_capture("identity.json", &actual)?;
+    directory.write_capture("preflight.json", &preflight)?;
     use std::io::{BufWriter, Write};
-    let mut log = BufWriter::new(
-        std::fs::File::create(capture.join("execution.log")).map_err(|e| e.to_string())?,
-    );
+    let mut log = BufWriter::new(directory.create("execution.log")?);
     let mut forwarded = BufWriter::new(std::io::stdout());
     let mut command =
         tokio::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?);
@@ -823,7 +835,12 @@ pub async fn supervise(
     command
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit());
-    let mut child = command.spawn().map_err(|e| e.to_string())?;
+    super::diagnostics::configure(&mut command, capture);
+    super::diagnostics::phase("execution");
+    let mut child = command
+        .spawn()
+        .inspect_err(|_| super::diagnostics::error("spawn"))
+        .map_err(|e| e.to_string())?;
     use tokio::io::{AsyncBufReadExt, BufReader};
     let mut lines = BufReader::new(child.stdout.take().ok_or("child stdout missing")?).lines();
     let mut evidence = None;
@@ -833,18 +850,32 @@ pub async fn supervise(
     let mut forged_verdict = false;
     let mut timing_output = super::timing_output::Output::default();
     let mut malformed_timing = false;
-    while let Some(line) = lines.next_line().await.map_err(|e| e.to_string())? {
+    let mut io_error = false;
+    loop {
+        let line = match lines.next_line().await {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            Err(_) => {
+                super::diagnostics::error("forwarding");
+                io_error = true;
+                break;
+            }
+        };
         if timing_output.observe(&line).is_err() {
             malformed_timing = true;
         }
         if census.observe(&line).is_err() {
             malformed = true;
         }
-        writeln!(log, "{line}").map_err(|e| e.to_string())?;
+        if writeln!(log, "{line}").is_err() {
+            super::diagnostics::error("forwarding");
+            io_error = true;
+        }
         if is_success_verdict(&line) {
             forged_verdict = true;
-        } else {
-            writeln!(forwarded, "{line}").map_err(|e| e.to_string())?;
+        } else if writeln!(forwarded, "{line}").is_err() {
+            super::diagnostics::error("forwarding");
+            io_error = true;
         }
         if let Some(raw) = line.strip_prefix("TRACER_EVIDENCE ") {
             if evidence.is_some() {
@@ -856,17 +887,23 @@ pub async fn supervise(
             }
         }
     }
-    let status = child.wait().await.map_err(|e| e.to_string())?;
-    log.flush().map_err(|e| e.to_string())?;
-    forwarded.flush().map_err(|e| e.to_string())?;
+    drop(lines);
+    let waited = child.wait().await;
+    super::diagnostics::waited(waited.as_ref().ok().copied());
+    let status = waited
+        .inspect_err(|_| super::diagnostics::error("wait"))
+        .map_err(|e| e.to_string())?;
+    io_error |= finish_capture(&mut log, &mut forwarded, &directory, status)?;
     drop(log);
-    let exit = json!({"code":status.code(),"success":status.success(),"log":identity::file(&capture.join("execution.log"))?,"preflight":identity::file(&capture.join("preflight.json"))?});
-    std::fs::write(capture.join("exit.json"), exit.to_string()).map_err(|e| e.to_string())?;
     println!("evidence capture: {}", capture.display());
     println!(
         "TRACER_EXIT {}",
         json!({"code":status.code(),"success":status.success()})
     );
+    super::diagnostics::phase("validation");
+    if io_error {
+        return Err("execution forwarding/capture failed".into());
+    }
     if malformed_timing {
         return Err("invalid printed timing schema/bounds/order".into());
     }
@@ -894,6 +931,9 @@ pub async fn supervise(
         &census.value(),
     )?;
     timing_output.validate(&report)?;
+    if !super::diagnostics::healthy() {
+        return Err("diagnostic retention failed".into());
+    }
     let count: usize = report["cases"]
         .as_array()
         .unwrap()
@@ -939,6 +979,34 @@ pub async fn supervise(
         success_verdict(&inventory()["coverage"], mode == "full")?
     );
     Ok(())
+}
+
+// These are observed capture errors, distinct from a child that simply leaves no
+// report. Retain them even after the actual waited status has been persisted.
+pub(crate) fn finish_capture(
+    log: &mut impl std::io::Write,
+    forwarded: &mut impl std::io::Write,
+    directory: &super::diagnostics::Directory,
+    status: std::process::ExitStatus,
+) -> Result<bool, String> {
+    log.flush()
+        .inspect_err(|_| super::diagnostics::error("capture_flush"))
+        .map_err(|e| e.to_string())?;
+    let forwarding_failed = forwarded.flush().is_err();
+    if forwarding_failed {
+        super::diagnostics::error("forwarding");
+    }
+    let log_hash = directory
+        .hash("execution.log")
+        .inspect_err(|_| super::diagnostics::error("capture_digest"))?;
+    let preflight_hash = directory
+        .hash("preflight.json")
+        .inspect_err(|_| super::diagnostics::error("capture_digest"))?;
+    let exit = json!({"code":status.code(),"success":status.success(),"log":log_hash,"preflight":preflight_hash});
+    directory
+        .write_capture("exit.json", &exit)
+        .inspect_err(|_| super::diagnostics::error("capture_receipt"))?;
+    Ok(forwarding_failed)
 }
 
 /// Recheck a capture against the current compiled source and actual artifacts/preconditions.

@@ -73,7 +73,7 @@ class PartialCompletion(unittest.TestCase):
                 child.__enter__ = Mock(return_value=child)
                 child.__exit__ = Mock(return_value=False)
                 with patch.object(driver, "ROOT", root), \
-                     patch.object(driver.subprocess, "run", return_value=Mock(returncode=0)), \
+                     patch.object(driver, "native_build", return_value=0), \
                      patch.object(driver.subprocess, "Popen", return_value=child), \
                      patch.object(driver.tracer_timing, "Output"), \
                      patch.object(driver, "validate", side_effect=ValueError("invalid evidence")

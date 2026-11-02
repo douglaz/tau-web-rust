@@ -27,8 +27,12 @@ impl crate::Case {
             cursor,
         };
         let holds = holds.into().checked(&binding);
+        let instance = format!("{site}.i{occurrence:03}");
+        if !holds {
+            crate::diagnostics::primary(&self.id, &instance);
+        }
         self.assertions
-            .push(json!({"id":format!("{site}.i{occurrence:03}"),"site":site,"ok":holds}));
+            .push(json!({"id":instance,"site":site,"ok":holds}));
         println!("   [{}] {what}", if holds { "ok" } else { "FAILED" });
         if !holds {
             self.failures.push(what.to_string());
