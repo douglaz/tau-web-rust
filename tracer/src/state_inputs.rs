@@ -16,6 +16,7 @@ const ERROR: &str = "original worker query/field/operation correspondence mismat
 #[must_use]
 pub struct Predicate {
     holds: bool,
+    reboot: Option<crate::reboot_evidence::Reboot>,
     comparisons: Vec<usize>,
     views: Vec<crate::view_inputs::Predicate>,
     files: Vec<crate::file_inputs::Predicate>,
@@ -25,6 +26,7 @@ impl From<bool> for Predicate {
     fn from(holds: bool) -> Self {
         Self {
             holds,
+            reboot: None,
             comparisons: Vec::new(),
             views: Vec::new(),
             files: Vec::new(),
@@ -43,6 +45,7 @@ impl From<crate::view_inputs::Predicate> for Predicate {
     fn from(value: crate::view_inputs::Predicate) -> Self {
         Self {
             holds: value.continues(),
+            reboot: None,
             comparisons: Vec::new(),
             views: vec![value],
             files: Vec::new(),
@@ -54,6 +57,7 @@ impl From<crate::file_inputs::Predicate> for Predicate {
     fn from(value: crate::file_inputs::Predicate) -> Self {
         Self {
             holds: value.continues(),
+            reboot: None,
             comparisons: Vec::new(),
             views: Vec::new(),
             files: vec![value],
@@ -65,6 +69,7 @@ impl From<crate::observer::DisplayedComparison> for Predicate {
     fn from(value: crate::observer::DisplayedComparison) -> Self {
         Self {
             holds: value.continues(),
+            reboot: None,
             comparisons: Vec::new(),
             views: Vec::new(),
             files: Vec::new(),
@@ -72,7 +77,19 @@ impl From<crate::observer::DisplayedComparison> for Predicate {
         }
     }
 }
+impl From<crate::reboot_evidence::Reboot> for Predicate {
+    fn from(reboot: crate::reboot_evidence::Reboot) -> Self {
+        let holds = reboot.holds();
+        Self {
+            reboot: Some(reboot),
+            ..Self::from(holds)
+        }
+    }
+}
 impl Predicate {
+    pub fn take_reboot(&mut self) -> Option<crate::reboot_evidence::Reboot> {
+        self.reboot.take()
+    }
     pub fn continues(&self) -> bool {
         self.holds
     }
@@ -85,7 +102,9 @@ impl Predicate {
         files.extend(other.files);
         let mut displayed = self.displayed;
         displayed.extend(other.displayed);
+        assert!(self.reboot.is_none() || other.reboot.is_none());
         Self {
+            reboot: self.reboot.or(other.reboot),
             holds: self.holds && other.holds,
             comparisons,
             views,
@@ -210,6 +229,7 @@ impl State {
         uses.push(json!({"predicate":predicate,"sources":[self.original.source,other.original.source],"paths":[paths(self),paths(other)],"transform":transform,"comparisons":comparisons,"result":result,"case":history::active_case_id(),"at_ns":completion::now(),"history_cursor":history::cursor(),"check_ns":null,"check_cursor":null,"instance":null}));
         Predicate {
             holds: result,
+            reboot: None,
             comparisons: vec![index],
             views: Vec::new(),
             files: Vec::new(),
@@ -243,6 +263,7 @@ impl State {
         uses.push(json!({"predicate":predicate,"sources":[self.original.source,before.original.source,replayed.original.source],"paths":[[self.path.clone()],[before.path.clone()],[format!("{}/records",replayed.path)]],"transform":"failed_append","comparisons":comparisons,"result":result,"case":history::active_case_id(),"at_ns":completion::now(),"history_cursor":history::cursor(),"check_ns":null,"check_cursor":null,"instance":null}));
         Predicate {
             holds: result,
+            reboot: None,
             comparisons: vec![index],
             views: Vec::new(),
             files: Vec::new(),

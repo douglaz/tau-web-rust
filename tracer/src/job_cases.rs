@@ -390,16 +390,18 @@ e["call"] == call
             .len(),
     );
     worker = settle_unresolved("settle.job_cases.002", run, tab, worker).await?;
+    let reboot_wait = run.sshd.machine.reboot_wait()?;
     let (new, running, running_id) = drop_command(
         ("job.reboot.running", "job.reboot.running", 0),
         run,
         tab,
         worker,
         args("fixture"),
-        "sleep 30; echo too-late",
+        &reboot_wait.command,
     )
     .await?;
     worker = new;
+    let setup = Instant::now();
     legacy_slots.push(
         run.inspect(&worker).await?["records"]
             .as_array()
@@ -429,7 +431,12 @@ e["call"] == call
     let old_boot =
         std::fs::read(run.sshd.machine.path(&running_id, "boot")).map_err(|e| e.to_string())?;
     let count = run.sshd.machine.observe().len();
-    run.sshd.machine.reboot();
+    let mut reboot_fixture = run
+        .sshd
+        .machine
+        .reboot_with_running(&running_id, setup)
+        .await?;
+    reboot_fixture.missing_record_absent = !run.sshd.machine.path(&missing_id, "").exists();
     take(run.seen);
     let start = Instant::now();
     let report = collect(run, &worker, args("fixture")).await?;
@@ -442,24 +449,17 @@ e["call"] == call
             && evidence(&report, finished)["exit_status"] == 4
             && evidence(&report, finished)["stdout"] == "before-reboot\n",
     );
+    let reboot = reboot_evidence::Reboot::observe(
+        old_boot != std::fs::read(run.sshd.machine.root.join("boot")).map_err(|e| e.to_string())?,
+        reboot_evidence::Job::observe(running, &evidence(&report, running), &state),
+        reboot_evidence::Job::observe(missing, &evidence(&report, missing), &state),
+        reboot_fixture,
+    );
+    println!("   reboot observations: {}", json!(reboot));
     case.check(
         "job_cases.a015",
         "boot identity proves ended without a terminal, missing stays distinct",
-        old_boot != std::fs::read(run.sshd.machine.root.join("boot")).map_err(|e| e.to_string())?
-            && evidence(&report, running)["state"] == "ended"
-            && evidence(&report, missing)["state"] == "missing"
-            && [running, missing].iter().all(|id| {
-                state["calls"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|c| c["call"] == *id && c["state"] == "unresolved")
-                    && state["terminals"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .all(|t| t["call"] != *id)
-            }),
+        reboot,
     );
     case.check(
         "job_cases.a016",

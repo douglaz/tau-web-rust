@@ -325,7 +325,14 @@ impl Store {
         self.directory.write(self.status_file, &json!({"schema":1,"at_ns":completion::now(),"phase":self.phase,"case":self.case,"status":status}), false)
     }
     fn failure(&self, kind: &str, class: &str, instance: Option<&str>) -> Result<(), String> {
-        self.directory.write("first-failure.json", &json!({"schema":1,"at_ns":completion::now(),"phase":self.phase,"case":self.case,"kind":kind,"class":class,"instance":instance}), true)
+        self.directory.write(
+            "first-failure.json",
+            &self.failure_record(kind, class, instance),
+            true,
+        )
+    }
+    fn failure_record(&self, kind: &str, class: &str, instance: Option<&str>) -> Value {
+        json!({"schema":1,"at_ns":completion::now(),"phase":self.phase,"case":self.case,"kind":kind,"class":class,"instance":instance})
     }
 }
 pub fn phase(phase: &'static str) {
@@ -354,7 +361,7 @@ fn instance_site(instance: &str) -> Option<&str> {
     let count: u64 = occurrence.parse().ok()?;
     (count > 0 && count <= 999999 && instance == format!("{site}.i{count:03}")).then_some(site)
 }
-pub fn primary(case: &str, instance: &str) {
+pub fn primary(case: &str, instance: &str, reboot: Option<&crate::reboot_evidence::Reboot>) {
     update(|store| {
         let Some(spec) = completion::inventory()["cases"]
             .as_array()
@@ -387,7 +394,21 @@ pub fn primary(case: &str, instance: &str) {
             return store.invalid_identity();
         }
         store.case = Some(case.to_owned());
-        store.failure("primary", "check", Some(instance))
+        if (site == "job_cases.a015") != reboot.is_some() {
+            return store.invalid_identity();
+        }
+        if let Some(reboot) = reboot {
+            if case != "job_cases.c004.p001" || site != "job_cases.a015" || reboot.holds() {
+                return store.invalid_identity();
+            }
+            let mut value = store.failure_record("primary", "check", Some(instance));
+            value["reboot"] = json!(reboot);
+            store.directory.write("first-failure.json", &value, true)?;
+            // An earlier failure must not suppress this assertion's bounded observations.
+            store.directory.write("reboot-failure.json", &value, true)
+        } else {
+            store.failure("primary", "check", Some(instance))
+        }
     });
 }
 pub fn prerequisite(instance: &str) {
@@ -549,6 +570,61 @@ mod tests {
             terminal(false);
             assert_eq!(read(&scratch, "first-failure.json"), Some(first));
         }
+        {
+            let scratch = Scratch::new();
+            install(&scratch, "groups");
+            let state = json!({"calls":[{"call":2,"state":"unresolved"},{"call":3,"state":"unresolved"}],"terminals":[]});
+            let reboot = || {
+                crate::reboot_evidence::Reboot::observe(
+                    false,
+                    crate::reboot_evidence::Job::observe(2, &json!({"state":"ended"}), &state),
+                    crate::reboot_evidence::Job::observe(3, &json!({"state":"missing"}), &state),
+                    crate::reboot_evidence::Fixture {
+                        setup_ms: 31001,
+                        boundary_alive: true,
+                        boundary_stopped: true,
+                        record_present: true,
+                        exit_present: false,
+                        record_boot_matches: true,
+                        after_alive: false,
+                        after_exit_present: false,
+                        record_boot_preserved: true,
+                        missing_record_absent: true,
+                    },
+                )
+            };
+            let mut check = crate::Case::new(
+                "job_cases.c004",
+                "reboot keeps records; ended and missing calls stay unresolved (CNF-55)",
+            );
+            check.check("job_cases.a015", "SENTINEL description", reboot());
+            let first = read(&scratch, "first-failure.json").unwrap();
+            assert_eq!(first["instance"], "job_cases.a015.i001");
+            assert_eq!(first["reboot"]["checks"]["boot_changed"], false);
+            assert_eq!(first["reboot"]["running"]["collection"], "ended");
+            assert!(first.to_string().len() < 8192);
+            assert!(!first.to_string().contains("SENTINEL"));
+            phase("cleanup");
+            cleanup_result(false);
+            terminal(false);
+            primary("main.c001.p001", "main.a001.i001", None);
+            assert_eq!(read(&scratch, "first-failure.json"), Some(first.clone()));
+            assert_eq!(read(&scratch, "reboot-failure.json"), Some(first));
+            let later = Scratch::new();
+            install(&later, "groups");
+            primary("main.c001.p001", "main.a001.i001", None);
+            let earlier = read(&later, "first-failure.json");
+            primary(
+                "job_cases.c004.p001",
+                "job_cases.a015.i001",
+                Some(&reboot()),
+            );
+            assert_eq!(read(&later, "first-failure.json"), earlier);
+            let record = read(&later, "reboot-failure.json").unwrap();
+            assert_eq!(record["case"], "job_cases.c004.p001");
+            assert_eq!(record["instance"], "job_cases.a015.i001");
+            assert_eq!(record["reboot"]["checks"]["boot_changed"], false);
+        }
         for (id, instance, prerequisite) in [
             ("SENTINEL", "main.a122.i001", false),
             ("main.c001.p001", "main.a122.i001", false),
@@ -564,7 +640,7 @@ mod tests {
             if prerequisite {
                 super::prerequisite(instance);
             } else {
-                primary(id, instance);
+                primary(id, instance, None);
             }
             let first = read(&scratch, "first-failure.json").unwrap();
             assert_eq!(first["class"], "retention");
@@ -592,7 +668,7 @@ mod tests {
             install(&scratch, "cleanup");
             case("main.c001.p001");
             if earlier {
-                primary("main.c001.p001", "main.a001.i001");
+                primary("main.c001.p001", "main.a001.i001", None);
             }
             let before = read(&scratch, "first-failure.json");
             let mut cleanup = Box::pin(async {
@@ -647,7 +723,7 @@ mod tests {
                 install(&scratch, "execution");
                 case("main.c001.p001");
                 if earlier {
-                    primary("main.c001.p001", "main.a001.i001");
+                    primary("main.c001.p001", "main.a001.i001", None);
                 }
                 let before = read(&scratch, "first-failure.json");
                 waited(Some(status));

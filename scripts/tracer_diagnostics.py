@@ -36,6 +36,53 @@ def digest(value, length=64):
     return value
 
 
+def reboot_evidence(value):
+    fields(value, ('boot_changed', 'running', 'missing', 'fixture', 'checks'))
+    def boolean(item):
+        if type(item) is not bool:
+            raise ValueError('invalid reboot boolean')
+        return item
+    boolean(value['boot_changed'])
+    for role in ('running', 'missing'):
+        job = value[role]
+        fields(job, ('call', 'collection', 'call_state', 'terminal'))
+        if integer(job['call']) == 0:
+            raise ValueError('invalid reboot call')
+        if type(job['collection']) is not str or job['collection'] not in (
+                'finished', 'running', 'ended', 'missing', 'other_machine', 'incomplete',
+                'absent', 'unrecognized'):
+            raise ValueError('invalid reboot collection state')
+        if type(job['call_state']) is not str or job['call_state'] not in (
+                'unresolved', 'finished', 'disposed', 'cancelled', 'absent', 'unrecognized'):
+            raise ValueError('invalid reboot call state')
+        if job['terminal'] is not None:
+            boolean(job['terminal'])
+    if value['running']['call'] == value['missing']['call']:
+        raise ValueError('reboot roles share a call')
+    fixture = value['fixture']
+    flags = ('boundary_alive', 'boundary_stopped', 'record_present', 'exit_present',
+             'record_boot_matches', 'after_alive', 'after_exit_present',
+             'record_boot_preserved', 'missing_record_absent')
+    fields(fixture, ('setup_ms', *flags))
+    integer(fixture['setup_ms'])
+    for key in flags:
+        boolean(fixture[key])
+    expected = dict(boot_changed=value['boot_changed'],
+                    running_ended=value['running']['collection'] == 'ended',
+                    missing_missing=value['missing']['collection'] == 'missing',
+                    running_unresolved=value['running']['call_state'] == 'unresolved',
+                    missing_unresolved=value['missing']['call_state'] == 'unresolved',
+                    running_no_terminal=value['running']['terminal'] is False,
+                    missing_no_terminal=value['missing']['terminal'] is False)
+    fields(value['checks'], expected)
+    for key, item in value['checks'].items():
+        if boolean(item) != expected[key]:
+            raise ValueError('inconsistent reboot operand')
+    if all(expected.values()):
+        raise ValueError('reboot evidence has no failed operand')
+    return value
+
+
 def decode(raw):
     def pairs(items):
         value = {}
@@ -203,6 +250,7 @@ class Publication:
                                     ('served_build', 'tracer_build', 'native_build', 'native', 'validation', 'driver')},
                        'capture': missing('unavailable'), 'first_failure': missing(),
                        'context': missing(), 'native_context': missing(), 'driver_failure': missing(),
+                       'reboot_failure': missing(),
                        'execution': actual_exit(None), 'identity': missing(),
                        'receipt': missing(), 'preflight': missing(),
                        'timing': missing(), 'preparation': missing()}
@@ -334,7 +382,7 @@ class Publication:
         return dict(value)
 
     def failure(self, value):
-        fields(value, ('schema', 'at_ns', 'phase', 'case', 'kind', 'class', 'instance'))
+        fields(value, {'schema', 'at_ns', 'phase', 'case', 'kind', 'class', 'instance'} | ({'reboot'} if 'reboot' in value else set()))
         self.context({key: value[key] for key in ('schema', 'at_ns', 'phase', 'case')} | {'status': 'failed'})
         kind, category, instance = value['kind'], value['class'], value['instance']
         if category not in CLASSES or kind not in ('primary', 'prerequisite', 'execution'):
@@ -352,7 +400,19 @@ class Publication:
                 raise ValueError('foreign primary instance')
             if kind == 'prerequisite' and (category not in ('prerequisite', 'cleanup') or self.prerequisites is None or site not in self.prerequisites):
                 raise ValueError('foreign prerequisite instance')
+        if kind == 'primary' and value['case'] == 'job_cases.c004.p001' and site == 'job_cases.a015' and 'reboot' not in value:
+            raise ValueError('missing reboot evidence')
+        if 'reboot' in value:
+            if kind != 'primary' or value['case'] != 'job_cases.c004.p001' or site != 'job_cases.a015':
+                raise ValueError('foreign reboot evidence')
+            reboot_evidence(value['reboot'])
         return dict(value)
+
+    def reboot_failure(self, value):
+        result = self.failure(value)
+        if result['kind'] != 'primary' or result['case'] != 'job_cases.c004.p001' or 'reboot' not in result:
+            raise ValueError('foreign reboot assertion record')
+        return result
 
     def identity(self, value):
         # Explicitly select hashes and booleans, never the entire provenance object.
@@ -372,7 +432,7 @@ class Publication:
         if self.native_pid is None:
             return
         path = self.root / 'target/tracer-evidence' / f'{self.native_pid}-{self.invocation}'
-        for key in ('first_failure', 'context', 'native_context', 'identity', 'receipt', 'preflight'):
+        for key in ('first_failure', 'reboot_failure', 'context', 'native_context', 'identity', 'receipt', 'preflight'):
             self.packet[key] = missing()
         self.packet['execution'] = actual_exit(None)
         try:
@@ -383,6 +443,11 @@ class Publication:
                     raise ValueError('foreign diagnostic supervisor')
                 self.packet['capture'] = available(True)
                 self.packet['first_failure'] = select(capture, 'first-failure.json', self.failure)
+                self.packet['reboot_failure'] = select(capture, 'reboot-failure.json', self.reboot_failure)
+                first = self.packet['first_failure']
+                reboot = self.packet['reboot_failure']
+                if first['state'] == reboot['state'] == 'available' and 'reboot' in first['value'] and first != reboot:
+                    self.packet['reboot_failure'] = missing('untrusted')
                 self.packet['context'] = select(capture, 'status.json', self.context)
                 self.packet['native_context'] = select(capture, 'native-status.json', self.context)
                 execution = select(capture, 'supervisor.json', waited)
@@ -408,7 +473,7 @@ class Publication:
             self.packet['capture'] = missing()
         except (OSError, ValueError, KeyError, TypeError, UnicodeError, RecursionError, OverflowError):
             self.packet['capture'] = missing('untrusted')
-            for key in ('first_failure', 'context', 'native_context', 'identity', 'receipt', 'preflight'):
+            for key in ('first_failure', 'reboot_failure', 'context', 'native_context', 'identity', 'receipt', 'preflight'):
                 self.packet[key] = missing('untrusted')
             self.packet['execution'] = actual_exit(None)
         self.publish()
@@ -483,7 +548,7 @@ def verify_packet(root, invocation):
         packet = directory.read('packet.json', LIMIT)
     required = {'schema', 'invocation', 'packet_state', 'driver', 'outcomes',
                 'capture', 'first_failure', 'context', 'native_context', 'driver_failure',
-                'execution', 'identity', 'receipt', 'preflight', 'timing', 'preparation'}
+                'execution', 'identity', 'receipt', 'preflight', 'timing', 'preparation', 'reboot_failure'}
     fields(packet, required | ({'inputs'} if 'inputs' in packet else set()))
     if type(packet['schema']) is not int or packet['schema'] != 1 or packet['invocation'] != invocation or packet['packet_state'] not in ('partial', 'finalized', 'truncated'):
         raise ValueError('foreign publication packet')
@@ -560,10 +625,14 @@ def verify_packet(root, invocation):
         integer(value['at_ns'])
 
     for key, check in (('capture', capture), ('first_failure', validator.failure),
+                       ('reboot_failure', validator.reboot_failure),
                        ('context', validator.context), ('native_context', validator.context),
                        ('identity', identity), ('receipt', receipt), ('preflight', preflight),
                        ('timing', timing), ('preparation', preparation), ('driver_failure', driver_failure)):
         optional(key, check)
+    first, reboot = packet['first_failure'], packet['reboot_failure']
+    if first['state'] == reboot['state'] == 'available' and 'reboot' in first['value'] and first != reboot:
+        raise ValueError('reboot assertion record disagrees with first failure')
     if 'inputs' in packet:
         inputs = packet['inputs']
         fields(inputs, ('source', 'inventory', 'validation_contracts'))

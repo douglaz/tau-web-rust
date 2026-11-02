@@ -58,6 +58,7 @@ mod page_queries;
 mod predicate_inputs;
 mod reader;
 mod reader_checks;
+mod reboot_evidence;
 mod requirements;
 mod seed_cases;
 mod seed_operations;

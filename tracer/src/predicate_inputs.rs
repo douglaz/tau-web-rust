@@ -26,10 +26,12 @@ impl crate::Case {
             at,
             cursor,
         };
-        let holds = holds.into().checked(&binding);
+        let mut predicate = holds.into();
+        let reboot = predicate.take_reboot();
+        let holds = predicate.checked(&binding);
         let instance = format!("{site}.i{occurrence:03}");
         if !holds {
-            crate::diagnostics::primary(&self.id, &instance);
+            crate::diagnostics::primary(&self.id, &instance, reboot.as_ref());
         }
         self.assertions
             .push(json!({"id":instance,"site":site,"ok":holds}));
