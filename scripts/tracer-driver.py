@@ -307,7 +307,9 @@ def observed_child(command, diagnostic, outcome, **kwargs):
     child = None
     try:
         try:
-            process = subprocess.Popen(command, **kwargs)
+            # Isolate every invocation child so cancellation also reaches its
+            # execution descendants before terminal diagnostics are published.
+            process = subprocess.Popen(command, start_new_session=True, **kwargs)
         except OSError:
             if diagnostic:
                 diagnostic.fail("spawn")
@@ -656,7 +658,8 @@ def main():
             # after retiring this handler, while ownership is still held.
             raise KeyboardInterrupt
         if _ACTIVE_CHILD is not None:
-            _ACTIVE_CHILD.send_signal(signum)
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(_ACTIVE_CHILD.pid, signum)
         if diagnostic:
             diagnostic.fail("cancelled")
             diagnostic.collect()

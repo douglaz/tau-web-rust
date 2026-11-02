@@ -516,6 +516,89 @@ sys.exit(driver.main())
                     self.assertNotIn('SENTINEL', json.dumps(packet))
         self.publication = diagnostics.Publication(self.root)
 
+    def test_cancellation_reaches_execution_descendant(self):
+        harness = r'''
+import importlib.util, sys
+from pathlib import Path
+sys.dont_write_bytecode = True
+sys.path.insert(0, sys.argv[1])
+spec = importlib.util.spec_from_file_location('driver', Path(sys.argv[1])/'tracer-driver.py')
+driver = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(driver)
+driver.ROOT = Path(sys.argv[2])
+executor = r"""
+import os, signal, sys, time
+from pathlib import Path
+root = Path(sys.argv[1])
+def cancelled(signum, _frame):
+    (root/'execution-stopped').write_text(str(signum))
+    raise SystemExit(0)
+for sig in (signal.SIGTERM, signal.SIGINT):
+    signal.signal(sig, cancelled)
+(root/'execution-ready').write_text(str(os.getpid()))
+while True:
+    time.sleep(0.01)
+"""
+supervisor = r"""
+import subprocess, sys, time
+child = subprocess.Popen([sys.executable, '-c', sys.argv[2], sys.argv[1]],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+child.wait()
+"""
+def run(publication):
+    publication.stage('native_execution')
+    with driver.observed_child([sys.executable, '-c', supervisor, str(driver.ROOT), executor],
+                               publication, 'native', stdout=-1, stderr=-1) as child:
+        (driver.ROOT/'supervisor-ready').write_text(str(child.pid))
+        return child.wait()
+driver.run = run
+sys.exit(driver.main())
+'''
+        self.publication.stage('admission', 'failed')
+        self.publication.close()
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            with self.subTest(signal=signum):
+                ready = self.root / 'execution-ready'
+                stopped = self.root / 'execution-stopped'
+                supervisor_ready = self.root / 'supervisor-ready'
+                for path in (ready, stopped, supervisor_ready):
+                    path.unlink(missing_ok=True)
+                execution_pid = None
+                with subprocess.Popen([sys.executable, '-c', harness, str(ROOT / 'scripts'), str(self.root)],
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+                    try:
+                        deadline = time.monotonic() + 10
+                        while not ready.exists() or not supervisor_ready.exists():
+                            self.assertIsNone(process.poll())
+                            self.assertLess(time.monotonic(), deadline)
+                            time.sleep(0.01)
+                        execution_pid = int(ready.read_text())
+                        supervisor_pid = int(supervisor_ready.read_text())
+                        self.assertIn(str(self.root).encode(), Path(f'/proc/{execution_pid}/cmdline').read_bytes())
+                        self.assertEqual(os.getpgid(execution_pid), supervisor_pid)
+                        self.assertNotEqual(os.getpgrp(), supervisor_pid)
+                        process.send_signal(signum)
+                        stdout, stderr = process.communicate(timeout=10)
+                        self.assertEqual(process.returncode, 128 + signum, (stdout, stderr))
+                        deadline = time.monotonic() + 2
+                        while not stopped.exists() and time.monotonic() < deadline:
+                            time.sleep(0.01)
+                        self.assertTrue(stopped.exists(), 'execution descendant did not receive cancellation')
+                        self.assertEqual(int(stopped.read_text()), signum)
+                        packet = json.loads(self.publication.path.read_text())
+                        diagnostics.verify_packet(self.root, packet['invocation'])
+                        self.assertEqual(packet['driver']['status'], 'cancelled')
+                        self.assertEqual(packet['driver_failure']['value']['class'], 'cancelled')
+                        self.assertEqual(packet['first_failure'], diagnostics.missing())
+                    finally:
+                        if execution_pid is not None:
+                            command = Path(f'/proc/{execution_pid}/cmdline')
+                            if command.exists() and command.read_bytes():
+                                self.assertIn(str(self.root).encode(), command.read_bytes())
+                                with contextlib.suppress(ProcessLookupError):
+                                    os.kill(execution_pid, signal.SIGKILL)
+        self.publication = diagnostics.Publication(self.root)
+
     def test_cancellation_owns_publication_until_delayed_child_is_reaped(self):
         harness = r'''
 import importlib.util, sys
