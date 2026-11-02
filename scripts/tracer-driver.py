@@ -11,6 +11,9 @@ import stat
 import sys
 import time
 import importlib.util
+import signal
+import contextlib
+import tracer_diagnostics
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.dont_write_bytecode = True
@@ -295,9 +298,75 @@ def validate(report, mode, plan, inventory, source, exit_code, census, helpers, 
         if not any(s["invocation"] == specs[case["id"]]["invocation"] and s["id"].startswith(owner) and s["start_ns"] <= case["start_ns"] <= case["end_ns"] <= s["end_ns"] for s in report["scenario_spans"]):
             raise ValueError("case outside scenario scope")
 
-def execute(mode, arguments, plan, inventory, source):
-    build_exit = subprocess.run(["cargo", "build", "--locked", "-p", "tracer"], cwd=ROOT, stdin=subprocess.DEVNULL, check=False).returncode
-    print("TRACER_NATIVE_BUILD_EXIT " + json.dumps({"code": build_exit}))
+_ACTIVE_CHILD = None
+
+
+@contextlib.contextmanager
+def observed_child(command, diagnostic, outcome, **kwargs):
+    global _ACTIVE_CHILD
+    child = None
+    try:
+        try:
+            # Isolate every invocation child so cancellation also reaches its
+            # execution descendants before terminal diagnostics are published.
+            process = subprocess.Popen(command, start_new_session=True, **kwargs)
+        except OSError:
+            if diagnostic:
+                diagnostic.fail("spawn")
+            raise
+        with process as child:
+            _ACTIVE_CHILD = child
+            if diagnostic and outcome == 'native':
+                diagnostic.native_pid = child.pid
+                diagnostic.publish()
+            yield child
+    finally:
+        try:
+            # Popen's KeyboardInterrupt path waits only briefly. Reap the child
+            # before publishing its outcome, including a slow cancellation.
+            if child is not None and child.returncode is None:
+                child.wait()
+        finally:
+            _ACTIVE_CHILD = None
+            if child is not None and diagnostic:
+                diagnostic.outcome(outcome, child.returncode)
+                if outcome == 'native':
+                    diagnostic.collect()
+
+
+def native_build(diagnostic):
+    with observed_child(["cargo", "build", "--locked", "-p", "tracer"], diagnostic,
+                        "native_build", cwd=ROOT, stdin=subprocess.DEVNULL) as child:
+        return child.wait()
+
+
+def forward(diagnostic, text, *, file=None, flush=False):
+    try:
+        print(text, file=file, flush=flush)
+    except (OSError, ValueError):
+        if diagnostic:
+            diagnostic.fail("forwarding")
+        raise
+
+
+def forwarded_lines(child, diagnostic):
+    try:
+        yield from child.stdout
+    except (OSError, ValueError):
+        if diagnostic:
+            diagnostic.fail("forwarding")
+        raise
+
+
+def execute(mode, arguments, plan, inventory, source, diagnostic=None):
+    if diagnostic:
+        diagnostic.stage("native_build")
+    build_exit = native_build(diagnostic)
+    if diagnostic:
+        if build_exit:
+            diagnostic.fail("build")
+        diagnostic.outcome("native_build", build_exit)
+    forward(diagnostic, "TRACER_NATIVE_BUILD_EXIT " + json.dumps({"code": build_exit}))
     if build_exit:
         return build_exit, 1
     binary = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target")) / "debug/tracer"
@@ -316,8 +385,14 @@ def execute(mode, arguments, plan, inventory, source):
     helpers = None
     timing_output = tracer_timing.Output()
     timing_error = None
-    with subprocess.Popen(command, cwd=ROOT, stdout=subprocess.PIPE, text=True) as child:
-        for line in child.stdout:
+    environment = dict(os.environ)
+    if diagnostic:
+        diagnostic.stage("native_execution")
+        environment['_TAU_DIAGNOSTIC_INVOCATION'] = diagnostic.invocation
+        environment['_TAU_DIAGNOSTIC_DRIVER_PID'] = str(os.getpid())
+        environment.pop('_TAU_DIAGNOSTIC_CAPTURE', None)
+    with observed_child(command, diagnostic, "native", cwd=ROOT, stdout=subprocess.PIPE, text=True, env=environment) as child:
+        for line in forwarded_lines(child, diagnostic):
             try:
                 timing_output.observe(line)
             except (ValueError, KeyError, TypeError):
@@ -325,7 +400,12 @@ def execute(mode, arguments, plan, inventory, source):
             if line.startswith(("TRACER PASS", "TRACER PARTIAL PASS", "TARGETED PASS")):
                 verdicts.append(line.strip())
                 continue
-            sys.stdout.write(line)
+            try:
+                sys.stdout.write(line)
+            except (OSError, ValueError):
+                if diagnostic:
+                    diagnostic.fail("forwarding")
+                malformed = True
             if line.startswith("evidence capture: "):
                 captures.append(line[len("evidence capture: "):].strip())
             if line.startswith("TRACER_EXIT "):
@@ -364,6 +444,11 @@ def execute(mode, arguments, plan, inventory, source):
                 except ValueError:
                     malformed = True
         exit_code = child.wait()
+    if diagnostic:
+        diagnostic.outcome("native", exit_code)
+        diagnostic.collect()
+        diagnostic.timing(timing_output.records)
+        diagnostic.stage("validation")
     try:
         if len(captures) != 1 or len(execution_exits) != 1:
             raise ValueError("missing/duplicate actual execution receipt")
@@ -394,11 +479,16 @@ def execute(mode, arguments, plan, inventory, source):
         if exit_code != 0 or verdicts != [required]:
             raise ValueError("native validation failed or missing/duplicate/forged verdict")
     except (ValueError, KeyError, TypeError, OSError) as error:
-        print("evidence refused: " + str(error), file=sys.stderr)
-        print("TARGETED FAIL" if mode == "targeted" else "TRACER FAIL", file=sys.stderr)
-        print("TRACER_SHELL_EXIT " + json.dumps({"execution": execution_exit, "native": exit_code, "validation": 1}))
+        if diagnostic:
+            diagnostic.fail("validation")
+            diagnostic.outcome("validation", 1)
+        forward(diagnostic, "evidence refused: " + str(error), file=sys.stderr)
+        forward(diagnostic, "TARGETED FAIL" if mode == "targeted" else "TRACER FAIL", file=sys.stderr)
+        forward(diagnostic, "TRACER_SHELL_EXIT " + json.dumps({"execution": execution_exit, "native": exit_code, "validation": 1}))
         return exit_code, 1
-    print("TRACER_SHELL_EXIT " + json.dumps({"execution": execution_exit, "native": exit_code, "validation": 0}))
+    if diagnostic:
+        diagnostic.outcome("validation", 0)
+    forward(diagnostic, "TRACER_SHELL_EXIT " + json.dumps({"execution": execution_exit, "native": exit_code, "validation": 0}))
     return exit_code, 0
 
 
@@ -452,9 +542,13 @@ def admit(mode, arguments, environment):
     return selected
 
 
-def main():
+def run(diagnostic):
     # Forward in chunks; assertion lines do not introduce a flush operation.
-    sys.stdout.reconfigure(line_buffering=False, write_through=False)
+    try:
+        sys.stdout.reconfigure(line_buffering=False, write_through=False)
+    except (OSError, ValueError):
+        diagnostic.fail("forwarding")
+        raise
     arguments = sys.argv[1:]
     mode = arguments.pop(0) if arguments else "full"
     if mode == "list" and not arguments:
@@ -462,30 +556,44 @@ def main():
     try:
         selected = admit(mode, arguments, os.environ)
     except ValueError as error:
-        print(str(error), file=sys.stderr)
+        diagnostic.fail("admission")
+        forward(diagnostic, str(error), file=sys.stderr)
         if mode == "targeted":
-            print("TARGETED FAIL", file=sys.stderr)
+            forward(diagnostic, "TARGETED FAIL", file=sys.stderr)
         return 1
     started = time.monotonic_ns()
+    diagnostic.stage("identity")
     inventory = read_inventory()
+    diagnostic.identifiers(inventory, tracer_requirements.prerequisite_counts(inventory))
     try:
         plan = execution_plan(selected, inventory) if mode == "targeted" else None
     except (ValueError, StopIteration) as error:
-        print(str(error) or "selection has no reviewed execution plan", file=sys.stderr)
-        print("TARGETED FAIL", file=sys.stderr)
+        diagnostic.fail("admission")
+        forward(diagnostic, str(error) or "selection has no reviewed execution plan", file=sys.stderr)
+        forward(diagnostic, "TARGETED FAIL", file=sys.stderr)
         return 1
     source = tree_hash(ROOT, source_paths(ROOT), source=True)
+    diagnostic.packet['inputs'] = {
+        'source': tracer_diagnostics.digest(source),
+        'inventory': tracer_diagnostics.digest(file_hash(ROOT / 'tracer/inventory.json')),
+        'validation_contracts': {key: tracer_diagnostics.digest(value) for key, value in validation_contracts(ROOT, source_paths(ROOT)).items()}}
+    diagnostic.publish()
     phases = []
     actual_exits = []
     final_success = False
     try:
         for name in ["served", "tracer"]:
+            diagnostic.stage("prepare_" + name)
             start = time.monotonic_ns()
             build_records = []
             invalid_build_timing = False
-            with subprocess.Popen(["scripts/build-web.sh", name], cwd=ROOT, stdout=subprocess.PIPE, text=True) as child:
-                for line in child.stdout:
-                    sys.stdout.write(line)
+            with observed_child(["scripts/build-web.sh", name], diagnostic, name + "_build", cwd=ROOT, stdout=subprocess.PIPE, text=True) as child:
+                for line in forwarded_lines(child, diagnostic):
+                    try:
+                        sys.stdout.write(line)
+                    except (OSError, ValueError):
+                        diagnostic.fail("forwarding")
+                        raise
                     if line.startswith("TRACER_BUILD_TIMING"):
                         try:
                             if not line.startswith("TRACER_BUILD_TIMING "):
@@ -494,6 +602,9 @@ def main():
                         except ValueError:
                             invalid_build_timing = True
                 build_exit = child.wait()
+            diagnostic.outcome(name + "_build", build_exit)
+            if build_exit:
+                diagnostic.fail("build")
             actual_exits.append(build_exit)
             end = time.monotonic_ns()
             phases.append({"phase": "prepare_" + name, "start_ns": start - started, "end_ns": end - started, "exit": build_exit})
@@ -501,28 +612,115 @@ def main():
                 raise ValueError("invalid build timing multiplicity/schema")
             tracer_timing.build(build_records[0], name, start, end, build_exit)
             if build_exit:
-                print("TARGETED FAIL" if mode == "targeted" else "TRACER FAIL", file=sys.stderr)
+                forward(diagnostic, "TARGETED FAIL" if mode == "targeted" else "TRACER FAIL", file=sys.stderr)
                 return build_exit
         start = time.monotonic_ns()
-        child_exit, validation_exit = execute(mode, arguments, plan, inventory, source)
+        child_exit, validation_exit = execute(mode, arguments, plan, inventory, source, diagnostic)
         actual_exits.append(child_exit)
         phases.append({"phase": "execute_through_cleanup", "start_ns": start - started, "end_ns": time.monotonic_ns() - started, "exit": child_exit})
         final_success = validation_exit == 0
         return validation_exit
-    except (ValueError, KeyError, TypeError) as error:
-        print("preparation refused: " + str(error), file=sys.stderr)
-        print("TARGETED FAIL" if mode == "targeted" else "TRACER FAIL", file=sys.stderr)
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        diagnostic.fail("validation")
+        forward(diagnostic, "preparation refused: " + str(error), file=sys.stderr)
+        forward(diagnostic, "TARGETED FAIL" if mode == "targeted" else "TRACER FAIL", file=sys.stderr)
         return 1
     finally:
+        diagnostic.stage("preparation_report")
+        diagnostic.preparation(phases, time.monotonic_ns() - started)
         try:
             preparation = tracer_timing.preparation({"schema": 1, "mode": mode, "phases": phases, "duration_ns": time.monotonic_ns() - started}, actual_exits, mode)
         except (ValueError, KeyError, TypeError) as error:
-            print("preparation refused: " + str(error), file=sys.stderr)
-            print("TARGETED FAIL" if mode == "targeted" else "TRACER FAIL", file=sys.stderr)
+            forward(diagnostic, "preparation refused: " + str(error), file=sys.stderr)
+            forward(diagnostic, "TARGETED FAIL" if mode == "targeted" else "TRACER FAIL", file=sys.stderr)
+            diagnostic.fail("report")
+            diagnostic.stage("preparation_report", "failed")
             raise SystemExit(1) from None
-        print("TRACER_PREPARATION " + preparation, flush=True)
-        if final_success:
-            print(success_verdict(mode, inventory), flush=True)
+        try:
+            forward(diagnostic, "TRACER_PREPARATION " + preparation, flush=True)
+            if final_success:
+                forward(diagnostic, success_verdict(mode, inventory), flush=True)
+        except (OSError, ValueError):
+            diagnostic.fail("forwarding")
+            raise
+
+
+def main():
+    diagnostic = None
+    result = 1
+    cancelled = None
+    finishing = False
+    def interrupted(signum, _frame):
+        nonlocal cancelled
+        cancelled = signum
+        if finishing:
+            # Terminal cleanup owns the packet now. Let it publish cancellation
+            # after retiring this handler, while ownership is still held.
+            raise KeyboardInterrupt
+        if _ACTIVE_CHILD is not None:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(_ACTIVE_CHILD.pid, signum)
+        if diagnostic:
+            diagnostic.fail("cancelled")
+            diagnostic.collect()
+            diagnostic.stage(diagnostic.packet['driver']['stage'], "cancelled")
+        raise KeyboardInterrupt
+    old_handlers = {sig: signal.signal(sig, interrupted) for sig in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        tracer_diagnostics.github_output("diagnostic_invocation", "")
+        diagnostic = tracer_diagnostics.Publication(ROOT)
+        tracer_diagnostics.github_output("diagnostic_invocation", diagnostic.invocation)
+        result = run(diagnostic)
+    except KeyboardInterrupt:
+        result = 128 + (cancelled or signal.SIGINT)
+    except SystemExit as error:
+        result = error.code if type(error.code) is int else 1
+    except (OSError, ValueError, KeyError, TypeError, StopIteration):
+        # Opaque errors stay in local logs. The public record carries the fixed stage only.
+        if diagnostic:
+            diagnostic.fail("validation")
+        print("tracer preparation/execution failed", file=sys.stderr)
+        result = 1
+    finally:
+        finishing = True
+        # Retire handlers before terminal publication and descriptor release.
+        # A signal at the handoff still changes the result; retry the interrupted
+        # restoration so no diagnostic handler outlives the publication.
+        for sig, handler in old_handlers.items():
+            while True:
+                try:
+                    signal.signal(sig, handler)
+                    break
+                except KeyboardInterrupt:
+                    result = 128 + (cancelled or signal.SIGINT)
+        # sys.exit uses the low byte of an integer. A negative child returncode
+        # describes that child's signal, never a signal delivered to this driver.
+        result %= 256
+        if diagnostic:
+            try:
+                for stream in (sys.stdout, sys.stderr):
+                    try:
+                        stream.flush()
+                    except (OSError, ValueError):
+                        # The interpreter can override sys.exit with 120 if shutdown
+                        # retries a failed flush. That eventual exit is unknown.
+                        result = result or 1
+                        diagnostic.fail("forwarding")
+                if result:
+                    diagnostic.fail("cancelled" if cancelled else "validation")
+                diagnostic.collect()
+                if result:
+                    try:
+                        print("TRACER_DIAGNOSTIC " + json.dumps(diagnostic.packet, separators=(',', ':')), file=sys.stderr, flush=True)
+                    except (OSError, ValueError):
+                        diagnostic.fail("forwarding")
+                diagnostic.finish(result, cancelled)
+            except (OSError, ValueError, KeyError, TypeError):
+                print("diagnostic retention unavailable", file=sys.stderr)
+                result = result or 1
+            finally:
+                diagnostic.close()
+    return result
 
 
 if __name__ == "__main__":
