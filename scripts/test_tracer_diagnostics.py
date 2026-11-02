@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Retention controls establish mechanics, never coverage or historical diagnosis."""
 import contextlib
+import copy
 import importlib.util
 import io
 import json
@@ -73,6 +74,127 @@ class Retention(unittest.TestCase):
         self.assertEqual(packet['context']['value']['phase'], 'cleanup')
         self.assertEqual(packet['execution']['code'], 23)
         self.assertEqual(packet['receipt']['state'], 'missing')
+
+    def reboot_failure(self):
+        reboot = dict(boot_changed=False,
+                      running=dict(call=21, collection='ended', call_state='unresolved', terminal=False),
+                      missing=dict(call=24, collection='missing', call_state='unresolved', terminal=False),
+                      fixture=dict(setup_ms=31001, boundary_alive=True, boundary_stopped=True,
+                                   record_present=True, exit_present=False, record_boot_matches=True,
+                                   after_alive=False, after_exit_present=False, record_boot_preserved=True,
+                                   missing_record_absent=True),
+                      checks=dict(boot_changed=False, running_ended=True, missing_missing=True,
+                                  running_unresolved=True, missing_unresolved=True,
+                                  running_no_terminal=True, missing_no_terminal=True))
+        return self.first(case='job_cases.c004.p001', instance='job_cases.a015.i001', reboot=reboot)
+
+    def test_reboot_payload_crosses_collection_and_upload_admission(self):
+        first = self.reboot_failure()
+        self.write('first-failure.json', first)
+        self.write('status.json', dict(schema=1, at_ns=29, phase='cleanup', case='job_cases.c004.p001', status='failed'))
+        self.write('supervisor.json', diagnostics.actual_exit(23))
+        (self.capture / 'execution.log').write_text('SENTINEL command stdout private journal')
+        self.publication.collect()
+        self.publication.fail('validation')
+        self.publication.stage('validation', 'failed')
+        self.publication.finish(1, False)
+        packet = diagnostics.verify_packet(self.root, self.publication.invocation)
+        self.assertEqual(packet['first_failure'], diagnostics.available(first))
+        self.assertEqual(packet['context']['value']['phase'], 'cleanup')
+        self.assertEqual(packet['execution'], diagnostics.actual_exit(23))
+        self.assertEqual(packet['driver_failure']['value']['class'], 'validation')
+        self.packet()
+
+    def test_reboot_closed_schema_types_bounds_and_association_at_both_boundaries(self):
+        valid = self.reboot_failure()
+        mutations = []
+        for path, item in [
+                (('reboot', 'raw'), 'SENTINEL'),
+                (('reboot', 'running', 'collection'), 'SENTINEL'),
+                (('reboot', 'running', 'collection'), []),
+                (('reboot', 'running', 'call_state'), 'SENTINEL'),
+                (('reboot', 'running', 'terminal'), 0),
+                (('reboot', 'running', 'call'), True),
+                (('reboot', 'running', 'call'), 0),
+                (('reboot', 'running', 'call'), 24),
+                (('reboot', 'fixture', 'setup_ms'), 1 << 64),
+                (('reboot', 'fixture', 'setup_ms'), -1),
+                (('reboot', 'fixture', 'boundary_alive'), 'SENTINEL'),
+                (('reboot', 'fixture', 'extra'), 'SENTINEL'),
+                (('reboot', 'checks', 'boot_changed'), True),
+                (('reboot', 'checks', 'running_ended'), 1),
+                (('case',), 'job_cases.c003.p001'),
+                (('instance',), 'job_cases.a014.i001'),
+                (('kind',), 'execution')]:
+            value = copy.deepcopy(valid)
+            parent = value
+            for key in path[:-1]:
+                parent = parent[key]
+            parent[path[-1]] = item
+            mutations.append(value)
+        without_payload = copy.deepcopy(valid)
+        del without_payload['reboot']
+        mutations.append(without_payload)
+        all_green = copy.deepcopy(valid)
+        all_green['reboot']['boot_changed'] = all_green['reboot']['checks']['boot_changed'] = True
+        mutations.append(all_green)
+        for value in mutations:
+            with self.subTest(value=value):
+                self.write('first-failure.json', value)
+                self.publication.collect()
+                self.assertEqual(self.packet()['first_failure'], diagnostics.missing('untrusted'))
+                packet = json.loads(self.publication.path.read_bytes())
+                packet['first_failure'] = diagnostics.available(value)
+                self.publication.path.write_text(json.dumps(packet))
+                with self.assertRaises((ValueError, TypeError)):
+                    diagnostics.verify_packet(self.root, self.publication.invocation)
+        oversized = copy.deepcopy(valid)
+        oversized['reboot']['running']['collection'] = 'SENTINEL' * 2000
+        self.write('first-failure.json', oversized)
+        self.publication.collect()
+        self.assertEqual(self.packet()['first_failure'], diagnostics.missing('truncated'))
+        self.write('first-failure.json', valid)
+        self.write('owner.json', dict(schema=1, driver=os.getpid(), supervisor=123, invocation='0'*64))
+        self.publication.collect()
+        self.assertEqual(self.packet()['first_failure'], diagnostics.missing('untrusted'))
+
+    def test_later_reboot_failure_does_not_replace_or_depend_on_first_failure(self):
+        first, reboot = self.first(), self.reboot_failure()
+        self.write('first-failure.json', first)
+        self.write('reboot-failure.json', reboot)
+        self.publication.collect()
+        packet = diagnostics.verify_packet(self.root, self.publication.invocation)
+        self.assertEqual(packet['first_failure'], diagnostics.available(first))
+        self.assertEqual(packet['reboot_failure'], diagnostics.available(reboot))
+        self.write('reboot-failure.json', first)
+        self.publication.collect()
+        self.assertEqual(self.packet()['reboot_failure'], diagnostics.missing('untrusted'))
+        packet = self.packet()
+        packet['reboot_failure'] = diagnostics.available(first)
+        self.publication.path.write_text(json.dumps(packet))
+        with self.assertRaises(ValueError):
+            diagnostics.verify_packet(self.root, self.publication.invocation)
+        self.write('first-failure.json', reboot)
+        other = copy.deepcopy(reboot)
+        other['instance'] = 'job_cases.a015.i002'
+        self.write('reboot-failure.json', other)
+        self.publication.collect()
+        packet = self.packet()
+        self.assertEqual(packet['first_failure'], diagnostics.available(reboot))
+        self.assertEqual(packet['reboot_failure'], diagnostics.missing('untrusted'))
+        packet['reboot_failure'] = diagnostics.available(other)
+        self.publication.path.write_text(json.dumps(packet))
+        with self.assertRaises(ValueError):
+            diagnostics.verify_packet(self.root, self.publication.invocation)
+
+    def test_reboot_absent_and_unrecognized_observations_remain_explicit(self):
+        value = self.reboot_failure()
+        value['reboot']['running'].update(collection='unrecognized', call_state='absent', terminal=None)
+        value['reboot']['checks'].update(running_ended=False, running_unresolved=False, running_no_terminal=False)
+        self.write('first-failure.json', value)
+        self.publication.collect()
+        packet = diagnostics.verify_packet(self.root, self.publication.invocation)
+        self.assertEqual(packet['first_failure'], diagnostics.available(value))
 
     def test_exact_prerequisite_and_cleanup_classes(self):
         for failure in [self.first(kind='prerequisite', **{'class': 'prerequisite'}, instance='runtime.worker.ready.i003'),

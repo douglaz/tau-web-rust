@@ -1,6 +1,7 @@
 //! Real fixture processes, with fixed machine paths mapped into one owned directory.
 
 use std::collections::BTreeMap;
+use std::fs::{File, OpenOptions};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -90,6 +91,13 @@ pub fn alive(pid: u32) -> bool {
 
 fn shell_quote(path: &str) -> String {
     format!("'{}'", path.replace('\'', "'\\''"))
+}
+
+/// An unwritten FIFO keeps this command pending until fixture reboot or cleanup.
+/// Keeping both ends open prevents EOF, independently of elapsed setup time.
+pub struct RebootWait {
+    _fifo: File,
+    pub command: String,
 }
 
 impl Machine {
@@ -205,6 +213,103 @@ impl Machine {
         }
     }
 
+    pub fn reboot_wait(&self) -> Result<RebootWait, String> {
+        let path = self.root.join("reboot-wait");
+        let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        if unsafe { libc::mkfifo(name.as_ptr(), 0o600) } != 0 {
+            return Err("cannot create reboot wait".into());
+        }
+        let fifo = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|_| "cannot open reboot wait")?;
+        Ok(RebootWait {
+            _fifo: fifo,
+            command: format!(
+                "read -r reboot < {}; echo too-late",
+                shell_quote(path.to_str().unwrap())
+            ),
+        })
+    }
+
+    /// Freeze the inspected command before killing its fixture group. Once stopped,
+    /// it cannot finish between the liveness observation and reboot's SIGKILL.
+    pub async fn reboot_with_running(
+        &self,
+        id: &str,
+        setup: Instant,
+    ) -> Result<crate::reboot_evidence::Fixture, String> {
+        let job = self.observe().get(id).cloned().ok_or("reboot job absent")?;
+        let command = ProcessIdentity {
+            pid: job.pid,
+            start: job.start,
+        };
+        if job.ended.is_some() || !command.matches() || !alive(job.pid) || !job.group.matches() {
+            return Err("reboot command ended before boundary".into());
+        }
+        // Only this recorded fixture command is signalled; identity is checked again below.
+        if unsafe { libc::kill(job.pid as i32, libc::SIGSTOP) } != 0 {
+            return Err("cannot stop reboot command".into());
+        }
+        let mut stopped = false;
+        for _ in 0..300 {
+            stopped = command.matches()
+                && std::fs::read_to_string(format!("/proc/{}/stat", job.pid))
+                    .ok()
+                    .and_then(|s| s.rsplit_once(") ").map(|(_, rest)| rest.starts_with('T')))
+                    .unwrap_or(false);
+            if stopped {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let boundary_alive = command.matches() && alive(job.pid);
+        let record_boot =
+            std::fs::read(self.path(id, "boot")).map_err(|_| "reboot record boot absent")?;
+        let mut evidence = crate::reboot_evidence::Fixture {
+            setup_ms: setup
+                .elapsed()
+                .as_millis()
+                .try_into()
+                .map_err(|_| "reboot setup duration")?,
+            boundary_alive,
+            boundary_stopped: stopped,
+            record_present: self.path(id, "ready").is_file(),
+            exit_present: self.path(id, "exit").exists(),
+            record_boot_matches: std::fs::read(self.root.join("boot"))
+                .is_ok_and(|b| b == record_boot),
+            after_alive: true,
+            after_exit_present: false,
+            record_boot_preserved: false,
+            missing_record_absent: false,
+        };
+        if !evidence.boundary_alive
+            || !evidence.boundary_stopped
+            || !evidence.record_present
+            || evidence.exit_present
+            || !evidence.record_boot_matches
+        {
+            return Err("reboot boundary liveness or record check failed".into());
+        }
+        self.reboot();
+        // Observe death without waiting on the harness collection path.
+        for _ in 0..300 {
+            evidence.after_alive = command.matches() && alive(job.pid);
+            if !evidence.after_alive {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        evidence.after_exit_present = self.path(id, "exit").exists();
+        evidence.record_boot_preserved =
+            std::fs::read(self.path(id, "boot")).is_ok_and(|b| b == record_boot);
+        if evidence.after_alive || evidence.after_exit_present || !evidence.record_boot_preserved {
+            return Err("reboot did not preserve an unfinished ended record".into());
+        }
+        Ok(evidence)
+    }
+
     pub fn reboot(&self) {
         for (_, job) in self.launches() {
             kill_group(job.group);
@@ -280,6 +385,31 @@ mod tests {
     fn replace_once(text: &str, from: &str, to: &str) -> String {
         assert_eq!(text.matches(from).count(), 1, "scratch anchor: {from}");
         text.replace(from, to)
+    }
+
+    #[tokio::test]
+    async fn reboot_wait_survives_disconnect_and_ends_only_at_reboot() {
+        let machine = Machine::new();
+        let wait = machine.reboot_wait().unwrap();
+        let id = "c".repeat(48);
+        let (mut child, guard) = start(
+            &machine,
+            &jobs::launch(&id, "fixture", wait.command.as_bytes()),
+        );
+        let job = launched(&machine, &id).await;
+        drop(guard);
+        child.wait().await.unwrap();
+        let setup = Instant::now();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(alive(job.pid));
+        assert!(!machine.path(&id, "exit").exists());
+        let boundary = machine.reboot_with_running(&id, setup).await.unwrap();
+        assert!(boundary.boundary_alive && boundary.boundary_stopped);
+        assert!(!boundary.after_alive && !boundary.after_exit_present);
+        assert!(boundary.record_boot_preserved);
+        let (read, _guard) = start(&machine, &jobs::collect(&id));
+        assert_eq!(result(read).await.classify("fixture"), State::Ended);
+        assert!(machine.reboot_with_running(&id, setup).await.is_err());
     }
 
     #[tokio::test]
