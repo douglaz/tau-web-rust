@@ -73,6 +73,8 @@ jobs:
           echo "$RUNNER_TEMP/$name" >> "$GITHUB_PATH"
       - name: clippy on wasm32, the served build (CNF-2)
         run: cargo clippy --locked -p tau-web --target wasm32-unknown-unknown --all-targets -- -D warnings
+      - name: web preparation publication and concurrency controls
+        run: python3 -B -m unittest discover -s scripts -p 'test_web_preparation.py'
       - name: clippy on wasm32, the tracer build (CNF-2)
         run: cargo clippy --locked -p tau-web --target wasm32-unknown-unknown --all-targets --features tracer -- -D warnings
       - name: the wasm32 graph holds nothing ADR-0024 keeps out

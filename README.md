@@ -117,6 +117,24 @@ There are two builds of the same page, both release builds:
   The writer, allocator, seed-backup append and completed-read exports remain tracer-only.
   Neither build contains a compiled client key or relay key.
 
+Web preparation keeps Cargo outputs in `${CARGO_TARGET_DIR:-target}/web/served` and
+`web/tracer`; the native tracer stays at the outer target root. Relative target roots
+are relative to this repository. Each invocation builds and reads the same variant
+directory, so unchanged feature switches keep both compilations warm.
+
+Preparation serializes writers with `dist/.web-preparation.lock`. The tracer driver
+retains that lock from preparation through execution and validation. A second lock
+in each variant's Cargo directory protects the compiled wasm until binding generation
+finishes, including across worktrees sharing a target root. Generated bundles are
+ordinary directories, staged beside their destination and published with one atomic
+rename (Linux `renameat2` exchange when replacing an existing bundle). Failures before
+publication leave the previous complete bundle available. Interruption after that
+boundary can leave the complete new bundle; neither is success evidence for a failed
+invocation. A hard kill can leave a hidden staging directory. Direct
+directory consumers should run after successful preparation; they do not acquire the
+driver's lifetime lock. These locks protect cooperating preparation commands, not
+manual edits of build outputs or source changes during execution.
+
 ### Goals and the model's tools
 
 For each live bound session, the page offers a goal card containing the operator's own words

@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.dont_write_bytecode = True
 import tracer_timing
 import tracer_requirements
+import web_preparation
 _history_spec = importlib.util.spec_from_file_location("tracer_history", ROOT / "scripts/tracer_history.py")
 _history = importlib.util.module_from_spec(_history_spec)
 _history_spec.loader.exec_module(_history)
@@ -358,7 +359,7 @@ def forwarded_lines(child, diagnostic):
         raise
 
 
-def execute(mode, arguments, plan, inventory, source, diagnostic=None):
+def execute(mode, arguments, plan, inventory, source, diagnostic=None, artifact_lock=None):
     if diagnostic:
         diagnostic.stage("native_build")
     build_exit = native_build(diagnostic)
@@ -391,7 +392,8 @@ def execute(mode, arguments, plan, inventory, source, diagnostic=None):
         environment['_TAU_DIAGNOSTIC_INVOCATION'] = diagnostic.invocation
         environment['_TAU_DIAGNOSTIC_DRIVER_PID'] = str(os.getpid())
         environment.pop('_TAU_DIAGNOSTIC_CAPTURE', None)
-    with observed_child(command, diagnostic, "native", cwd=ROOT, stdout=subprocess.PIPE, text=True, env=environment) as child:
+    with observed_child(command, diagnostic, "native", cwd=ROOT, stdout=subprocess.PIPE, text=True, env=environment,
+                        pass_fds=() if artifact_lock is None else (artifact_lock,)) as child:
         for line in forwarded_lines(child, diagnostic):
             try:
                 timing_output.observe(line)
@@ -563,6 +565,12 @@ def run(diagnostic):
         return 1
     started = time.monotonic_ns()
     diagnostic.stage("identity")
+    with web_preparation.preparation_lock(ROOT) as lock:
+        return run_prepared(diagnostic, arguments, mode, selected, lock, started)
+
+
+def run_prepared(diagnostic, arguments, mode, selected, lock, started):
+    diagnostic.stage("identity")
     inventory = read_inventory()
     diagnostic.identifiers(inventory, tracer_requirements.prerequisite_counts(inventory))
     try:
@@ -587,7 +595,9 @@ def run(diagnostic):
             start = time.monotonic_ns()
             build_records = []
             invalid_build_timing = False
-            with observed_child(["scripts/build-web.sh", name], diagnostic, name + "_build", cwd=ROOT, stdout=subprocess.PIPE, text=True) as child:
+            build_environment = dict(os.environ, **{web_preparation.LOCK_FD: str(lock)})
+            with observed_child(["scripts/build-web.sh", name], diagnostic, name + "_build", cwd=ROOT, stdout=subprocess.PIPE, text=True,
+                                env=build_environment, pass_fds=(lock,)) as child:
                 for line in forwarded_lines(child, diagnostic):
                     try:
                         sys.stdout.write(line)
@@ -615,7 +625,7 @@ def run(diagnostic):
                 forward(diagnostic, "TARGETED FAIL" if mode == "targeted" else "TRACER FAIL", file=sys.stderr)
                 return build_exit
         start = time.monotonic_ns()
-        child_exit, validation_exit = execute(mode, arguments, plan, inventory, source, diagnostic)
+        child_exit, validation_exit = execute(mode, arguments, plan, inventory, source, diagnostic, artifact_lock=lock)
         actual_exits.append(child_exit)
         phases.append({"phase": "execute_through_cleanup", "start_ns": start - started, "end_ns": time.monotonic_ns() - started, "exit": child_exit})
         final_success = validation_exit == 0

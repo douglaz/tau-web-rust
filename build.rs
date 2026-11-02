@@ -88,8 +88,29 @@ fn main() {
     // commit the pin is. Without these, a pin bump with no `git submodule update` leaves a
     // cached build green on the old tree, which is the drift ADR-0031 exists to prevent.
     println!("cargo::rerun-if-changed=spec");
-    println!("cargo::rerun-if-changed=.git/HEAD");
-    println!("cargo::rerun-if-changed=.git/index");
+    // In a linked worktree .git is a file, so literal .git/HEAD and .git/index
+    // never exist and would invalidate both variant builds on every invocation.
+    for name in ["HEAD", "index"] {
+        println!(
+            "cargo::rerun-if-changed={}",
+            git(&["rev-parse", "--git-path", name])
+        );
+    }
+    // A soft reset moves a symbolic HEAD's ref without changing HEAD or index.
+    // A packed ref can become loose again, so watch its nearest existing parent
+    // when the ref file is absent. Missing watch paths would rebuild forever.
+    let reference = git(&["rev-parse", "--symbolic-full-name", "HEAD"]);
+    if reference != "HEAD" {
+        let mut path = std::path::PathBuf::from(git(&["rev-parse", "--git-path", &reference]));
+        while !path.exists() {
+            assert!(path.pop(), "no existing parent for {reference}");
+        }
+        println!("cargo::rerun-if-changed={}", path.display());
+    }
+    let packed = git(&["rev-parse", "--git-path", "packed-refs"]);
+    if std::path::Path::new(&packed).exists() {
+        println!("cargo::rerun-if-changed={packed}");
+    }
 
     // Every input under bundle/ is compiled in, so every one of them must parse and every one
     // of them is embedded — a fourth input added there is gated and shipped the day it lands,
