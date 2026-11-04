@@ -59,6 +59,7 @@ pub(crate) mod authority;
 pub mod delivery;
 mod goals;
 pub(crate) mod inference;
+pub mod poc;
 pub mod reinstall;
 mod scan;
 
@@ -205,6 +206,7 @@ pub(crate) enum Event {
     Exposure(Exposure),
     ModeAcceptance(Acceptance),
     Goal(crate::goals::Goal),
+    Poc(poc::Record),
     SignatureRefusal(SignatureRefusal),
     ConnectionRefusal(ConnectionRefusal),
     InferenceAccount {
@@ -361,6 +363,7 @@ pub struct Store<S> {
     exposure_ledger: Vec<Exposure>,
     conduct_acceptances: Vec<Acceptance>,
     goals: Vec<crate::goals::Goal>,
+    poc: std::collections::BTreeMap<String, poc::Task>,
     pending_requirements: std::collections::BTreeMap<String, goals::Pending>,
     signature_refusals: Vec<SignatureRefusal>,
     connection_refusals: Vec<ConnectionRefusal>,
@@ -497,6 +500,7 @@ impl<S: Storage> Store<S> {
             exposure_ledger: Vec::new(),
             conduct_acceptances: Vec::new(),
             goals: Vec::new(),
+            poc: Default::default(),
             pending_requirements: Default::default(),
             signature_refusals: Vec::new(),
             connection_refusals: Vec::new(),
@@ -1439,6 +1443,10 @@ impl<S: Storage> Store<S> {
                     self.replay_exposure(number, exposure)
                         .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
                 }
+                (_, Event::Poc(record)) => {
+                    self.apply_poc(number, record)
+                        .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
+                }
                 (_, Event::Goal(goal)) => {
                     self.check_goal(goal)
                         .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
@@ -1637,6 +1645,13 @@ impl<S: Storage> Store<S> {
         // duplicate members are rejected and mnemonic buffers retain Event's zeroization.
         let event: Event = serde_json::from_slice(&plaintext)
             .map_err(|_| "its event is not one this version reads".to_string())?;
+        if let Event::Poc(_) = &event {
+            let value: Value =
+                serde_json::from_slice(&plaintext).map_err(|_| "task record shape")?;
+            if serde_json::to_value(&event).map_err(|_| "task record shape")? != value {
+                return Err("task record shape".into());
+            }
+        }
         if let Event::DedicatedReinstall(_) = &event {
             let value: Value =
                 serde_json::from_slice(&plaintext).map_err(|_| "dedicated record shape")?;
@@ -2193,6 +2208,10 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
             State::Refused(why) => json!({ "state": "refused", "reason": why }),
         };
         if let State::Unlocked(store) = &self.state {
+            if !store.poc.is_empty() {
+                report["tasks"] = serde_json::to_value(store.poc.values().collect::<Vec<_>>())
+                    .expect("tasks serialize");
+            }
             let approvals = store.reinstall_approvals();
             if approvals.as_array().is_some_and(|a| !a.is_empty()) {
                 report["reinstall_approvals"] = approvals;
@@ -2209,7 +2228,7 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
             State::Unlocked(store) if store.authority.state() == "ended" => {
                 // Durable history remains readable; no runtime session or action survives end.
                 let mut history = serde_json::Map::new();
-                for field in ["seed_backup_owed","seed_backup_completion","setup","delivery","goals",
+                for field in ["seed_backup_owed","seed_backup_completion","setup","delivery","goals","tasks",
                     "mode_acceptances","signature_refusals","installations","exposure_ledger",
                     "connection_refusals","reinstall_approvals","locked","inference_calls","records",
                     "calls","terminals","dispositions","standing","jobs","typed_calls","observations",

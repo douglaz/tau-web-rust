@@ -182,6 +182,13 @@ impl<S: Storage> Store<S> {
             document_source,
         };
         self.check_goal(&goal)?;
+        if !crate::redaction::Redacted::inference_value_is_safe(
+            self,
+            &serde_json::to_value(&goal).expect("goal serializes"),
+            &[],
+        ) {
+            return Err("goal credential boundary".into());
+        }
         self.commit(&Event::Goal(goal.clone())).await?;
         self.goals.push(goal);
         Ok(())

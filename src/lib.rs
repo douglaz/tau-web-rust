@@ -20,6 +20,7 @@ pub mod inference_limits;
 pub mod jobs;
 pub mod lifecycle;
 pub mod modes;
+pub mod poc;
 pub mod redaction;
 pub mod relay_auth;
 pub mod scan;
@@ -503,6 +504,45 @@ mod worker {
     #[wasm_bindgen]
     pub async fn run_command(request: String) -> Result<String, wasm_bindgen::JsValue> {
         request_operation(request, false).await
+    }
+
+    #[wasm_bindgen]
+    pub async fn task_request(request: String) -> String {
+        crate::poc::web::request(request).await
+    }
+
+    /// Preserve the existing page exercises in builds that include the browser fixtures.
+    #[wasm_bindgen]
+    pub async fn run_page_goal(session: String, checks: String) -> String {
+        #[cfg(feature = "tracer")]
+        {
+            let _ = checks;
+            crate::harness::goals::run_goal(session).await
+        }
+        #[cfg(not(feature = "tracer"))]
+        {
+            let result = async {
+                let checks: Vec<String> =
+                    serde_json::from_str(&checks).map_err(|_| "verification checks")?;
+                let task = local()
+                    .lock()
+                    .await
+                    .store()
+                    .ok_or("locked")?
+                    .poc_create(&session, checks)
+                    .await?;
+                crate::poc::web::publish_progress(&session).await;
+                let request = serde_json::json!({"action":"resume","id":task.id,"session":session})
+                    .to_string();
+                let report = crate::poc::web::request(request).await;
+                let report = serde_json::from_str(&report).map_err(|_| "task report")?;
+                Ok::<_, String>(crate::poc::run::page_outcome(&task.id, &report))
+            }
+            .await;
+            result
+                .unwrap_or_else(|why| serde_json::json!({"refused":why}))
+                .to_string()
+        }
     }
 
     /// Stop the current unresolved-command waits on this machine. Settles nothing.
