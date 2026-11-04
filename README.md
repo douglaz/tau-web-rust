@@ -979,7 +979,10 @@ The page's exact-member `{"bind":{"machine":"fixture"}}` message names one appro
 machine. Locked stores and active seed-backup ceremonies refuse first; `Dispatch::check_binding`
 then checks the entry, class and access. A second live binding refuses without journaling.
 Binding also requires that exact identity to be listed under the current seed in allocation
-metadata, including after Restore; status is not filtered here. The client key derives at
+metadata, including after Restore, with Reserved or Created status. Failed and Destroyed
+tombstones refuse before key derivation, exposure, mode acceptance or session creation.
+Replay checks eligibility at each exposure's journal position, so a later tombstone preserves
+earlier exposure without restoring a live session. The client key derives at
 the entry's journaled identity, the exposure entry commits, and only
 then does a live session receive the key. A failed append creates no session.
 

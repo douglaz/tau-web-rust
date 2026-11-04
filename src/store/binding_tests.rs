@@ -303,6 +303,256 @@ fn restored_only_other() -> Store<MemoryStorage> {
     reopen(&source)
 }
 
+// Observations have no operator writer yet. Use the store's authenticated observation path
+// so unlock reconstructs every transition from durable bytes.
+fn set_binding_status(store: &mut Store<MemoryStorage>, status: allocation::Status) {
+    let identity = store.dispatch.approved_entries["fixture"]
+        .approved
+        .identity
+        .clone();
+    match status {
+        allocation::Status::Reserved => (),
+        allocation::Status::Created => {
+            block_on(store.observe(allocation::Event::Created(identity))).unwrap();
+        }
+        allocation::Status::Failed => {
+            block_on(store.observe(allocation::Event::Failed(identity))).unwrap();
+        }
+        allocation::Status::Destroyed => {
+            block_on(store.observe(allocation::Event::Created(identity.clone()))).unwrap();
+            block_on(store.observe(allocation::Event::Destroyed(identity))).unwrap();
+        }
+    }
+}
+
+fn restore_binding_metadata(store: &mut Store<MemoryStorage>) {
+    let metadata = store.allocation().export();
+    block_on(store.record(allocation::Event::Restore(metadata))).unwrap();
+}
+
+fn tombstone_binding_refuses_without_effects(status: allocation::Status) {
+    for recovery in ["live", "restart", "restore"] {
+        for explicit_modes in [false, true] {
+            let mut store = approved();
+            // Eligible entries elsewhere, even at the same index in another family, cannot
+            // authorize the tombstoned machine. Preserve another machine's prior acceptance.
+            let pass_identity = block_on(store.allocate(Family::Passes)).unwrap();
+            assert_eq!(pass_identity.index, 0);
+            block_on(store.bind_with_modes("fixture-other", &[Mode::NoArtifactPin])).unwrap();
+            set_binding_status(&mut store, status);
+            if recovery == "restore" {
+                restore_binding_metadata(&mut store);
+            }
+            if recovery != "live" {
+                store = reopen(&store);
+                assert!(store.sessions().is_empty());
+            }
+            assert_eq!(store.dispatch.check_binding("fixture"), Ok(()));
+            assert_eq!(store.scan_readiness(), Ok(()));
+            assert_eq!(
+                store.check_binding_modes("fixture", &[Mode::NoArtifactPin]),
+                Ok(())
+            );
+            assert!(!store.inference.ended);
+            let files = store.storage.files();
+            let allocation = store.allocation().clone();
+            assert_eq!(allocation.entries()[0].status, status);
+            assert_eq!(allocation.next_unused().machines, 2);
+            let sessions = store.sessions();
+            let exposures = store.exposure_ledger().to_vec();
+            let acceptances = store.mode_acceptances();
+            assert!(!acceptances.is_empty());
+            let next = store.records().end;
+            let result = if explicit_modes {
+                block_on(store.bind_with_modes("fixture", &[Mode::NoArtifactPin]))
+            } else {
+                block_on(store.bind("fixture"))
+            };
+            assert_eq!(
+                result,
+                Err("binding identity is a tombstoned allocation".into()),
+                "{status:?}, {recovery}, explicit_modes={explicit_modes}"
+            );
+            // Inspect the actual key holders; a connection refusal would journal a different
+            // observation and would not prove that no session received this machine's key.
+            assert!(
+                store
+                    .sessions
+                    .iter()
+                    .all(|s| s.client_key("fixture").is_none())
+            );
+            assert_eq!(store.sessions(), sessions);
+            assert_eq!(store.exposure_ledger(), exposures);
+            assert_eq!(store.mode_acceptances(), acceptances);
+            assert_eq!(store.records().end, next);
+            assert_eq!(store.storage.files(), files);
+            assert_eq!(store.allocation(), &allocation);
+            assert!(store.failed.is_none());
+            let restarted = reopen(&store);
+            assert!(restarted.sessions().is_empty());
+            assert_eq!(restarted.allocation(), &allocation);
+            assert_eq!(restarted.exposure_ledger(), exposures);
+            assert_eq!(restarted.storage.files(), files);
+            assert_eq!(restarted.records().end, next);
+        }
+    }
+}
+
+#[test]
+fn failed_allocation_binding_refuses_without_effects() {
+    tombstone_binding_refuses_without_effects(allocation::Status::Failed);
+}
+
+#[test]
+fn destroyed_allocation_binding_refuses_without_effects() {
+    tombstone_binding_refuses_without_effects(allocation::Status::Destroyed);
+}
+
+#[test]
+fn reserved_and_created_bindings_give_the_machine_key_and_exposure() {
+    for status in [allocation::Status::Reserved, allocation::Status::Created] {
+        for restored in [false, true] {
+            let mut store = approved();
+            set_binding_status(&mut store, status);
+            if restored {
+                restore_binding_metadata(&mut store);
+            }
+            let mut store = reopen(&store);
+            let allocation = store.allocation().clone();
+            let identity = store.dispatch.approved_entries["fixture"]
+                .approved
+                .identity
+                .clone();
+            let number = store.records().end;
+            let result = block_on(store.bind_with_modes("fixture", &[Mode::NoArtifactPin]));
+            assert!(
+                result.is_ok(),
+                "{status:?} must remain bindable, restored={restored}: {result:?}"
+            );
+            let id = result.unwrap();
+            assert_eq!(id, format!("session-{number}"));
+            let session = block_on(store.connection_session("fixture")).unwrap();
+            assert_eq!(
+                session.client_key("fixture").unwrap().public_key(),
+                store
+                    .seed()
+                    .unwrap()
+                    .ssh_client_key(identity.derivation_version, identity.index)
+                    .unwrap()
+                    .public_key()
+            );
+            assert!(session.client_key("fixture-other").is_none());
+            assert_eq!(
+                store.exposure_ledger(),
+                &[Exposure {
+                    session: id,
+                    bound_set: vec![BoundMachine {
+                        machine: "fixture".into(),
+                        identity,
+                    }],
+                    accepted_modes: vec![Mode::NoArtifactPin],
+                }]
+            );
+            assert_eq!(store.allocation(), &allocation);
+            let restarted = reopen(&store);
+            assert_eq!(restarted.exposure_ledger(), store.exposure_ledger());
+            assert_eq!(restarted.allocation(), &allocation);
+            assert!(restarted.sessions().is_empty());
+        }
+    }
+}
+
+#[test]
+fn exposure_before_later_tombstone_survives_replay_without_sessions() {
+    for status in [allocation::Status::Failed, allocation::Status::Destroyed] {
+        let mut store = approved();
+        block_on(store.bind_with_modes("fixture", &[Mode::NoArtifactPin])).unwrap();
+        let exposures = store.exposure_ledger().to_vec();
+        set_binding_status(&mut store, status);
+        let allocation = store.allocation().clone();
+        assert_eq!(allocation.entries()[0].status, status);
+        assert_eq!(allocation.next_unused().machines, 2);
+        let files = store.storage.files();
+        let result = block_on(unlock(
+            MemoryStorage::with_files(files.clone()),
+            &Fixed,
+            pass(),
+        ));
+        assert!(
+            result.is_ok(),
+            "exposure before later {status:?} must survive replay: {:?}",
+            result.as_ref().err()
+        );
+        let restarted = result.unwrap();
+        assert_eq!(restarted.exposure_ledger(), exposures);
+        assert_eq!(restarted.allocation(), &allocation);
+        assert_eq!(restarted.storage.files(), files);
+        assert_eq!(restarted.records().end, store.records().end);
+        assert!(restarted.sessions().is_empty());
+        assert_eq!(restarted.mode_acceptances().len(), 1);
+    }
+}
+
+fn tombstone_before_exposure_refuses_replay(status: allocation::Status) {
+    for restored in [false, true] {
+        let mut store = approved();
+        set_binding_status(&mut store, status);
+        if restored {
+            restore_binding_metadata(&mut store);
+        }
+        let mut store = reopen(&store);
+        assert_eq!(store.dispatch.check_binding("fixture"), Ok(()));
+        assert_eq!(store.scan_readiness(), Ok(()));
+        assert_eq!(
+            store.check_binding_modes("fixture", &[Mode::NoArtifactPin]),
+            Ok(())
+        );
+        let allocation = store.allocation().clone();
+        assert_eq!(allocation.entries()[0].status, status);
+        assert_eq!(allocation.next_unused().machines, 2);
+        let number = store.records().end;
+        let exposure = Exposure {
+            session: format!("session-{number}"),
+            bound_set: vec![BoundMachine {
+                machine: "fixture".into(),
+                identity: store.dispatch.approved_entries["fixture"]
+                    .approved
+                    .identity
+                    .clone(),
+            }],
+            accepted_modes: vec![Mode::NoArtifactPin],
+        };
+        block_on(store.commit(&Event::Exposure(exposure))).unwrap();
+        let files = store.storage.files();
+        let storage = MemoryStorage::with_files(files.clone());
+        let result = block_on(unlock(storage.clone(), &Fixed, pass()));
+        assert!(
+            result.is_err(),
+            "{status:?}-before-Exposure must refuse replay, restored={restored}"
+        );
+        let why = result.err().unwrap();
+        assert_eq!(
+            why,
+            format!(
+                "record {number}: exposure identity is a tombstoned allocation; replay stopped"
+            ),
+            "{status:?}, restored={restored}"
+        );
+        assert_eq!(storage.files(), files);
+        assert_eq!(store.allocation(), &allocation);
+    }
+}
+
+#[test]
+fn failed_allocation_before_exposure_refuses_replay() {
+    tombstone_before_exposure_refuses_replay(allocation::Status::Failed);
+}
+
+#[test]
+fn destroyed_allocation_before_exposure_refuses_replay() {
+    tombstone_before_exposure_refuses_replay(allocation::Status::Destroyed);
+}
+
 #[test]
 fn replay_refuses_exposure_for_an_unlisted_identity() {
     let mut source = restored_only_other();
