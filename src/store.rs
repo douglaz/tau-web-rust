@@ -686,15 +686,7 @@ impl<S: Storage> Store<S> {
             .approved
             .identity
             .clone();
-        if identity.seed != self.allocation().seed()
-            || !self
-                .allocation()
-                .entries()
-                .iter()
-                .any(|e| e.identity == identity)
-        {
-            return Err("binding identity is not listed under the current seed".into());
-        }
+        self.check_bindable_identity(&identity, "binding")?;
         let key = self
             .seed()
             .expect("seed first")
@@ -969,6 +961,25 @@ impl<S: Storage> Store<S> {
         }
     }
 
+    fn check_bindable_identity(
+        &self,
+        identity: &allocation::Identity,
+        context: &str,
+    ) -> Result<(), String> {
+        let entry = self
+            .allocation()
+            .entries()
+            .iter()
+            .find(|e| identity.seed == self.allocation().seed() && e.identity == *identity)
+            .ok_or_else(|| format!("{context} identity is not listed under the current seed"))?;
+        match entry.status {
+            allocation::Status::Reserved | allocation::Status::Created => Ok(()),
+            allocation::Status::Failed | allocation::Status::Destroyed => {
+                Err(format!("{context} identity is a tombstoned allocation"))
+            }
+        }
+    }
+
     fn replay_exposure(&mut self, number: u64, exposure: &Exposure) -> Result<(), String> {
         if exposure.session != format!("session-{number}") || exposure.bound_set.len() != 1 {
             return Err("invalid exposure ledger entry".into());
@@ -983,15 +994,8 @@ impl<S: Storage> Store<S> {
             if bound.identity != approved.approved.identity {
                 return Err("exposure identity differs from approved entry".into());
             }
-            if bound.identity.seed != self.allocation().seed()
-                || !self
-                    .allocation()
-                    .entries()
-                    .iter()
-                    .any(|e| e.identity == bound.identity)
-            {
-                return Err("exposure identity is not listed under the current seed".into());
-            }
+            // Replay owns the allocation projection at this record, before later tombstones.
+            self.check_bindable_identity(&bound.identity, "exposure")?;
             self.dispatch
                 .check_binding(&bound.machine)
                 .map_err(|_| "exposure lacks binding prerequisites")?;
