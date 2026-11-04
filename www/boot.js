@@ -186,8 +186,13 @@ const renderSetup = (store) => {
         paragraph(card, session.goal.text);
         paragraph(card, `Source: ${session.goal.source}.`);
         if (session.goal.document_source) paragraph(card, `Document source: ${session.goal.document_source}.`);
-        if (!(session.standing_modes ?? []).includes('Acting on a goal with no brief')) {
-          paragraph(card, 'No brief is available.');
+        const accepted = (session.standing_modes ?? []).includes('Acting on a goal with no brief');
+        const continuation = (store.tasks ?? []).find(task => (task.continuation_sessions ?? []).includes(session.identity));
+        const started = (store.tasks ?? []).some(task => task.start_session === session.identity);
+        if (continuation) {
+          paragraph(card, `This session continues task ${continuation.id}. Use Resume on that task.`);
+        } else if (!accepted || !started) {
+          paragraph(card, accepted ? 'Start was accepted. Continue with verification commands for this same goal and machine.' : 'No brief is available.');
           const checks = document.createElement('textarea');
           checks.setAttribute('aria-label', 'Verification commands, one per line');
           paragraph(card, 'Verification commands, one per line. Choose checks that establish the requested service is working. Empty checks cannot establish success.');
@@ -195,7 +200,7 @@ const renderSetup = (store) => {
           const accept = document.createElement('button');
           accept.type = 'button';
           accept.dataset.goalAccept = session.identity;
-          accept.textContent = 'Acting on a goal with no brief';
+          accept.textContent = accepted ? 'Continue accepted task start' : 'Acting on a goal with no brief';
           accept.addEventListener('click', () => {
             accept.disabled = true;
             worker.postMessage({ goal_accept: { session: session.identity, checks: checks.value.split('\n').filter(line => line.trim()) } });

@@ -10,8 +10,12 @@ fn pass() -> LocalPassphrase {
     LocalPassphrase::new(b"inference fixture passphrase".to_vec())
 }
 fn ready() -> Store<MemoryStorage> {
-    let mut s = crate::store::inference::tests::ready();
+    let mut s = ready_without_requirements();
     s.fixture_requirements("fixture");
+    s
+}
+fn ready_without_requirements() -> Store<MemoryStorage> {
+    let mut s = crate::store::inference::tests::ready();
     let session = s.sessions[0].identity.clone();
     block_on(s.enter_goal(&session, "install and run a small service".into(), None)).unwrap();
     block_on(s.accept_mode(&session, Mode::NoBrief)).unwrap();
@@ -182,8 +186,10 @@ struct Fixture {
     exit: u32,
     hold_observe: bool,
     observe_error: bool,
+    collection_reports: Option<Vec<Value>>,
     observe_release: Option<Rc<Cell<bool>>>,
     live: Rc<Cell<bool>>,
+    authority_error: Option<String>,
     continuation: Option<crate::lifecycle::Continuation>,
     reports: Rc<RefCell<Vec<Value>>>,
     publish_release: Option<Rc<Cell<bool>>>,
@@ -202,8 +208,10 @@ impl Fixture {
                 exit: 0,
                 hold_observe: false,
                 observe_error: false,
+                collection_reports: None,
                 observe_release: None,
                 live: Rc::new(Cell::new(true)),
+                authority_error: None,
                 continuation: None,
                 reports: Rc::default(),
                 publish_release: None,
@@ -249,6 +257,9 @@ impl Runtime for Fixture {
         if let Some(continuation) = &self.continuation {
             continuation.check()?;
         }
+        if let Some(why) = &self.authority_error {
+            return Err(why.clone());
+        }
         if !self.live.get() {
             return Err("fixture authority lost".into());
         }
@@ -270,13 +281,13 @@ impl Runtime for Fixture {
         tool: Tool,
     ) -> Result<Task, String> {
         let mut store = self.store.borrow_mut();
-        store.poc_authority(&task.id, session)?;
-        if tool.machine() == task.machine {
-            store.poc_tool(&task.id, session, &tool)?;
-        }
-        block_on(store.poc_change(&task.id, task.revision, Change::Propose { call_id, tool }))
+        block_on(store.poc_propose(task, session, call_id, tool))
     }
+
     async fn execute(&mut self, binding: Binding, task: &Task) -> Result<(), String> {
+        self.store
+            .borrow_mut()
+            .poc_prepare_execution(task, &binding.session)?;
         let store = self.store.clone();
         let call = run::commit_command(
             async {
@@ -343,6 +354,11 @@ impl Runtime for Fixture {
                 return Ok(Observation::Committed);
             }
         }
+        if let Some(reports) = &self.collection_reports {
+            return Ok(Observation::Unknown(
+                self.store.borrow().poc_collection_reason(pending, reports),
+            ));
+        }
         let record = {
             let mut remote = self.remote.borrow_mut();
             remote.reads.push(pending.job.clone());
@@ -375,7 +391,9 @@ impl Runtime for Fixture {
             {
                 Observation::Committed
             } else {
-                Observation::Unknown("job missing or without trustworthy outcome".into())
+                Observation::Unknown(
+                    store.poc_collection_reason(pending, &[serde_json::to_value(r).unwrap()]),
+                )
             },
         )
     }
@@ -505,7 +523,7 @@ fn poc_three_crash_windows_collect_original_job_and_committed_evidence() {
 
 #[test]
 fn poc_observes_running_missing_ended_mismatch_and_failed_reads_without_resend() {
-    for case in 0..6 {
+    for case in 0..5 {
         let (mut f, task, session) = Fixture::new();
         let proposed = proposal(&mut f.store.borrow_mut(), &task);
         append(&mut f.store.borrow_mut(), &proposed, &session);
@@ -978,7 +996,8 @@ fn poc_stale_requests_duplicate_resume_and_abandon_cannot_launch_or_checkpoint_t
                 .poll(&mut Context::from_waker(Waker::noop()))
                 .is_pending()
         );
-        change(&mut shared.borrow_mut(), &pending, Change::Abandon);
+        let current = shared.borrow().poc_task(&task.id).unwrap();
+        change(&mut shared.borrow_mut(), &current, Change::Abandon);
     }
     let store = f.store.borrow();
     assert_eq!(store.poc_task(&task.id).unwrap().pending, pending.pending);
@@ -1224,11 +1243,11 @@ fn poc_two_resume_futures_consume_one_job_response_once() {
         release.set(true);
         assert!(matches!(
             a.as_mut().poll(&mut Context::from_waker(Waker::noop())),
-            Poll::Ready(Ok(_))
+            Poll::Ready(Err(_))
         ));
         assert!(matches!(
             b.as_mut().poll(&mut Context::from_waker(Waker::noop())),
-            Poll::Ready(Err(_))
+            Poll::Ready(Ok(_))
         ));
     }
     assert_eq!(first.task(&task.id).completed.len(), 1);
@@ -1481,7 +1500,7 @@ fn poc_protected_progress_precedes_command_and_check_results_and_allows_abandon(
                 let mut duplicate = Script::default();
                 assert_eq!(
                     block_on(run::drive(&mut control, &mut duplicate, &task.id, &session)),
-                    Err("task action already active".into())
+                    Err("task action already active; collection may be waiting for the recorded job; let it finish or interrupt the session before Resume".into())
                 );
                 abandoned = change(&mut control.store.borrow_mut(), &pending, Change::Abandon);
                 release.set(true);
@@ -1663,4 +1682,1057 @@ fn poc_initial_page_outcome_keeps_protected_concrete_error_and_task_identity() {
             .get("refused")
             .is_none()
     );
+}
+
+#[test]
+fn poc_unavailable_and_wrong_machine_steps_need_no_installation_declaration() {
+    let (mut f, _, _) = Fixture::new();
+    let mut store = ready_without_requirements();
+    let session = store.sessions[0].identity.clone();
+    let task = create_task(&mut store);
+    *f.store.borrow_mut() = store;
+    let tools = [
+        Tool::Job {
+            machine: "fixture".into(),
+            job: crate::goals::Job::FetchArtifact,
+            arguments: json!({}),
+        },
+        Tool::Typed {
+            machine: "fixture".into(),
+            operation: crate::dispatch::Operation::Read,
+            arguments: Default::default(),
+        },
+        Tool::Exec {
+            machine: "outside".into(),
+            command: "never-send".into(),
+        },
+    ];
+    for (i, tool) in tools.into_iter().enumerate() {
+        let step = block_on(run::resume(
+            &mut f,
+            &mut Script::one(&format!("call-{i}"), tool),
+            &task.id,
+            &session,
+        ))
+        .unwrap();
+        assert_eq!(step.steps, i as u32 + 1);
+        assert_eq!(step.completed.len(), i + 1);
+        assert_eq!(step.status, Status::Running);
+    }
+    let current = f.task(&task.id);
+    assert_eq!(
+        current.completed[0].2["content"]["unavailable"],
+        "operation unavailable in this task runner"
+    );
+    assert_eq!(
+        current.completed[1].2["content"]["unavailable"],
+        "operation unavailable in this task runner"
+    );
+    assert_eq!(current.completed[2].2["content"]["refused"], "bound set");
+    assert!(
+        f.store
+            .borrow()
+            .pending_requirements_view(&session)
+            .is_null()
+    );
+    assert!(f.store.borrow().dispatch.calls.is_empty());
+    assert!(f.remote.borrow().sends.is_empty());
+    assert_eq!(
+        reopen(&f.store.borrow()).poc_task(&task.id).unwrap(),
+        current
+    );
+}
+
+#[test]
+fn poc_exec_and_check_propose_requirements_and_require_explicit_approval() {
+    for verification in [false, true] {
+        let (mut f, _, _) = Fixture::new();
+        let mut store = ready_without_requirements();
+        let session = store.sessions[0].identity.clone();
+        let task = create_task(&mut store);
+        *f.store.borrow_mut() = store;
+        let mut model = Script::one(
+            "next",
+            if verification {
+                done()
+            } else {
+                exec("install-example-service")
+            },
+        );
+        if verification {
+            block_on(run::resume(&mut f, &mut model, &task.id, &session)).unwrap();
+        }
+        let paused = block_on(run::resume(&mut f, &mut model, &task.id, &session)).unwrap();
+        assert_eq!(paused.status, Status::Paused);
+        assert!(
+            paused
+                .pause_reason
+                .as_ref()
+                .unwrap()
+                .contains("installation facts: approved declaration missing")
+        );
+        assert!(paused.proposal.is_some());
+        assert!(f.remote.borrow().sends.is_empty());
+        let pending = f.store.borrow().pending_requirements_view(&session);
+        assert_eq!(pending["proposal"]["machine"], "fixture");
+        assert_eq!(pending["proposal"]["kind"], "declaration");
+        let candidate = pending["candidate"].as_u64().unwrap();
+        let still_pending = block_on(run::resume(
+            &mut f,
+            &mut Script::default(),
+            &task.id,
+            &session,
+        ))
+        .unwrap();
+        assert!(
+            still_pending
+                .pause_reason
+                .as_ref()
+                .unwrap()
+                .contains("proposal approval pending; review the open requirements card")
+        );
+        assert!(
+            !still_pending
+                .pause_reason
+                .as_ref()
+                .unwrap()
+                .contains("fresh accepted")
+        );
+        assert_eq!(still_pending.steps, paused.steps);
+        assert_eq!(still_pending.requests, paused.requests);
+        assert_eq!(still_pending.proposal, paused.proposal);
+        assert!(f.remote.borrow().sends.is_empty());
+        assert_eq!(
+            reopen(&f.store.borrow()).poc_task(&task.id).unwrap(),
+            still_pending
+        );
+        // Rejection consumes no authority to send. Resume offers the same visible flow again.
+        f.store
+            .borrow_mut()
+            .reject_requirements(&session, "fixture", candidate)
+            .unwrap();
+        let rejected = block_on(run::resume(
+            &mut f,
+            &mut Script::default(),
+            &task.id,
+            &session,
+        ))
+        .unwrap();
+        assert!(rejected.pending.is_none());
+        assert!(
+            rejected
+                .pause_reason
+                .as_ref()
+                .unwrap()
+                .contains("approved declaration missing")
+        );
+        assert_eq!(
+            (rejected.requests, rejected.steps),
+            (paused.requests, paused.steps)
+        );
+        assert!(f.remote.borrow().sends.is_empty());
+        let pending = f.store.borrow().pending_requirements_view(&session);
+        block_on(f.store.borrow_mut().approve_requirements(
+            &session,
+            "fixture",
+            pending["candidate"].as_u64().unwrap(),
+        ))
+        .unwrap();
+        let finished = block_on(run::resume(
+            &mut f,
+            &mut Script::default(),
+            &task.id,
+            &session,
+        ))
+        .unwrap();
+        assert!(finished.pending.is_none());
+        assert_eq!(f.remote.borrow().sends.values().sum::<u32>(), 1);
+        assert_eq!(finished.steps, if verification { 2 } else { 1 });
+        assert_eq!(
+            reopen(&f.store.borrow()).poc_task(&task.id).unwrap(),
+            finished
+        );
+    }
+}
+
+#[test]
+fn poc_requirements_approval_after_session_loss_cannot_send() {
+    let mut store = ready_without_requirements();
+    let session = store.sessions[0].identity.clone();
+    let task = create_task(&mut store);
+    let task = proposal(&mut store, &task);
+    assert!(store.poc_prepare_execution(&task, &session).is_err());
+    let pending = store.pending_requirements_view(&session);
+    store.sessions[0].ended.set(true);
+    assert!(
+        block_on(store.approve_requirements(
+            &session,
+            "fixture",
+            pending["candidate"].as_u64().unwrap()
+        ))
+        .is_err()
+    );
+    assert!(
+        block_on(store.poc_append(
+            &binding(&task, &session),
+            &entry(&task, &session),
+            &approval()
+        ))
+        .is_err()
+    );
+    assert!(store.dispatch.calls.is_empty());
+}
+
+#[test]
+fn poc_inspection_checkpoint_replaces_authority_pause_before_held_collection() {
+    for abandon in [false, true] {
+        let (mut f, task, session) = Fixture::new();
+        let proposed = proposal(&mut f.store.borrow_mut(), &task);
+        append(&mut f.store.borrow_mut(), &proposed, &session);
+        let pending = f.task(&task.id).pending.unwrap();
+        f.live.set(false);
+        let paused = block_on(run::resume(
+            &mut f,
+            &mut Script::default(),
+            &task.id,
+            &session,
+        ))
+        .unwrap();
+        assert_eq!(paused.status, Status::Paused);
+        let session = f.reload();
+        f.live.set(true);
+        let release = Rc::new(Cell::new(false));
+        f.observe_release = Some(release.clone());
+        let control = f.clone();
+        {
+            let mut model = Script::default();
+            let mut future = Box::pin(run::drive(&mut f, &mut model, &task.id, &session));
+            assert!(
+                future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            let waiting = control.task(&task.id);
+            assert_eq!(waiting.status, Status::Waiting);
+            assert!(
+                waiting
+                    .pause_reason
+                    .as_ref()
+                    .unwrap()
+                    .contains("inspecting the recorded job")
+            );
+            assert!(
+                !waiting
+                    .pause_reason
+                    .as_ref()
+                    .unwrap()
+                    .contains("is running")
+            );
+            assert_eq!(waiting.pending, Some(pending.clone()));
+            assert_eq!(
+                control.reports.borrow().last().unwrap()["tasks"][0]["status"],
+                "waiting"
+            );
+            assert_eq!(
+                reopen(&control.store.borrow()).poc_task(&task.id).unwrap(),
+                waiting
+            );
+            if abandon {
+                change(&mut control.store.borrow_mut(), &waiting, Change::Abandon);
+            } else {
+                control.live.set(false);
+            }
+            release.set(true);
+            let result = future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()));
+            if abandon {
+                assert!(
+                    matches!(result, Poll::Ready(Err(_))),
+                    "stale collector cannot overwrite Abandon"
+                );
+            } else {
+                assert!(
+                    matches!(result, Poll::Ready(Ok(_))),
+                    "lost authority becomes a concrete pause"
+                );
+            }
+        }
+        assert_eq!(control.task(&task.id).pending, Some(pending));
+        assert_eq!(control.store.borrow().dispatch.calls.len(), 1);
+        assert!(control.remote.borrow().sends.is_empty());
+        if abandon {
+            assert_eq!(control.task(&task.id).status, Status::Abandoned);
+        } else {
+            f.hold_observe = false;
+            let paused = block_on(run::resume(
+                &mut f,
+                &mut Script::default(),
+                &task.id,
+                &session,
+            ))
+            .unwrap();
+            assert_eq!(paused.status, Status::Paused);
+        }
+    }
+}
+
+#[test]
+fn poc_structured_refusal_and_collection_causes_are_protected_before_progress() {
+    let secret = "fixture-account-private-value";
+    let (f, task, session) = Fixture::new();
+    let cases = [
+        (
+            json!({"refused":"host-key", "pinned":"pin", "presented":"other"}),
+            "host-key mismatch",
+        ),
+        (json!({"held":true,"calls":[]}), "machine held"),
+        (
+            json!({"unresolved":true,"call":1,"why":format!("read failed {secret}")}),
+            "command outcome unresolved",
+        ),
+        (
+            json!({"refused":"launch-too-long","bytes":99999}),
+            "shorten the command",
+        ),
+        (
+            json!({"refused":"signature-lowering"}),
+            "signature-lowering",
+        ),
+        (json!({"refused":"disposition"}), "machine disposition"),
+        (json!({"refused":"barrier"}), "machine barrier"),
+        (
+            json!({"refused":"journal","why":"installation facts: approved declaration missing"}),
+            "approved declaration missing",
+        ),
+        (
+            json!({"refused":"failed","why":format!("authentication failed {secret}")}),
+            "transport or authentication failed",
+        ),
+    ];
+    for (report, expected) in cases {
+        let why = f.store.borrow().poc_refusal(&report);
+        assert!(why.contains(expected), "{why}");
+        assert!(!why.contains(secret));
+        let current = f.task(&task.id);
+        let paused = change(&mut f.store.borrow_mut(), &current, Change::Pause(why));
+        assert!(!serde_json::to_string(&paused).unwrap().contains(secret));
+        assert_eq!(
+            reopen(&f.store.borrow()).poc_task(&task.id).unwrap(),
+            paused
+        );
+    }
+    let current = f.task(&task.id);
+    let proposed = proposal(&mut f.store.borrow_mut(), &current);
+    append(&mut f.store.borrow_mut(), &proposed, &session);
+    let current = f.task(&task.id);
+    let pending = current.pending.as_ref().unwrap();
+    let reports = vec![
+        json!({"call":pending.call + 1,"not_read":true,"why":"wrong call"}),
+        json!({"call":pending.call,"not_read":true,"why":format!("own dispatch awaits its record {secret}")}),
+    ];
+    let why = f.store.borrow().poc_collection_reason(pending, &reports);
+    assert!(why.contains("not read"));
+    assert!(why.contains("own dispatch awaits its record"));
+    assert!(!why.contains("wrong call"));
+    assert!(!why.contains(secret));
+    let paused = change(
+        &mut f.store.borrow_mut(),
+        &current,
+        Change::Wait {
+            why,
+            running: false,
+        },
+    );
+    assert_eq!(paused.pending, current.pending);
+    assert_eq!(f.store.borrow().dispatch.calls.len(), 1);
+    let replay = reopen(&f.store.borrow());
+    assert_eq!(replay.poc_task(&task.id).unwrap(), paused);
+    assert!(
+        !replay
+            .protect_output(&json!({"task":paused,"history":paused.completed}))
+            .unwrap()
+            .to_string()
+            .contains(secret)
+    );
+    assert!(f.remote.borrow().sends.is_empty());
+}
+
+#[test]
+fn poc_page_start_preflights_correctable_checks_and_continues_partial_acceptance() {
+    for checks in [vec!["x".repeat(8193)], vec!["check".into(); 17]] {
+        let mut store = crate::store::inference::tests::ready();
+        let session = store.sessions[0].identity.clone();
+        block_on(store.enter_goal(&session, "install and run a small service".into(), None))
+            .unwrap();
+        let files = store.storage.files();
+        let error = block_on(store.poc_start(&session, checks)).unwrap_err();
+        assert!(error.contains("verification"), "{error}");
+        assert_eq!(
+            store.storage.files(),
+            files,
+            "invalid checks never consume acceptance"
+        );
+        let checks = vec!["systemctl is-active example.service".into()];
+        // This is the same preflight/acceptance boundary used by the page start helper.
+        block_on(store.poc_accept_start(&session, &checks)).unwrap();
+        assert_eq!(
+            store.poc.len(),
+            1,
+            "acceptance atomically records the task inputs"
+        );
+        assert_eq!(
+            store
+                .conduct_acceptances
+                .iter()
+                .filter(|a| a.session == session)
+                .count(),
+            1
+        );
+        let task = block_on(store.poc_start(&session, checks.clone())).unwrap();
+        assert_eq!(task.goal, "install and run a small service");
+        assert_eq!(block_on(store.poc_start(&session, checks)).unwrap(), task);
+        assert!(block_on(store.poc_start(&session, vec!["different-check".into()])).is_err());
+        assert_eq!(store.poc.len(), 1);
+        assert!(store.dispatch.calls.is_empty());
+        assert_eq!(reopen(&store).poc_task(&task.id).unwrap(), task);
+        assert!(
+            block_on(store.accept_mode(&session, Mode::NoBrief)).is_err(),
+            "legacy acceptance stays one-shot"
+        );
+    }
+}
+
+#[test]
+fn poc_empty_model_pause_is_concrete_durable_and_resumable() {
+    for why in ["", " \t\n "] {
+        let (mut f, task, session) = Fixture::new();
+        let completed = block_on(run::resume(
+            &mut f,
+            &mut Script::one(
+                "unavailable",
+                Tool::Typed {
+                    machine: "fixture".into(),
+                    operation: crate::dispatch::Operation::Read,
+                    arguments: Default::default(),
+                },
+            ),
+            &task.id,
+            &session,
+        ))
+        .unwrap()
+        .completed;
+        let mut model = Script {
+            calls: VecDeque::from([Err(why.into())]),
+            ..Default::default()
+        };
+        let paused = block_on(run::resume(&mut f, &mut model, &task.id, &session)).unwrap();
+        assert_eq!(paused.status, Status::Paused);
+        assert!(!paused.requesting);
+        assert!(
+            paused
+                .pause_reason
+                .as_ref()
+                .unwrap()
+                .contains("no usable pause reason")
+        );
+        assert_eq!(paused.requests, 2);
+        assert_eq!(
+            reopen(&f.store.borrow()).poc_task(&task.id).unwrap(),
+            paused
+        );
+        let session = f.reload();
+        let paused = block_on(run::resume(
+            &mut f,
+            &mut run::Unconfigured,
+            &task.id,
+            &session,
+        ))
+        .unwrap();
+        assert_eq!(
+            paused.pause_reason.as_deref(),
+            Some("no inference endpoint configured")
+        );
+        assert_eq!(paused.requests, 3);
+        assert_eq!(paused.completed, completed);
+        assert!(f.remote.borrow().sends.is_empty());
+    }
+}
+
+#[test]
+fn poc_repeated_page_start_after_send_keeps_the_original_task_and_job() {
+    let (mut f, task, session) = Fixture::new();
+    f.window = Window::AfterSend;
+    let control = f.clone();
+    {
+        let mut model = Script::one("install", exec("install-example-service"));
+        let mut future = Box::pin(run::drive(&mut f, &mut model, &task.id, &session));
+        assert!(
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        let pending = control.task(&task.id);
+        let again = block_on(
+            control
+                .store
+                .borrow_mut()
+                .poc_start(&session, task.checks.clone()),
+        )
+        .unwrap();
+        assert_eq!(again, pending);
+        assert_eq!(control.remote.borrow().sends.values().sum::<u32>(), 1);
+    }
+    let session = f.reload();
+    let result = block_on(run::resume(
+        &mut f,
+        &mut Script::default(),
+        &task.id,
+        &session,
+    ))
+    .unwrap();
+    assert!(result.pending.is_none());
+    assert_eq!(result.completed.len(), 1);
+    assert_eq!(f.remote.borrow().sends.values().sum::<u32>(), 1);
+    assert_eq!(f.store.borrow().poc.len(), 1);
+}
+
+fn bind_fresh(s: &mut Store<MemoryStorage>) -> String {
+    block_on(s.bind("fixture")).unwrap();
+    let session = s.sessions.last().unwrap().identity.clone();
+    s.synthetic_confirm_limits(100).unwrap();
+    session
+}
+
+fn assert_continuation_page(s: &Store<MemoryStorage>, task: &Task) {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut probe = Command::new("node")
+        .args(["-e", include_str!("page-probe.cjs")])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let payload = json!({"state":"unlocked", "seed_backup_stage":"inactive",
+        "setup":s.dispatch.setup_view(), "sessions":s.sessions(), "tasks":[task]});
+    probe
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.to_string().as_bytes())
+        .unwrap();
+    let output = probe.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn poc_reload_continuation_approval_cannot_start_another_task_pending_or_settled() {
+    for pending in [true, false] {
+        let (mut f, task, session) = Fixture::new();
+        block_on(run::resume(
+            &mut f,
+            &mut Script::one(
+                "outside",
+                Tool::Exec {
+                    machine: "outside".into(),
+                    command: "never".into(),
+                },
+            ),
+            &task.id,
+            &session,
+        ))
+        .unwrap();
+        let mut model = Script::one("install", exec("install-example-service"));
+        if pending {
+            f.window = Window::AfterSend;
+            let mut future = Box::pin(run::resume(&mut f, &mut model, &task.id, &session));
+            assert!(
+                future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            drop(future);
+        } else {
+            block_on(run::resume(&mut f, &mut model, &task.id, &session)).unwrap();
+        }
+        let before = f.task(&task.id);
+        assert_eq!(before.pending.is_some(), pending);
+        assert!(!before.completed.is_empty());
+        let mut store = reopen(&f.store.borrow());
+        assert!(
+            store.sessions.is_empty(),
+            "reopen never restores runtime authority"
+        );
+        let fresh = bind_fresh(&mut store);
+        assert!(store.poc_authority(&task.id, &fresh).is_err());
+        block_on(store.poc_authorize(&task.id, &fresh)).unwrap();
+        let continued = store.poc_task(&task.id).unwrap();
+        assert_eq!(continued.id, before.id);
+        assert_eq!(continued.start_session, session);
+        assert_eq!(
+            continued.continuation_sessions,
+            std::slice::from_ref(&fresh)
+        );
+        assert_eq!(continued.completed, before.completed);
+        assert_eq!(
+            (continued.requests, continued.steps),
+            (before.requests, before.steps)
+        );
+        assert_eq!(continued.checks, before.checks);
+        assert_eq!(continued.pending, before.pending);
+        assert_continuation_page(&store, &continued);
+        let files = store.storage.files();
+        for checks in [continued.checks.clone(), vec!["different-check".into()]] {
+            assert!(
+                block_on(store.poc_start(&fresh, checks.clone()))
+                    .unwrap_err()
+                    .contains("use Resume")
+            );
+            assert!(block_on(store.poc_create(&fresh, checks.clone())).is_err());
+            assert!(block_on(store.poc_accept_start(&fresh, &checks)).is_err());
+        }
+        assert_eq!(store.storage.files(), files);
+        assert_eq!(store.poc.len(), 1);
+        assert_eq!(store.dispatch.calls.len(), 1);
+        assert_eq!(reopen(&store).poc_task(&task.id).unwrap(), continued);
+        *f.store.borrow_mut() = store;
+        f.window = Window::Normal;
+        let result = block_on(run::resume(
+            &mut f,
+            &mut run::Unconfigured,
+            &task.id,
+            &fresh,
+        ))
+        .unwrap();
+        assert!(result.pending.is_none());
+        assert_eq!(f.remote.borrow().sends.values().sum::<u32>(), 1);
+        assert_eq!(f.store.borrow().poc.len(), 1);
+        assert_eq!(result.steps, before.steps);
+        // A different explicit start on a fresh session may intentionally use the same goal.
+        let mut next = reopen(&f.store.borrow());
+        let new_session = bind_fresh(&mut next);
+        block_on(next.enter_goal(&new_session, before.goal, None)).unwrap();
+        let new_task = block_on(next.poc_start(&new_session, before.checks)).unwrap();
+        assert_ne!(new_task.id, task.id);
+        assert_eq!(next.poc.len(), 2);
+        assert!(
+            next.poc_authority(&task.id, &new_session)
+                .err()
+                .unwrap()
+                .contains("another task")
+        );
+    }
+}
+
+#[test]
+fn poc_start_acceptance_and_inputs_replay_atomically_even_when_append_reply_is_lost() {
+    for fault in [
+        Some(Fault::Fail(1)),
+        Some(Fault::Fail(2)),
+        Some(Fault::Fail(3)),
+        Some(Fault::LandThenFail(3)),
+        None,
+    ] {
+        let mut store = crate::store::inference::tests::ready();
+        store.fixture_requirements("fixture");
+        let session = store.sessions[0].identity.clone();
+        block_on(store.enter_goal(&session, "install and run a small service".into(), None))
+            .unwrap();
+        let checks = vec!["systemctl is-active example.service".into()];
+        if let Some(fault) = fault {
+            store.storage.fault(fault);
+        }
+        let result = block_on(store.poc_start(&session, checks.clone()));
+        if fault.is_some() {
+            assert!(result.is_err());
+            assert!(store.poc.is_empty());
+            assert!(
+                !store
+                    .conduct_acceptances
+                    .iter()
+                    .any(|a| a.session == session)
+            );
+            assert!(
+                block_on(store.poc_start(&session, checks.clone())).is_err(),
+                "append failure leaves the writer fail closed"
+            );
+        }
+        let mut replay = reopen(&store);
+        assert!(replay.sessions.is_empty());
+        assert!(replay.dispatch.calls.is_empty());
+        if matches!(fault, Some(Fault::Fail(_))) {
+            assert!(replay.poc.is_empty());
+            assert!(
+                !replay
+                    .conduct_acceptances
+                    .iter()
+                    .any(|a| a.session == session)
+            );
+            continue;
+        }
+        assert_eq!(replay.poc.len(), 1);
+        let recovered = replay.poc.values().next().unwrap().clone();
+        if let Ok(returned) = result {
+            assert_eq!(returned, recovered);
+        }
+        assert_eq!(recovered.checks, checks);
+        assert_eq!(recovered.goal, "install and run a small service");
+        assert_eq!((recovered.requests, recovered.steps), (0, 0));
+        assert!(replay.poc_authority(&recovered.id, &session).is_err());
+        let fresh = bind_fresh(&mut replay);
+        assert!(replay.poc_authority(&recovered.id, &fresh).is_err());
+        block_on(replay.poc_authorize(&recovered.id, &fresh)).unwrap();
+        let (mut f, _, _) = Fixture::new();
+        *f.store.borrow_mut() = replay;
+        let settled = block_on(run::resume(
+            &mut f,
+            &mut Script::one("install", exec("install-example-service")),
+            &recovered.id,
+            &fresh,
+        ))
+        .unwrap();
+        assert_eq!(settled.id, recovered.id);
+        assert_eq!(settled.checks, checks);
+        assert_eq!(settled.completed.len(), 1);
+        block_on(run::resume(
+            &mut f,
+            &mut run::Unconfigured,
+            &recovered.id,
+            &fresh,
+        ))
+        .unwrap();
+        assert_eq!(f.remote.borrow().sends.values().sum::<u32>(), 1);
+        assert_eq!(f.store.borrow().poc.len(), 1);
+        assert_eq!(
+            reopen(&f.store.borrow()).poc_task(&recovered.id).unwrap(),
+            f.task(&recovered.id)
+        );
+    }
+}
+
+#[test]
+fn poc_authority_pause_preserves_distinct_protected_error_and_pending_identity() {
+    let (mut f, task, session) = Fixture::new();
+    let proposed = proposal(&mut f.store.borrow_mut(), &task);
+    append(&mut f.store.borrow_mut(), &proposed, &session);
+    let before = f.task(&task.id);
+    for why in [
+        "session ended fixture-account-private-value",
+        "fresh authority must bind only the task machine",
+    ] {
+        f.authority_error = Some(why.into());
+        let paused = block_on(run::resume(
+            &mut f,
+            &mut Script::default(),
+            &task.id,
+            &session,
+        ))
+        .unwrap();
+        let reason = paused.pause_reason.as_ref().unwrap();
+        assert!(reason.contains(why.split(" fixture-account").next().unwrap()));
+        assert!(!reason.contains("fixture-account-private-value"));
+        assert_eq!(paused.pending, before.pending);
+        assert_eq!(
+            (paused.steps, paused.requests),
+            (before.steps, before.requests)
+        );
+        assert_eq!(
+            reopen(&f.store.borrow()).poc_task(&task.id).unwrap(),
+            paused
+        );
+        assert!(f.remote.borrow().sends.is_empty());
+    }
+}
+
+#[test]
+fn poc_production_collector_reports_preserve_observed_causes_and_uncertainty() {
+    for case in 0..6 {
+        let (mut f, task, session) = Fixture::new();
+        let proposed = proposal(&mut f.store.borrow_mut(), &task);
+        append(&mut f.store.borrow_mut(), &proposed, &session);
+        let pending_task = f.task(&task.id);
+        let mut observed = record(&pending_task, None, "fixture-account-private-value");
+        let expected = match case {
+            0 => {
+                observed = crate::jobs::Record::Missing;
+                "no record found"
+            }
+            1 => {
+                if let crate::jobs::Record::Present { alive, .. } = &mut observed {
+                    *alive = false;
+                }
+                "process ended without a trustworthy exit"
+            }
+            2 => {
+                observed = crate::jobs::Record::Incomplete {
+                    machine: Some(hex::encode("fixture")),
+                    command: None,
+                };
+                "incomplete job record"
+            }
+            3 => {
+                if let crate::jobs::Record::Present { machine, .. } = &mut observed {
+                    *machine = hex::encode("foreign");
+                }
+                "foreign machine record"
+            }
+            _ => {
+                if let crate::jobs::Record::Present { command, alive, .. } = &mut observed {
+                    *command = hex::encode("different");
+                    *alive = false;
+                }
+                "command/record mismatch"
+            }
+        };
+        let pending = pending_task.pending.as_ref().unwrap();
+        evidence(&mut f.store.borrow_mut(), &pending_task, observed);
+        let serialized =
+            serde_json::to_value(f.store.borrow().poc_committed(pending).unwrap()).unwrap();
+        assert!(serialized.get("why").is_none());
+        let why = f
+            .store
+            .borrow()
+            .poc_collection_reason(pending, std::slice::from_ref(&serialized));
+        assert!(why.contains(expected), "{why}");
+        assert!(why.contains(&pending.job));
+        assert!(!why.contains("fixture-account-private-value"));
+        let paused = change(
+            &mut f.store.borrow_mut(),
+            &pending_task,
+            Change::Wait {
+                why,
+                running: false,
+            },
+        );
+        assert_eq!(paused.pending, pending_task.pending);
+        assert!(paused.completed.is_empty());
+        assert!(matches!(
+            f.store.borrow().dispatch.check_command("fixture"),
+            Err(crate::dispatch::DispatchRefusal::Held(_))
+        ));
+        assert!(
+            block_on(
+                f.store
+                    .borrow_mut()
+                    .poc_change(&task.id, paused.revision, Change::Settle)
+            )
+            .is_err()
+        );
+        let mut replay = reopen(&f.store.borrow());
+        assert_eq!(replay.poc_task(&task.id).unwrap(), paused);
+        let fresh = bind_fresh(&mut replay);
+        block_on(replay.poc_authorize(&task.id, &fresh)).unwrap();
+        *f.store.borrow_mut() = replay;
+        // Repeated Resume reads the same record and never authorizes another intent/send.
+        f.observe_error = true;
+        for _ in 0..2 {
+            let paused = block_on(run::resume(
+                &mut f,
+                &mut Script::default(),
+                &task.id,
+                &fresh,
+            ))
+            .unwrap();
+            assert_eq!(paused.pending, pending_task.pending);
+            assert_ne!(paused.status, Status::Complete);
+        }
+        assert_eq!(f.store.borrow().dispatch.calls.len(), 1);
+        assert!(f.remote.borrow().sends.is_empty());
+        let mut malformed = serialized;
+        malformed.as_object_mut().unwrap().remove("state");
+        assert!(
+            f.store
+                .borrow()
+                .poc_collection_reason(pending, &[malformed])
+                .contains("malformed")
+        );
+        assert!(
+            f.store
+                .borrow()
+                .poc_collection_reason(pending, &[json!({"call":pending.call,"job":"other"})])
+                .contains("identity mismatch")
+        );
+    }
+}
+
+#[test]
+fn poc_collector_checkpoint_failures_preserve_pending_jobs_and_verification() {
+    let secret = "fixture-account-private-value";
+    for verifying in [false, true] {
+        for case in 0..6 {
+            let (mut f, task, session) = Fixture::new();
+            if verifying {
+                block_on(run::resume(
+                    &mut f,
+                    &mut Script::one("done", done()),
+                    &task.id,
+                    &session,
+                ))
+                .unwrap();
+            }
+            // Launch once, then lose the response before any evidence checkpoint.
+            f.window = Window::AfterSend;
+            {
+                let mut model = Script::one("install", exec("install-example-service"));
+                let mut running =
+                    std::pin::pin!(run::resume(&mut f, &mut model, &task.id, &session));
+                assert!(
+                    running
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_pending()
+                );
+            }
+            let before = f.task(&task.id);
+            let pending = before.pending.as_ref().unwrap();
+            let Tool::Exec { command, .. } = &before.proposal.as_ref().unwrap().tool else {
+                panic!("pending command expected")
+            };
+            let uncommitted = block_on(crate::harness::BoundJournal::uncommitted(
+                &*f.store.borrow(),
+                &crate::jobs::Evidence {
+                    call: pending.call,
+                    job: pending.job.clone(),
+                    record: record(&before, Some(0), secret),
+                },
+                &before.machine,
+                &hex::encode(command),
+            ))
+            .unwrap();
+            let uncommitted = serde_json::to_value(uncommitted).unwrap();
+            assert!(!uncommitted.to_string().contains(secret));
+            let (report, expected) = match case {
+                0..=3 => (
+                    // Exact collector failure shape, including unavailable diagnostics.
+                    json!({"call":pending.call,"job":pending.job,"failed":true,
+                        "why":if case < 2 {
+                            format!("job evidence append: storage unavailable {secret}")
+                        } else {
+                            "wait stopped before journaling job evidence".into()
+                        },
+                        "job_record":if case % 2 == 0 { uncommitted } else { Value::Null }}),
+                    "evidence checkpoint not confirmed",
+                ),
+                4 => (
+                    json!({"call":pending.call,"job":pending.job,"failed":true,
+                        "why":format!("session channel: record read failed {secret}")}),
+                    "record read failed",
+                ),
+                _ => (
+                    json!({"call":pending.call,"job":pending.job,"not_read":true,
+                        "why":"sessions ended before record was read"}),
+                    "not read",
+                ),
+            };
+            f.collection_reports = Some(vec![report]);
+            let mut session = session;
+            let mut model = Script::default();
+            for _ in 0..3 {
+                let paused = block_on(run::resume(&mut f, &mut model, &task.id, &session)).unwrap();
+                let why = paused.pause_reason.as_ref().unwrap();
+                assert!(why.contains(expected), "{why}");
+                if case < 4 {
+                    assert!(why.contains("observation remains uncertain"), "{why}");
+                    assert!(!why.contains("record read failed"), "{why}");
+                    assert!(why.contains(if case < 2 {
+                        "storage unavailable"
+                    } else {
+                        "wait stopped before journaling job evidence"
+                    }));
+                } else {
+                    assert!(!why.contains("evidence checkpoint"), "{why}");
+                }
+                assert!(why.contains(&pending.job));
+                assert!(!serde_json::to_string(&paused).unwrap().contains(secret));
+                assert_eq!(paused.status, Status::Paused);
+                assert_eq!(paused.pending, before.pending);
+                assert_eq!(paused.proposal, before.proposal);
+                assert_eq!(paused.completed, before.completed);
+                assert_eq!(paused.verification, before.verification);
+                assert_eq!(
+                    (paused.requests, paused.steps),
+                    (before.requests, before.steps)
+                );
+                assert!(f.store.borrow().poc_committed(pending).is_none());
+                assert!(matches!(
+                    f.store.borrow().dispatch.check_command("fixture"),
+                    Err(crate::dispatch::DispatchRefusal::Held(_))
+                ));
+                assert_eq!(f.store.borrow().dispatch.calls.len(), 1);
+                assert_eq!(f.remote.borrow().sends.len(), 1);
+                assert_eq!(f.remote.borrow().sends[&pending.job], 1);
+                assert!(model.seen.is_empty());
+                let mut replay = reopen(&f.store.borrow());
+                assert_eq!(replay.poc_task(&task.id).unwrap(), paused);
+                session = bind_fresh(&mut replay);
+                block_on(replay.poc_authorize(&task.id, &session)).unwrap();
+                *f.store.borrow_mut() = replay;
+            }
+        }
+    }
+}
+
+#[test]
+fn poc_held_read_nested_host_key_and_read_append_failures_keep_safe_causes() {
+    let (f, task, session) = Fixture::new();
+    let task = proposal(&mut f.store.borrow_mut(), &task);
+    append(&mut f.store.borrow_mut(), &task, &session);
+    let task = f.task(&task.id);
+    let pending = task.pending.as_ref().unwrap();
+    let secret = "fixture-account-private-value";
+    // Same held/calls/not_read/why/unreachable shape used by the command admission reader.
+    let nested = json!({"held":true,"machine":"fixture","calls":[{
+        "call":pending.call,"not_read":true,"why":{"unreachable":{
+            "refused":"host-key","pinned":"pin","presented":"different", "why":format!("pin refused {secret}")
+        }}}], "release":["finished_record","disposition"]});
+    let why = f.store.borrow().poc_refusal(&nested);
+    assert!(why.contains("host-key mismatch"), "{why}");
+    assert!(why.contains(&format!("call {}", pending.call)));
+    assert!(why.contains("not read"));
+    assert!(!why.contains(secret));
+    for (report, expected) in [
+        (nested, "host-key mismatch"),
+        (
+            json!({"held":true,"calls":[{"call":pending.call,"failed":true,"why":format!("record channel failed {secret}")}]}),
+            "record read failed",
+        ),
+        (
+            json!({"held":true,"calls":[{"call":pending.call,"not_journaled":true,"why":format!("job evidence append: {secret}")}]}),
+            "evidence checkpoint not confirmed",
+        ),
+        (json!({"refused":"unbound","machine":"fixture"}), "unbound"),
+        (
+            json!({"refused":"no-entry","machine":"fixture"}),
+            "no approved entry",
+        ),
+        (json!({"refused":"provenance"}), "provenance"),
+    ] {
+        let why = f.store.borrow().poc_refusal(&report);
+        assert!(why.contains(expected), "{why}");
+        assert!(!why.contains(secret));
+        let current = f.task(&task.id);
+        let paused = change(
+            &mut f.store.borrow_mut(),
+            &current,
+            Change::Wait {
+                why,
+                running: false,
+            },
+        );
+        assert_eq!(paused.pending, task.pending);
+        assert_eq!(
+            reopen(&f.store.borrow()).poc_task(&task.id).unwrap(),
+            paused
+        );
+        assert_ne!(paused.status, Status::Complete);
+        assert!(f.remote.borrow().sends.is_empty());
+    }
 }

@@ -1,6 +1,6 @@
 // The harness worker alone holds the seed and keys. Only the dedicated seed-backup display
 // carries words to the page; re-entry and passphrase buffers are zero-filled by the module.
-import init, { spec_commit, open, create, unlock, seed_backup_display, seed_backup_answer, seed_backup_reentry, seed_backup_skip, seed_backup_redisplay, setup_approve, setup_answer, bind, goal_request, goal_accept, run_page_goal, task_request, requirements_answer, delivery_request, end_sessions, sweep_inference, lifecycle_transition, publication_generation, publish_report, verify_inference_clock, withdraw_reinstall } from './pkg/tau_web.js';
+import init, { spec_commit, open, create, unlock, seed_backup_display, seed_backup_answer, seed_backup_reentry, seed_backup_skip, seed_backup_redisplay, setup_approve, setup_answer, bind, goal_request, accept_page_goal, run_page_goal, task_request, requirements_answer, delivery_request, end_sessions, sweep_inference, lifecycle_transition, publication_generation, publish_report, verify_inference_clock, withdraw_reinstall } from './pkg/tau_web.js';
 
 try {
   await init();
@@ -66,7 +66,7 @@ onmessage = async ({ data }) => {
   else if (data.requirements_answer && typeof data.requirements_answer === 'object') report = await requirements_answer(JSON.stringify(data.requirements_answer));
   else if (data.delivery && typeof data.delivery === 'object') report = await delivery_request(JSON.stringify(data.delivery));
   else if (data.goal_accept && typeof data.goal_accept === 'object') {
-    report = await goal_accept(JSON.stringify({ session: data.goal_accept.session }));
+    report = await accept_page_goal(data.goal_accept.session, JSON.stringify(data.goal_accept.checks ?? []));
     await reportStore(report, generation, session);
     if (!JSON.parse(report).error) {
       const outcome = JSON.parse(await run_page_goal(data.goal_accept.session, JSON.stringify(data.goal_accept.checks ?? [])));

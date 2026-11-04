@@ -55,6 +55,8 @@ pub struct Verification {
 pub struct Task {
     pub id: String,
     pub start_session: String,
+    #[serde(default)]
+    pub continuation_sessions: Vec<String>,
     pub goal: String,
     pub machine: String,
     pub approved_plan: Option<String>,
@@ -108,6 +110,7 @@ pub enum Change {
     Propose { call_id: String, tool: Tool },
     PrepareCheck,
     Settle,
+    Inspect,
     Wait { why: String, running: bool },
     Pause(String),
     Raise(Limits),
@@ -121,6 +124,17 @@ pub(crate) enum Record {
         session: String,
         checks: Vec<String>,
         limits: Limits,
+    },
+    Start {
+        id: String,
+        session: String,
+        checks: Vec<String>,
+        limits: Limits,
+    },
+    Authorize {
+        id: String,
+        expected: u64,
+        session: String,
     },
     Change {
         id: String,
@@ -153,11 +167,17 @@ impl<S: Storage> Store<S> {
             return Err("task ended".into());
         }
         let live = self.live_goal_session(session)?;
+        if self
+            .poc_session_task(session)
+            .is_some_and(|owner| owner.id != id)
+        {
+            return Err("session authority belongs to another task; bind a fresh session".into());
+        }
         if live.bound_set != [task.machine.as_str()] {
             return Err("fresh authority must bind only the task machine".into());
         }
         if self.pending_requirements.contains_key(session) {
-            return Err("proposal approval pending".into());
+            return Err("proposal approval pending; review the open requirements card and approve explicitly or reject before Resume".into());
         }
         if !self
             .conduct_acceptances
@@ -179,11 +199,43 @@ impl<S: Storage> Store<S> {
         if live.bound_set != [task.machine.as_str()] {
             return Err("fresh authority must bind only the task machine".into());
         }
-        if self.goal(session).is_none() {
-            self.enter_goal(session, task.goal, None).await?;
+        if let Some(owner) = self.poc_session_task(session) {
+            if owner.id != id {
+                return Err("session already belongs to another task; bind a fresh session".into());
+            }
+            return self.poc_authority(id, session).map(|_| ());
         }
-        self.accept_mode(session, Mode::NoBrief).await?;
-        Ok(())
+        if self.goal(session).is_none() {
+            self.enter_goal(session, task.goal.clone(), None).await?;
+        }
+        let record = Record::Authorize {
+            id: id.into(),
+            expected: task.revision,
+            session: session.into(),
+        };
+        self.project_poc(self.next, &record)?;
+        let number = self.commit(&Event::Poc(record.clone())).await?;
+        self.apply_poc(number, &record)
+    }
+    fn poc_session_task(&self, session: &str) -> Option<&Task> {
+        self.poc.values().find(|t| {
+            t.start_session == session || t.continuation_sessions.iter().any(|s| s == session)
+        })
+    }
+    fn poc_new_acceptance(&self, session: &str) -> Result<Option<Acceptance>, String> {
+        if self
+            .conduct_acceptances
+            .iter()
+            .any(|a| a.session == session && a.mode == Mode::NoBrief)
+        {
+            return Ok(None);
+        }
+        let acceptance = Acceptance {
+            session: session.into(),
+            mode: Mode::NoBrief,
+        };
+        self.check_acceptance(&acceptance)?;
+        Ok(Some(acceptance))
     }
     pub async fn poc_raise(&mut self, id: &str, limits: Limits) -> Result<Task, String> {
         crate::poc::run::check_raise(id)?;
@@ -198,29 +250,152 @@ impl<S: Storage> Store<S> {
             return Err("bound set".into());
         }
         // Reuse the legacy installation check without granting stored goals session authority.
-        if !matches!(tool, Tool::Done { .. }) {
+        if matches!(tool, Tool::Exec { .. }) {
             self.dispatch.check_installation(tool.machine())?;
         }
         Ok(())
     }
+    /// Record a safe proposal before testing prerequisites for its eventual effect.
+    pub async fn poc_propose(
+        &mut self,
+        task: &Task,
+        session: &str,
+        call_id: String,
+        tool: Tool,
+    ) -> Result<Task, String> {
+        self.poc_authority(&task.id, session)?;
+        self.poc_safe(&tool)?;
+        self.poc_change(&task.id, task.revision, Change::Propose { call_id, tool })
+            .await
+    }
+
+    /// The pinned minimum is only a proposal. The existing approval card must authorize it.
+    pub fn poc_prepare_execution(&mut self, task: &Task, session: &str) -> Result<(), String> {
+        let tool = &task
+            .proposal
+            .as_ref()
+            .ok_or("missing command proposal")?
+            .tool;
+        self.poc_authority(&task.id, session)?;
+        if self.poc_task(&task.id)?.revision != task.revision || task.pending.is_some() {
+            return Err("stale task execution".into());
+        }
+        if self
+            .dispatch
+            .approved_entries
+            .get(&task.machine)
+            .is_some_and(|m| m.declaration.is_none())
+        {
+            self.propose_requirements(
+                session,
+                self.next,
+                crate::declaration::Proposal::Declaration {
+                    machine: task.machine.clone(),
+                    declaration: crate::declaration::ad_hoc_minimum(),
+                },
+                tool,
+            )?;
+            return Err("installation facts: approved declaration missing; review the proposed requirements, approve explicitly, then Resume".into());
+        }
+        self.poc_tool(&task.id, session, tool)
+    }
+
+    /// Map structured transport reports only after passing the existing protection boundary.
+    pub fn poc_refusal(&self, report: &Value) -> String {
+        match self.protect_output(report) {
+            Ok(safe) => crate::poc::run::refusal_reason(&safe),
+            Err(_) => "command refused; diagnostic protection failed; inspect connection and task configuration".into(),
+        }
+    }
+    pub fn poc_collection_reason(&self, pending: &Pending, reports: &[Value]) -> String {
+        match self.protect_output(&json!(reports)) {
+            Ok(safe) => crate::poc::run::collection_reason(
+                pending,
+                safe.as_array().expect("protected reports"),
+            ),
+            Err(_) => format!(
+                "collection failed for pending call {} job {}: diagnostic protection failed; pending identity retained",
+                pending.call, pending.job
+            ),
+        }
+    }
+
+    fn poc_check_start(&self, session: &str, checks: &[String]) -> Result<(), String> {
+        let live = self.live_goal_session(session)?;
+        if let Some(task) = self.poc_session_task(session)
+            && task.start_session != session
+        {
+            return Err(format!(
+                "session is authorized to continue task {}; use Resume for that task or bind a fresh session to explicitly start new work",
+                task.id
+            ));
+        }
+        self.goal(session).ok_or("missing goal")?;
+        if live.bound_set.len() != 1 {
+            return Err("task start requires exactly one bound machine".into());
+        }
+        if checks.len() > 16 {
+            return Err("too many verification commands; supply at most 16 and start again".into());
+        }
+        if checks.iter().any(|c| c.trim().is_empty() || c.len() > 8192) {
+            return Err("verification commands must contain 1 to 8192 bytes; correct the commands and start again".into());
+        }
+        self.poc_safe(&checks)?;
+        Ok(())
+    }
+    /// Acceptance and task inputs share one durable boundary, including a lost append reply.
+    pub async fn poc_accept_start(
+        &mut self,
+        session: &str,
+        checks: &[String],
+    ) -> Result<(), String> {
+        self.poc_start(session, checks.to_vec()).await.map(|_| ())
+    }
+    pub async fn poc_start(&mut self, session: &str, checks: Vec<String>) -> Result<Task, String> {
+        self.poc_create_inner(session, checks, true).await
+    }
     pub async fn poc_create(&mut self, session: &str, checks: Vec<String>) -> Result<Task, String> {
-        self.check_goal_start(session)?;
-        if let Some(task) = self.poc.values().find(|t| t.start_session == session) {
+        self.poc_create_inner(session, checks, false).await
+    }
+    async fn poc_create_inner(
+        &mut self,
+        session: &str,
+        checks: Vec<String>,
+        accept: bool,
+    ) -> Result<Task, String> {
+        self.poc_check_start(session, &checks)?;
+        if self.pending_requirements.contains_key(session) {
+            return Err("proposal approval pending".into());
+        }
+        if let Some(task) = self.poc_session_task(session) {
             if task.checks != checks {
                 return Err("accepted start already has verification checks".into());
             }
             return self.poc_task(&task.id);
         }
-        let record = Record::Create {
-            id: hex::encode(random::<24>()?),
-            session: session.into(),
-            checks,
-            limits: Limits::default(),
+        let id = hex::encode(random::<24>()?);
+        let session = session.into();
+        let limits = Limits::default();
+        let record = if accept {
+            Record::Start {
+                id,
+                session,
+                checks,
+                limits,
+            }
+        } else {
+            self.check_goal_start(&session)?;
+            Record::Create {
+                id,
+                session,
+                checks,
+                limits,
+            }
         };
         let task = self.project_poc(self.next, &record)?;
         self.poc_safe(&task)?;
-        self.commit(&Event::Poc(record)).await?;
-        self.poc.insert(task.id.clone(), task.clone());
+        let number = self.commit(&Event::Poc(record.clone())).await?;
+        self.apply_poc(number, &record)?;
         Ok(task)
     }
     pub async fn poc_change(
@@ -231,11 +406,9 @@ impl<S: Storage> Store<S> {
     ) -> Result<Task, String> {
         match &mut change {
             Change::Pause(why) | Change::Wait { why, .. } => {
-                *why = self
-                    .protect_output(&json!(why))?
-                    .as_str()
-                    .ok_or("pause encoding")?
-                    .into();
+                *why = self.protect_output(&json!(why)).ok()
+                    .and_then(|v| v.as_str().map(str::to_owned))
+                    .unwrap_or_else(|| "task paused: diagnostic protection failed; inspect authority and configuration before Resume".into());
             }
             _ => {}
         }
@@ -329,6 +502,11 @@ impl<S: Storage> Store<S> {
         if let Record::Command { intent, .. } = record {
             self.apply_intent(number, intent.clone())?;
         }
+        if let Record::Start { session, .. } | Record::Authorize { session, .. } = record
+            && let Some(acceptance) = self.poc_new_acceptance(session)?
+        {
+            self.conduct_acceptances.push(acceptance);
+        }
         self.poc.insert(task.id.clone(), task);
         Ok(())
     }
@@ -338,8 +516,17 @@ impl<S: Storage> Store<S> {
             session,
             checks,
             limits,
+        }
+        | Record::Start {
+            id,
+            session,
+            checks,
+            limits,
         } = record
         {
+            if matches!(record, Record::Start { .. }) {
+                self.poc_new_acceptance(session)?;
+            }
             let goal = self.goal(session).ok_or("task requires recorded goal")?;
             let exposure = self
                 .exposure_ledger
@@ -349,22 +536,24 @@ impl<S: Storage> Store<S> {
             if id.len() != 48
                 || hex::decode(id).is_err()
                 || self.poc.contains_key(id)
-                || self.poc.values().any(|t| t.start_session == *session)
+                || self.poc_session_task(session).is_some()
                 || exposure.bound_set.len() != 1
                 || checks.len() > 16
                 || checks.iter().any(|c| c.trim().is_empty() || c.len() > 8192)
                 || limits.requests == 0
                 || limits.steps == 0
-                || !self
-                    .conduct_acceptances
-                    .iter()
-                    .any(|a| a.session == *session && a.mode == Mode::NoBrief)
+                || (matches!(record, Record::Create { .. })
+                    && !self
+                        .conduct_acceptances
+                        .iter()
+                        .any(|a| a.session == *session && a.mode == Mode::NoBrief))
             {
                 return Err("invalid task creation".into());
             }
             return Ok(Task {
                 id: id.clone(),
                 start_session: session.clone(),
+                continuation_sessions: vec![],
                 goal: goal.text.clone(),
                 machine: exposure.bound_set[0].machine.clone(),
                 approved_plan: None,
@@ -384,7 +573,9 @@ impl<S: Storage> Store<S> {
             });
         }
         let (id, expected) = match record {
-            Record::Change { id, expected, .. } => (id, *expected),
+            Record::Change { id, expected, .. } | Record::Authorize { id, expected, .. } => {
+                (id, *expected)
+            }
             Record::Command { binding, .. } => (&binding.task, binding.revision),
             _ => unreachable!(),
         };
@@ -393,6 +584,24 @@ impl<S: Storage> Store<S> {
             return Err("stale or ended task".into());
         }
         match record {
+            Record::Authorize { session, .. } => {
+                let exposure = self
+                    .exposure_ledger
+                    .iter()
+                    .find(|e| e.session == *session)
+                    .ok_or("task continuation requires binding")?;
+                if self.poc_session_task(session).is_some()
+                    || exposure.bound_set.len() != 1
+                    || exposure.bound_set[0].machine != task.machine
+                    || self.goal(session).is_none_or(|g| g.text != task.goal)
+                {
+                    return Err(
+                        "task continuation session differs or already belongs to a task".into(),
+                    );
+                }
+                self.poc_new_acceptance(session)?;
+                task.continuation_sessions.push(session.clone());
+            }
             Record::Command { binding, intent } => {
                 let proposal = task.proposal.as_ref().ok_or("missing task proposal")?;
                 let Tool::Exec { machine, command } = &proposal.tool else {
@@ -564,6 +773,13 @@ impl<S: Storage> Store<S> {
                         });
                         task.active();
                     }
+                }
+                Change::Inspect => {
+                    if task.pending.is_none() {
+                        return Err("inspection requires pending identity".into());
+                    }
+                    task.active();
+                    task.pause_reason = Some("inspecting the recorded job; collection may wait for completion; an active collection must finish or be interrupted before Resume".into());
                 }
                 Change::Settle => {
                     let pending = task.pending.as_ref().ok_or("task has no pending job")?;

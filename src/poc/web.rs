@@ -76,16 +76,19 @@ impl<P: PinSource> Runtime for Web<'_, P> {
         let mut writer = local.lock().await;
         self.continuation.check()?;
         let store = writer.store().ok_or("locked")?;
-        store.poc_authority(&task.id, session)?;
-        // Wrong-machine proposals record a refused step; they never reach the transport.
-        if tool.machine() == task.machine {
-            store.poc_tool(&task.id, session, &tool)?;
-        }
-        store
-            .poc_change(&task.id, task.revision, Change::Propose { call_id, tool })
-            .await
+        store.poc_propose(task, session, call_id, tool).await
     }
+
     async fn execute(&mut self, binding: Binding, task: &Task) -> Result<(), String> {
+        {
+            let local = local();
+            let mut writer = local.lock().await;
+            self.continuation.check()?;
+            writer
+                .store()
+                .ok_or("locked")?
+                .poc_prepare_execution(task, &binding.session)?;
+        }
         if self.target.machine != task.machine {
             return Err("resolved target differs from task machine".into());
         }
@@ -128,9 +131,15 @@ impl<P: PinSource> Runtime for Web<'_, P> {
             false,
         )
         .await;
-        result.map(|_| ()).map_err(|_| {
-            "tracked command could not complete; inspect task and connection configuration".into()
-        })
+        match result {
+            Ok(_) => Ok(()),
+            Err(why) => Err(local()
+                .lock()
+                .await
+                .store()
+                .ok_or("locked")?
+                .poc_refusal(&why.to_json())),
+        }
     }
     async fn observe(&mut self, task: &Task, session: &str) -> Result<Observation, String> {
         if let Some(observation) = committed(task).await? {
@@ -180,13 +189,19 @@ impl<P: PinSource> Runtime for Web<'_, P> {
         if let Some(observation) = committed(task).await? {
             return Ok(observation);
         }
+        let local = local();
+        let mut writer = local.lock().await;
+        let store = writer.store().ok_or("locked")?;
+        let pending = task.pending.as_ref().ok_or("missing pending job")?;
+        let call = pending.call;
         match result {
-            Ok(reports) => {
-                let call = task.pending.as_ref().ok_or("missing pending job")?.call;
-                let running = reports.iter().any(|r| r["call"] == call && r["state"] == "running");
-                Ok(if running { Observation::Running } else { Observation::Unknown("recorded job outcome unavailable; pending identity retained for inspection".into()) })
-            }
-            Err(_) => Err("recorded job could not be read; check target, trusted host pin and connection, then Resume".into()),
+            Ok(reports) => Ok(Observation::Unknown(
+                store.poc_collection_reason(pending, &reports),
+            )),
+            Err(why) => Err(format!(
+                "collection failed for pending call {call}: {}; pending identity retained",
+                store.poc_refusal(&why.to_json())
+            )),
         }
     }
 }
@@ -400,7 +415,7 @@ pub(crate) async fn request(request: String) -> String {
             match request.action.as_str() {
                 "start" => {
                     store
-                        .poc_create(
+                        .poc_start(
                             request.session.as_deref().ok_or("session required")?,
                             request.checks.unwrap_or_default(),
                         )

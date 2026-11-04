@@ -98,7 +98,7 @@ pub async fn drive(
     session: &str,
 ) -> Result<Task, String> {
     if !ACTIVE.with_borrow_mut(|set| set.insert(id.into())) {
-        return Err("task action already active".into());
+        return Err("task action already active; collection may be waiting for the recorded job; let it finish or interrupt the session before Resume".into());
     }
     let _active = Active(id.into());
     loop {
@@ -122,15 +122,8 @@ pub async fn resume(
         return Ok(task);
     }
     runtime.progress(&task).await;
-    if runtime.authority(id, session).await.is_err() {
-        return runtime
-            .change(
-                &task,
-                Change::Pause(
-                    "fresh accepted session authority for the task machine is required".into(),
-                ),
-            )
-            .await;
+    if let Err(why) = runtime.authority(id, session).await {
+        return pause_authority(runtime, &task, why).await;
     }
     if task.pending.is_some() {
         return inspect(runtime, &task, session).await;
@@ -145,31 +138,30 @@ pub async fn resume(
             }
             // The durable request count is consumed even if this future is lost.
             let next = model.next(&task.goal, &task.machine, &task.completed).await;
-            if runtime.authority(id, session).await.is_err() {
-                return pause_authority(runtime, &task).await;
+            if let Err(why) = runtime.authority(id, session).await {
+                return pause_authority(runtime, &task, why).await;
             }
             task = match next {
                 Ok((call_id, tool)) => match runtime.propose(&task, session, call_id, tool).await {
                     Ok(task) => task,
-                    Err(_) => {
+                    Err(why) => {
                         return runtime
-                            .change(
-                                &task,
-                                Change::Pause(
-                                    "invalid, duplicate or unsafe tool proposal refused".into(),
-                                ),
-                            )
+                            .change(&task, Change::Pause(concrete_pause(why)))
                             .await;
                     }
                 },
-                Err(why) => return runtime.change(&task, Change::Pause(why)).await,
+                Err(why) => {
+                    return runtime
+                        .change(&task, Change::Pause(concrete_pause(why)))
+                        .await;
+                }
             };
         }
     }
     if task.proposal.is_some() {
         runtime.progress(&task).await;
-        if runtime.authority(id, session).await.is_err() {
-            return pause_authority(runtime, &task).await;
+        if let Err(why) = runtime.authority(id, session).await {
+            return pause_authority(runtime, &task, why).await;
         }
         let binding = Binding {
             task: id.into(),
@@ -203,13 +195,16 @@ pub async fn resume(
 }
 
 async fn inspect(runtime: &mut impl Runtime, task: &Task, session: &str) -> Result<Task, String> {
-    if runtime.authority(&task.id, session).await.is_err() {
-        return pause_authority(runtime, task).await;
+    if let Err(why) = runtime.authority(&task.id, session).await {
+        return pause_authority(runtime, task, why).await;
     }
+    let inspecting = runtime.change(task, Change::Inspect).await?;
+    runtime.progress(&inspecting).await;
+    let task = &inspecting;
     let observation = runtime.observe(task, session).await;
-    // Rechecking the original revision also rejects Abandon or another Resume's outcome.
-    if runtime.authority(&task.id, session).await.is_err() {
-        return pause_authority(runtime, task).await;
+    // Rechecking the inspection revision also rejects Abandon or another Resume's outcome.
+    if let Err(why) = runtime.authority(&task.id, session).await {
+        return pause_authority(runtime, task, why).await;
     }
     match observation {
         Ok(Observation::Committed) => match runtime.change(task, Change::Settle).await {
@@ -251,13 +246,157 @@ async fn inspect(runtime: &mut impl Runtime, task: &Task, session: &str) -> Resu
     }
 }
 
-async fn pause_authority(runtime: &mut impl Runtime, task: &Task) -> Result<Task, String> {
+async fn pause_authority(
+    runtime: &mut impl Runtime,
+    task: &Task,
+    why: String,
+) -> Result<Task, String> {
     runtime
         .change(
             task,
-            Change::Pause(
-                "fresh accepted session authority for the task machine is required".into(),
-            ),
+            Change::Pause(if why.starts_with("proposal approval pending") {
+                why
+            } else {
+                format!(
+                    "fresh accepted session authority for the task machine is required: {}",
+                    concrete_pause(why)
+                )
+            }),
         )
         .await
+}
+
+fn concrete_pause(why: String) -> String {
+    if why.trim().is_empty() {
+        "inference returned no usable pause reason; configure inference and Resume".into()
+    } else {
+        why
+    }
+}
+
+/// Render selected structured causes; callers protect the report before rendering diagnostics.
+pub fn refusal_reason(report: &Value) -> String {
+    let category = report["refused"].as_str().unwrap_or_else(|| {
+        if report["held"] == true {
+            "held"
+        } else if report["unresolved"] == true {
+            "unresolved"
+        } else if report["historical"] == true {
+            "historical"
+        } else {
+            "command"
+        }
+    });
+    if matches!(category, "held" | "command-held")
+        && let Some(failed) = report["calls"].as_array().and_then(|calls| {
+            calls.iter().find(|r| {
+                r["not_read"] == true || r["failed"] == true || r["not_journaled"] == true
+            })
+        })
+    {
+        let identity = format!(
+            "call {}{}",
+            failed["call"],
+            failed["job"]
+                .as_str()
+                .map(|j| format!(" job {j}"))
+                .unwrap_or_default()
+        );
+        return format!(
+            "machine held by an unresolved command; {identity}: {}",
+            collection_cause(failed)
+        );
+    }
+    let action = match category {
+        "host-key" => "host-key mismatch; verify the trusted host pin before Resume",
+        "held" | "command-held" => {
+            "machine held by an unresolved command; inspect its recorded job"
+        }
+        "unresolved" => "command outcome unresolved; inspect the original pending job",
+        "barrier" => "machine barrier; inspect unresolved operations",
+        "disposition" => "machine disposition prevents this command",
+        "launch-too-long" => "command is too long to launch; shorten the command",
+        "signature-lowering" => "signature-lowering refused",
+        "journal" => "command journal or storage refused",
+        "failed" => "transport or authentication failed; check connection configuration",
+        "relay" => "relay refused the connection",
+        "no-pin" => "trusted host pin missing; configure it before Resume",
+        "no-credentials" => "connection credentials missing; restore session authority",
+        "unbound" => "machine is unbound; bind the task machine before Resume",
+        "no-entry" => "machine has no approved entry; review setup before Resume",
+        "provenance" => "command provenance refused; restore the task session binding",
+        _ => "tracked command refused; inspect task and connection configuration",
+    };
+    let detail = report.get("why").or_else(|| report.get("reason"));
+    match detail {
+        Some(Value::String(why)) if !why.trim().is_empty() => format!("{action}: {why}"),
+        Some(why) if !why.is_null() => format!("{action}: {why}"),
+        _ => action.into(),
+    }
+}
+
+pub fn collection_reason(pending: &crate::store::poc::Pending, reports: &[Value]) -> String {
+    let identity = format!("pending call {} job {}", pending.call, pending.job);
+    let Some(report) = reports.iter().find(|r| r["call"] == pending.call) else {
+        return format!("collection returned no outcome for {identity}; pending identity retained");
+    };
+    if report.get("job").is_some_and(|job| job != &pending.job) {
+        return format!(
+            "collection record identity mismatch for {identity}; pending identity retained"
+        );
+    }
+    let cause = collection_cause(report);
+    format!("collection {cause} for {identity}; pending identity retained")
+}
+
+fn collection_cause(report: &Value) -> String {
+    let category = if report["not_journaled"] == true
+        || (report["failed"] == true && report.get("job_record").is_some())
+    {
+        // The collector includes job_record (possibly null) only after a successful read.
+        // An append error or stopped wait does not prove whether its commit landed.
+        "evidence checkpoint not confirmed; observation remains uncertain"
+    } else if report["not_read"] == true {
+        "not read"
+    } else if report["failed"] == true {
+        "record read failed"
+    } else {
+        // These are the production collector's flattened Report fields, not synthetic reasons.
+        let Ok(observed) = serde_json::from_value::<crate::jobs::Report>(report.clone()) else {
+            return "has missing or malformed outcome metadata".into();
+        };
+        if observed.number.is_none() || observed.evidence.record.validate().is_err() {
+            return "has no committed observation metadata".into();
+        }
+        if observed.state == crate::jobs::State::OtherMachine {
+            return "recorded a foreign machine record; record mismatch".into();
+        }
+        if matches!(observed.comparison, crate::jobs::Comparison::Finding { .. }) {
+            return "recorded a command/record mismatch".into();
+        }
+        return match observed.state {
+            crate::jobs::State::Missing => "recorded no record found",
+            crate::jobs::State::Ended => "recorded process ended without a trustworthy exit status",
+            crate::jobs::State::Incomplete => "recorded an incomplete job record",
+            crate::jobs::State::Running => "recorded job still running",
+            crate::jobs::State::Finished => {
+                "returned a finished record without matching committed terminal evidence"
+            }
+            crate::jobs::State::OtherMachine => unreachable!(),
+        }
+        .into();
+    };
+    match report.get("why") {
+        Some(why) => format!("{category}: {}", read_detail(why)),
+        None => category.into(),
+    }
+}
+
+fn read_detail(why: &Value) -> String {
+    if let Some(unreachable) = why.get("unreachable") {
+        return format!("unreachable: {}", refusal_reason(unreachable));
+    }
+    why.as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| why.to_string())
 }
