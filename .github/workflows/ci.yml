@@ -4,6 +4,7 @@ on:
   push:
     branches: [main] # a branch under review is covered by pull_request; both would run twice
   pull_request:
+  workflow_dispatch: # the full suite, run at PoC checkpoints (AGENTS.md, "Checks per edit")
 
 jobs:
   # The specification's own checks, run from the pinned tree. They are its facts; the
@@ -36,7 +37,12 @@ jobs:
           submodules: recursive
       - run: cargo fmt --check # CNF-2
       - run: cargo clippy --locked --all-targets -- -D warnings # CNF-2
-      - run: cargo test --locked # runs build.rs, so the pin and bundle gates run here
+      - name: the full suite, at a checkpoint (runs build.rs, so the pin and bundle gates run here)
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: cargo test --locked
+      - name: the PoC's narrow tests (runs build.rs, so the pin and bundle gates run here)
+        if: ${{ github.event_name != 'workflow_dispatch' }}
+        run: cargo test --locked poc
 
   # The browser harness (twr-ggw.2), from a clean checkout with nothing manual (CNF-1): the wasm32
   # build on ADR-0024's configuration and its checks, the served build (ARC-32) and its checks,
@@ -85,11 +91,15 @@ jobs:
         run: cargo run --locked -p tracer -- check-absence dist/served
       - name: the served page's policy is ARC-33's
         run: cargo run --locked -p tracer -- check-csp dist/served
-      - name: the tracer, in headless Chrome
+      - name: the tracer, in headless Chrome (full at a checkpoint, the smoke path otherwise)
         id: tracer
         run: |
           chrome=$(command -v google-chrome)
-          CHROME="$chrome" scripts/tracer.sh
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            CHROME="$chrome" scripts/tracer.sh
+          else
+            CHROME="$chrome" scripts/tracer.sh targeted TAU_TRACER_HOLD_CASE=drop
+          fi
       - name: admit this invocation's bounded diagnostics
         id: tracer-diagnostics
         if: ${{ always() && (steps.tracer.outcome == 'failure' || steps.tracer.outcome == 'cancelled') && steps.tracer.outputs.diagnostic_invocation != '' }}
