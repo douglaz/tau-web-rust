@@ -20,12 +20,14 @@ let redisplay = false;
 let ceremony = false;
 let suspended = false;
 const goalOutcomes = new Map();
+const pocDeclarationDrafts = new Map();
 const render = (store) => {
   const { state } = store;
   $('store-state').dataset.lifecycle = store.lifecycle_state ?? '';
   if (store.seed_backup_stage !== undefined) ceremony = state === 'unlocked' && store.seed_backup_stage !== 'inactive';
   if (['locked', 'none', 'refused'].includes(state)) ceremony = false;
   renderSetup(store);
+  renderPoc(store);
   $('store').dataset.state = state;
   $('store-state').textContent = state === 'refused'
     ? `The local store is refused: ${store.reason}. Reload the page to try again.`
@@ -327,6 +329,131 @@ const renderDelivery = (section, machine, store) => {
   }
   section.append(card);
 };
+const clearPocInputs = () => {
+  pocDeclarationDrafts.clear();
+  for (const field of $('poc').querySelectorAll('input')) {
+    if (field.type === 'checkbox') field.checked = false;
+    else field.value = '';
+  }
+  $('poc-elevation').value = $('poc-class').value = '';
+  $('poc-public-keys').replaceChildren();
+};
+const renderPoc = (store) => {
+  const enabled = store.state === 'unlocked' && !ceremony &&
+    !['suspended', 'reconciling', 'ended'].includes(store.lifecycle_state);
+  $('poc').hidden = store.state !== 'unlocked';
+  for (const control of $('poc').querySelectorAll('input, select, button')) control.disabled = !enabled;
+  $('poc-key-status').textContent = store.poc_configuration?.key_set === true ? 'Key set.' : store.poc_configuration?.key_set === false ? 'Key unset.' : 'Key status unavailable.';
+  if (['locked', 'none', 'refused', 'lost', 'starting'].includes(store.state) || store.lifecycle_state === 'ended') clearPocInputs();
+  // Working/lifecycle reports can omit sessions. Prune only a full unlocked report;
+  // a surviving suspended worker retains the same session's unsubmitted text.
+  if (store.state === 'unlocked' && Array.isArray(store.sessions)) {
+    const live = new Set(store.sessions.filter(s => s.session_state !== 'ended').map(s => s.identity));
+    for (const identity of pocDeclarationDrafts.keys()) {
+      if (!live.has(identity)) pocDeclarationDrafts.delete(identity);
+    }
+  }
+  const targets = $('poc-targets');
+  targets.replaceChildren();
+  for (const target of store.poc_targets ?? []) {
+    const row = document.createElement('section');
+    paragraph(row, `${target.machine}: relay profile ${target.profile}; elevation ${target.elevation}.`);
+    paragraph(row, `Host ${target.host}, port ${target.port}, user ${target.user}; relay ${target.relay}.`);
+    paragraph(row, `Independent host pin: ${target.pin}`);
+    for (const [kind, label] of [['poc_bind', 'Bind'], ['poc_public_keys', 'Show public keys']]) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.disabled = !enabled;
+      button.textContent = `${label} ${target.machine}`;
+      button.addEventListener('click', () => {
+        button.disabled = true;
+        worker.postMessage({ [kind]: { machine: target.machine } });
+      });
+      row.append(button);
+    }
+    for (const session of store.sessions ?? []) {
+      if (session.session_state === 'ended' || !(session.bound_set ?? []).includes(target.machine) || !session.goal) continue;
+      const accept = document.createElement('button');
+      accept.type = 'button'; accept.disabled = !enabled;
+      accept.textContent = 'Accept acting on this goal without a brief (PoC)';
+      accept.dataset.pocAccept = session.identity;
+      accept.addEventListener('click', () => worker.postMessage({poc_accept: {session: session.identity}}));
+      row.append(accept);
+      if (!(session.standing_modes ?? []).includes('Acting on a goal with no brief')) continue;
+      paragraph(row, 'Declaration candidate: edit the JSON for your intended installation, then propose it. The next card requires explicit approval; these are requirements, not measurements.');
+      const declaration = document.createElement('textarea');
+      declaration.dataset.pocDeclaration = session.identity;
+      declaration.setAttribute('aria-label', 'Installation declaration candidate JSON');
+      declaration.disabled = !enabled;
+      declaration.value = pocDeclarationDrafts.get(session.identity) ?? JSON.stringify(store.poc_declaration_candidate, null, 2);
+      declaration.addEventListener('input', () => pocDeclarationDrafts.set(session.identity, declaration.value));
+      const propose = document.createElement('button');
+      propose.type = 'button'; propose.disabled = !enabled;
+      propose.dataset.pocPropose = session.identity;
+      propose.textContent = 'Propose installation declaration';
+      propose.addEventListener('click', () => {
+        try {
+          pocDeclarationDrafts.set(session.identity, declaration.value);
+          worker.postMessage({poc_propose_requirements: {session: session.identity,
+            proposal: {kind: 'declaration', machine: target.machine, declaration: JSON.parse(declaration.value)}}});
+        } catch { paragraph(row, 'Declaration must be valid JSON.'); }
+      });
+      row.append(declaration, propose);
+    }
+    targets.append(row);
+  }
+  if (store.poc_keys && enabled) {
+    const slot = $('poc-public-keys');
+    slot.replaceChildren();
+    if (store.poc_keys.refused) paragraph(slot, store.poc_keys.refused);
+    else {
+      paragraph(slot, `Public keys for ${store.poc_keys.machine}`);
+      for (const [field, label] of [['authorized_keys', 'SSH authorized_keys line'], ['relay_pubkey', 'Relay AUTH public key']]) {
+        const value = String(store.poc_keys[field] ?? '');
+        paragraph(slot, label);
+        const text = document.createElement('pre');
+        text.textContent = value;
+        const copy = document.createElement('button');
+        copy.type = 'button';
+        copy.textContent = `Copy ${label}`;
+        copy.addEventListener('click', async () => {
+          try { await navigator.clipboard.writeText(value); copy.textContent = 'Copied'; }
+          catch { copy.textContent = 'Select and copy the text above'; }
+        });
+        slot.append(text, copy);
+      }
+    }
+  } else if (!enabled) $('poc-public-keys').replaceChildren();
+};
+$('poc-inference-form').addEventListener('submit', event => {
+  event.preventDefault();
+  const field = $('poc-key');
+  const bytes = new TextEncoder().encode(field.value);
+  field.value = '';
+  try {
+    worker.postMessage({ poc_configure: {
+      endpoint: $('poc-endpoint').value,
+      model: $('poc-model').value,
+      key: bytes,
+    } }, [bytes.buffer]);
+  } finally {
+    if (bytes.byteLength) bytes.fill(0);
+  }
+});
+$('poc-target-form').addEventListener('submit', event => {
+  event.preventDefault();
+  worker.postMessage({ poc_enroll: {
+    target: {
+      machine: $('poc-machine').value, relay: $('poc-relay').value,
+      profile: $('poc-profile').value, host: $('poc-host').value,
+      port: Number($('poc-port').value), user: $('poc-user').value,
+      elevation: $('poc-elevation').value, pin: $('poc-pin').value,
+    },
+    approve_existing: $('poc-approve-existing').checked,
+    class_answer: $('poc-class').value,
+    approve_maintained_access: $('poc-approve-access').checked,
+  } });
+});
 let worker;
 const start = () => {
   goalOutcomes.clear();
@@ -392,6 +519,7 @@ const lock = () => {
     previous.postMessage({ end_sessions: true });
   }
   clearWords();
+  clearPocInputs();
   $('seed-backup-input').value = '';
   redisplay = false;
   $('passphrase').value = '';

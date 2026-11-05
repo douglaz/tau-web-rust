@@ -58,6 +58,51 @@ pub async fn run(
     collect: bool,
 ) -> Result<serde_json::Value, String> {
     use serde_json::json;
+    if let Some((evidence, held)) = POC_RELEASE.with_borrow_mut(Option::take) {
+        let intent = journal
+            .intent(evidence.call)
+            .await
+            .ok_or("fixture intent")?;
+        let recorded = journal.read(evidence.call).await.ok_or("fixture command")?;
+        journal
+            .fail_next_append(request["fail_append"] == json!(true))
+            .await;
+        let result = journal.job_evidence(&evidence).await;
+        journal.fail_next_append(false).await;
+        let report = result?;
+        let outcome = if collect {
+            crate::harness::collected(vec![
+                serde_json::to_value(&report).map_err(|_| "fixture report")?,
+            ])
+        } else {
+            let done = crate::harness::Done {
+                seq: evidence.call,
+                sent: crate::jobs::launch(
+                    intent.job.as_deref().ok_or("fixture job")?,
+                    &recorded.machine,
+                    &recorded.command,
+                )
+                .into_bytes(),
+                recorded,
+                stdout: report.stdout.as_bytes().to_vec(),
+                stderr: report.stderr.as_bytes().to_vec(),
+                exit_status: report.exit_status.ok_or("fixture exit")?,
+                terminal: report.number.ok_or("fixture terminal")?,
+                host_key: String::new(),
+                evidence: report,
+            };
+            if held {
+                crate::harness::held_report(
+                    &target.machine,
+                    vec![crate::harness::dispatch_result(done.seq, done.report())],
+                    None,
+                )
+            } else {
+                done.report()
+            }
+        };
+        return Ok(crate::harness::response(outcome));
+    }
     let before = journal.commands().await.len();
     journal
         .fail_next_append(request["fail_append"] == json!(true))
@@ -72,7 +117,7 @@ pub async fn run(
         )
         .await
         {
-            Ok(records) => json!({"collected": records}),
+            Ok(records) => crate::harness::collected(records),
             Err(refusal) => refusal.to_json(),
         }
     } else {
@@ -90,14 +135,15 @@ pub async fn run(
     journal.fail_next_append(false).await;
     journal.withhold_credentials(false);
     let appended = journal.commands().await;
-    Ok(json!({
-        "pin_source": PIN_SOURCE_MARKER,
-        "outcome": outcome,
-        "journal_entries": appended[before.min(appended.len())..].iter()
-            .map(|(_, e)| hex::encode(&e.command))
-            .collect::<Vec<_>>(),
-        "pinned_after": TestPins.pin(&target.machine).map(|pin| pin.0),
-    }))
+    let mut report = crate::harness::response(outcome);
+    report["pin_source"] = PIN_SOURCE_MARKER.into();
+    report["journal_entries"] = appended[before.min(appended.len())..]
+        .iter()
+        .map(|(_, e)| hex::encode(&e.command))
+        .collect::<Vec<_>>()
+        .into();
+    report["pinned_after"] = json!(TestPins.pin(&target.machine).map(|pin| pin.0));
+    Ok(report)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -241,4 +287,14 @@ pub(crate) fn session_point_receiver(point: &str) -> Option<tokio::sync::oneshot
         let _ = sender.send(());
     });
     Some(receiver)
+}
+
+#[cfg(target_arch = "wasm32")]
+std::thread_local! {
+    static POC_RELEASE: std::cell::RefCell<Option<(crate::jobs::Evidence, bool)>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn prepare_poc_release(evidence: crate::jobs::Evidence, held_release: bool) {
+    POC_RELEASE.with_borrow_mut(|held| *held = Some((evidence, held_release)));
 }

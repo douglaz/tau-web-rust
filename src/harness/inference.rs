@@ -112,6 +112,17 @@ async fn publication(generation: u64, session: String, report: String, post: boo
             if let Some(error) = safe.get("error") {
                 current["error"] = error.clone();
             }
+            if local.dispatch_refusal().is_none() {
+                if let Some(configuration) = safe.get("poc_configuration")
+                    && configuration.as_object().is_some_and(|v| v.len() == 1)
+                    && configuration["key_set"].is_boolean()
+                {
+                    current["poc_configuration"] = configuration.clone();
+                }
+                if let Some(keys) = safe.get("poc_keys") {
+                    current["poc_keys"] = keys.clone();
+                }
+            }
             Ok(current)
         } else {
             Ok(local.report(value.get("error").and_then(Value::as_str)))
@@ -126,6 +137,9 @@ async fn publication(generation: u64, session: String, report: String, post: boo
         if !carries_result && let Some(history) = &history {
             value["goal_history"] = history.clone();
         }
+        // Read-only custody survives suspension/reconciliation. It grants no authority,
+        // and is taken from the holder rather than trusting a page-supplied status.
+        value["poc_configuration"] = json!({"key_set":crate::poc::inference::key_is_set()});
         let encoded = value.to_string();
         let message = if post {
             let mut message = value.clone();
@@ -191,6 +205,7 @@ pub async fn lifecycle_transition(event: String) -> String {
         "hidden" | "visible" => {}
         "freeze" => {
             owner.suspend();
+            crate::poc::inference::freeze();
             super::wait::stop_all();
             super::goals::suspend();
             FETCHES.with_borrow(|fetches| {
@@ -700,6 +715,7 @@ pub async fn sweep_inference() {
 pub async fn end_sessions() {
     ENDING.set(true);
     crate::lifecycle::owner().end();
+    crate::poc::inference::end();
     authority_changed();
     super::goals::end();
     super::wait::stop_all();

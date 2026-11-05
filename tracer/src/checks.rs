@@ -116,6 +116,10 @@ pub fn needles() -> Vec<(String, Vec<u8>)> {
         "test_hold_move",
         "test_hold_job_read",
         "test_hold_session_point",
+        "test_poc_prepare_release",
+        "test_poc_release_counts",
+        "prepare_poc_release",
+        "poc_terminal_append",
         "session_point",
         "session_point_receiver",
         "session_authentication",
@@ -434,6 +438,33 @@ mod tests {
             assert!(
                 super::absence(&dir)
                     .expect_err("planted inference needle escaped check-absence")
+                    .contains(needle)
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn poc_absence_detects_each_planted_release_needle() {
+        let dir = std::env::temp_dir().join(format!(
+            "tau-poc-release-absence-{}-{}",
+            std::process::id(),
+            hex::encode(crate::fixtures::urandom::<8>())
+        ));
+        std::fs::create_dir_all(dir.join("pkg")).unwrap();
+        for file in super::SERVED_FILES {
+            std::fs::write(dir.join(file), b"").unwrap();
+        }
+        assert!(super::absence(&dir).is_ok());
+        for needle in [
+            "test_poc_prepare_release",
+            "test_poc_release_counts",
+            "prepare_poc_release",
+            "poc_terminal_append",
+        ] {
+            std::fs::write(dir.join("pkg/tau_web_bg.wasm"), needle).unwrap();
+            assert!(
+                super::absence(&dir)
+                    .expect_err("planted release needle escaped check-absence")
                     .contains(needle)
             );
         }

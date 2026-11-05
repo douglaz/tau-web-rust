@@ -572,6 +572,8 @@ fn target(machine: &str) -> Target {
     Target {
         machine: machine.into(),
         relay: value["relay"].as_str().unwrap_or_default().into(),
+        profile: "v1".into(),
+        stored: false,
         host: value["host"].as_str().unwrap_or_default().into(),
         port: value["port"].as_u64().unwrap_or(0) as u16,
         user: value["user"].as_str().unwrap_or_default().into(),

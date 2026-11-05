@@ -1,7 +1,7 @@
 //! The attempt itself, on the browser's WebSocket: wasm32 only.
 
 use super::wait;
-use super::{AppendRefusal, BoundJournal, Entry, PinSource};
+use super::{AppendRefusal, BoundJournal, Done, Entry, PinSource, Target};
 use crate::binding::{AdmissionRefusal, Session};
 use crate::dispatch::{Approval, CommandHold, DestructiveDisposition, DispatchRefusal};
 use crate::jobs::{self, Evidence, Record};
@@ -14,28 +14,34 @@ use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 use ws_stream_wasm::{WsEvent, WsMessage, WsMeta, WsStream};
 
-/// A machine as reached through the relay: `wss://<relay>/v1/tcp/<host>/<port>` (`WIR-1`,
-/// paid-tcp-relay `844e834`).
-pub struct Target {
-    pub machine: String,
-    /// The relay's URL, `wss://…/`, which the AUTH's `relay` tag names.
-    pub relay: String,
-    pub host: String,
-    pub port: u16,
-    pub user: String,
-}
-
-/// What a completed command returns, including the journal read-back it was reconciled with.
-pub struct Done {
-    pub seq: u64,
-    pub sent: Vec<u8>,
-    pub recorded: Entry,
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
-    pub exit_status: u32,
-    pub terminal: u64,
-    pub host_key: String,
-    pub evidence: jobs::Report,
+async fn access(
+    target: &Target,
+) -> Result<
+    (
+        Target,
+        jobs::Elevation,
+        Option<crate::credential::HostKeyPin>,
+    ),
+    String,
+> {
+    if !target.stored {
+        if target.profile != "v1" {
+            return Err(format!("unsupported relay profile: {}", target.profile));
+        }
+        return Ok((target.clone(), jobs::Elevation::None, None));
+    }
+    let local = crate::worker::local();
+    let mut local = local.lock().await;
+    let store = local.store().ok_or("locked before target resolution")?;
+    let (resolved, pins) = crate::poc::targets::resolve(store, &target.machine)?;
+    let pin = pins
+        .pin(&target.machine)
+        .ok_or("stored target pin missing")?;
+    let elevation = store
+        .poc_target(&target.machine)
+        .ok_or("stored target missing")?
+        .elevation;
+    Ok((resolved, elevation, Some(pin)))
 }
 
 /// Why an attempt ended without the command being sent, or without its result.
@@ -128,20 +134,7 @@ impl Refusal {
 /// or the refusal. Never key material.
 pub fn report(outcome: &Result<Done, Refusal>) -> Value {
     match outcome {
-        Ok(done) => json!({
-            "done": true,
-            "seq": done.seq,
-            "call": done.seq,
-            "terminal": done.terminal,
-            "sent": hex::encode(&done.sent),
-            "recorded": hex::encode(&done.recorded.command),
-            "recorded_machine": done.recorded.machine,
-            "stdout": String::from_utf8_lossy(&done.stdout),
-            "stderr": String::from_utf8_lossy(&done.stderr),
-            "exit_status": done.exit_status,
-            "host_key": done.host_key,
-            "job_record": done.evidence,
-        }),
+        Ok(done) => done.report(),
         Err(refusal) => refusal.to_json(),
     }
 }
@@ -248,6 +241,8 @@ pub async fn run_command(
     origin: Option<&std::rc::Rc<Session>>,
     #[cfg(feature = "tracer")] tamper_auth: bool,
 ) -> Result<Done, Refusal> {
+    let (target, elevation, _) = access(target).await.map_err(Refusal::Failed)?;
+    let target = &target;
     let session = resolve(journal, &target.machine, origin).await?;
     journal
         .check_signature(&target.machine, command)
@@ -265,7 +260,7 @@ pub async fn run_command(
         )
         .await);
     }
-    let bytes = jobs::launch_size(&target.machine, command);
+    let bytes = jobs::launch_size_with_elevation(&target.machine, command, elevation);
     if !jobs::launch_fits(bytes) {
         return Err(Refusal::LaunchTooLong { bytes });
     }
@@ -349,7 +344,20 @@ pub async fn run_command(
                 evidence: None,
             });
         }
-        let sent = jobs::launch(job, &entry.machine, &entry.command).into_bytes();
+        let (_, elevation, _) = access(target).await.map_err(|why| Refusal::Unresolved {
+            call: seq,
+            why,
+            evidence: None,
+        })?;
+        if stop.stopped() || ssh.is_closed() || journal.current(&session).await.is_err() {
+            return Err(Refusal::Unresolved {
+                call: seq,
+                why: "sessions ended before command transmission".into(),
+                evidence: None,
+            });
+        }
+        let sent = jobs::launch_with_elevation(job, &entry.machine, &entry.command, elevation)
+            .into_bytes();
         let progress = super::job_read::Read::default();
         let result = stop
             .until(exec_record(&mut channel, &sent, Some(&progress)))
@@ -372,10 +380,13 @@ pub async fn run_command(
         // CNF-30: the journal determines the wrapper's exact transmitted bytes.
         let recorded = journal.read(seq).await;
         let replayed = journal.intent(seq).await;
+        let authority = access(target).await;
         let recorded = match (recorded, replayed) {
             (Some(recorded), Some(replayed))
                 if replayed.job.as_deref().is_some_and(|id| {
-                    jobs::launch(id, &recorded.machine, &recorded.command).as_bytes() == sent
+                    authority.as_ref().is_ok_and(|(_, elevation, _)| {
+                        jobs::launch_reconciles(id, &recorded, *elevation, &sent)
+                    })
                 }) && recorded.machine == target.machine =>
             {
                 recorded
@@ -535,7 +546,7 @@ async fn held(
         if let Some(own) = own {
             let result = stop.until(own.get()).await;
             reports.push(match result {
-                Some(result) => json!({"call":intent.call,"dispatch_result":result}),
+                Some(result) => super::dispatch_result(intent.call, result),
                 None => not_read(stopped_why("stopped while awaiting own dispatch's result")),
             });
             continue;
@@ -583,7 +594,7 @@ async fn held(
                 .await
                 .map_err(|e| format!("session channel: {e}"))?;
             journal.current(session).await?;
-            read_job_record(&mut channel, job, &progress).await
+            read_job_record(&mut channel, job, &progress, target).await
         };
         let record = match stop.until(read).await {
             Some(Ok(record)) => record,
@@ -628,14 +639,7 @@ async fn held(
             }
         }
     }
-    let mut answer = json!({"held":true,"machine":target.machine,"calls":reports,
-        "release":["finished_record","disposition"]});
-    if let Some(disposition) = hold.disposition {
-        answer["disposition"] = json!(disposition.disposition);
-        answer["continuation"] = json!(disposition.continuation);
-        answer["dispatch_still_restricted"] = json!(true);
-    }
-    answer
+    super::held_report(&target.machine, reports, hold.disposition.as_ref())
 }
 
 /// Collecting is a read. It neither consults command dispositions nor appends an intent.
@@ -646,6 +650,8 @@ pub async fn collect_jobs(
     target: &Target,
     #[cfg(feature = "tracer")] tamper_auth: bool,
 ) -> Result<Vec<Value>, Refusal> {
+    let (target, _, _) = access(target).await.map_err(Refusal::Failed)?;
+    let target = &target;
     let stop = wait::Stop::collection();
     let session = resolve(journal, &target.machine, None).await?;
     let calls = journal
@@ -711,7 +717,7 @@ pub async fn collect_jobs(
                 .await
                 .map_err(|e| format!("session channel: {e}"))?;
             journal.current(&session).await?;
-            read_job_record(&mut channel, &job, &progress).await
+            read_job_record(&mut channel, &job, &progress, target).await
         };
         let record = match stop.until(read).await {
             Some(Ok(record)) => record,
@@ -787,13 +793,23 @@ async fn read_job_record(
     channel: &mut russh::Channel<client::Msg>,
     job: &str,
     progress: &super::job_read::Read,
+    target: &Target,
 ) -> Result<Record, String> {
     #[cfg(feature = "tracer")]
     crate::testonly::hold_job_read().await?;
     if super::inference::ending() {
         return Err("sessions ended before record was read".into());
     }
-    exec_record(channel, jobs::collect(job).as_bytes(), Some(progress)).await
+    let (_, elevation, _) = access(target).await?;
+    if super::inference::ending() {
+        return Err("sessions ended before record was read".into());
+    }
+    exec_record(
+        channel,
+        jobs::collect_with_elevation(job, elevation).as_bytes(),
+        Some(progress),
+    )
+    .await
 }
 
 /// The SSH exit status belongs to the wrapper, never to the command. Only a complete,
@@ -851,8 +867,16 @@ async fn connect(
     ),
     Refusal,
 > {
+    let (target, _, stored_pin) = access(target).await.map_err(Refusal::Failed)?;
+    let target = &target;
     // CHN-R4: with no pin there is nothing to check a key against, so nothing is contacted.
-    let pinned = pins.pin(&target.machine).ok_or(Refusal::NoPin)?.0;
+    let pinned = if target.stored {
+        stored_pin
+    } else {
+        pins.pin(&target.machine)
+    }
+    .ok_or(Refusal::NoPin)?
+    .0;
     if !journal.credentials_available() {
         return Err(Refusal::NoCredentials);
     }
@@ -872,7 +896,7 @@ async fn connect(
     };
 
     journal.current(session).await.map_err(Refusal::Journal)?;
-    let url = format!("{}v1/tcp/{}/{}", target.relay, target.host, target.port);
+    let url = target.contact_url(Some(&pinned)).map_err(Refusal::Failed)?;
     let (mut meta, mut ws) = WsMeta::connect(&url, None)
         .await
         .map_err(|e| Refusal::Failed(format!("relay websocket: {e}")))?;

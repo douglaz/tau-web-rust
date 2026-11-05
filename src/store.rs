@@ -59,6 +59,7 @@ pub(crate) mod authority;
 pub mod delivery;
 mod goals;
 pub(crate) mod inference;
+pub mod poc_targets;
 pub mod reinstall;
 mod scan;
 
@@ -213,6 +214,7 @@ pub(crate) enum Event {
     InferenceIntent(crate::inference::Intent),
     InferenceTerminal(crate::inference::Terminal),
     DedicatedReinstall(reinstall::Record),
+    PocTarget(poc_targets::Record),
 }
 
 impl Drop for Event {
@@ -356,12 +358,16 @@ pub struct Store<S> {
     inference: inference::State,
     scans: crate::scan::References,
     reinstall: reinstall::State,
+    poc_targets: std::collections::BTreeMap<String, poc_targets::Record>,
+    /// Memory-only credential fingerprints continue protecting late evidence after key disposal.
+    poc_credential_filters: Vec<crate::poc::inference::EchoFilter>,
     authority: Rc<crate::lifecycle::Authority>,
     response_calls: std::collections::BTreeSet<u64>,
     exposure_ledger: Vec<Exposure>,
     conduct_acceptances: Vec<Acceptance>,
     goals: Vec<crate::goals::Goal>,
     pending_requirements: std::collections::BTreeMap<String, goals::Pending>,
+    poc_requirement_candidate: u64,
     signature_refusals: Vec<SignatureRefusal>,
     connection_refusals: Vec<ConnectionRefusal>,
     /// Set by a failed append, whose move may have landed: no append follows in this worker.
@@ -492,12 +498,15 @@ impl<S: Storage> Store<S> {
             inference: inference::State::default(),
             scans: Default::default(),
             reinstall: Default::default(),
+            poc_targets: Default::default(),
+            poc_credential_filters: Vec::new(),
             authority: crate::lifecycle::owner(),
             response_calls: std::collections::BTreeSet::new(),
             exposure_ledger: Vec::new(),
             conduct_acceptances: Vec::new(),
             goals: Vec::new(),
             pending_requirements: Default::default(),
+            poc_requirement_candidate: 0,
             signature_refusals: Vec::new(),
             connection_refusals: Vec::new(),
             failed: None,
@@ -1432,6 +1441,10 @@ impl<S: Storage> Store<S> {
                     self.apply_inference(number, &event)
                         .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
                 }
+                (_, Event::PocTarget(record)) => {
+                    self.replay_poc_target(number, record)
+                        .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
+                }
                 (_, Event::DedicatedReinstall(record)) => {
                     self.replay_reinstall(number, record)?;
                 }
@@ -1637,7 +1650,7 @@ impl<S: Storage> Store<S> {
         // duplicate members are rejected and mnemonic buffers retain Event's zeroization.
         let event: Event = serde_json::from_slice(&plaintext)
             .map_err(|_| "its event is not one this version reads".to_string())?;
-        if let Event::DedicatedReinstall(_) = &event {
+        if matches!(&event, Event::DedicatedReinstall(_) | Event::PocTarget(_)) {
             let value: Value =
                 serde_json::from_slice(&plaintext).map_err(|_| "dedicated record shape")?;
             if serde_json::to_value(&event).map_err(|_| "dedicated record shape")? != value {
@@ -1898,18 +1911,32 @@ impl<S: Storage> Journal for Store<S> {
         &mut self,
         evidence: &crate::jobs::Evidence,
     ) -> Result<crate::jobs::Report, String> {
-        let evidence = self.protect_job_evidence(evidence)?;
-        let evidence = &evidence;
-        let call = self
-            .dispatch
-            .calls
-            .get(&evidence.call)
-            .ok_or("job evidence names no call")?;
-        let terminal =
-            evidence.record.classify(&call.intent.machine) == crate::jobs::State::Finished;
+        let intent = self.dispatch.calls.get(&evidence.call).map(|c| &c.intent);
+        let report = self.job_report(
+            evidence,
+            Some(self.next),
+            intent.map_or("", |i| i.machine.as_str()),
+            intent.map_or("", |i| i.command.as_str()),
+        )?;
+        let terminal = report.state == crate::jobs::State::Finished;
         let mut next = self.dispatch.clone();
-        let report =
-            self.protect_job_report(next.job_evidence(self.next, evidence.clone(), terminal)?)?;
+        let mut report = next.job_evidence(self.next, report.evidence.clone(), terminal)?;
+        // Replay derives this same canonical projection from the committed evidence.
+        // Protect display copies of the journal command without changing that authority.
+        report.comparison = serde_json::from_value(self.protect_output(
+            &serde_json::to_value(&report.comparison).map_err(|_| "job comparison encoding")?,
+        )?)
+        .map_err(|_| "job comparison protection")?;
+        // The durable evidence must itself be stable under release protection.
+        let value = serde_json::to_value(&report).map_err(|_| "job report encoding")?;
+        if self.protect_output(&value)? != value {
+            return Err("protected output unavailable".into());
+        }
+        if terminal {
+            self.preflight_job_release(&report)?;
+            #[cfg(all(feature = "tracer", target_arch = "wasm32"))]
+            crate::testonly::session_point("poc_terminal_append").await;
+        }
         let evidence = &report.evidence;
         let event = if terminal {
             Event::JobTerminal(evidence.clone())
@@ -2193,6 +2220,12 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
             State::Refused(why) => json!({ "state": "refused", "reason": why }),
         };
         if let State::Unlocked(store) = &self.state {
+            if !store.poc_targets.is_empty() {
+                report["poc_targets"] = store.poc_targets_view();
+                report["poc_declaration_candidate"] =
+                    serde_json::to_value(crate::declaration::ad_hoc_minimum())
+                        .expect("candidate serializes");
+            }
             let approvals = store.reinstall_approvals();
             if approvals.as_array().is_some_and(|a| !a.is_empty()) {
                 report["reinstall_approvals"] = approvals;
@@ -5091,8 +5124,7 @@ impl<S: Storage> crate::harness::BoundJournal for Store<S> {
         machine: &str,
         command: &str,
     ) -> Result<crate::jobs::Report, String> {
-        let evidence = self.protect_job_evidence(evidence)?;
-        self.protect_job_report(crate::jobs::uncommitted(&evidence, machine, command))
+        self.job_report(evidence, None, machine, command)
     }
     async fn current(&self, session: &Session) -> Result<(), String> {
         self.check_current_session(session)

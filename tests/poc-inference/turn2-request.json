@@ -1,0 +1,80 @@
+{
+  "model": "model-a",
+  "max_tokens": 1200,
+  "tool_choice": "auto",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You configure one Linux machine by calling tools. Call exactly one tool per reply. Use exec to inspect or change the machine, and call done when the goal is reached."
+    },
+    {
+      "role": "user",
+      "content": "Goal: find out which Linux distribution machine-a runs."
+    },
+    {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+        {
+          "type": "function",
+          "index": 0,
+          "id": "call_8WkuhLVPu27hNVhpSY746UxB",
+          "function": {
+            "name": "exec",
+            "arguments": "{\"machine\":\"machine-a\",\"command\":\"cat /etc/os-release || uname -a\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_8WkuhLVPu27hNVhpSY746UxB",
+      "content": "exit 0\nNAME=\"Arch Linux\"\nPRETTY_NAME=\"Arch Linux\"\nID=arch\nBUILD_ID=rolling\n"
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "exec",
+        "description": "Run a shell command on the machine and return its exit code and output.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "machine": {
+              "type": "string"
+            },
+            "command": {
+              "type": "string",
+              "description": "The shell command."
+            }
+          },
+          "required": [
+            "machine",
+            "command"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "done",
+        "description": "Report that the goal is reached.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "machine": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "machine"
+          ],
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}

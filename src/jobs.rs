@@ -62,6 +62,62 @@ pub fn collect(id: &str) -> String {
     )
 }
 
+/// The immutable machine record selects the privilege route for launch and every read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Elevation {
+    #[serde(rename = "none")]
+    None,
+    #[serde(rename = "sudo -n")]
+    SudoNoninteractive,
+}
+
+fn elevated(script: String, elevation: Elevation) -> String {
+    match elevation {
+        Elevation::None => script,
+        Elevation::SudoNoninteractive => format!(
+            "sudo -n sh -c {} || {{ status=$?; printf '%s\\n' 'sudo -n elevation or job wrapper failed; outcome unresolved' >&2; exit \"$status\"; }}",
+            quote(&script)
+        ),
+    }
+}
+
+pub fn launch_with_elevation(
+    id: &str,
+    machine: &str,
+    command: &[u8],
+    elevation: Elevation,
+) -> String {
+    elevated(launch(id, machine, command), elevation)
+}
+
+pub fn collect_with_elevation(id: &str, elevation: Elevation) -> String {
+    elevated(collect(id), elevation)
+}
+
+pub fn launch_size_with_elevation(machine: &str, command: &[u8], elevation: Elevation) -> usize {
+    launch_with_elevation(
+        "000000000000000000000000000000000000000000000000",
+        machine,
+        command,
+        elevation,
+    )
+    .len()
+}
+
+/// Recompose the complete transmitted argument from the recorded intent and access authority.
+pub fn launch_reconciles(
+    job: &str,
+    entry: &crate::harness::Entry,
+    elevation: Elevation,
+    sent: &[u8],
+) -> bool {
+    valid_id(job)
+        && launch_with_elevation(job, &entry.machine, &entry.command, elevation).as_bytes() == sent
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod elevation_tests;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Record {

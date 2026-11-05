@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 const CASES: &[(&str, &str)] = &[
     (
         "main.c001.p001",
-        "the served build loads, derives bound credentials and has no pin or request hook",
+        "the served build loads, requires a stored target and defines no request hook",
     ),
     ("main.c002.p001", "create and unlock (twr-ggw.5, CNF-82)"),
     (

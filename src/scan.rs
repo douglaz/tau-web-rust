@@ -124,6 +124,27 @@ impl References {
         Ok(())
     }
 
+    /// Conservative SHA/HMAC byte-work estimate, including the final marker check.
+    /// The PoC's aggregate budget charges this before invoking the existing scanner.
+    pub(crate) fn work_cost(&self, bytes: usize) -> usize {
+        self.material
+            .borrow()
+            .values()
+            .fold(bytes, |cost, material| {
+                let length = usize::try_from(material.length).unwrap_or(usize::MAX);
+                let windows = if bytes < length {
+                    0
+                } else {
+                    bytes - length + 1
+                };
+                cost.saturating_add(
+                    windows
+                        .saturating_mul(length.saturating_add(512))
+                        .saturating_mul(2),
+                )
+            })
+    }
+
     /// No chunk is released early. Concatenation preserves raw windows crossing deliveries.
     pub(crate) fn scan(&self, chunks: &[&[u8]]) -> Result<Zeroizing<Vec<u8>>, String> {
         self.ready()?;

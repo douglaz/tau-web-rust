@@ -1190,7 +1190,7 @@ async fn run_cases(
     // The served build loads, and its harness worker runs a request on what it has stored.
     let mut case = Case::new(
         "main.c001",
-        "the served build loads, derives bound credentials and has no pin or request hook",
+        "the served build loads, requires a stored target and defines no request hook",
     );
     let from = browser.event_count();
     let (mut served_tab, mut served_worker) = run.open(served_origin, false).await?;
@@ -1274,9 +1274,9 @@ async fn run_cases(
     let observed = take(seen);
     case.check(
         "main.a009",
-        "served command before approval names no entry before contact or append",
+        "served command without an enrolled target refuses before contact or append",
         crate::state_inputs::all!(
-            report["outcome"] == json!({"refused":"no-entry","machine":"fixture"}),
+            report["outcome"] == json!({"refused":"machine has no stored target or pin"}),
             observed.relay_accepted == 0,
             observed.ssh_connections == 0,
             run.inspect_state_at("state.main.no_entry.after", &served_worker)
@@ -1297,9 +1297,10 @@ async fn run_cases(
         .await?;
     let observed = take(seen);
     show(&observed);
-    case.check("main.a010",
-        "called in its worker on the machine the tracer build pins, the served harness refused for the missing pin (CHN-R4)",
-        report == json!({ "outcome": { "refused": "no-pin" } }),
+    case.check(
+        "main.a010",
+        "fixture approval cannot substitute for an independently enrolled target and pin (CHN-R4)",
+        report == json!({ "outcome": { "refused": "machine has no stored target or pin" } }),
     );
     case.check(
         "main.a011",
@@ -1316,8 +1317,8 @@ async fn run_cases(
     let observed = take(seen);
     case.check(
         "main.a013",
-        "served collection refuses the missing pin before contact or append",
-        report == json!({"outcome":{"refused":"no-pin"}})
+        "served collection without an enrolled target and pin refuses before contact or append",
+        report == json!({"outcome":{"refused":"machine has no stored target or pin"}})
             && observed.relay_accepted == 0
             && observed.ssh_connections == 0
             && run.inspect(&served_worker).await?["records"] == json!([0, 1, 2, 3, 4, 5, 6, 7, 8]),

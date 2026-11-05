@@ -285,22 +285,38 @@ pub(super) async fn run(
         &store_files(&run.dump_at("file.binding_cases.dump.005", tab).await?),
         pass,
     )?;
-    let refusal: Value = serde_json::from_slice(&opened.records[3].1).map_err(|e| e.to_string())?;
+    // Served requests resolve stored targets before connection admission.
+    let refusal_outcome = if tracer {
+        json!({"refused":"unbound","machine":"fixture"})
+    } else {
+        json!({"refused":"machine has no stored target or pin"})
+    };
+    let expected_records = if tracer {
+        json!([0, 1, 2, 3, 4])
+    } else {
+        json!([0, 1, 2])
+    };
     case.check(
         "binding_cases.a001",
         "unbound command and collection refuse without binding, intent or contact",
-        result["outcome"] == json!({"refused":"unbound","machine":"fixture"})
+        result["outcome"] == refusal_outcome
             && collected["outcome"] == result["outcome"]
             && state["sessions"] == json!([])
             && state["calls"] == json!([])
-            && state["records"] == json!([0, 1, 2, 3, 4])
+            && state["records"] == expected_records
             && observed.relay_accepted == 0
             && observed.ssh_connections == 0,
     );
     case.check(
         "binding_cases.a002",
-        "independent reader reads the journaled unbound refusal",
-        refusal == json!({"connection_refusal":{"machine":"fixture","reason":"unbound"}}),
+        "independent reader verifies the refusal append boundary",
+        if tracer {
+            let refusal: Value =
+                serde_json::from_slice(&opened.records[3].1).map_err(|e| e.to_string())?;
+            refusal == json!({"connection_refusal":{"machine":"fixture","reason":"unbound"}})
+        } else {
+            opened.records.len() == 3
+        },
     );
     prepare(run, tab, &mut worker, pass).await?;
     let state = run.inspect(&worker).await?;
@@ -449,8 +465,11 @@ pub(super) async fn run(
         } else {
             case.check(
                 "binding_cases.a008",
-                "bound served command reaches the missing-pin gate without contact",
-                result["outcome"] == json!({"refused":"no-pin"}) && observed.relay_accepted == 0,
+                "bound served command requires a stored target and pin before contact",
+                result["outcome"] == refusal_outcome
+                    && observed.relay_accepted == 0
+                    && observed.ssh_connections == 0
+                    && run.inspect(&worker).await?["calls"] == json!([]),
             );
         }
     }
@@ -511,7 +530,7 @@ pub(super) async fn run(
     case.check(
         "binding_cases.a011",
         "an attempt after restart is unbound until another operator binding",
-        report["outcome"]["refused"] == "unbound"
+        report["outcome"] == refusal_outcome
             && seen.relay_accepted == 0
             && seen.ssh_connections == 0,
     );
@@ -548,7 +567,7 @@ pub(super) async fn run(
     case.check(
         "binding_cases.a013",
         "after re-display completes the session remains ended until rebinding",
-        report["outcome"]["refused"] == "unbound"
+        report["outcome"] == refusal_outcome
             && run.inspect(&worker).await?["sessions"] == json!([])
             && seen.relay_accepted == 0
             && seen.ssh_connections == 0,

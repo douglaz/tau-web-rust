@@ -45,9 +45,19 @@ impl Redacted {
         body: &[u8],
         credentials: &[&[u8]],
     ) -> Result<Self, String> {
-        let mut held = store.held_credentials()?;
-        held.borrowed.extend_from_slice(credentials);
-        redact(&store.scan_output(&[body])?, &[], &held)
+        crate::poc::inference::work::scope(|| {
+            let mut held = store.held_credentials()?;
+            held.borrowed.extend_from_slice(credentials);
+            let scanned = store.scan_output(&[body])?;
+            let output = redact(&scanned, &[], &held)?;
+            // Only replacement can introduce a new echo into already protected bytes.
+            if output.as_bytes() != scanned.as_slice()
+                && !store.poc_output_is_safe(output.as_bytes())?
+            {
+                return Err("protected output unavailable".into());
+            }
+            Ok(output)
+        })
     }
 
     /// Refuse decoded values rather than execute a command altered by redaction.
@@ -56,22 +66,38 @@ impl Redacted {
         value: &serde_json::Value,
         credentials: &[&[u8]],
     ) -> bool {
-        use serde_json::Value;
-        let Ok(mut held) = store.held_credentials() else {
-            return false;
-        };
-        held.borrowed.extend_from_slice(credentials);
-        fn safe(value: &Value, held: &Held<'_>) -> bool {
-            let exact =
-                |bytes: &[u8]| redact(bytes, &[], held).is_ok_and(|r| r.as_bytes() == bytes);
-            match value {
-                Value::String(s) => exact(s.as_bytes()),
-                Value::Array(a) => a.iter().all(|v| safe(v, held)),
-                Value::Object(o) => o.iter().all(|(k, v)| exact(k.as_bytes()) && safe(v, held)),
-                _ => exact(value.to_string().as_bytes()),
-            }
-        }
-        safe(value, &held) && store.protect_output(value).is_ok_and(|safe| safe == *value)
+        crate::poc::inference::work::scope(|| {
+            Ok((|| {
+                use serde_json::Value;
+                let Ok(mut held) = store.held_credentials() else {
+                    return false;
+                };
+                held.borrowed.extend_from_slice(credentials);
+                fn safe(value: &Value, held: &Held<'_>) -> bool {
+                    let exact = |bytes: &[u8]| {
+                        redact(bytes, &[], held).is_ok_and(|r| r.as_bytes() == bytes)
+                    };
+                    match value {
+                        Value::String(s) => exact(s.as_bytes()),
+                        Value::Array(a) => a.iter().all(|v| safe(v, held)),
+                        Value::Object(o) => {
+                            o.iter().all(|(k, v)| exact(k.as_bytes()) && safe(v, held))
+                        }
+                        _ => exact(value.to_string().as_bytes()),
+                    }
+                }
+                safe(value, &held) && store.protect_output(value).is_ok_and(|safe| safe == *value)
+            })())
+        })
+        .unwrap_or(false)
+    }
+
+    /// One decoded representation, without recursively invoking the PoC decoder.
+    pub(crate) fn decoded<S: Storage>(store: &Store<S>, body: &[u8]) -> Result<Self, String> {
+        crate::poc::inference::work::scope(|| {
+            crate::poc::inference::work::charge(body.len().saturating_mul(4))?;
+            redact(&store.scan_decoded(body)?, &[], &store.held_credentials()?)
+        })
     }
 
     pub(crate) fn for_store<S: Storage>(
@@ -79,11 +105,27 @@ impl Redacted {
         body: &[u8],
         fields: &[&str],
     ) -> Result<Self, String> {
-        redact(
-            &store.scan_output(&[body])?,
-            fields,
-            &store.held_credentials()?,
-        )
+        Self::for_store_cached(store, body, fields, &mut Vec::new())
+    }
+
+    /// Cache belongs to this store and these immutable filters, within one synchronous call.
+    /// Exact placed-secret and held-credential boundaries still run on every representation.
+    pub(crate) fn for_store_cached<S: Storage>(
+        store: &Store<S>,
+        body: &[u8],
+        fields: &[&str],
+        cache: &mut Vec<crate::poc::inference::EchoCache>,
+    ) -> Result<Self, String> {
+        crate::poc::inference::work::scope(|| {
+            let scanned = store.scan_output_cached(&[body], cache)?;
+            let output = redact(&scanned, fields, &store.held_credentials()?)?;
+            if output.as_bytes() != scanned.as_slice()
+                && !store.poc_output_is_safe(output.as_bytes())?
+            {
+                return Err("protected output unavailable".into());
+            }
+            Ok(output)
+        })
     }
 }
 
@@ -158,12 +200,17 @@ fn redact(body: &[u8], fields: &[&str], held: &Held<'_>) -> Result<Redacted, Str
     // one needle must not conceal an overlapping needle from another credential.
     let mut ranges = Vec::new();
     for needle in held.values() {
-        for (start, window) in bytes.windows(needle.len()).enumerate() {
-            if window == needle {
-                ranges.push((start, start + needle.len()));
-            }
-        }
+        credential_matches(&bytes, needle, |start| {
+            crate::poc::inference::work::charge(32)?;
+            ranges.push((start, start + needle.len()));
+            Ok(false)
+        })?;
     }
+    crate::poc::inference::work::charge(
+        ranges
+            .len()
+            .saturating_mul(ranges.len().max(1).ilog2() as usize + 1),
+    )?;
     ranges.sort_unstable();
     let mut merged: Vec<(usize, usize)> = Vec::new();
     for (start, end) in ranges {
@@ -185,13 +232,54 @@ fn redact(body: &[u8], fields: &[&str], held: &Held<'_>) -> Result<Redacted, Str
     output.extend_from_slice(&bytes[cursor..]);
     // The marker itself (or its junction with preserved bytes) could contain a held value.
     // Refuse instead of claiming that such an output passed.
-    if held
-        .values()
-        .any(|needle| output.windows(needle.len()).any(|w| w == needle))
-    {
-        return Err("redaction marker cannot exclude held credentials".into());
+    for needle in held.values() {
+        if credential_matches(&output, needle, |_| Ok(true))? {
+            return Err("redaction marker cannot exclude held credentials".into());
+        }
     }
     Ok(Redacted { bytes: output })
+}
+
+/// KMP compares at most linear byte-work, including overlapping occurrences. Charge before
+/// allocating the prefix table or scanning, rather than charging every window's full length.
+fn credential_matches(
+    bytes: &[u8],
+    needle: &[u8],
+    mut found: impl FnMut(usize) -> Result<bool, String>,
+) -> Result<bool, String> {
+    crate::poc::inference::work::charge(
+        bytes
+            .len()
+            .saturating_mul(4)
+            .saturating_add(needle.len().saturating_mul(16)),
+    )?;
+    let mut prefix = Zeroizing::new(vec![0usize; needle.len()]);
+    let mut matched = 0;
+    for i in 1..needle.len() {
+        while matched > 0 && needle[i] != needle[matched] {
+            matched = prefix[matched - 1];
+        }
+        if needle[i] == needle[matched] {
+            matched += 1;
+        }
+        prefix[i] = matched;
+    }
+    matched = 0;
+    for (i, byte) in bytes.iter().enumerate() {
+        while matched > 0 && *byte != needle[matched] {
+            matched = prefix[matched - 1];
+        }
+        if *byte == needle[matched] {
+            matched += 1;
+        }
+        if matched == needle.len() {
+            if found(i + 1 - matched)? {
+                return Ok(true);
+            }
+            matched = prefix[matched - 1];
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]

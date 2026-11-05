@@ -32,6 +32,38 @@
 </section>
 </section>
 <section id="tau-setup" hidden aria-label="Setup machines"></section>
+<section id="tau-poc" hidden aria-label="Connection configuration">
+<h2>Inference</h2>
+<p>The key stays in this worker's memory. App Lock, reload or worker loss clears it; re-enter it after unlocking. Switching apps retains it if the worker survives. Freezing aborts a request. Provider billing limits remain the provider's responsibility.</p>
+<p id="tau-poc-key-status" role="status">Key unset.</p>
+<form id="tau-poc-inference-form" novalidate>
+<p><label>HTTPS chat completions endpoint <input id="tau-poc-endpoint" type="url" required autocomplete="off"></label></p>
+<p><label>Model identifier <input id="tau-poc-model" required autocomplete="off"></label></p>
+<p><label>Key <input id="tau-poc-key" type="password" required autocomplete="off"></label></p>
+<button type="submit">Set inference configuration</button>
+</form>
+<h2>Existing machine</h2>
+<p>This PoC supports one existing machine per fresh local store. Each machine name permanently binds these connection fields, pin, profile and elevation. To change them, use a fresh local store and a new name; keep the current store for its task history. Obtain the host fingerprint independently; a presented SSH key is never accepted here.</p>
+<form id="tau-poc-target-form">
+<p><label>Machine name <input id="tau-poc-machine" required autocomplete="off"></label></p>
+<p><label>Relay URL (wss://, ending in /) <input id="tau-poc-relay" type="url" required autocomplete="off"></label></p>
+<p><label>Relay profile <select id="tau-poc-profile"><option value="v1">v1</option></select></label></p>
+<p><label>Host <input id="tau-poc-host" required autocomplete="off"></label></p>
+<p><label>Port <input id="tau-poc-port" type="number" required min="1" max="65535"></label></p>
+<p><label>SSH user <input id="tau-poc-user" required autocomplete="off"></label></p>
+<p><label>Elevation <select id="tau-poc-elevation" required><option value="">Choose elevation</option><option value="none">none</option><option value="sudo -n">sudo -n</option></select></label></p>
+<p><label>Independent host fingerprint <input id="tau-poc-pin" required autocomplete="off" placeholder="SHA256:…"></label></p>
+<p>Will this machine serve people you have never met, for example by renting out space on it or hosting other people's accounts?</p>
+<p>If unsure, choose Not sure. That class never holds spendable keys and binds alone.</p>
+<p><label>Class answer <select id="tau-poc-class" required><option value="">Choose an answer</option><option value="yes">Yes</option><option value="no">No, only me and people I know</option><option value="not_sure">Not sure</option></select></label></p>
+<p><label><input id="tau-poc-approve-existing" type="checkbox" required>Approve this existing machine. This does not order a machine or assert installation facts.</label></p>
+<p><label><input id="tau-poc-approve-access" type="checkbox" required>Approve maintained, ad-hoc access to this machine.</label></p>
+<button type="submit">Enroll existing machine</button>
+</form>
+<p>After enrollment, bind the machine and copy its public keys. Install the SSH line and enroll the relay public key separately. Set the bound session’s goal below. In this section accept acting without a brief, edit and propose the installation declaration candidate, then explicitly approve its requirements card below. Command admission requires that approval. The durable task flow is a later integration step.</p>
+<div id="tau-poc-targets"></div>
+<div id="tau-poc-public-keys" aria-live="polite"></div>
+</section>
 <p id="tau-persist" role="status"></p>
 </body>
 </html>
