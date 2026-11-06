@@ -391,6 +391,8 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
         #[serde(deny_unknown_fields)]
         struct Request {
             session: String,
+            #[serde(default)]
+            checks: Vec<String>,
         }
         let result = async {
             if let Some(why) = self.dispatch_refusal() {
@@ -402,16 +404,10 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
             let request: Request =
                 serde_json::from_str(request).map_err(|_| "invalid PoC acceptance")?;
             let store = self.store().ok_or("locked")?;
-            store.check_goal_start(&request.session).or_else(|why| {
-                if why == "Acting on a goal with no brief requires acceptance" {
-                    Ok(())
-                } else {
-                    Err(why)
-                }
-            })?;
             store
-                .accept_mode(&request.session, crate::modes::Mode::NoBrief)
+                .poc_start(&request.session, request.checks)
                 .await
+                .map(|_| ())
         }
         .await;
         self.report(result.as_ref().err().map(String::as_str))

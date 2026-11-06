@@ -96,7 +96,7 @@ impl Clock {
             || discrepancy(self.last, pair)
         {
             self.valid = false;
-            return Err("clock uncertain; verification required".into());
+            return Err(crate::poc::wait::CLOCK_UNCERTAIN.into());
         }
         let result = (|| {
             fn bound(time: u64, elapsed: u64, rate: Rate, ceil: bool) -> Option<u64> {
@@ -131,7 +131,7 @@ impl Clock {
             }
             _ => {
                 self.valid = false;
-                Err("clock evidence out of range".into())
+                Err(crate::poc::wait::CLOCK_RANGE.into())
             }
         }
     }

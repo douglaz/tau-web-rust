@@ -32,12 +32,14 @@ impl ZeroizeOnDrop for ScanMaterial {}
 
 impl ScanMaterial {
     pub(crate) fn parse(bytes: &[u8]) -> Result<Self, String> {
-        let value: Self = serde_json::from_slice(bytes).map_err(|_| "invalid scan material")?;
+        let value: Self =
+            serde_json::from_slice(bytes).map_err(|_| crate::poc::wait::SCAN_MATERIAL)?;
         if value.length < 16
             || usize::try_from(value.length).is_err()
-            || serde_json::to_vec(&value).map_err(|_| "scan material encoding")? != bytes
+            || serde_json::to_vec(&value).map_err(|_| crate::poc::wait::SCAN_MATERIAL_ENCODING)?
+                != bytes
         {
-            return Err("noncanonical or unsupported scan material".into());
+            return Err(crate::poc::wait::SCAN_MATERIAL_SHAPE.into());
         }
         Ok(value)
     }
@@ -83,7 +85,7 @@ impl References {
 
     pub(crate) fn install(&mut self, id: String, material: ScanMaterial) -> Result<(), String> {
         if !self.required.contains_key(&id) || self.material.borrow().contains_key(&id) {
-            return Err("scan identity is not awaiting material".into());
+            return Err(crate::poc::wait::SCAN_INSTALL.into());
         }
         self.material.get_mut().insert(id, material);
         self.revision.set(
@@ -119,7 +121,7 @@ impl References {
 
     pub(crate) fn ready(&self) -> Result<(), String> {
         if self.invalid_inventory || self.required.len() != self.material.borrow().len() {
-            return Err("required scan material unavailable; output withheld".into());
+            return Err(crate::poc::wait::SCAN_UNAVAILABLE.into());
         }
         Ok(())
     }
@@ -152,7 +154,8 @@ impl References {
         let mut ranges = Vec::new();
         let material_set = self.material.borrow();
         for (identity, material) in material_set.iter() {
-            let length = usize::try_from(material.length).map_err(|_| "scan length")?;
+            let length =
+                usize::try_from(material.length).map_err(|_| crate::poc::wait::SCAN_LENGTH)?;
             for (start, window) in bytes.windows(length).enumerate() {
                 if material.matches(window) {
                     ranges.push((start, start + length, identity));
@@ -186,7 +189,7 @@ impl References {
                 .windows(material.length as usize)
                 .any(|w| material.matches(w))
             {
-                return Err("scan marker contains protected material; output withheld".into());
+                return Err(crate::poc::wait::SCAN_MARKER.into());
             }
         }
         Ok(output)

@@ -972,16 +972,20 @@ async fn connect(
     // does not have.
     let config = Arc::new(client::Config::default());
     journal.current(session).await.map_err(Refusal::Journal)?;
-    let mut ssh = match client::connect_stream(config, ws.into_io(), handler).await {
-        Ok(ssh) => ssh,
-        Err(e) => {
-            let presented = presented.lock().expect("pin check lock").clone();
-            return Err(match presented {
-                Some(presented) if presented != pinned => Refusal::HostKey { pinned, presented },
-                _ => Refusal::Failed(format!("ssh: {e}")),
-            });
-        }
-    };
+    let mut ssh =
+        match client::connect_stream(config, super::relay_io::RelayIo(ws.into_io()), handler).await
+        {
+            Ok(ssh) => ssh,
+            Err(e) => {
+                let presented = presented.lock().expect("pin check lock").clone();
+                return Err(match presented {
+                    Some(presented) if presented != pinned => {
+                        Refusal::HostKey { pinned, presented }
+                    }
+                    _ => Refusal::Failed(format!("ssh: {e}")),
+                });
+            }
+        };
     let host_key = presented
         .lock()
         .expect("pin check lock")

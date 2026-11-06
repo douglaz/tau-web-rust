@@ -55,6 +55,7 @@ mod mode_cases;
 mod observer;
 mod operation_windows;
 mod page_queries;
+mod poc_fixture;
 mod predicate_inputs;
 mod reader;
 mod reader_checks;
@@ -108,6 +109,7 @@ async fn main() {
             Ok(())
         }),
         ["check-csp", dir] => checks::csp(Path::new(dir)),
+        ["poc-fixtures"] => poc_fixture::run().await,
         ["list"] => {
             println!("{}", catalogue::cases());
             Ok(())

@@ -54,7 +54,7 @@ impl Redacted {
             if output.as_bytes() != scanned.as_slice()
                 && !store.poc_output_is_safe(output.as_bytes())?
             {
-                return Err("protected output unavailable".into());
+                return Err(crate::poc::wait::PROTECTED_UNAVAILABLE.into());
             }
             Ok(output)
         })
@@ -122,7 +122,7 @@ impl Redacted {
             if output.as_bytes() != scanned.as_slice()
                 && !store.poc_output_is_safe(output.as_bytes())?
             {
-                return Err("protected output unavailable".into());
+                return Err(crate::poc::wait::PROTECTED_UNAVAILABLE.into());
             }
             Ok(output)
         })
@@ -234,7 +234,7 @@ fn redact(body: &[u8], fields: &[&str], held: &Held<'_>) -> Result<Redacted, Str
     // Refuse instead of claiming that such an output passed.
     for needle in held.values() {
         if credential_matches(&output, needle, |_| Ok(true))? {
-            return Err("redaction marker cannot exclude held credentials".into());
+            return Err(crate::poc::wait::REDACTION_MARKER.into());
         }
     }
     Ok(Redacted { bytes: output })

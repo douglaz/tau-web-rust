@@ -23,11 +23,13 @@ const goalOutcomes = new Map();
 const pocDeclarationDrafts = new Map();
 const render = (store) => {
   const { state } = store;
+  if (state !== 'unlocked') $('task-results')?.replaceChildren();
   $('store-state').dataset.lifecycle = store.lifecycle_state ?? '';
   if (store.seed_backup_stage !== undefined) ceremony = state === 'unlocked' && store.seed_backup_stage !== 'inactive';
   if (['locked', 'none', 'refused'].includes(state)) ceremony = false;
   renderSetup(store);
   renderPoc(store);
+  renderTasks(store);
   $('store').dataset.state = state;
   $('store-state').textContent = state === 'refused'
     ? `The local store is refused: ${store.reason}. Reload the page to try again.`
@@ -187,15 +189,25 @@ const renderSetup = (store) => {
         paragraph(card, session.goal.text);
         paragraph(card, `Source: ${session.goal.source}.`);
         if (session.goal.document_source) paragraph(card, `Document source: ${session.goal.document_source}.`);
-        if (!(session.standing_modes ?? []).includes('Acting on a goal with no brief')) {
-          paragraph(card, 'No brief is available.');
+        const accepted = (session.standing_modes ?? []).includes('Acting on a goal with no brief');
+        const continuation = (store.tasks ?? []).find(task => (task.continuation_sessions ?? []).includes(session.identity));
+        const started = (store.tasks ?? []).some(task => task.start_session === session.identity);
+        if (continuation) {
+          paragraph(card, `This session continues task ${continuation.id}. Use Resume on that task.`);
+        } else if (!accepted || !started) {
+          paragraph(card, accepted ? 'Start was accepted. Continue with verification commands for this same goal and machine.' : 'No brief is available.');
+          const checks = document.createElement('textarea');
+          checks.setAttribute('aria-label', 'Verification commands, one per line');
+          paragraph(card, 'Verification commands, one per line. Choose checks that establish the requested service is working. Empty checks cannot establish success.');
+          card.append(checks);
           const accept = document.createElement('button');
           accept.type = 'button';
           accept.dataset.goalAccept = session.identity;
-          accept.textContent = 'Acting on a goal with no brief';
+          accept.dataset.pocAccept = session.identity;
+          accept.textContent = accepted ? 'Continue accepted task start' : 'Acting on a goal with no brief';
           accept.addEventListener('click', () => {
             accept.disabled = true;
-            worker.postMessage({ goal_accept: { session: session.identity } });
+            worker.postMessage({ goal_accept: { session: session.identity, checks: checks.value.split('\n').filter(line => line.trim()) } });
           });
           card.append(accept);
         }
@@ -271,6 +283,72 @@ const renderSetup = (store) => {
   }
   if (store.lifecycle_state === 'ended') {
     for (const control of slot.querySelectorAll('button, input, textarea')) control.remove();
+  }
+};
+
+// Terminal results arrive individually so a large history cannot suppress a new result.
+const renderCommandResult = (result) => {
+  if ($('store').dataset.state !== 'unlocked') return;
+  let slot = $('task-results');
+  if (!slot) {
+    slot = document.createElement('section'); slot.id = 'tau-task-results';
+    $('setup').after(slot);
+  }
+  const card = document.createElement('section');
+  card.dataset.commandResult = String(result.call);
+  paragraph(card, `Recorded call ${result.call}; job ${result.job}; exit ${result.exit_status ?? 'unknown'}.${result.historical ? ' Historical result; no current action authority.' : ''}`);
+  for (const field of ['stdout', 'stderr']) {
+    paragraph(card, field);
+    const output = document.createElement('pre'); output.textContent = result[field] ?? ''; card.append(output);
+  }
+  const previous = slot.querySelector(`[data-command-result="${Number(result.call)}"]`);
+  if (previous) previous.replaceWith(card); else slot.append(card);
+};
+
+const renderTasks = (store) => {
+  let slot = $('tasks');
+  if (!slot) {
+    slot = document.createElement('section');
+    slot.id = 'tau-tasks';
+    $('setup').after(slot);
+  }
+  slot.replaceChildren();
+  slot.hidden = store.state !== 'unlocked' || store.seed_backup_stage !== 'inactive';
+  if (slot.hidden) return;
+  for (const task of store.tasks ?? []) {
+    const card = document.createElement('section');
+    card.dataset.task = task.id;
+    paragraph(card, `Task ${task.id}: ${task.status}; machine ${task.machine}.`);
+    paragraph(card, task.goal);
+    paragraph(card, `Requests ${task.requests}/${task.limits.requests}; steps ${task.steps}/${task.limits.steps}. Verification commands count as steps.`);
+    for (const [id, tool, outcome] of task.completed) paragraph(card, `${id}: ${JSON.stringify(tool)} → ${JSON.stringify(outcome)}`);
+    if (task.proposal) paragraph(card, `Next ${task.proposal.call_id}: ${JSON.stringify(task.proposal.tool)}`);
+    if (task.pending) paragraph(card, `Pending job ${task.pending.job}; journal call ${task.pending.call}. Resume inspects this job without launching it again.`);
+    if (task.pause_reason) paragraph(card, task.pause_reason);
+    for (const check of task.verification) paragraph(card, `Verification: ${check.command}; job ${check.job}; exit ${check.exit_status ?? 'unknown'}; ${check.excerpt}`);
+    if (['complete', 'abandoned'].includes(task.status)) { slot.append(card); continue; }
+    const session = (store.sessions ?? []).find(s => s.session_state !== 'ended' && s.bound_set.length === 1 && s.bound_set[0] === task.machine);
+    paragraph(card, 'Resume needs fresh binding and acceptance for this same machine. Progress is history, not current authority. Missing inference and target configuration must be supplied before live execution.');
+    const action = (text, request) => {
+      const button = document.createElement('button');
+      button.type = 'button'; button.textContent = text;
+      button.addEventListener('click', () => { button.disabled = true; worker.postMessage({ task: { id: task.id, ...request } }); });
+      card.append(button);
+    };
+    if (session && store.lifecycle_state !== 'ended') {
+      if (!(session.standing_modes ?? []).includes('Acting on a goal with no brief')) action('Accept Acting on a goal with no brief for this task', { action: 'authorize', session: session.identity });
+      else action('Resume', { action: 'resume', session: session.identity });
+    } else paragraph(card, `Bind ${task.machine} after unlock to Resume.`);
+    if (session && task.verification.some(check => check.exit_status !== null && check.exit_status !== 0)) {
+      action('Prepare verification retry', { action: 'retry-checks', session: session.identity });
+    }
+    action('Abandon', { action: 'abandon' });
+    const requests = document.createElement('input'); requests.type = 'number'; requests.min = task.limits.requests; requests.max = 1000; requests.value = task.limits.requests; requests.setAttribute('aria-label', 'Task request limit');
+    const steps = document.createElement('input'); steps.type = 'number'; steps.min = task.limits.steps; steps.max = 2000; steps.value = task.limits.steps; steps.setAttribute('aria-label', 'Task step limit');
+    const raise = document.createElement('button'); raise.type = 'button'; raise.textContent = 'Raise limits';
+    raise.addEventListener('click', () => { raise.disabled = true; worker.postMessage({ task: { action: 'raise', id: task.id, limits: { requests: Number(requests.value), steps: Number(steps.value) } } }); });
+    card.append(requests, steps, raise);
+    slot.append(card);
   }
 };
 
@@ -373,12 +451,6 @@ const renderPoc = (store) => {
     }
     for (const session of store.sessions ?? []) {
       if (session.session_state === 'ended' || !(session.bound_set ?? []).includes(target.machine) || !session.goal) continue;
-      const accept = document.createElement('button');
-      accept.type = 'button'; accept.disabled = !enabled;
-      accept.textContent = 'Accept acting on this goal without a brief (PoC)';
-      accept.dataset.pocAccept = session.identity;
-      accept.addEventListener('click', () => worker.postMessage({poc_accept: {session: session.identity}}));
-      row.append(accept);
       if (!(session.standing_modes ?? []).includes('Acting on a goal with no brief')) continue;
       paragraph(row, 'Declaration candidate: edit the JSON for your intended installation, then propose it. The next card requires explicit approval; these are requirements, not measurements.');
       const declaration = document.createElement('textarea');
@@ -475,6 +547,7 @@ const start = () => {
       if (rest.goal_outcome) goalOutcomes.set(rest.goal_outcome.session, rest.goal_outcome.outcome);
       render({ state, error, reason, ...rest });
     }
+    else if (data.command_result) renderCommandResult(data.command_result);
     else if (Object.keys(data).length === 1 && typeof data.seed_backup_display === 'string') {
       if (document.visibilityState === 'hidden') { lock(); return; }
       clearWords();

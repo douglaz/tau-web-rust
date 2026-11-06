@@ -158,15 +158,15 @@ impl Decimal {
     }
     pub fn parse(text: &str) -> Result<Self, String> {
         let mut parts = text.split(['e', 'E']);
-        let mantissa = parts.next().ok_or("invalid spend")?;
+        let mantissa = parts.next().ok_or(crate::poc::wait::INVALID_SPEND)?;
         let exponent: i32 = parts
             .next()
             .map(str::parse)
             .transpose()
-            .map_err(|_| "invalid spend exponent")?
+            .map_err(|_| crate::poc::wait::SPEND_EXPONENT)?
             .unwrap_or(0);
         if parts.next().is_some() {
-            return Err("invalid spend".into());
+            return Err(crate::poc::wait::INVALID_SPEND.into());
         }
         let mut fraction = None;
         let mut digits = Vec::new();
@@ -179,17 +179,18 @@ impl Decimal {
                     *n += 1;
                 }
             } else {
-                return Err("invalid nonnegative spend".into());
+                return Err(crate::poc::wait::NONNEGATIVE_SPEND.into());
             }
         }
         if digits.is_empty() || mantissa.starts_with('.') || mantissa.ends_with('.') {
-            return Err("invalid spend".into());
+            return Err(crate::poc::wait::INVALID_SPEND.into());
         }
-        let scale =
-            i64::try_from(fraction.unwrap_or(0)).map_err(|_| "spend scale")? - i64::from(exponent);
+        let scale = i64::try_from(fraction.unwrap_or(0))
+            .map_err(|_| crate::poc::wait::SPEND_SCALE)?
+            - i64::from(exponent);
         // Bound resource use, refusing unsupported evidence rather than rounding it.
         if scale.unsigned_abs() > 10000 {
-            return Err("unsupported spend precision".into());
+            return Err(crate::poc::wait::SPEND_PRECISION.into());
         }
         if scale < 0 {
             digits.extend(std::iter::repeat_n(0, (-scale) as usize));
@@ -335,13 +336,13 @@ impl Limits {
             return Err(why.clone());
         }
         if self.spent.at_least(&Decimal::parse(&self.cap())?) {
-            self.ended = Some("session cap exhausted".into());
-            return Err("session cap exhausted".into());
+            self.ended = Some(crate::poc::wait::CAP_EXHAUSTED.into());
+            return Err(crate::poc::wait::CAP_EXHAUSTED.into());
         }
         let (_, upper) = self.clock.interval(now)?;
         if self.expires.is_some_and(|expiry| upper >= expiry) {
-            self.ended = Some("session expired".into());
-            return Err("session expired".into());
+            self.ended = Some(crate::poc::wait::SESSION_EXPIRED.into());
+            return Err(crate::poc::wait::SESSION_EXPIRED.into());
         }
         Ok(())
     }

@@ -120,6 +120,14 @@ pub fn needles() -> Vec<(String, Vec<u8>)> {
         "test_poc_release_counts",
         "prepare_poc_release",
         "poc_terminal_append",
+        "test_poc_model",
+        "test_poc_profile",
+        "test_poc_register_credential",
+        "poc_model_next",
+        "fixture-call-",
+        "poc_progress_publication",
+        "poc_execution_return",
+        "poc_model_return",
         "session_point",
         "session_point_receiver",
         "session_authentication",
@@ -460,8 +468,20 @@ mod tests {
             "test_poc_release_counts",
             "prepare_poc_release",
             "poc_terminal_append",
+            "test_poc_model",
+            "test_poc_profile",
+            "test_poc_register_credential",
+            "poc_model_next",
+            "fixture-call-",
+            "poc_progress_publication",
+            "poc_execution_return",
+            "poc_model_return",
         ] {
-            std::fs::write(dir.join("pkg/tau_web_bg.wasm"), needle).unwrap();
+            std::fs::write(
+                dir.join("extra.js"),
+                format!("export const marker = {needle:?};"),
+            )
+            .unwrap();
             assert!(
                 super::absence(&dir)
                     .expect_err("planted release needle escaped check-absence")

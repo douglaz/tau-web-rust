@@ -59,6 +59,7 @@ pub(crate) mod authority;
 pub mod delivery;
 mod goals;
 pub(crate) mod inference;
+pub mod poc;
 pub mod poc_targets;
 pub mod reinstall;
 mod scan;
@@ -206,6 +207,7 @@ pub(crate) enum Event {
     Exposure(Exposure),
     ModeAcceptance(Acceptance),
     Goal(crate::goals::Goal),
+    Poc(poc::Record),
     SignatureRefusal(SignatureRefusal),
     ConnectionRefusal(ConnectionRefusal),
     InferenceAccount {
@@ -251,17 +253,22 @@ fn decode<const N: usize>(field: &str, text: &str) -> Result<[u8; N], String> {
     let bytes = Zeroizing::new(
         URL_SAFE_NO_PAD
             .decode(text)
-            .map_err(|e| format!("{field}: not unpadded base64url ({e})"))?,
+            .map_err(|e| crate::poc::wait::decode_error(field, &e.to_string()))?,
     );
     bytes
         .as_slice()
         .try_into()
-        .map_err(|_| format!("{field}: {} bytes, not {N}", bytes.len()))
+        .map_err(|_| crate::poc::wait::decode_length(field, bytes.len() as u64, N as u64))
 }
 
 fn random<const N: usize>() -> Result<[u8; N], String> {
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    if let Some(bytes) = poc::tests::fixed_identifier_bytes() {
+        return Ok(bytes);
+    }
     let mut bytes = [0; N];
-    getrandom::fill(&mut bytes).map_err(|e| format!("getrandom: {e}"))?;
+    getrandom::fill(&mut bytes)
+        .map_err(|e| crate::poc::wait::ENTROPY.render(0, "", &e.to_string()))?;
     Ok(bytes)
 }
 
@@ -366,6 +373,7 @@ pub struct Store<S> {
     exposure_ledger: Vec<Exposure>,
     conduct_acceptances: Vec<Acceptance>,
     goals: Vec<crate::goals::Goal>,
+    poc: std::collections::BTreeMap<String, poc::Task>,
     pending_requirements: std::collections::BTreeMap<String, goals::Pending>,
     poc_requirement_candidate: u64,
     signature_refusals: Vec<SignatureRefusal>,
@@ -411,7 +419,8 @@ pub async fn create<S: Storage>(
     let salt = Salt(random().map_err(refused)?);
     let nonce: [u8; 12] = random().map_err(refused)?;
     let mut key = DataKey([0; 32]);
-    getrandom::fill(&mut key.0).map_err(|e| Failure::Refused(format!("getrandom: {e}")))?;
+    getrandom::fill(&mut key.0)
+        .map_err(|e| Failure::Refused(crate::poc::wait::ENTROPY.render(0, "", &e.to_string())))?;
     let wrapping = kdf.derive(passphrase, &salt).await.map_err(refused)?;
     let wrapped_key = cipher(&wrapping.0)
         .encrypt(
@@ -505,6 +514,7 @@ impl<S: Storage> Store<S> {
             exposure_ledger: Vec::new(),
             conduct_acceptances: Vec::new(),
             goals: Vec::new(),
+            poc: Default::default(),
             pending_requirements: Default::default(),
             poc_requirement_candidate: 0,
             signature_refusals: Vec::new(),
@@ -672,7 +682,7 @@ impl<S: Storage> Store<S> {
         modes: &[Mode],
     ) -> Result<String, String> {
         if self.inference.ended {
-            return Err("sessions ended".into());
+            return Err(crate::poc::wait::SESSIONS_ENDED.into());
         }
         self.check_binding_modes(machine, modes)?;
         self.dispatch
@@ -685,11 +695,6 @@ impl<S: Storage> Store<S> {
         {
             return Err("already bound".into());
         }
-        self.pending_requirements.retain(|owner, _| {
-            self.sessions
-                .iter()
-                .any(|s| s.identity == *owner && !s.ended.get())
-        });
         self.ensure_scan_references().await?;
         let identity = self.dispatch.approved_entries[machine]
             .approved
@@ -710,7 +715,13 @@ impl<S: Storage> Store<S> {
                 identity,
             }],
         };
+        self.poc_adoption_safe(None, Some(&exposure))?;
         self.commit(&Event::Exposure(exposure.clone())).await?;
+        self.pending_requirements.retain(|owner, _| {
+            self.sessions
+                .iter()
+                .any(|s| s.identity == *owner && !s.ended.get())
+        });
         self.exposure_ledger.push(exposure);
         self.sessions
             .push(Rc::new(Session::new(session.clone(), machine.into(), key)));
@@ -893,7 +904,9 @@ impl<S: Storage> Store<S> {
             return Ok(Rc::clone(origin));
         }
         if self.inference.ended {
-            return Err(AdmissionRefusal::Journal("sessions ended".into()));
+            return Err(AdmissionRefusal::Journal(
+                crate::poc::wait::SESSIONS_ENDED.into(),
+            ));
         }
         if !self.dispatch.approved_entries.contains_key(machine) {
             return Err(AdmissionRefusal::NoEntry);
@@ -1136,13 +1149,19 @@ impl<S: Storage> Store<S> {
     ) -> Result<(), String> {
         let mut next = self.dispatch.clone();
         next.associate_stored(self.next, evidence.clone())?;
+        let prior_diagnostic = self.uncommitted_evidence.clone();
         if matches!(evidence, crate::dispatch::StoredAssociation::Protected(_)) {
             self.uncommitted_evidence = Some(crate::dispatch::EvidenceDiagnostic::Association {
                 committed: false,
                 association: evidence.clone(),
             });
         }
-        self.commit(&Event::Association(evidence)).await?;
+        if let Err(why) = self.commit(&Event::Association(evidence)).await {
+            if why == crate::poc::wait::JOURNAL_REFUSED && self.failed.is_none() {
+                self.uncommitted_evidence = prior_diagnostic;
+            }
+            return Err(why);
+        }
         self.uncommitted_evidence = None;
         self.dispatch = next;
         Ok(())
@@ -1261,10 +1280,7 @@ impl<S: Storage> Store<S> {
 
     pub(crate) fn held_credentials(&self) -> Result<crate::redaction::Held<'_>, String> {
         use crate::redaction::{Derived, Held};
-        let seed = self
-            .seed
-            .as_ref()
-            .ok_or("response requires an unlocked seed")?;
+        let seed = self.seed.as_ref().ok_or(crate::poc::wait::UNLOCKED_SEED)?;
         let mut held = Held {
             borrowed: vec![seed.bytes(), &self.key.0],
             mnemonic: seed.phrase(),
@@ -1278,7 +1294,7 @@ impl<S: Storage> Store<S> {
             let bindings = session.given.borrow();
             for holding in bindings.iter() {
                 if holding.credential.response_bytes().is_none() {
-                    return Err("session credential has no response scan representation".into());
+                    return Err(crate::poc::wait::CREDENTIAL_SCAN.into());
                 }
             }
             held.bindings.push(bindings);
@@ -1305,7 +1321,7 @@ impl<S: Storage> Store<S> {
                 }
                 Ok(())
             })();
-            derived.map_err(|_| "held credential derivation refused".to_string())?;
+            derived.map_err(|_| crate::poc::wait::DERIVATION.to_string())?;
         }
         Ok(held)
     }
@@ -1348,13 +1364,19 @@ impl<S: Storage> Store<S> {
     ) -> Result<Vec<u64>, String> {
         let mut next = self.dispatch.clone();
         let settled = next.receive_stored(self.next, evidence.clone())?;
+        let prior_diagnostic = self.uncommitted_evidence.clone();
         if matches!(evidence, crate::dispatch::StoredReceipt::Protected(_)) {
             self.uncommitted_evidence = Some(crate::dispatch::EvidenceDiagnostic::Receipt {
                 committed: false,
                 receipt: evidence.clone(),
             });
         }
-        self.commit(&Event::OperationReceipt(evidence)).await?;
+        if let Err(why) = self.commit(&Event::OperationReceipt(evidence)).await {
+            if why == crate::poc::wait::JOURNAL_REFUSED && self.failed.is_none() {
+                self.uncommitted_evidence = prior_diagnostic;
+            }
+            return Err(why);
+        }
         self.uncommitted_evidence = None;
         self.dispatch = next;
         Ok(settled)
@@ -1389,7 +1411,10 @@ impl<S: Storage> Store<S> {
     /// store with no record: a store that holds a seed never gets another.
     async fn finish_creation(&mut self) -> Result<(), String> {
         assert_eq!(self.next, FIRST, "a seed only for a store with no record");
-        let seed = Seed::generate().map_err(|e| format!("getrandom: {e}"))?;
+        let seed = Seed::generate()
+            .map_err(|e| crate::poc::wait::ENTROPY.render(0, "", &e.to_string()))?;
+        #[cfg(all(test, not(target_arch = "wasm32")))]
+        let seed = poc::tests::fixed_seed().unwrap_or(seed);
         self.commit(&Event::Seed {
             mnemonic: seed.phrase().to_string(),
         })
@@ -1450,6 +1475,10 @@ impl<S: Storage> Store<S> {
                 }
                 (_, Event::Exposure(exposure)) => {
                     self.replay_exposure(number, exposure)
+                        .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
+                }
+                (_, Event::Poc(record)) => {
+                    self.apply_poc(number, record)
                         .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
                 }
                 (_, Event::Goal(goal)) => {
@@ -1650,6 +1679,13 @@ impl<S: Storage> Store<S> {
         // duplicate members are rejected and mnemonic buffers retain Event's zeroization.
         let event: Event = serde_json::from_slice(&plaintext)
             .map_err(|_| "its event is not one this version reads".to_string())?;
+        if let Event::Poc(_) = &event {
+            let value: Value =
+                serde_json::from_slice(&plaintext).map_err(|_| "task record shape")?;
+            if serde_json::to_value(&event).map_err(|_| "task record shape")? != value {
+                return Err("task record shape".into());
+            }
+        }
         if matches!(&event, Event::DedicatedReinstall(_) | Event::PocTarget(_)) {
             let value: Value =
                 serde_json::from_slice(&plaintext).map_err(|_| "dedicated record shape")?;
@@ -1767,22 +1803,26 @@ impl<S: Storage> Store<S> {
     /// staging name, then moved onto its own name. The caller applies it only once this returns.
     async fn commit(&mut self, event: &Event) -> Result<u64, String> {
         if let Some(why) = &self.failed {
-            return Err(format!(
-                "an earlier append failed ({why}), so none follows until the worker restarts"
-            ));
+            return Err(crate::poc::wait::EARLIER_APPEND.render(0, "", why));
         }
         let number = self.next;
         // Credential format v1: "Never perform 2^32 encryptions under one data key". Record 0 is
         // the first, so record 2^32 - 1 would be the 2^32nd. Nothing is written, so no move can
         // have landed. Re-encrypting under a fresh key does not exist yet: appends stop here.
         if number >= u64::from(u32::MAX) {
-            return Err(format!(
-                "record {number} would be the 2^32nd encryption under this store's data key"
-            ));
+            return Err(crate::poc::wait::ENCRYPTION_CAP.render(number, "", ""));
         }
         let previous = hex::encode(self.previous.0);
-        let nonce: [u8; 12] = random()?;
         let plaintext = Zeroizing::new(serde_json::to_vec(event).expect("an event serializes"));
+        for filter in &self.poc_credential_filters {
+            if filter
+                .literal_match(&plaintext)
+                .map_err(|_| crate::poc::wait::JOURNAL_REFUSED.to_string())?
+            {
+                return Err(crate::poc::wait::JOURNAL_REFUSED.into());
+            }
+        }
+        let nonce: [u8; 12] = random()?;
         let ciphertext = cipher(&self.key.0)
             .encrypt(
                 &nonce.into(),
@@ -1791,7 +1831,7 @@ impl<S: Storage> Store<S> {
                     aad: record_aad(&self.id, EVENT, number, &previous).as_bytes(),
                 },
             )
-            .map_err(|_| "AES-GCM refused the record".to_string())?;
+            .map_err(|_| crate::poc::wait::ENCRYPTION_REFUSED.to_string())?;
         let bytes = serde_json::to_vec(&RecordJson {
             id: self.id.clone(),
             kind: EVENT.into(),
@@ -1822,7 +1862,9 @@ impl<S: Storage> Journal for Store<S> {
         command: &[u8],
     ) -> Result<(), AppendRefusal> {
         if self.inference.ended {
-            return Err(AppendRefusal::Storage("sessions ended".into()));
+            return Err(AppendRefusal::Storage(
+                crate::poc::wait::SESSIONS_ENDED.into(),
+            ));
         }
         if self.installation_unpinned(machine)
             && let Some(form) = crate::modes::lowering(command)
@@ -1842,7 +1884,9 @@ impl<S: Storage> Journal for Store<S> {
 
     async fn check(&self, machine: &str) -> Result<(), AppendRefusal> {
         if self.inference.ended {
-            return Err(AppendRefusal::Storage("sessions ended".into()));
+            return Err(AppendRefusal::Storage(
+                crate::poc::wait::SESSIONS_ENDED.into(),
+            ));
         }
         self.dispatch
             .check_command(machine)
@@ -1930,7 +1974,7 @@ impl<S: Storage> Journal for Store<S> {
         // The durable evidence must itself be stable under release protection.
         let value = serde_json::to_value(&report).map_err(|_| "job report encoding")?;
         if self.protect_output(&value)? != value {
-            return Err("protected output unavailable".into());
+            return Err(crate::poc::wait::PROTECTED_UNAVAILABLE.into());
         }
         if terminal {
             self.preflight_job_release(&report)?;
@@ -2226,6 +2270,12 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
                     serde_json::to_value(crate::declaration::ad_hoc_minimum())
                         .expect("candidate serializes");
             }
+            if !store.poc.is_empty() {
+                report["tasks"] = serde_json::to_value(
+                    store.poc.values().map(poc::Task::view).collect::<Vec<_>>(),
+                )
+                .expect("tasks serialize");
+            }
             let approvals = store.reinstall_approvals();
             if approvals.as_array().is_some_and(|a| !a.is_empty()) {
                 report["reinstall_approvals"] = approvals;
@@ -2242,7 +2292,7 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
             State::Unlocked(store) if store.authority.state() == "ended" => {
                 // Durable history remains readable; no runtime session or action survives end.
                 let mut history = serde_json::Map::new();
-                for field in ["seed_backup_owed","seed_backup_completion","setup","delivery","goals",
+                for field in ["seed_backup_owed","seed_backup_completion","setup","delivery","goals","tasks",
                     "mode_acceptances","signature_refusals","installations","exposure_ledger",
                     "connection_refusals","reinstall_approvals","locked","inference_calls","records",
                     "calls","terminals","dispositions","standing","jobs","typed_calls","observations",
@@ -2255,7 +2305,7 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
                 history["lifecycle_state"] = "ended".into();
                 history["seed_backup_stage"] = "inactive".into();
                 history["sessions"] = json!([]);
-                history["error"] = "sessions ended".into();
+                history["error"] = crate::poc::wait::SESSIONS_ENDED.into();
                 if let Some(deliveries) = history["delivery"].as_array_mut() {
                     for delivery in deliveries {
                         delivery["placement_eligible"] = false.into();

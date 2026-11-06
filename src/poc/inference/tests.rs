@@ -893,7 +893,7 @@ fn poc_retained_prefilters_are_digests_and_decode_limits_withhold() {
     let key = b"Ab9!";
     let filter = EchoFilter::new(&[key]);
     let raw = filter
-        .0
+        .representations
         .iter()
         .find(|pattern| pattern.0 == key.len())
         .unwrap();
@@ -1092,4 +1092,54 @@ fn poc_cached_text_does_not_bypass_decoded_binary_boundary() {
     // still scan those exact text bytes, even though that text was already visited.
     assert_eq!(safe[0], value[0]);
     assert_eq!(safe[1], crate::redaction::MARKER);
+}
+
+#[test]
+fn poc_journal_filter_keeps_literal_and_symbolic_boundaries_distinct() {
+    let key = b"literal-482700-key";
+    let mut filter = EchoFilter::new(&[key]);
+    assert!(filter.literal_match(key).unwrap());
+    assert!(!filter.literal_match(hex::encode(key).as_bytes()).unwrap());
+    assert!(!filter.literal_match(b"literal-482701-key").unwrap());
+    filter.merge(EchoFilter::new(&[b"replacement-credential-482700"]));
+    assert!(filter.literal_match(key).unwrap());
+    assert!(
+        filter
+            .literal_match(b"replacement-credential-482700")
+            .unwrap()
+    );
+    let template = br#"{"goal":{"session":"session-0","text":"line\nabcdef012345","source":"operator_session_goal_card","document_source":null}}"#;
+    for counter in [0, 9, 10, 99, 100, u64::from(u32::MAX), u64::MAX] {
+        let concrete = format!(
+            "{{\"goal\":{{\"session\":\"session-{counter}\",\"text\":\"line\\nabcdef012345\",\"source\":\"operator_session_goal_card\",\"document_source\":null}}}}"
+        );
+        for window in concrete.as_bytes().windows(16) {
+            assert!(EchoFilter::new(&[window]).symbolic_match(template).unwrap());
+        }
+    }
+    assert!(
+        EchoFilter::new(&[b"1234567890123456"])
+            .symbolic_match(template)
+            .unwrap()
+    );
+}
+
+#[test]
+fn poc_journal_hex_domain_keeps_generated_job_spans_across_rotations() {
+    let template = br#"{"job":"","provenance":{"target":{"entry":"machine-a"},"session":"session-0","requester":"session"}}"#;
+    for job in ["0123456789abcdef", "fedcba9876543210"] {
+        let concrete = format!(
+            "{{\"job\":\"{job}\",\"provenance\":{{\"target\":{{\"entry\":\"machine-a\"}},\"session\":\"session-999\",\"requester\":\"session\"}}}}"
+        );
+        let credential = format!("{job}\",\"provenance\":{{");
+        let mut filter = EchoFilter::new(&[credential.as_bytes()]);
+        filter.merge(EchoFilter::new(&[b"replacement-credential-482700"]));
+        assert!(filter.symbolic_hex_match(template).unwrap());
+        assert!(filter.literal_match(concrete.as_bytes()).unwrap());
+    }
+    assert!(
+        !EchoFilter::new(&[b"ordinary-resume-key-482700"])
+            .symbolic_hex_match(template)
+            .unwrap()
+    );
 }

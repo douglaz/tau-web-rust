@@ -17,6 +17,8 @@ pub(crate) mod inference;
 #[cfg(any(target_arch = "wasm32", test))]
 mod job_read;
 #[cfg(target_arch = "wasm32")]
+mod relay_io;
+#[cfg(target_arch = "wasm32")]
 mod run;
 #[cfg(target_arch = "wasm32")]
 mod wait;

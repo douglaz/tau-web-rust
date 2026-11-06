@@ -20,7 +20,7 @@ pub mod inference_limits;
 pub mod jobs;
 pub mod lifecycle;
 pub mod modes;
-mod poc;
+pub mod poc;
 pub mod redaction;
 pub mod relay_auth;
 pub mod scan;
@@ -170,6 +170,21 @@ mod worker {
             .to_string()
     }
 
+    /// Register scan custody without usable configuration so append checks remain independently
+    /// exercised even when conservative configuration admission already refuses the fixture.
+    #[cfg(feature = "tracer")]
+    #[wasm_bindgen]
+    pub async fn test_poc_register_credential(key: Vec<u8>) -> Result<(), wasm_bindgen::JsValue> {
+        let key = zeroize::Zeroizing::new(key);
+        local()
+            .lock()
+            .await
+            .store()
+            .ok_or("locked")?
+            .remember_poc_credential(&key);
+        Ok(())
+    }
+
     #[cfg(feature = "tracer")]
     #[wasm_bindgen]
     pub async fn test_poc_job_evidence(
@@ -317,6 +332,22 @@ mod worker {
                 .expect("fixture restored");
         }
         report.to_string()
+    }
+
+    /// Corrupt only the fixture projection after binding; no durable target changes.
+    #[cfg(feature = "tracer")]
+    #[wasm_bindgen]
+    pub async fn test_poc_profile(
+        machine: String,
+        profile: String,
+    ) -> Result<(), wasm_bindgen::JsValue> {
+        let local = local();
+        let mut writer = local.lock().await;
+        let store = writer.store().ok_or("locked")?;
+        let mut target = store.poc_target(&machine).ok_or("fixture target")?.clone();
+        target.profile = profile;
+        store.test_poc_replace_target(&machine, target)?;
+        Ok(())
     }
 
     #[wasm_bindgen]
@@ -721,6 +752,53 @@ mod worker {
     #[wasm_bindgen]
     pub async fn run_command(request: String) -> Result<String, wasm_bindgen::JsValue> {
         request_operation(request, false).await
+    }
+
+    #[wasm_bindgen]
+    pub async fn task_request(request: String) -> String {
+        crate::poc::web::request(request).await
+    }
+
+    /// Preserve the existing page exercises in builds that include the browser fixtures.
+    #[wasm_bindgen]
+    pub async fn run_page_goal(session: String, checks: String) -> String {
+        run_page_goal_with(session, checks, crate::poc::web::Response::default()).await
+    }
+    pub(crate) async fn run_page_goal_with(
+        session: String,
+        checks: String,
+        response: crate::poc::web::Response,
+    ) -> String {
+        #[cfg(feature = "tracer")]
+        if !crate::poc::web::page_uses_runner(&session).await {
+            return crate::harness::goals::run_goal(session).await;
+        }
+        {
+            let result = async {
+                let checks: Vec<String> =
+                    serde_json::from_str(&checks).map_err(|_| "verification checks")?;
+                let task = local()
+                    .lock()
+                    .await
+                    .store()
+                    .ok_or("locked")?
+                    .poc_page_start(&session, checks)
+                    .await?;
+                crate::poc::web::publish_progress(&session).await;
+                if task.status == crate::store::poc::Status::Paused {
+                    return Ok(serde_json::json!({"task":task.id}));
+                }
+                let request = serde_json::json!({"action":"resume","id":task.id,"session":session})
+                    .to_string();
+                let report = crate::poc::web::request_with(request, response).await;
+                let report = serde_json::from_str(&report).map_err(|_| "task report")?;
+                Ok::<_, String>(crate::poc::run::page_outcome(&task.id, &report))
+            }
+            .await;
+            result
+                .unwrap_or_else(|why| serde_json::json!({"refused":why}))
+                .to_string()
+        }
     }
 
     /// Stop the current unresolved-command waits on this machine. Settles nothing.

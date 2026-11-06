@@ -43,10 +43,8 @@ impl Authority {
     pub fn ordinary(&self) -> Result<(), String> {
         match self.phase.get() {
             Phase::Running => Ok(()),
-            Phase::Suspended => {
-                Err("reconciliation or verification required after suspension".into())
-            }
-            Phase::Ended => Err("sessions ended".into()),
+            Phase::Suspended => Err(crate::poc::wait::SUSPENSION.into()),
+            Phase::Ended => Err(crate::poc::wait::SESSIONS_ENDED.into()),
         }
     }
     pub fn verification(&self) -> bool {
@@ -65,7 +63,7 @@ impl Authority {
     }
     pub fn revalidated(&self) -> Result<(), String> {
         if !self.verification() {
-            return Err("sessions ended".into());
+            return Err(crate::poc::wait::SESSIONS_ENDED.into());
         }
         self.phase.set(Phase::Running);
         Ok(())
@@ -89,7 +87,7 @@ impl Authority {
     }
     pub(crate) fn clock_continuation(self: &Rc<Self>) -> Result<Continuation, String> {
         if !self.verification() {
-            return Err("sessions ended".into());
+            return Err(crate::poc::wait::SESSIONS_ENDED.into());
         }
         Ok(Continuation {
             owner: self.clone(),
@@ -107,7 +105,7 @@ impl Continuation {
     pub fn check(&self) -> Result<(), String> {
         if self.clock_verification {
             if !self.owner.verification() {
-                return Err("sessions ended".into());
+                return Err(crate::poc::wait::SESSIONS_ENDED.into());
             }
         } else {
             self.owner.ordinary()?;

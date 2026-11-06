@@ -102,6 +102,8 @@ pub(crate) async fn configure(
     let config = Configuration::new(endpoint, model)?;
     valid_key(&key)?;
     let store = local.store().ok_or("locked")?;
+    store.poc_configuration_ready()?;
+    store.poc_configuration_key(&key)?;
     if !safe(
         store,
         &json!({"endpoint":config.endpoint,"model":config.model}),

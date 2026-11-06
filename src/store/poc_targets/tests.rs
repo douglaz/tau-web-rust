@@ -1548,3 +1548,58 @@ fn poc_job_lossy_text_cannot_reintroduce_a_placed_secret() {
     assert_eq!(block_on(store.collectable("machine-a")).unwrap().len(), 1);
     assert!(block_on(store.check("machine-a")).is_err());
 }
+
+#[test]
+fn poc_page_single_acceptance_keeps_checks_and_waits_for_operator_declaration() {
+    let mut local = Local::new(MemoryStorage::default(), Fixed);
+    block_on(local.open());
+    assert_eq!(block_on(local.create(pass()))["state"], "unlocked");
+    local.seed_backup_answer();
+    block_on(local.seed_backup_complete(None));
+    let store = local.store().unwrap();
+    enroll(store);
+    let session = block_on(store.poc_bind("machine-a")).unwrap();
+    block_on(store.enter_goal(&session, "Inspect a service".into(), None)).unwrap();
+    let request = json!({"session":session,"checks":["true"]}).to_string();
+    assert!(block_on(local.poc_accept(&request)).get("error").is_none());
+    let task = block_on(
+        local
+            .store()
+            .unwrap()
+            .poc_page_start(&session, vec!["true".into()]),
+    )
+    .unwrap();
+    assert_eq!(task.requests, 0);
+    assert_eq!(task.checks, ["true"]);
+    assert_eq!(task.status, crate::store::poc::Status::Paused);
+    assert!(
+        local
+            .store()
+            .unwrap()
+            .pending_requirements_view(&session)
+            .is_null()
+    );
+    assert!(
+        block_on(local.poc_accept(&json!({"session":session,"checks":["false"]}).to_string()))
+            .get("error")
+            .is_some()
+    );
+    let same = block_on(
+        local
+            .store()
+            .unwrap()
+            .poc_start(&session, vec!["true".into()]),
+    )
+    .unwrap();
+    assert_eq!(same.id, task.id);
+    assert_eq!(
+        local
+            .store()
+            .unwrap()
+            .conduct_acceptances
+            .iter()
+            .filter(|acceptance| acceptance.session == session)
+            .count(),
+        1
+    );
+}

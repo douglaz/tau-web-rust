@@ -1,6 +1,6 @@
 # AGENTS.md
 
-This is the `poc/lite` branch. It builds a small proof of concept on top of the existing
+This is the `poc/integration` branch. It builds a small proof of concept on top of the existing
 implementation of the harness that the specification at `spec/` describes (spec ADR-0031).
 
 ## Milestone
@@ -43,7 +43,9 @@ pipe reports the pipeline's status rather than the check's.
 - `scripts/build-web.sh served`, then `cargo run --locked -p tracer -- check-absence dist/served`
   and `cargo run --locked -p tracer -- check-csp dist/served`
 - the browser smoke, `CHROME=<chrome> scripts/tracer.sh targeted TAU_TRACER_HOLD_CASE=drop`, plus
-  the PoC's own targeted case once it exists
+  `node scripts/check-poc-page.mjs` for each of first-key, rotation, publication, progress,
+  interruption, aggregate, resolver, configuration, wire, first-key-checks, reload-key,
+  reload-control, reload-progress, keyless-collection, metadata-key and mismatched-terminal
 
 The wasm32 steps need three tools: the wasm32 target, the wasm-bindgen CLI at the version in
 `Cargo.lock`, and a clang that targets wasm32 so it can compile ring (`README.md`, "Building and

@@ -88,17 +88,18 @@ impl<S: Storage> Store<S> {
                 .storage
                 .read(&format!("scan-{identity}"))
                 .await
-                .map_err(|_| "required scan material unavailable")?;
-            let blob: Blob = serde_json::from_slice(&bytes).map_err(|_| "invalid scan envelope")?;
-            if serde_json::to_vec(&blob).map_err(|_| "scan envelope encoding")? != bytes {
-                return Err("noncanonical scan envelope".into());
+                .map_err(|_| crate::poc::wait::SCAN_REQUIRED)?;
+            let blob: Blob =
+                serde_json::from_slice(&bytes).map_err(|_| crate::poc::wait::SCAN_ENVELOPE)?;
+            if serde_json::to_vec(&blob).map_err(|_| crate::poc::wait::SCAN_ENCODING)? != bytes {
+                return Err(crate::poc::wait::SCAN_NONCANONICAL.into());
             }
-            let nonce = decode::<12>("scan nonce", &blob.nonce)?;
+            let nonce = decode::<12>(crate::poc::wait::SCAN_NONCE_FIELD, &blob.nonce)?;
             let ciphertext = URL_SAFE_NO_PAD
                 .decode(&blob.ciphertext)
-                .map_err(|_| "invalid scan ciphertext")?;
+                .map_err(|_| crate::poc::wait::SCAN_CIPHERTEXT)?;
             if URL_SAFE_NO_PAD.encode(&ciphertext) != blob.ciphertext {
-                return Err("noncanonical scan ciphertext".into());
+                return Err(crate::poc::wait::SCAN_NONCANONICAL_CIPHER.into());
             }
             let aad = format!("tau-web/local/v1/{}/scan/{identity}", self.id);
             let plaintext = Zeroizing::new(
@@ -110,7 +111,7 @@ impl<S: Storage> Store<S> {
                             aad: aad.as_bytes(),
                         },
                     )
-                    .map_err(|_| "scan authentication failed")?,
+                    .map_err(|_| crate::poc::wait::SCAN_AUTH)?,
             );
             authenticated.push((identity, ScanMaterial::parse(&plaintext)?));
         }
@@ -167,7 +168,7 @@ impl<S: Storage> Store<S> {
             && text.len().is_multiple_of(2)
             && text.bytes().all(|b| b.is_ascii_hexdigit());
         if hexadecimal {
-            raw = Zeroizing::new(hex::decode(text).map_err(|_| "output hex")?);
+            raw = Zeroizing::new(hex::decode(text).map_err(|_| crate::poc::wait::OUTPUT_HEX)?);
         }
         let safe = crate::redaction::Redacted::decoded(self, &raw)?;
         if hexadecimal {
@@ -246,7 +247,9 @@ impl<S: Storage> Store<S> {
                             .bytes()
                             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
                     {
-                        let raw = Zeroizing::new(hex::decode(text).map_err(|_| "output hex")?);
+                        let raw = Zeroizing::new(
+                            hex::decode(text).map_err(|_| crate::poc::wait::OUTPUT_HEX)?,
+                        );
                         hex::encode(bytes(store, &raw, cache)?.as_slice())
                     } else {
                         text.clone()
@@ -267,7 +270,8 @@ impl<S: Storage> Store<S> {
                         for field in ["stdout", "stderr"] {
                             if let Some(encoded) = record.get(field).and_then(Value::as_str) {
                                 let raw = Zeroizing::new(
-                                    hex::decode(encoded).map_err(|_| "job output hex")?,
+                                    hex::decode(encoded)
+                                        .map_err(|_| crate::poc::wait::JOB_OUTPUT_HEX)?,
                                 );
                                 let safe = bytes(store, &raw, cache)?;
                                 values["record"][field] = hex::encode(safe.as_slice()).into();
@@ -283,7 +287,7 @@ impl<S: Storage> Store<S> {
                         let safe = bytes(store, key.as_bytes(), cache)?;
                         let key = String::from_utf8_lossy(&safe).into_owned();
                         if result.insert(key, protect(store, value, cache)?).is_some() {
-                            return Err("output key collision after protection".into());
+                            return Err(crate::poc::wait::OUTPUT_COLLISION.into());
                         }
                     }
                     Value::Object(result)
@@ -343,6 +347,18 @@ impl<S: Storage> Store<S> {
         // protect_output inherits an enclosing work scope; no remaining budget is reset here.
         for value in crate::harness::release_forms(&done) {
             self.protect_output(&value)?;
+        }
+        if self.poc.values().any(|task| {
+            task.pending
+                .as_ref()
+                .is_some_and(|pending| pending.call == intent.call)
+        }) {
+            // A task releases each terminal independently of the bounded history view.
+            let mut result =
+                serde_json::to_value(report).map_err(|_| crate::poc::wait::RESULT_ENCODING)?;
+            self.protect_output(&json!({"command_result":result}))?;
+            crate::jobs::historical(&mut result, "stale result after suspension");
+            self.protect_output(&json!({"command_result":result}))?;
         }
         Ok(())
     }
@@ -457,7 +473,9 @@ impl<S: Storage> Store<S> {
                     (&output[1], stderr, &mut report.stderr),
                 ] {
                     crate::poc::inference::work::charge(raw.len().saturating_mul(4))?;
-                    let bytes = Zeroizing::new(hex::decode(raw).map_err(|_| "job output hex")?);
+                    let bytes = Zeroizing::new(
+                        hex::decode(raw).map_err(|_| crate::poc::wait::JOB_OUTPUT_HEX)?,
+                    );
                     let safe = crate::redaction::Redacted::for_store_cached(
                         self,
                         &bytes,
@@ -486,7 +504,7 @@ impl<S: Storage> Store<S> {
                             .as_bytes()
                                 != decoded.as_bytes())
                     {
-                        return Err("protected output unavailable".into());
+                        return Err(crate::poc::wait::PROTECTED_UNAVAILABLE.into());
                     }
                 }
             }

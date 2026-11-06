@@ -135,7 +135,11 @@ impl<S: Storage> Store<S> {
             .await
         }
         .await;
-        self.pending_requirements.remove(session);
+        if result.as_ref().err().map(String::as_str) != Some(crate::poc::wait::JOURNAL_REFUSED)
+            || self.failed.is_some()
+        {
+            self.pending_requirements.remove(session);
+        }
         result
     }
 
@@ -159,13 +163,13 @@ impl<S: Storage> Store<S> {
     pub fn live_goal_session(&self, session: &str) -> Result<Rc<Session>, String> {
         self.check_session_authority(session, self.session_pair(session))?;
         if self.inference.ended {
-            return Err("sessions ended".into());
+            return Err(crate::poc::wait::SESSIONS_ENDED.into());
         }
         self.sessions
             .iter()
             .find(|s| s.identity == session)
             .cloned()
-            .ok_or("goal requires a live session".into())
+            .ok_or(crate::poc::wait::LIVE_GOAL.into())
     }
 
     pub async fn enter_goal(
@@ -182,6 +186,13 @@ impl<S: Storage> Store<S> {
             document_source,
         };
         self.check_goal(&goal)?;
+        if !crate::redaction::Redacted::inference_value_is_safe(
+            self,
+            &serde_json::to_value(&goal).expect("goal serializes"),
+            &[],
+        ) {
+            return Err("goal credential boundary".into());
+        }
         self.commit(&Event::Goal(goal.clone())).await?;
         self.goals.push(goal);
         Ok(())

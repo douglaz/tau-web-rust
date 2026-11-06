@@ -298,3 +298,31 @@ std::thread_local! {
 pub(crate) fn prepare_poc_release(evidence: crate::jobs::Evidence, held_release: bool) {
     POC_RELEASE.with_borrow_mut(|held| *held = Some((evidence, held_release)));
 }
+
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static POC_MODEL: std::cell::RefCell<Option<(String, u64)>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub fn test_poc_model(command: String) {
+    POC_MODEL.with_borrow_mut(|model| *model = Some((command, 0)));
+}
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn poc_model_next(machine: &str) -> Option<(String, crate::goals::Tool)> {
+    POC_MODEL.with_borrow_mut(|model| {
+        let (command, count) = model.as_mut()?;
+        *count += 1;
+        let tool = if *count == 1 {
+            crate::goals::Tool::Exec {
+                machine: machine.into(),
+                command: command.clone(),
+            }
+        } else {
+            crate::goals::Tool::Done {
+                machine: machine.into(),
+            }
+        };
+        Some((format!("fixture-call-{count}"), tool))
+    })
+}

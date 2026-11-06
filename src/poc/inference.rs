@@ -120,7 +120,7 @@ pub(crate) mod work {
             }
             None => {
                 left.set(0);
-                Err("protected output withheld: protection work bound exceeded".into())
+                Err(crate::poc::wait::WORK_BOUND.into())
             }
         })
     }
@@ -128,7 +128,7 @@ pub(crate) mod work {
         use serde_json::Value;
         charge(512)?;
         if depth > 32 {
-            return Err("protected output withheld: value depth exceeded".into());
+            return Err(crate::poc::wait::VALUE_DEPTH.into());
         }
         match value {
             Value::String(s) => charge(s.len())?,
@@ -171,11 +171,34 @@ pub(crate) struct EchoCache {
     binary: std::collections::BTreeSet<sha2::digest::Output<Sha256>>,
 }
 
-pub(crate) struct EchoFilter(Vec<EchoPattern>);
+pub(crate) struct EchoFilter {
+    representations: Vec<EchoPattern>,
+    literal: Vec<EchoPattern>,
+    decimal_free: Vec<EchoPattern>,
+    decimal_only: bool,
+    hex_free: Vec<EchoPattern>,
+    hex_only: bool,
+}
+
+fn echo_pattern(form: &[u8]) -> EchoPattern {
+    (
+        form.len(),
+        (form.len() >= 16).then(|| rolling_hash(form) as u16),
+        Sha256::digest(rolling_hash(form).to_be_bytes()),
+        Sha256::digest(form),
+        (form.len() >= 16).then(|| byte_sum(form)),
+    )
+}
 impl EchoFilter {
     pub(crate) fn new(credentials: &[&[u8]]) -> Self {
         let mut patterns = Vec::new();
+        let mut literal = Vec::new();
+        let mut decimal_free = Vec::new();
+        let mut decimal_only = false;
+        let mut hex_free = Vec::new();
+        let mut hex_only = false;
         for credential in credentials.iter().copied().filter(|c| !c.is_empty()) {
+            literal.push(echo_pattern(credential));
             let text = String::from_utf8_lossy(credential);
             let escaped = Zeroizing::new(serde_json::to_string(&*text).expect("string encoding"));
             let forms = [
@@ -199,31 +222,125 @@ impl EchoFilter {
                 ),
                 Zeroizing::new(escaped.as_bytes()[1..escaped.len() - 1].to_vec()),
             ];
-            for form in &forms {
+            // Hexadecimal command payloads are outside structural admission. Only a raw
+            // or JSON-escaped credential can span their generated job field and its envelope;
+            // encoded occurrences wholly inside arbitrary payloads retain the append checks.
+            for form in [&forms[0], &forms[6]] {
+                let normalized = Zeroizing::new(
+                    form.iter()
+                        .copied()
+                        .filter(|b| !b.is_ascii_hexdigit())
+                        .collect::<Vec<_>>(),
+                );
+                if normalized.is_empty() {
+                    hex_only = true;
+                } else {
+                    hex_free.push(echo_pattern(&normalized));
+                }
+            }
+            for (index, form) in forms.iter().enumerate() {
                 // Coarse prefilters avoid digesting ordinary windows, even for short keys.
                 // A candidate still needs both cryptographic digest checks.
-                patterns.push((
-                    form.len(),
-                    (form.len() >= 16).then(|| rolling_hash(form.as_slice()) as u16),
-                    Sha256::digest(rolling_hash(form.as_slice()).to_be_bytes()),
-                    Sha256::digest(form.as_slice()),
-                    (form.len() >= 16).then(|| byte_sum(form.as_slice())),
-                ));
+                patterns.push(echo_pattern(form));
+                let normalized = Zeroizing::new(
+                    form.iter()
+                        .copied()
+                        .filter(|b| !b.is_ascii_digit())
+                        .collect::<Vec<_>>(),
+                );
+                if normalized.is_empty() {
+                    decimal_only = true;
+                } else if !matches!(index, 1 | 2) {
+                    // Hex encodings cannot cross a bounded decimal with non-hex borders.
+                    // Exact encodings and all-digit forms retain their existing checks.
+                    decimal_free.push(echo_pattern(&normalized));
+                }
             }
         }
         patterns.sort();
         patterns.dedup();
-        Self(patterns)
+        literal.sort();
+        literal.dedup();
+        decimal_free.sort();
+        decimal_free.dedup();
+        hex_free.sort();
+        hex_free.dedup();
+        Self {
+            representations: patterns,
+            literal,
+            decimal_free,
+            decimal_only,
+            hex_free,
+            hex_only,
+        }
     }
 
     pub(crate) fn merge(&mut self, other: Self) {
-        self.0.extend(other.0);
-        self.0.sort();
-        self.0.dedup();
+        for (ours, theirs) in [
+            (&mut self.representations, other.representations),
+            (&mut self.literal, other.literal),
+            (&mut self.decimal_free, other.decimal_free),
+            (&mut self.hex_free, other.hex_free),
+        ] {
+            ours.extend(theirs);
+            ours.sort();
+            ours.dedup();
+        }
+        self.decimal_only |= other.decimal_only;
+        self.hex_only |= other.hex_only;
+    }
+
+    /// One literal pass, with no decoding or replacement, over the exact append plaintext.
+    pub(crate) fn literal_match(&self, bytes: &[u8]) -> Result<bool, String> {
+        work::scope(|| Self::contains_patterns(&self.literal, bytes))
+    }
+
+    /// Erasing decimal digits overapproximates every symbolic decimal width and value.
+    /// Digits inside retained literals are erased too: false positives refuse admission.
+    /// Only digests survive registration; neither usable keys nor decoded history are retained.
+    pub(crate) fn symbolic_match(&self, template: &[u8]) -> Result<bool, String> {
+        work::scope(|| {
+            work::charge(template.len())?;
+            if self.decimal_only {
+                return Ok(true);
+            }
+            let normalized = Zeroizing::new(
+                template
+                    .iter()
+                    .copied()
+                    .filter(|b| !b.is_ascii_digit())
+                    .collect::<Vec<_>>(),
+            );
+            Self::contains_patterns(&self.decimal_free, &normalized)
+        })
+    }
+
+    /// Command intents generate hexadecimal job identifiers. Erasing the whole domain
+    /// overapproximates their unknown bytes and spans into the surrounding fixed envelope.
+    /// Retained references and fixed text lose hex characters too, conservatively refusing.
+    pub(crate) fn symbolic_hex_match(&self, template: &[u8]) -> Result<bool, String> {
+        work::scope(|| {
+            work::charge(template.len())?;
+            if self.hex_only {
+                return Ok(true);
+            }
+            let normalized = Zeroizing::new(
+                template
+                    .iter()
+                    .copied()
+                    .filter(|b| !b.is_ascii_hexdigit())
+                    .collect::<Vec<_>>(),
+            );
+            Self::contains_patterns(&self.hex_free, &normalized)
+        })
     }
 
     fn contains(&self, bytes: &[u8]) -> Result<bool, String> {
-        for (length, coarse, fingerprint, digest, sum) in &self.0 {
+        Self::contains_patterns(&self.representations, bytes)
+    }
+
+    fn contains_patterns(patterns: &[EchoPattern], bytes: &[u8]) -> Result<bool, String> {
+        for (length, coarse, fingerprint, digest, sum) in patterns {
             work::charge(1)?;
             if bytes.len() < *length {
                 continue;
@@ -261,7 +378,7 @@ impl EchoFilter {
 
     fn marker(&self) -> Result<String, String> {
         if self.contains(crate::redaction::MARKER.as_bytes())? {
-            Err("protected output unavailable".into())
+            Err(crate::poc::wait::PROTECTED_UNAVAILABLE.into())
         } else {
             Ok(crate::redaction::MARKER.into())
         }
@@ -280,7 +397,7 @@ impl EchoFilter {
     ) -> Result<Zeroizing<Vec<u8>>, String> {
         work::scope(|| {
             work::charge(bytes.len())?;
-            if self.0.is_empty() {
+            if self.representations.is_empty() {
                 return Ok(Zeroizing::new(bytes.to_vec()));
             }
             let original = Value::String(String::from_utf8_lossy(bytes).into_owned());
@@ -313,7 +430,7 @@ impl EchoFilter {
     ) -> Result<Value, String> {
         work::charge(512)?;
         if depth > 16 {
-            return Err("protected output withheld: encoding depth exceeded".into());
+            return Err(crate::poc::wait::ENCODING_DEPTH.into());
         }
         Ok(match value {
             Value::String(text) => {
@@ -395,17 +512,12 @@ impl EchoFilter {
                 let mut output = serde_json::Map::new();
                 for (key, value) in values {
                     let key = self.visit(&Value::String(key.clone()), depth + 1, boundary, seen)?;
-                    let key = key
-                        .as_str()
-                        .ok_or("inference protected field name invalid")?
-                        .to_owned();
+                    let key = key.as_str().ok_or(crate::poc::wait::FIELD_NAME)?.to_owned();
                     if output
                         .insert(key, self.visit(value, depth + 1, boundary, seen)?)
                         .is_some()
                     {
-                        return Err(
-                            "inference output withheld after protected field collision".into()
-                        );
+                        return Err(crate::poc::wait::FIELD_COLLISION.into());
                     }
                 }
                 output.into()
@@ -452,10 +564,7 @@ fn escaped_literals(text: &str) -> Result<Vec<String>, String> {
                 if fragment.contains('\\') {
                     count += 1;
                     if count > 4096 {
-                        return Err(
-                            "inference output escaped fragment count exceeds the local bound"
-                                .into(),
-                        );
+                        return Err(crate::poc::wait::FRAGMENTS.into());
                     }
                     if let Ok(decoded) = serde_json::from_str::<String>(fragment) {
                         fragments.push(decoded);

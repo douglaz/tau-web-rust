@@ -18,8 +18,8 @@ fn scope() -> WorkerGlobalScope {
 
 fn why(context: &str) -> impl Fn(JsValue) -> String + '_ {
     move |e| match e.dyn_ref::<js_sys::Error>() {
-        Some(error) => format!("{context}: {}", String::from(error.message())),
-        None => format!("{context}: {e:?}"),
+        Some(error) => crate::poc::wait::storage_error(context, &String::from(error.message())),
+        None => crate::poc::wait::storage_error(context, &format!("{e:?}")),
     }
 }
 
@@ -39,7 +39,11 @@ pub struct Opfs {
 impl Opfs {
     /// The directory, or `None` if it does not exist and `create` is not set.
     async fn directory(&self, create: bool) -> Result<Option<FileSystemDirectoryHandle>, String> {
-        let root = wait(scope().navigator().storage().get_directory(), "OPFS").await?;
+        let root = wait(
+            scope().navigator().storage().get_directory(),
+            crate::poc::wait::OPFS_CONTEXT,
+        )
+        .await?;
         let root: FileSystemDirectoryHandle = root.unchecked_into();
         let options = FileSystemGetDirectoryOptions::new();
         options.set_create(create);
@@ -59,7 +63,7 @@ impl Opfs {
         let directory = self
             .directory(create)
             .await?
-            .ok_or_else(|| format!("{DIRECTORY}: not found"))?;
+            .ok_or_else(crate::poc::wait::directory_missing)?;
         let options = FileSystemGetFileOptions::new();
         options.set_create(create);
         let file = wait(directory.get_file_handle_with_options(name, &options), name).await?;
@@ -114,11 +118,17 @@ impl Storage for Opfs {
         crate::testonly::hold_move().await?;
         let file = self.file(from, false).await?;
         let move_to: Function = Reflect::get(&file, &"move".into())
-            .map_err(why("move"))?
+            .map_err(why(crate::poc::wait::MOVE_CONTEXT))?
             .dyn_into()
-            .map_err(|_| "move: FileSystemHandle.move() is not available".to_string())?;
-        let promise = move_to.call1(&file, &to.into()).map_err(why("move"))?;
-        wait(promise.unchecked_into(), &format!("move {from} to {to}")).await?;
+            .map_err(|_| crate::poc::wait::MOVE_UNAVAILABLE.to_string())?;
+        let promise = move_to
+            .call1(&file, &to.into())
+            .map_err(why(crate::poc::wait::MOVE_CONTEXT))?;
+        wait(
+            promise.unchecked_into(),
+            &crate::poc::wait::move_context(from, to),
+        )
+        .await?;
         Ok(())
     }
 }
