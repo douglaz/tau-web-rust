@@ -40,6 +40,13 @@ pub fn needles() -> Vec<(String, Vec<u8>)> {
         crate::semantic_domains::auxiliary::auxiliary_absence(),
     );
     let mut needles = Vec::new();
+    for encoded in [
+        vec![0x31; 32],
+        hex::encode([0x31; 32]).into_bytes(),
+        STANDARD_NO_PAD.encode(hex::encode([0x31; 32])).into_bytes(),
+    ] {
+        needles.push(("provider fixture credential".into(), encoded));
+    }
     let phrases = std::iter::once("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about")
         .chain(include_str!("../../tests/vectors/seed-backup-collisions.txt").lines());
     for (fixture, mnemonic) in phrases.enumerate() {
@@ -123,6 +130,9 @@ pub fn needles() -> Vec<(String, Vec<u8>)> {
         "test_poc_model",
         "test_poc_profile",
         "test_poc_register_credential",
+        "test_procurement_origin",
+        "procurement_create_intent",
+        "procurement_associated",
         "poc_model_next",
         "fixture-call-",
         "poc_progress_publication",

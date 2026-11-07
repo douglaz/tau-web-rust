@@ -195,8 +195,16 @@ impl<S: Storage> Store<S> {
             let size = chunks.iter().map(|c| c.len()).sum::<usize>();
             crate::poc::inference::work::charge(self.scans.work_cost(size))?;
             let mut safe = self.scans.scan(chunks)?;
-            cache.resize_with(self.poc_credential_filters.len(), Default::default);
-            for (filter, cache) in self.poc_credential_filters.iter().zip(cache) {
+            cache.resize_with(
+                self.poc_credential_filters.len() + self.provider_filters.len(),
+                Default::default,
+            );
+            for (filter, cache) in self
+                .poc_credential_filters
+                .iter()
+                .chain(&self.provider_filters)
+                .zip(cache)
+            {
                 safe = filter.protect_bytes_cached(&safe, cache)?;
             }
             Ok(safe)
@@ -204,7 +212,11 @@ impl<S: Storage> Store<S> {
     }
 
     pub(crate) fn poc_output_is_safe(&self, bytes: &[u8]) -> Result<bool, String> {
-        for filter in &self.poc_credential_filters {
+        for filter in self
+            .poc_credential_filters
+            .iter()
+            .chain(&self.provider_filters)
+        {
             if filter.protect_bytes(bytes)?.as_slice() != bytes {
                 return Ok(false);
             }

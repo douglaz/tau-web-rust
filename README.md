@@ -53,6 +53,9 @@ explicit app Lock and pagehide end them.
 
 ## The harness
 
+The bounded served-page purchase flow and its local HTTPS checks are described in
+[Browser provisioning](docs/provisioning.md).
+
 `src/` is the harness worker's wasm module, built for `wasm32-unknown-unknown` on spec ADR-0024's
 configuration, beside the pinned inputs above. It runs in a dedicated worker the page starts,
 because spec `STA-1` says "A single **harness worker** MUST be the only writer of durable state".

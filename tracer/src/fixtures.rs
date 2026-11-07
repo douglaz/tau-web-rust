@@ -241,7 +241,8 @@ struct SshSession {
 
 impl SshSession {
     fn admit(&self, user: &str, key: &PublicKey) -> Auth {
-        let admitted = user == tau_web::testonly::SSH_USER
+        let admitted = (user == tau_web::testonly::SSH_USER
+            || (user == "arch" && self.machine.root.join("provisioning").is_file()))
             && std::fs::read_to_string(self.machine.root.join("authorized_keys"))
                 .ok()
                 .is_some_and(|file| {
@@ -366,6 +367,16 @@ impl server::Handler for SshSession {
         }
         let mapped = self.machine.map(data);
         let mut command = tokio::process::Command::new("sh");
+        if self.machine.root.join("provisioning").is_file() {
+            command.env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    self.machine.root.join("bin").display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            );
+        }
         if mapped.len() > tau_web::jobs::MAX_LAUNCH_BYTES {
             // Mapping machine paths to a longer scratch directory must not introduce
             // an argument-size refusal absent from the original accepted launch.
@@ -705,6 +716,8 @@ impl SessionGate {
 }
 
 pub struct Relay {
+    /// Only the provisioning fixture maps the documentation address to its own local sshd.
+    pub fixture_port: Arc<Mutex<Option<u16>>>,
     pub session_gate: Arc<SessionGate>,
     /// `wss://127.0.0.1:<port>/`, the URL the AUTH's `relay` tag must name.
     pub url: String,
@@ -719,6 +732,7 @@ pub struct Relay {
 }
 
 struct RelayState {
+    fixture_port: Arc<Mutex<Option<u16>>>,
     session_gate: Arc<SessionGate>,
     url: String,
     passes: Arc<Mutex<Vec<Pass>>>,
@@ -745,7 +759,9 @@ pub async fn relay(seen: Observed, tls: TlsAcceptor, passes: Vec<Pass>, hold: bo
         Semaphore::MAX_PERMITS
     }));
     let session_gate = Arc::new(SessionGate::default());
+    let fixture_port = Arc::new(Mutex::new(None));
     let state = Arc::new(RelayState {
+        fixture_port: fixture_port.clone(),
         session_gate: session_gate.clone(),
         url: url.clone(),
         passes: Arc::new(Mutex::new(passes)),
@@ -798,6 +814,7 @@ pub async fn relay(seen: Observed, tls: TlsAcceptor, passes: Vec<Pass>, hold: bo
         }
     });
     Relay {
+        fixture_port,
         session_gate,
         url,
         pace,
@@ -1023,7 +1040,15 @@ async fn relay_connection(mut ws: Ws, path: &str, state: &RelayState, log: &Log)
     // 844e834). Until OK the socket is still read, and a binary frame closes it with 1002 and is
     // not forwarded (WIR-8), even one that is ready when the dial completes (`pre_ok`). WIR-8
     // says nothing of a text frame here, so it is logged and otherwise ignored.
-    let address = format!("{}:{}", path.0, path.1);
+    let fixture_port = *state.fixture_port.lock().unwrap();
+    let address = match fixture_port {
+        Some(port) if path.0 == "192.0.2.10" && path.1 == 22 => format!("127.0.0.1:{port}"),
+        Some(_) => {
+            close(&mut ws, 1008, log).await;
+            return;
+        }
+        None => format!("{}:{}", path.0, path.1),
+    };
     log.event(Event::Dial(address.clone()));
     let dial = async {
         let tcp = TcpStream::connect(&address).await?;

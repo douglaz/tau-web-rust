@@ -80,6 +80,9 @@ pub(crate) fn end() {
 pub(crate) fn key_is_set() -> bool {
     KEY.with_borrow(Option::is_some)
 }
+pub(crate) fn response_pending() -> bool {
+    COMMAND_RESPONSES.get() != 0
+}
 
 pub(crate) async fn configure(
     endpoint: String,
@@ -93,7 +96,7 @@ pub(crate) async fn configure(
     if let Some(why) = local.dispatch_refusal() {
         return Err(why.into());
     }
-    if COMMAND_RESPONSES.get() != 0 {
+    if response_pending() {
         return Err(
             "inference configuration refused: command response pending; retry after it completes"
                 .into(),

@@ -25,7 +25,7 @@ pub struct Enrollment {
     pub approve_maintained_access: bool,
 }
 
-fn eligible_pass(allocation: &Metadata) -> Option<&Identity> {
+pub(super) fn eligible_pass(allocation: &Metadata) -> Option<&Identity> {
     allocation
         .entries()
         .iter()
@@ -74,6 +74,18 @@ impl<S: Storage> Store<S> {
             } else {
                 Err("stored target is immutable; use a fresh store and a new machine name".into())
             };
+        }
+        if let Some(purchase) = &self.procurement {
+            if purchase.target.as_ref() != Some(&record.target)
+                || purchase.machine != record.target.machine
+                || purchase.identity != record.machine_identity
+                || purchase.relay_identity != record.relay_identity
+                || purchase.class_answer != record.class_answer
+                || record.access != Access::ad_hoc()
+            {
+                return Err("purchase handoff identity conflicts".into());
+            }
+            return Ok((self.dispatch.clone(), self.allocation().clone()));
         }
         if !self.dispatch.approved_entries.is_empty() || !self.poc_targets.is_empty() {
             return Err(
@@ -150,6 +162,9 @@ impl<S: Storage> Store<S> {
 
     pub async fn poc_enroll(&mut self, enrollment: Enrollment) -> Result<(), String> {
         self.authority.ordinary()?;
+        if self.procurement.is_some() {
+            return Err("A purchase already owns this store; Resume that machine.".into());
+        }
         if self.inference.ended {
             return Err("sessions ended".into());
         }
@@ -262,12 +277,17 @@ impl<S: Storage> Store<S> {
         if eligible_pass(self.allocation()) != Some(&record.relay_identity) {
             return Err("enrolled relay pass is no longer transport authority".into());
         }
+        self.poc_identity_public_keys(machine, &record.machine_identity)
+    }
+
+    pub(super) fn poc_identity_public_keys(
+        &self,
+        machine: &str,
+        identity: &Identity,
+    ) -> Result<Value, String> {
         let seed = self.seed().ok_or("seed unavailable")?;
         let client = seed
-            .ssh_client_key(
-                record.machine_identity.derivation_version,
-                record.machine_identity.index,
-            )
+            .ssh_client_key(identity.derivation_version, identity.index)
             .map_err(|_| "client public key unavailable")?;
         let relay = self.relay_key().ok_or("relay public key unavailable")?;
         let mut wire = Vec::with_capacity(51);
@@ -282,6 +302,21 @@ impl<S: Storage> Store<S> {
         Ok(
             json!({"machine":machine,"authorized_keys":authorized_keys,"relay_pubkey":hex::encode(relay.public_key())}),
         )
+    }
+
+    pub(super) fn purchase_target_record(
+        target: TargetRecord,
+        identity: Identity,
+        relay_identity: Identity,
+        class_answer: ClassAnswer,
+    ) -> Record {
+        Record {
+            target,
+            machine_identity: identity,
+            relay_identity,
+            class_answer,
+            access: Access::ad_hoc(),
+        }
     }
 }
 
@@ -347,16 +382,18 @@ impl<S: Storage + Clone> Store<S> {
     pub(crate) async fn test_poc_journal(&self, needle: &str) -> Result<Value, String> {
         let mut reader = Store::new(self.storage.clone(), DataKey(self.key.0), self.id.clone());
         let mut contains = false;
+        let mut provider_protection = 0;
         for number in 0..self.next {
             let bytes = self.storage.read(&number.to_string()).await?;
             let event = reader.open(number, &bytes)?;
+            provider_protection += usize::from(matches!(event, Event::ProviderProtection(_)));
             contains |= serde_json::to_string(&event)
                 .map_err(|_| "fixture event encoding")?
                 .contains(needle);
             reader.previous = Address(Sha256::digest(&bytes).into());
         }
         Ok(
-            json!({"contains":contains,"records":self.next,"machines":self.allocation().next_unused().machines,"passes":self.allocation().next_unused().passes,"targets":self.poc_targets.len()}),
+            json!({"contains":contains,"records":self.next,"provider_protection":provider_protection,"machines":self.allocation().next_unused().machines,"passes":self.allocation().next_unused().passes,"targets":self.poc_targets.len()}),
         )
     }
 }

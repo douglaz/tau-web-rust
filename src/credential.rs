@@ -80,6 +80,11 @@ impl Credential for SessionInferenceKey {
     const ROW: u8 = 2;
     const NAME: &'static str = "Inference **session** key";
 }
+impl sealed::Sealed for crate::poc::provisioning::Account {}
+impl Credential for crate::poc::provisioning::Account {
+    const ROW: u8 = 1;
+    const NAME: &'static str = "Vendor API credential, used through a typed adapter";
+}
 impl Drop for SessionInferenceKey {
     fn drop(&mut self) {
         zeroize::Zeroize::zeroize(&mut self.0);
@@ -359,6 +364,7 @@ mod tests {
             (name, T::ROW, T::NAME)
         }
         vec![
+            entry::<crate::poc::provisioning::Account>(),
             entry::<crate::seed::Seed>(),
             entry::<SshClientKey>(),
             entry::<AttestSenderKey>(),

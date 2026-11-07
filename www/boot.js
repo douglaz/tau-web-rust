@@ -97,14 +97,19 @@ const renderSetup = (store) => {
   const entries = approved.length ? approved.map(m => m.entry) : store.setup_offer ?? [];
   if (!entries.length) return;
   paragraph(slot, approved.length ? 'Approved setup' : 'Approve the setup');
-  paragraph(slot, "Prices are fixture data, not a vendor's price.");
+  const purchase = Boolean(store.procurement?.phase);
+  if (!purchase) paragraph(slot, "Prices are fixture data, not a vendor's price.");
   for (const entry of entries) {
-    paragraph(slot, `${entry.machine}: ${entry.vendor}; ${entry.product}; ${entry.region}; ${entry.cost.amount} ${entry.cost.unit} per ${entry.cost.period}.`);
+    const billing = entry.cost.period.billing;
+    const period = billing ? `${billing.count} ${billing.interval}` : entry.cost.period;
+    paragraph(slot, `${entry.machine}: ${entry.vendor}; ${entry.product}; ${entry.region}; ${entry.cost.amount} ${entry.cost.unit} per ${period}.`);
   }
-  const monthly = entries.reduce((sum, entry) => sum + BigInt(entry.cost.amount), 0n);
-  paragraph(slot, `Setup total: ${monthly} sat per month; ${monthly * 12n} sat per year.`);
+  if (!purchase) {
+    const monthly = entries.reduce((sum, entry) => sum + BigInt(entry.cost.amount), 0n);
+    paragraph(slot, `Setup total: ${monthly} sat per month; ${monthly * 12n} sat per year.`);
+  }
   paragraph(slot, 'Each machine will be bound alone in its own session.');
-  paragraph(slot, "Recurring means each machine is billed by its vendor every month from the moment it is created until it is destroyed or abandoned, whether or not setup finishes. tau-web never pays for a machine and cannot stop a vendor's billing; only you can.");
+  paragraph(slot, purchase ? 'The purchase card records the approved billing interval and currency. App Lock and task Abandon do not cancel the VM or its billing. Payment remains external, and this page does not change automatic renewal.' : "Recurring means each machine is billed by its vendor every month from the moment it is created until it is destroyed or abandoned, whether or not setup finishes. tau-web never pays for a machine and cannot stop a vendor's billing; only you can.");
   if (!approved.length) {
     if (store.lifecycle_state === 'ended') return;
     const button = document.createElement('button');
@@ -407,7 +412,121 @@ const renderDelivery = (section, machine, store) => {
   }
   section.append(card);
 };
+let providerCatalogue = null;
+let providerSelectionDirty = true;
+let providerReviewToken = null;
+let providerDisplayedBilling = null;
+let providerDisplayedSelection = null;
+const providerRequest = action => worker.postMessage({provider_request: action});
+const renderProvider = (store, enabled) => {
+  $('provider-key-status').textContent = store.provider_configuration?.key_set ? 'Provider key set.' : 'Provider key unset; re-entry is required.';
+  const purchase = store.procurement ?? {};
+  providerDisplayedBilling = purchase.billing ? structuredClone(purchase.billing) : null;
+  providerDisplayedSelection = purchase.selection ? structuredClone(purchase.selection) : null;
+  const renewal = purchase.phase === 'terms_changed';
+  const reviewToken = purchase.selection ? JSON.stringify(purchase.selection) : null;
+  if (providerReviewToken !== reviewToken) {
+    $('provider-approve-charge').checked = false;
+    $('provider-approve-access').checked = false;
+    providerReviewToken = reviewToken;
+  }
+  if (renewal) {
+    $('provider-machine').value = purchase.machine;
+    $('provider-relay').value = purchase.relay;
+    $('provider-class').value = purchase.class_answer;
+  }
+  if (store.provider_catalogue) {
+    providerCatalogue = store.provider_catalogue;
+    const catalogue = $('provider-catalogue-view'); catalogue.replaceChildren();
+    const offerSelect = $('provider-offer'); offerSelect.replaceChildren(new Option('Choose a fetched offer', ''));
+    for (const [kind, offers] of [['fixed', providerCatalogue.offers.templates], ['custom', providerCatalogue.offers.custom_template ?? []]]) {
+      for (const offer of offers) {
+        const terms = offer.cost_plan ?? offer;
+        const hourly = terms.interval_type === 'hour';
+        const label = `${kind}: ${offer.name}; ${offer.region?.name}; ${kind === 'fixed' ? `${offer.cpu} CPU, ${offer.memory} memory bytes, ${offer.disk_size} disk bytes; ${terms.amount} ${terms.currency} smallest units; ` : 'choose resources and request price; '}${terms.interval_amount} ${terms.interval_type}${hourly ? ' — unsupported credit-only hourly plan' : ''}`;
+        paragraph(catalogue, label);
+        const option = new Option(label, `${kind}:${offer.id}`); option.disabled = hourly; offerSelect.add(option);
+        if (kind === 'custom') { const bounds = document.createElement('pre'); bounds.textContent = JSON.stringify(offer, null, 2); catalogue.append(bounds); }
+      }
+    }
+    const images = $('provider-image'); images.replaceChildren(new Option('Choose a fetched image', ''));
+    for (const image of providerCatalogue.images) {
+      const unsupported = image.encrypted || image.distribution !== 'archlinux' || (image.default_username && image.default_username !== 'arch');
+      const label = `${image.distribution} ${image.flavour} ${image.version}${unsupported ? ' — unsupported (requires unencrypted Arch without console unlock)' : ''}`;
+      const option = new Option(label, String(image.id)); option.disabled = unsupported; images.add(option);
+    }
+    providerSelectionDirty = true; $('provider-approve-charge').checked = false;
+  }
+  if (store.provider_selection_reviewed || renewal) providerSelectionDirty = false;
+  const selection = $('provider-selection-view'); selection.replaceChildren();
+  if (purchase.selection) {
+    const c = purchase.selection.charge;
+    paragraph(selection, `Recurring charge: ${c.amount} ${c.currency === 'BTC' ? 'millisats' : c.currency + ' cents'} per ${c.interval_amount} ${c.interval_type}. Tax and processing fee are shown on the initial invoice.`);
+    const exact = document.createElement('pre'); exact.textContent = JSON.stringify(purchase.selection, null, 2); selection.append(exact);
+  }
+  const progress = $('provider-progress'); progress.replaceChildren();
+  if (purchase.phase) {
+    paragraph(progress, `Saved purchase ${purchase.machine}: ${purchase.phase}. VM ${purchase.vm_id ?? 'not associated'}; SSH registration ${purchase.ssh_key_id ?? 'not established'}.`);
+    paragraph(progress, `Provider account public identity: ${purchase.account}`);
+    paragraph(progress, `Provider auto-renewal policy: ${purchase.auto_renewal_enabled === true ? 'enabled' : purchase.auto_renewal_enabled === false ? 'disabled' : 'unknown'}. This page does not change that policy.`);
+    if (purchase.billing) {
+      const quote = purchase.billing.terms;
+      paragraph(progress, `Initial Lightning quote for VM ${purchase.billing.vm_id}: amount ${quote.amount}, tax ${quote.tax}, processing fee ${quote.processing_fee} (${quote.currency === 'BTC' ? 'millisats' : quote.currency + ' cents'}); ${quote.time} seconds for one approved billing period. Review these exact terms before issuing. Refresh may update this quote before issuance.`);
+    }
+    if (purchase.payment) {
+      const pay = purchase.payment;
+      paragraph(progress, `Payment ${pay.id} for VM ${pay.vm_id}: ${pay.is_paid ? 'paid' : 'payment pending'}; expires ${pay.expires}. Amount ${pay.amount}, tax ${pay.tax}, processing fee ${pay.processing_fee} (${pay.currency === 'BTC' ? 'millisats' : pay.currency + ' cents'}).`);
+      const invoice = document.createElement('pre'); invoice.textContent = pay.data.lightning; progress.append(invoice);
+    }
+    if (purchase.public_keys) {
+      paragraph(progress, 'Relay public key — enroll this separately with the relay operator:');
+      const publicKey = document.createElement('pre'); publicKey.textContent = purchase.public_keys.relay_pubkey; progress.append(publicKey);
+    }
+    if (purchase.target) paragraph(progress, `Published pin saved for VM ${purchase.vm_id}: ${purchase.target.pin}. Bind ${purchase.machine} below to use the existing configuration runner.`);
+  }
+  const canReview = !purchase.phase || ['approved', 'registered', 'terms_changed'].includes(purchase.phase);
+  for (const control of $('provider-selection-form').elements) control.disabled = !enabled || !canReview;
+  for (const control of $('provider-approval-form').elements) control.disabled = !enabled || (Boolean(purchase.phase) && !renewal) || providerSelectionDirty || !purchase.selection;
+  if (renewal) {
+    for (const name of ['provider-machine', 'provider-relay', 'provider-class']) $(name).disabled = true;
+  }
+  $('provider-resume').disabled = !enabled || !purchase.phase;
+  $('provider-invoice').disabled = !enabled || purchase.phase !== 'initial_invoice' || !purchase.billing;
+};
+$('provider-key-form').addEventListener('submit', event => {
+  event.preventDefault();
+  const field = $('provider-key'), bytes = new TextEncoder().encode(field.value); field.value = '';
+  try { worker.postMessage({provider_configure: {key: bytes}}, [bytes.buffer]); }
+  finally { if (bytes.byteLength) bytes.fill(0); }
+});
+$('provider-catalogue').addEventListener('click', () => providerRequest({action: 'catalogue'}));
+$('provider-selection-form').addEventListener('input', () => {
+  providerSelectionDirty = true; $('provider-approve-charge').checked = false;
+  for (const control of $('provider-approval-form').elements) control.disabled = true;
+});
+$('provider-selection-form').addEventListener('submit', event => {
+  event.preventDefault();
+  try {
+    const [kind, id] = $('provider-offer').value.split(':');
+    providerRequest({action: 'select', choice: {offer_id: Number(id), image_id: Number($('provider-image').value), resources: kind === 'custom' ? JSON.parse($('provider-resources').value) : null}});
+  } catch { paragraph($('provider-selection-view'), 'Enter valid custom resource JSON.'); }
+});
+$('provider-approval-form').addEventListener('submit', event => {
+  event.preventDefault(); if (providerSelectionDirty) return;
+  providerRequest({action: 'approve', selection: providerDisplayedSelection, approval: {machine: $('provider-machine').value, relay: $('provider-relay').value, class_answer: $('provider-class').value, approve_charge: $('provider-approve-charge').checked, approve_maintained_access: $('provider-approve-access').checked}});
+});
+$('provider-resume').addEventListener('click', () => providerRequest({action: 'resume'}));
+$('provider-invoice').addEventListener('click', () => providerRequest({action: 'initial_invoice', billing: providerDisplayedBilling}));
 const clearPocInputs = () => {
+  providerCatalogue = null;
+  providerSelectionDirty = true;
+  providerReviewToken = null;
+  providerDisplayedBilling = null;
+  providerDisplayedSelection = null;
+  $('provider-catalogue-view').replaceChildren();
+  $('provider-selection-view').replaceChildren();
+  $('provider-progress').replaceChildren();
+  $('provider-key').value = '';
   pocDeclarationDrafts.clear();
   for (const field of $('poc').querySelectorAll('input')) {
     if (field.type === 'checkbox') field.checked = false;
@@ -421,6 +540,7 @@ const renderPoc = (store) => {
     !['suspended', 'reconciling', 'ended'].includes(store.lifecycle_state);
   $('poc').hidden = store.state !== 'unlocked';
   for (const control of $('poc').querySelectorAll('input, select, button')) control.disabled = !enabled;
+  renderProvider(store, enabled);
   $('poc-key-status').textContent = store.poc_configuration?.key_set === true ? 'Key set.' : store.poc_configuration?.key_set === false ? 'Key unset.' : 'Key status unavailable.';
   if (['locked', 'none', 'refused', 'lost', 'starting'].includes(store.state) || store.lifecycle_state === 'ended') clearPocInputs();
   // Working/lifecycle reports can omit sessions. Prune only a full unlocked report;

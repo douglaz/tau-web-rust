@@ -13,11 +13,25 @@ pub struct RecurringCost {
 #[serde(rename_all = "snake_case")]
 pub enum Unit {
     Sat,
+    Millisat,
+    EurCent,
+    UsdCent,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Period {
     Month,
+    Billing {
+        count: u64,
+        interval: BillingInterval,
+    },
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BillingInterval {
+    Day,
+    Month,
+    Year,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -182,6 +196,42 @@ pub enum BindingRefusal {
 }
 
 impl Dispatch {
+    /// Procurement has its own exact charge approval and no satoshi conversion or totals.
+    pub(crate) fn apply_poc_purchase(
+        &mut self,
+        allocation: &mut Metadata,
+        approved: ApprovedEntry,
+        answer: ClassAnswer,
+    ) -> Result<(), String> {
+        if !self.approved_entries.is_empty() || approved.identity.family != Family::Machines {
+            return Err("purchase requires a fresh setup".into());
+        }
+        approved
+            .access
+            .as_ref()
+            .ok_or("purchase access missing")?
+            .validate()?;
+        allocation
+            .apply(&allocation::Event::Reserve(approved.identity.clone()))
+            .map_err(|e| e.to_string())?;
+        let name = approved.entry.machine.clone();
+        self.associations.push(Association {
+            target: Target::AllocationIndex(approved.identity.index),
+            entry: name.clone(),
+        });
+        self.current_installations.entry(name.clone()).or_default();
+        self.approved_entries.insert(
+            name,
+            ApprovedMachine {
+                approved,
+                answer: Some(answer),
+                class: Some(answer.class()),
+                declaration: None,
+                requirements: Vec::new(),
+            },
+        );
+        Ok(())
+    }
     /// The entry and its index must be journaled, then its class and access model, before binding.
     /// Access at binding is an implementation reading of ARC-44's installation boundary.
     pub fn check_binding(&self, entry: &str) -> Result<(), BindingRefusal> {

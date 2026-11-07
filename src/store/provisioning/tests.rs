@@ -1,0 +1,2017 @@
+use super::*;
+use crate::poc::provisioning::tests as fixtures;
+
+struct Fixed;
+impl Kdf for Fixed {
+    async fn derive(&self, _: LocalPassphrase, _: &Salt) -> Result<WrappingKey, String> {
+        Ok(WrappingKey([9; 32]))
+    }
+}
+fn pass() -> LocalPassphrase {
+    LocalPassphrase::new(b"local provisioning fixture".to_vec())
+}
+fn ready() -> Store<MemoryStorage> {
+    let mut s = block_on(create(MemoryStorage::default(), &Fixed, pass())).unwrap();
+    block_on(s.seed_backup(allocation::Completion::Skipped)).unwrap();
+    s
+}
+fn reopen(s: &Store<MemoryStorage>) -> Store<MemoryStorage> {
+    block_on(unlock(
+        MemoryStorage::with_files(s.storage.files()),
+        &Fixed,
+        pass(),
+    ))
+    .unwrap()
+}
+struct Fixture {
+    custom: bool,
+    current_selection: Selection,
+    fail_catalogue: bool,
+    returned_popularity: Option<f64>,
+    billing_terms: BillingTerms,
+    fail_quote: bool,
+    protection_fault: Option<(String, MemoryStorage, Fault)>,
+    prepared_protection: Option<crate::poc::inference::EchoFingerprints>,
+    response_filter: Option<crate::poc::inference::EchoFilter>,
+    response_echo: Option<String>,
+    vm_change: Option<(String, Value)>,
+    created: Option<String>,
+    advance_before_create: u64,
+    calls: Vec<String>,
+    machines: Vec<Value>,
+    payments: Vec<Value>,
+    lose_create: bool,
+    lose_invoice: bool,
+    lose_registration: bool,
+    account: String,
+    clock: u64,
+    fault_after: Option<(String, MemoryStorage, Fault)>,
+}
+impl Fixture {
+    fn new(custom: bool) -> Self {
+        Self {
+            custom,
+            current_selection: fixtures::selection(custom),
+            fail_catalogue: false,
+            returned_popularity: None,
+            billing_terms: fixtures::billing_terms(),
+            fail_quote: false,
+            protection_fault: None,
+            prepared_protection: None,
+            response_filter: None,
+            response_echo: None,
+            vm_change: None,
+            created: None,
+            advance_before_create: 0,
+            calls: Vec::new(),
+            machines: Vec::new(),
+            payments: Vec::new(),
+            lose_create: false,
+            lose_invoice: false,
+            lose_registration: false,
+            account: "a".repeat(64),
+            clock: timestamp("2026-11-06T14:00:00Z").unwrap(),
+            fault_after: None,
+        }
+    }
+    fn count(&self, request: &str) -> usize {
+        self.calls.iter().filter(|c| c.as_str() == request).count()
+    }
+}
+impl Api for Fixture {
+    fn prepare(
+        &mut self,
+        method: &str,
+        path: &str,
+        _: Option<&Value>,
+    ) -> Result<Option<crate::poc::inference::EchoFingerprints>, String> {
+        if self
+            .protection_fault
+            .as_ref()
+            .is_some_and(|(route, _, _)| *route == format!("{method} {path}"))
+        {
+            let (_, storage, fault) = self.protection_fault.take().unwrap();
+            storage.fault(fault);
+            return Ok(Some(
+                crate::poc::inference::EchoFilter::new(&[b"synthetic request scan material"])
+                    .fingerprints(),
+            ));
+        }
+        Ok(self.prepared_protection.take())
+    }
+
+    fn account(&self) -> String {
+        self.account.clone()
+    }
+    fn take_filter(&mut self) -> Option<crate::poc::inference::EchoFilter> {
+        self.response_filter.take()
+    }
+    fn now(&self) -> u64 {
+        self.clock
+    }
+    fn current(&self) -> Result<(), String> {
+        Ok(())
+    }
+    async fn request(
+        &mut self,
+        method: &str,
+        path: &str,
+        _body: Option<Value>,
+    ) -> Result<Value, String> {
+        self.calls.push(format!("{method} {path}"));
+        let result = match (method, path) {
+            ("GET", "/api/v1/vm/templates") => {
+                if self.fail_catalogue {
+                    return Err("catalogue unavailable".into());
+                }
+                let mut fixed = if self.custom {
+                    fixtures::offer()
+                } else {
+                    self.current_selection.offer.clone()
+                };
+                if let Some(echo) = &self.response_echo {
+                    fixed["name"] = echo.clone().into();
+                }
+                Ok(
+                    json!({"templates":[fixed],"custom_template":[if self.custom { self.current_selection.offer.clone() } else { fixtures::custom() }]}),
+                )
+            }
+            ("GET", "/api/v1/image") => Ok(json!([self.current_selection.image])),
+            ("POST", "/api/v1/vm/custom-template/price") => {
+                Ok(serde_json::to_value(&self.current_selection.charge).unwrap())
+            }
+            ("POST", "/api/v1/ssh-key") => {
+                if self.lose_registration {
+                    Err("lost".into())
+                } else {
+                    Ok(json!({"id":7,"name":"tau-0","created":"2026-11-06T14:00:00Z"}))
+                }
+            }
+            ("GET", "/api/v1/ssh-key") => {
+                Ok(json!([{"id":7,"name":"tau-0","created":"2026-11-06T14:00:00Z"}]))
+            }
+            ("GET", "/api/v1/vm") => Ok(json!(self.machines)),
+            ("POST", "/api/v1/vm" | "/api/v1/vm/custom-template") => {
+                self.clock += self.advance_before_create;
+                self.advance_before_create = 0;
+                let mut vm = fixtures::vm(&self.current_selection, 11);
+                if let Some(popularity) = self.returned_popularity {
+                    vm["image"]["popularity"] = json!(popularity);
+                }
+                if let Some(created) = &self.created {
+                    vm["created"] = created.clone().into();
+                }
+                if let Some((pointer, value)) = &self.vm_change {
+                    *vm.pointer_mut(pointer).unwrap() = value.clone();
+                }
+                self.machines.push(vm.clone());
+                if self.lose_create {
+                    Err("lost".into())
+                } else {
+                    Ok(vm)
+                }
+            }
+            ("GET", "/api/v1/vm/11/payments?limit=100&offset=0") => {
+                Ok(json!({"data":self.payments,"total":self.payments.len(),"offset":0,"limit":100}))
+            }
+            ("GET", "/api/v1/vm/11/renew/quote?method=lightning&intervals=1") => {
+                if self.fail_quote {
+                    Err("quote unavailable".into())
+                } else {
+                    Ok(serde_json::to_value(&self.billing_terms).unwrap())
+                }
+            }
+            ("GET", "/api/v1/vm/11/renew?method=lightning&intervals=1") => {
+                let mut p = fixtures::payment(11);
+                if let Some(created) = &self.created {
+                    p["created"] = created.clone().into();
+                }
+                for field in ["amount", "currency", "tax", "processing_fee", "time"] {
+                    p[field] = serde_json::to_value(&self.billing_terms).unwrap()[field].clone();
+                }
+                self.payments.push(p.clone());
+                if self.lose_invoice {
+                    Err("lost".into())
+                } else {
+                    Ok(p)
+                }
+            }
+            ("GET", "/api/v1/vm/11") => Ok(self.machines[0].clone()),
+            ("GET", "/api/v1/vm/12") => Ok(self.machines[1].clone()),
+            ("GET", "/api/v1/payment/aabb") => Ok(self.payments[0].clone()),
+            _ => Err("unexpected fixture route".into()),
+        };
+        if self
+            .fault_after
+            .as_ref()
+            .is_some_and(|(route, _, _)| route == &format!("{method} {path}"))
+        {
+            let (_, storage, fault) = self.fault_after.take().unwrap();
+            storage.fault(fault);
+        }
+        result
+    }
+}
+fn approve(s: &mut Store<MemoryStorage>, api: &mut Fixture) {
+    block_on(s.procurement_select(
+        api,
+        Choice {
+            offer_id: if api.custom { 2 } else { 1 },
+            image_id: 3,
+            resources: api.current_selection.resources.clone(),
+        },
+    ))
+    .unwrap();
+    block_on(s.procurement_approve(
+        api,
+        Approval {
+            machine: "machine-a".into(),
+            relay: "wss://relay.invalid/".into(),
+            class_answer: ClassAnswer::No,
+            approve_charge: true,
+            approve_maintained_access: true,
+        },
+    ))
+    .unwrap();
+}
+fn issue_invoice(s: &mut Store<MemoryStorage>, api: &mut Fixture) -> Result<(), String> {
+    if s.procurement.as_ref().is_none_or(|p| p.billing.is_none()) {
+        let result = block_on(s.procurement_resume(api, false));
+        if s.procurement.as_ref().is_none_or(|p| p.billing.is_none()) {
+            return result;
+        }
+    }
+    block_on(s.procurement_resume(api, true))
+}
+
+#[test]
+fn provisioning_fixed_and_custom_encrypted_same_identity_handoff_and_replay() {
+    for custom in [false, true] {
+        let mut s = ready();
+        let mut api = Fixture::new(custom);
+        approve(&mut s, &mut api);
+        let identity = s.procurement.as_ref().unwrap().identity.clone();
+        let before = s.poc_identity_public_keys("machine-a", &identity).unwrap();
+        assert!(s.poc_target("machine-a").is_none());
+        assert!(
+            block_on(s.procurement_resume(&mut api, false))
+                .unwrap_err()
+                .contains("initial Lightning")
+        );
+        assert!(
+            issue_invoice(&mut s, &mut api)
+                .unwrap_err()
+                .contains("Waiting for external payment")
+        );
+        api.payments[0]["is_paid"] = true.into();
+        block_on(s.procurement_resume(&mut api, false)).unwrap();
+        let mut loaded = reopen(&s);
+        block_on(loaded.procurement_resume(&mut api, false)).unwrap();
+        assert_eq!(loaded.poc_target("machine-a"), s.poc_target("machine-a"));
+        assert_eq!(loaded.poc_target("machine-a").unwrap().host, "192.0.2.10");
+        assert_eq!(loaded.poc_public_keys("machine-a").unwrap(), before);
+        assert_eq!(
+            loaded.dispatch.approved_entries["machine-a"]
+                .approved
+                .identity,
+            identity
+        );
+        assert_eq!(
+            loaded.dispatch.approved_entries["machine-a"]
+                .approved
+                .entry
+                .cost
+                .amount,
+            1000000
+        );
+        assert_eq!(loaded.procurement_view()["auto_renewal_enabled"], true);
+        assert_eq!(
+            api.count(if custom {
+                "POST /api/v1/vm/custom-template"
+            } else {
+                "POST /api/v1/vm"
+            }),
+            1
+        );
+        assert_eq!(
+            api.count("GET /api/v1/vm/11/renew?method=lightning&intervals=1"),
+            1
+        );
+        for bytes in s.storage.files().values() {
+            assert!(!String::from_utf8_lossy(bytes).contains("192.0.2.10"));
+        }
+        assert!(block_on(loaded.poc_bind("machine-a")).is_ok());
+        assert!(
+            loaded.dispatch.check_installation("machine-a").is_err(),
+            "ordinary declaration remains necessary"
+        );
+    }
+}
+#[test]
+fn provisioning_lost_create_and_invoice_reconcile_without_resend() {
+    let mut s = ready();
+    let mut api = Fixture::new(false);
+    api.lose_create = true;
+    approve(&mut s, &mut api);
+    assert!(block_on(s.procurement_resume(&mut api, false)).is_err());
+    let mut s = reopen(&s);
+    assert!(
+        block_on(s.procurement_resume(&mut api, false))
+            .unwrap_err()
+            .contains("initial Lightning")
+    );
+    api.lose_invoice = true;
+    assert!(issue_invoice(&mut s, &mut api).is_err());
+    let mut s = reopen(&s);
+    assert!(
+        issue_invoice(&mut s, &mut api)
+            .unwrap_err()
+            .contains("external payment")
+    );
+    assert_eq!(s.procurement_view()["vm_id"], 11);
+    assert_eq!(s.procurement_view()["payment"]["id"], "aabb");
+    assert_eq!(api.count("POST /api/v1/vm"), 1);
+    assert_eq!(
+        api.count("GET /api/v1/vm/11/renew?method=lightning&intervals=1"),
+        1
+    );
+}
+#[test]
+fn provisioning_unknown_create_stays_read_only_across_reload_and_empty_conflicting_multiple_evidence()
+ {
+    for mode in ["empty", "incomplete", "conflicting", "multiple"] {
+        let mut s = ready();
+        let mut api = Fixture::new(false);
+        api.lose_create = true;
+        approve(&mut s, &mut api);
+        assert!(block_on(s.procurement_resume(&mut api, false)).is_err());
+        match mode {
+            "empty" => api.machines.clear(),
+            "incomplete" => {
+                api.machines[0].as_object_mut().unwrap().remove("ssh_key");
+            }
+            "conflicting" => api.machines[0]["image"]["id"] = 999.into(),
+            _ => api
+                .machines
+                .push(fixtures::vm(&fixtures::selection(false), 12)),
+        }
+        let mut s = reopen(&s);
+        for _ in 0..2 {
+            assert!(block_on(s.procurement_resume(&mut api, false)).is_err());
+        }
+        assert_eq!(api.count("POST /api/v1/vm"), 1);
+        assert!(s.procurement.as_ref().unwrap().vm.is_none());
+        assert!(
+            block_on(s.procurement_select(
+                &mut api,
+                Choice {
+                    offer_id: 1,
+                    image_id: 3,
+                    resources: None
+                }
+            ))
+            .is_err()
+        );
+    }
+}
+#[test]
+fn provisioning_registration_uncertainty_never_inserts_or_creates_again() {
+    let mut s = ready();
+    let mut api = Fixture::new(false);
+    api.lose_registration = true;
+    approve(&mut s, &mut api);
+    assert!(block_on(s.procurement_resume(&mut api, false)).is_err());
+    let mut s = reopen(&s);
+    let error = block_on(s.procurement_resume(&mut api, false)).unwrap_err();
+    assert_eq!(api.count("POST /api/v1/ssh-key"), 1);
+    assert!(error.contains("no public-key material"));
+    assert_eq!(api.count("POST /api/v1/vm"), 0);
+}
+#[test]
+fn provisioning_expired_invoice_and_empty_publication_preserve_identities() {
+    let mut s = ready();
+    let mut api = Fixture::new(false);
+    approve(&mut s, &mut api);
+    assert!(issue_invoice(&mut s, &mut api).is_err());
+    api.clock += 2 * 86400;
+    assert!(
+        issue_invoice(&mut s, &mut api)
+            .unwrap_err()
+            .contains("expired")
+    );
+    api.clock -= 2 * 86400;
+    api.payments[0]["is_paid"] = true.into();
+    api.machines[0]["host_ssh_keys"] = json!([]);
+    assert!(
+        block_on(s.procurement_resume(&mut api, false))
+            .unwrap_err()
+            .contains("published host key")
+    );
+    assert!(s.poc_target("machine-a").is_none());
+    api.machines[0]["host_ssh_keys"] = json!([fixtures::publication()]);
+    let mut s = reopen(&s);
+    block_on(s.procurement_resume(&mut api, false)).unwrap();
+    assert_eq!(s.procurement_view()["vm_id"], 11);
+    assert_eq!(api.count("POST /api/v1/vm"), 1);
+}
+
+#[test]
+fn provisioning_pre_send_gap_and_uncertain_identity_appends_never_create_twice() {
+    let mut s = ready();
+    let mut api = Fixture::new(false);
+    approve(&mut s, &mut api);
+    block_on(s.procurement_commit(Record::RegistrationSent)).unwrap();
+    block_on(s.procurement_commit(Record::Registered(
+        json!({"id":7,"name":"tau-0","created":"2026-11-06T14:00:00Z"}),
+    )))
+    .unwrap();
+    block_on(s.procurement_commit(Record::CreateSent(Create {
+        before: Vec::new(),
+        started: api.now(),
+    })))
+    .unwrap();
+    let mut loaded = reopen(&s);
+    assert!(block_on(loaded.procurement_resume(&mut api, false)).is_err());
+    assert_eq!(api.count("POST /api/v1/vm"), 0);
+    for fault in [Fault::Fail(1), Fault::LandThenFail(3)] {
+        let mut s = ready();
+        let mut api = Fixture::new(false);
+        approve(&mut s, &mut api);
+        api.fault_after = Some(("POST /api/v1/vm".into(), s.storage.clone(), fault));
+        assert!(block_on(s.procurement_resume(&mut api, false)).is_err());
+        let mut loaded = reopen(&s);
+        assert!(
+            block_on(loaded.procurement_resume(&mut api, false))
+                .unwrap_err()
+                .contains("initial Lightning")
+        );
+        assert_eq!(api.count("POST /api/v1/vm"), 1);
+        assert_eq!(loaded.procurement_view()["vm_id"], 11);
+    }
+}
+
+#[test]
+fn provisioning_create_and_invoice_intent_failures_send_no_effect() {
+    for route in [
+        "GET /api/v1/vm",
+        "GET /api/v1/vm/11/renew/quote?method=lightning&intervals=1",
+    ] {
+        let mut s = ready();
+        let mut api = Fixture::new(false);
+        approve(&mut s, &mut api);
+        if route.contains("renew/quote") {
+            assert!(block_on(s.procurement_resume(&mut api, false)).is_err());
+        }
+        // An unchanged quote is the final read before the initial invoice intent.
+        api.fault_after = Some((route.into(), s.storage.clone(), Fault::Fail(1)));
+        assert!(issue_invoice(&mut s, &mut api).is_err());
+        assert!(
+            api.fault_after.is_none(),
+            "The intended response must arm the append fault"
+        );
+        assert_eq!(
+            api.count("POST /api/v1/vm"),
+            usize::from(route.contains("renew/quote"))
+        );
+        assert_eq!(
+            api.count("GET /api/v1/vm/11/renew?method=lightning&intervals=1"),
+            0
+        );
+    }
+}
+#[test]
+fn provisioning_failed_intent_write_sends_nothing_and_account_cannot_change() {
+    let mut s = ready();
+    let mut api = Fixture::new(false);
+    approve(&mut s, &mut api);
+    api.account = "b".repeat(64);
+    assert!(
+        block_on(s.procurement_resume(&mut api, false))
+            .unwrap_err()
+            .contains("same provider account")
+    );
+    assert_eq!(api.count("POST /api/v1/ssh-key"), 0);
+    api.account = "a".repeat(64);
+    s.storage.fault(Fault::Fail(1));
+    assert!(block_on(s.procurement_resume(&mut api, false)).is_err());
+    assert_eq!(api.count("POST /api/v1/ssh-key"), 0);
+}
+#[test]
+fn provisioning_provider_echoes_never_enter_journal_or_public_context() {
+    let mut s = ready();
+    let credential = hex::encode([7; 32]);
+    let a = protocol::Account::parse(credential.as_bytes()).unwrap();
+    s.remember_provider_filter(a.filter(credential.as_bytes()));
+    for text in [
+        credential.clone(),
+        hex::encode(credential.as_bytes()),
+        base64::engine::general_purpose::STANDARD.encode(credential.as_bytes()),
+    ] {
+        let value = json!({"name":text});
+        assert!(!crate::poc::inference::safe(&s, &value, &[]));
+        assert_ne!(s.protect_output(&value).unwrap(), value);
+    }
+    // Hexadecimal account custody must not activate inference structural refusal.
+    assert!(s.poc_credential_filters.is_empty());
+    let mut api = Fixture::new(false);
+    approve(&mut s, &mut api);
+    let mut echoed = fixtures::vm(&fixtures::selection(false), 11);
+    echoed["template"]["name"] = credential.into();
+    let next = s.next;
+    assert!(block_on(s.commit(&Event::Procurement(Record::Associated(echoed)))).is_err());
+    assert_eq!(s.next, next);
+}
+
+#[test]
+fn provisioning_fresh_store_preserves_report_shape_until_selection() {
+    let s = ready();
+    let mut local = Local::new(s.storage.clone(), Fixed);
+    block_on(local.open());
+    block_on(local.unlock(pass()));
+    assert!(local.report(None).get("procurement").is_none());
+    assert!(local.inspect().get("procurement").is_none());
+    let mut api = Fixture::new(false);
+    block_on(local.store().unwrap().procurement_select(
+        &mut api,
+        Choice {
+            offer_id: 1,
+            image_id: 3,
+            resources: None,
+        },
+    ))
+    .unwrap();
+    assert!(local.report(None)["procurement"]["selection"].is_object());
+}
+
+fn approval() -> Approval {
+    Approval {
+        machine: "machine-a".into(),
+        relay: "wss://relay.invalid/".into(),
+        class_answer: ClassAnswer::No,
+        approve_charge: true,
+        approve_maintained_access: true,
+    }
+}
+
+#[test]
+fn provisioning_delayed_fixed_and_custom_terms_require_same_identity_reapproval_across_reload() {
+    for custom in [false, true] {
+        for reload in [false, true] {
+            for change in ["price", "resources"] {
+                let mut s = ready();
+                let mut api = Fixture::new(custom);
+                approve(&mut s, &mut api);
+                let original = s.procurement.clone().unwrap();
+                let public = s
+                    .poc_identity_public_keys(&original.machine, &original.identity)
+                    .unwrap();
+                if change == "price" {
+                    api.current_selection.charge.amount *= 2;
+                    if !custom {
+                        api.current_selection.offer["cost_plan"]["amount"] =
+                            api.current_selection.charge.amount.into();
+                    }
+                } else if custom {
+                    api.current_selection.offer["max_cpu"] = json!(9);
+                } else {
+                    api.current_selection.offer["cpu"] = json!(2);
+                }
+                if reload {
+                    s = reopen(&s);
+                }
+                assert!(
+                    block_on(s.procurement_resume(&mut api, false))
+                        .unwrap_err()
+                        .contains("review and approve")
+                );
+                assert_eq!(api.count("POST /api/v1/vm"), 0);
+                assert_eq!(api.count("POST /api/v1/vm/custom-template"), 0);
+                assert_eq!(api.count("POST /api/v1/ssh-key"), 1);
+                assert!(s.procurement.as_ref().unwrap().create.is_none());
+                assert_eq!(s.procurement.as_ref().unwrap().selected, original.selected);
+                assert_eq!(s.procurement_view()["phase"], "terms_changed");
+                let pending = s
+                    .procurement
+                    .as_ref()
+                    .unwrap()
+                    .pending_selection
+                    .clone()
+                    .unwrap();
+                let mut s = reopen(&s);
+                assert_eq!(
+                    s.procurement.as_ref().unwrap().pending_selection.as_ref(),
+                    Some(&pending)
+                );
+                assert!(block_on(s.procurement_resume(&mut api, false)).is_err());
+                let mut changed_identity = approval();
+                changed_identity.machine = "machine-b".into();
+                assert!(block_on(s.procurement_approve(&mut api, changed_identity)).is_err());
+                let mut missing_consent = approval();
+                missing_consent.approve_charge = false;
+                assert!(block_on(s.procurement_approve(&mut api, missing_consent)).is_err());
+                block_on(s.procurement_approve(&mut api, approval())).unwrap();
+                let renewed = s.procurement.as_ref().unwrap();
+                assert_eq!(renewed.identity, original.identity);
+                assert_eq!(renewed.relay_identity, original.relay_identity);
+                assert_eq!(renewed.account, original.account);
+                assert_eq!(renewed.selected, pending);
+                assert!(renewed.pending_selection.is_none());
+                assert_eq!(
+                    s.poc_identity_public_keys(&original.machine, &original.identity)
+                        .unwrap(),
+                    public
+                );
+                assert_eq!(s.dispatch.approved_entries.len(), 1);
+                assert_eq!(
+                    s.dispatch.approved_entries["machine-a"]
+                        .approved
+                        .entry
+                        .cost
+                        .amount,
+                    api.current_selection.charge.amount
+                );
+                let mut s = reopen(&s);
+                assert!(
+                    block_on(s.procurement_resume(&mut api, false))
+                        .unwrap_err()
+                        .contains("initial Lightning")
+                );
+                assert_eq!(api.count("POST /api/v1/ssh-key"), 1);
+                assert_eq!(
+                    api.count(if custom {
+                        "POST /api/v1/vm/custom-template"
+                    } else {
+                        "POST /api/v1/vm"
+                    }),
+                    1
+                );
+                assert_eq!(s.procurement.as_ref().unwrap().identity, original.identity);
+            }
+        }
+    }
+}
+
+#[test]
+fn provisioning_unavailable_terms_never_create_and_pending_approval_is_checked_again() {
+    let mut s = ready();
+    let mut api = Fixture::new(false);
+    approve(&mut s, &mut api);
+    api.fail_catalogue = true;
+    assert!(block_on(s.procurement_resume(&mut api, false)).is_err());
+    assert!(s.procurement.as_ref().unwrap().create.is_none());
+    assert_eq!(api.count("POST /api/v1/vm"), 0);
+    api.fail_catalogue = false;
+    api.current_selection.offer["cpu"] = json!(2);
+    assert!(block_on(s.procurement_resume(&mut api, false)).is_err());
+    api.current_selection.offer["cpu"] = json!(3);
+    assert!(
+        block_on(s.procurement_approve(&mut api, approval()))
+            .unwrap_err()
+            .contains("review and approve")
+    );
+    assert_eq!(s.procurement.as_ref().unwrap().selected.offer["cpu"], 1);
+    assert_eq!(s.procurement_view()["selection"]["offer"]["cpu"], 3);
+    assert_eq!(api.count("POST /api/v1/vm"), 0);
+    let pending = s
+        .procurement
+        .as_ref()
+        .unwrap()
+        .pending_selection
+        .clone()
+        .unwrap();
+    assert!(
+        s.procurement_projection(&Record::CreateSent(Create {
+            before: vec![],
+            started: api.clock
+        }))
+        .is_err()
+    );
+    let mut loaded = reopen(&s);
+    block_on(loaded.procurement_approve(&mut api, approval())).unwrap();
+    assert_eq!(loaded.procurement.as_ref().unwrap().selected, pending);
+}
+
+#[test]
+fn provisioning_reapproval_and_reselection_cannot_reset_uncertain_create() {
+    let mut s = ready();
+    let mut api = Fixture::new(false);
+    approve(&mut s, &mut api);
+    api.lose_create = true;
+    assert!(block_on(s.procurement_resume(&mut api, false)).is_err());
+    let original = s.procurement.clone().unwrap();
+    api.machines.clear();
+    let mut selected = original.selected.clone();
+    selected.charge.amount *= 2;
+    selected.offer["cost_plan"]["amount"] = selected.charge.amount.into();
+    for _ in 0..2 {
+        let mut loaded = reopen(&s);
+        assert!(block_on(loaded.procurement_approve(&mut api, approval())).is_err());
+        assert!(
+            block_on(loaded.procurement_select(
+                &mut api,
+                Choice {
+                    offer_id: 1,
+                    image_id: 3,
+                    resources: None
+                }
+            ))
+            .is_err()
+        );
+        assert!(
+            loaded
+                .procurement_projection(&Record::TermsChanged(selected.clone()))
+                .is_err()
+        );
+        assert!(
+            loaded
+                .procurement_projection(&Record::Reapproved {
+                    selected: selected.clone(),
+                    approved_at: api.clock
+                })
+                .is_err()
+        );
+        assert!(block_on(loaded.procurement_resume(&mut api, false)).is_err());
+        assert_eq!(loaded.procurement, Some(original.clone()));
+        s = loaded;
+    }
+    assert_eq!(api.count("POST /api/v1/vm"), 1);
+}
+
+#[test]
+fn provisioning_image_statistic_drift_survives_association_reconciliation_observation_and_replay() {
+    for lost in [false, true] {
+        let mut s = ready();
+        let mut api = Fixture::new(false);
+        approve(&mut s, &mut api);
+        api.current_selection.image["popularity"] = json!(0.1001);
+        api.returned_popularity = Some(0.1002);
+        api.lose_create = lost;
+        assert!(block_on(s.procurement_resume(&mut api, false)).is_err());
+        let mut s = reopen(&s);
+        if lost {
+            assert!(
+                block_on(s.procurement_resume(&mut api, false))
+                    .unwrap_err()
+                    .contains("initial Lightning")
+            );
+        }
+        assert_eq!(s.procurement_view()["vm_id"], 11);
+        assert!(issue_invoice(&mut s, &mut api).is_err());
+        api.payments[0]["is_paid"] = json!(true);
+        api.machines[0]["image"]["popularity"] = json!(0.1003);
+        let good = api.machines[0].clone();
+        api.machines[0]["image"]["version"] = json!("different");
+        assert!(block_on(s.procurement_resume(&mut api, false)).is_err());
+        assert!(s.poc_target("machine-a").is_none());
+        api.machines[0] = good;
+        block_on(s.procurement_resume(&mut api, false)).unwrap();
+        let loaded = reopen(&s);
+        assert_eq!(loaded.poc_target("machine-a"), s.poc_target("machine-a"));
+        assert_eq!(api.count("POST /api/v1/vm"), 1);
+    }
+}
+
+#[test]
+fn provisioning_multiple_incomplete_and_conflicting_invoice_evidence_never_reissues() {
+    for mode in ["multiple", "incomplete", "conflicting", "empty"] {
+        let mut s = ready();
+        let mut api = Fixture::new(false);
+        approve(&mut s, &mut api);
+        api.lose_invoice = true;
+        assert!(issue_invoice(&mut s, &mut api).is_err());
+        let original = s.procurement.clone().unwrap();
+        match mode {
+            "multiple" => {
+                let mut second = api.payments[0].clone();
+                second["id"] = json!("aabc");
+                api.payments.push(second);
+            }
+            "incomplete" => {
+                api.payments[0].as_object_mut().unwrap().remove("time");
+            }
+            "conflicting" => {
+                api.payments[0]["amount"] = json!(2);
+            }
+            _ => api.payments.clear(),
+        }
+        for _ in 0..2 {
+            let mut loaded = reopen(&s);
+            assert!(issue_invoice(&mut loaded, &mut api).is_err());
+            assert_eq!(loaded.procurement, Some(original.clone()));
+            s = loaded;
+        }
+        assert_eq!(
+            api.count("GET /api/v1/vm/11/renew?method=lightning&intervals=1"),
+            1
+        );
+        assert_eq!(api.count("POST /api/v1/vm"), 1);
+    }
+}
+
+#[test]
+fn provisioning_invalidated_custom_resources_can_be_reselected_on_the_same_purchase() {
+    let mut s = ready();
+    let mut api = Fixture::new(true);
+    approve(&mut s, &mut api);
+    let original = s.procurement.clone().unwrap();
+    api.current_selection.offer["min_cpu"] = json!(3);
+    assert!(block_on(s.procurement_resume(&mut api, false)).is_err());
+    assert_eq!(api.count("POST /api/v1/vm/custom-template"), 0);
+    let mut resources = fixtures::custom_resources();
+    resources["cpu"] = json!(3);
+    api.current_selection.resources = Some(resources.clone());
+    block_on(s.procurement_select(
+        &mut api,
+        Choice {
+            offer_id: 2,
+            image_id: 3,
+            resources: Some(resources),
+        },
+    ))
+    .unwrap();
+    let mut s = reopen(&s);
+    block_on(s.procurement_approve(&mut api, approval())).unwrap();
+    assert!(
+        block_on(s.procurement_resume(&mut api, false))
+            .unwrap_err()
+            .contains("initial Lightning")
+    );
+    assert_eq!(s.procurement.as_ref().unwrap().identity, original.identity);
+    assert_eq!(
+        s.procurement.as_ref().unwrap().relay_identity,
+        original.relay_identity
+    );
+    assert_eq!(api.count("POST /api/v1/ssh-key"), 1);
+    assert_eq!(api.count("POST /api/v1/vm/custom-template"), 1);
+}
+
+#[test]
+fn provisioning_returned_registration_and_payment_append_uncertainty_preserves_no_retry() {
+    for route in [
+        "POST /api/v1/ssh-key",
+        "GET /api/v1/vm/11/renew?method=lightning&intervals=1",
+    ] {
+        for fault in [Fault::Fail(1), Fault::LandThenFail(3)] {
+            let landed = matches!(fault, Fault::LandThenFail(_));
+            let mut s = ready();
+            let mut api = Fixture::new(false);
+            approve(&mut s, &mut api);
+            if route.contains("renew") {
+                assert!(block_on(s.procurement_resume(&mut api, false)).is_err());
+            }
+            api.fault_after = Some((route.into(), s.storage.clone(), fault));
+            assert!(issue_invoice(&mut s, &mut api).is_err());
+            let mut loaded = reopen(&s);
+            if route.contains("renew") {
+                assert!(
+                    issue_invoice(&mut loaded, &mut api)
+                        .unwrap_err()
+                        .contains("external payment")
+                );
+                assert_eq!(loaded.procurement_view()["payment"]["id"], "aabb");
+            } else {
+                let result = block_on(loaded.procurement_resume(&mut api, false)).unwrap_err();
+                if landed {
+                    assert!(result.contains("initial Lightning"));
+                } else {
+                    assert!(result.contains("no public-key material"));
+                }
+            }
+            assert_eq!(api.count(route), 1);
+            assert!(api.count("POST /api/v1/vm") <= 1);
+        }
+    }
+}
+
+#[test]
+fn provisioning_invoice_pre_send_gap_replays_without_issuance() {
+    let mut s = ready();
+    let mut api = Fixture::new(false);
+    approve(&mut s, &mut api);
+    assert!(block_on(s.procurement_resume(&mut api, false)).is_err());
+    block_on(s.procurement_commit(Record::InvoiceSent(Invoice {
+        before: vec![],
+        started: api.clock,
+    })))
+    .unwrap();
+    let original = s.procurement.clone();
+    let mut loaded = reopen(&s);
+    for _ in 0..2 {
+        assert!(
+            issue_invoice(&mut loaded, &mut api)
+                .unwrap_err()
+                .contains("never be reissued")
+        );
+    }
+    assert_eq!(loaded.procurement, original);
+    assert_eq!(
+        api.count("GET /api/v1/vm/11/renew?method=lightning&intervals=1"),
+        0
+    );
+}
+
+#[test]
+fn provisioning_associated_vm_and_payment_identities_are_immutable_after_replay() {
+    let mut s = ready();
+    let mut api = Fixture::new(false);
+    approve(&mut s, &mut api);
+    assert!(issue_invoice(&mut s, &mut api).is_err());
+    let loaded = reopen(&s);
+    let p = loaded.procurement.as_ref().unwrap();
+    let mut other_vm = p.vm.clone().unwrap();
+    other_vm["id"] = json!(12);
+    assert!(
+        loaded
+            .procurement_projection(&Record::Associated(other_vm.clone()))
+            .is_err()
+    );
+    assert!(
+        loaded
+            .procurement_projection(&Record::Observation(other_vm))
+            .is_err()
+    );
+    let mut other_payment = p.payment.clone().unwrap();
+    other_payment["id"] = json!("aabc");
+    assert!(
+        loaded
+            .procurement_projection(&Record::Payment(other_payment))
+            .is_err()
+    );
+    let mut other_creation = p.vm.clone().unwrap();
+    other_creation["created"] = json!("2026-11-06T14:00:01Z");
+    assert!(
+        loaded
+            .procurement_projection(&Record::Observation(other_creation))
+            .is_err()
+    );
+    assert_eq!(loaded.procurement, s.procurement);
+}
+
+fn handoff(p: &Purchase) -> Record {
+    let vm = p.vm.as_ref().unwrap();
+    let (key, pin) = protocol::published_pin(vm).unwrap();
+    Record::Handoff {
+        target: TargetRecord {
+            machine: p.machine.clone(),
+            relay: p.relay.clone(),
+            profile: "v1".into(),
+            host: protocol::allocated_ipv4(vm).unwrap(),
+            port: 22,
+            user: "arch".into(),
+            elevation: crate::jobs::Elevation::SudoNoninteractive,
+            pin,
+        },
+        publication: json!({"origin":protocol::ORIGIN,"vm_id":vm["id"],"created":vm["created"],"selected_key":key,"host_ssh_keys":vm["host_ssh_keys"]}),
+    }
+}
+
+#[test]
+fn provisioning_unpaid_unknown_payment_and_boot_cannot_handoff_or_overwrite_a_target() {
+    let mut s = ready();
+    let mut api = Fixture::new(false);
+    approve(&mut s, &mut api);
+    assert!(issue_invoice(&mut s, &mut api).is_err());
+    let loaded = reopen(&s);
+    assert!(
+        loaded
+            .procurement_projection(&handoff(loaded.procurement.as_ref().unwrap()))
+            .is_err()
+    );
+    assert!(loaded.poc_target("machine-a").is_none());
+    for paid in [json!(null), json!(false)] {
+        api.payments[0]["is_paid"] = paid;
+        assert!(block_on(s.procurement_resume(&mut api, false)).is_err());
+        assert!(s.poc_target("machine-a").is_none());
+    }
+    api.payments[0]["is_paid"] = json!(true);
+    for state in [json!(null), json!("starting"), json!("unknown")] {
+        api.machines[0]["status"]["state"] = state;
+        assert!(
+            block_on(s.procurement_resume(&mut api, false))
+                .unwrap_err()
+                .contains("boot readiness")
+        );
+        assert!(s.poc_target("machine-a").is_none());
+        let loaded = reopen(&s);
+        assert!(
+            loaded
+                .procurement_projection(&handoff(loaded.procurement.as_ref().unwrap()))
+                .is_err()
+        );
+    }
+    api.machines[0]["status"]["state"] = json!("running");
+    block_on(s.procurement_commit(Record::Observation(api.machines[0].clone()))).unwrap();
+    let mut conflict = handoff(s.procurement.as_ref().unwrap());
+    if let Record::Handoff { target, .. } = &mut conflict {
+        target.pin = format!("SHA256:{}", "A".repeat(43));
+    }
+    assert!(s.procurement_projection(&conflict).is_err());
+    let mut foreign = handoff(s.procurement.as_ref().unwrap());
+    if let Record::Handoff { publication, .. } = &mut foreign {
+        publication["vm_id"] = json!(12);
+    }
+    assert!(s.procurement_projection(&foreign).is_err());
+    block_on(s.procurement_resume(&mut api, false)).unwrap();
+    let target = s.poc_target("machine-a").cloned();
+    let original = s.procurement.clone();
+    let mut changed_address = api.machines[0].clone();
+    changed_address["ip_assignments"][0]["ip"] = json!("192.0.2.11/24");
+    assert!(
+        s.procurement_projection(&Record::Observation(changed_address))
+            .is_err()
+    );
+    assert!(
+        s.procurement_projection(&handoff(s.procurement.as_ref().unwrap()))
+            .is_err()
+    );
+    assert_eq!(s.poc_target("machine-a").cloned(), target);
+    assert_eq!(s.procurement, original);
+    assert_eq!(reopen(&s).poc_target("machine-a").cloned(), target);
+}
+
+#[test]
+fn provisioning_existing_enrolled_machine_cannot_be_replaced_by_a_purchase() {
+    let mut s = ready();
+    let mut api = Fixture::new(false);
+    let target = TargetRecord {
+        machine: "existing".into(),
+        relay: "wss://relay.invalid/".into(),
+        profile: "v1".into(),
+        host: "192.0.2.9".into(),
+        port: 22,
+        user: "arch".into(),
+        elevation: crate::jobs::Elevation::SudoNoninteractive,
+        pin: fixtures::publication()["fingerprint_sha256"]
+            .as_str()
+            .unwrap()
+            .into(),
+    };
+    block_on(s.poc_enroll(super::super::poc_targets::Enrollment {
+        target: target.clone(),
+        approve_existing: true,
+        class_answer: ClassAnswer::No,
+        approve_maintained_access: true,
+    }))
+    .unwrap();
+    let mut loaded = reopen(&s);
+    assert!(
+        block_on(loaded.procurement_select(
+            &mut api,
+            Choice {
+                offer_id: 1,
+                image_id: 3,
+                resources: None
+            }
+        ))
+        .is_err()
+    );
+    assert!(block_on(loaded.procurement_approve(&mut api, approval())).is_err());
+    assert!(loaded.procurement.is_none());
+    assert_eq!(loaded.poc_target("existing"), Some(&target));
+    assert_eq!(api.count("POST /api/v1/ssh-key"), 0);
+    assert_eq!(api.count("POST /api/v1/vm"), 0);
+}
+
+#[test]
+fn provisioning_cpu_constraints_gate_direct_lost_create_observation_and_replay() {
+    for custom in [false, true] {
+        for mode in ["direct", "lost", "later"] {
+            for (field, bad) in [
+                ("cpu_arch", json!(null)),
+                ("cpu_arch", json!("arm64")),
+                ("cpu_mfg", json!(null)),
+                ("cpu_mfg", json!("amd")),
+                ("cpu_features", json!(null)),
+                ("cpu_features", json!(["AES"])),
+            ] {
+                let mut s = ready();
+                let mut api = Fixture::new(custom);
+                api.current_selection.offer["cpu_mfg"] = json!("intel");
+                api.current_selection.offer["cpu_features"] = json!(["AES", "AVX2"]);
+                approve(&mut s, &mut api);
+                let original_identity = s.procurement.as_ref().unwrap().identity.clone();
+                let pointer = format!("/template/{field}");
+                if mode != "later" {
+                    api.vm_change = Some((pointer.clone(), bad.clone()));
+                }
+                api.lose_create = mode == "lost";
+                assert!(block_on(s.procurement_resume(&mut api, false)).is_err());
+                if mode == "later" {
+                    assert!(issue_invoice(&mut s, &mut api).is_err());
+                    api.payments[0]["is_paid"] = json!(true);
+                    *api.machines[0].pointer_mut(&pointer).unwrap() = bad;
+                }
+                let mut loaded = reopen(&s);
+                assert!(block_on(loaded.procurement_resume(&mut api, false)).is_err());
+                assert!(loaded.poc_target("machine-a").is_none());
+                assert_eq!(
+                    loaded.procurement.as_ref().unwrap().identity,
+                    original_identity
+                );
+                assert_eq!(
+                    api.count(if custom {
+                        "POST /api/v1/vm/custom-template"
+                    } else {
+                        "POST /api/v1/vm"
+                    }),
+                    1
+                );
+                if mode == "later" {
+                    assert_eq!(loaded.procurement_view()["vm_id"], 11);
+                    let mut good = api.machines[0].clone();
+                    for (field, value) in [
+                        ("cpu_arch", json!("x86_64")),
+                        ("cpu_mfg", json!("INTEL")),
+                        ("cpu_features", json!(["avx2", "AES", "FMA"])),
+                    ] {
+                        good["template"][field] = value;
+                    }
+                    api.machines[0] = good;
+                    block_on(loaded.procurement_resume(&mut api, false)).unwrap();
+                    assert!(reopen(&loaded).poc_target("machine-a").is_some());
+                } else {
+                    assert!(loaded.procurement.as_ref().unwrap().vm.is_none());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn provisioning_documented_clock_skew_survives_direct_reconciliation_readiness_and_replay() {
+    for custom in [false, true] {
+        for lost in [false, true] {
+            for skew in [-60i64, -2, 2, 60] {
+                let mut s = ready();
+                let mut api = Fixture::new(custom);
+                api.clock = api.clock.checked_add_signed(skew).unwrap();
+                approve(&mut s, &mut api);
+                api.lose_create = lost;
+                assert!(block_on(s.procurement_resume(&mut api, false)).is_err());
+                let mut loaded = reopen(&s);
+                assert!(block_on(loaded.procurement_resume(&mut api, false)).is_err());
+                assert_eq!(loaded.procurement_view()["vm_id"], 11);
+                assert!(issue_invoice(&mut loaded, &mut api).is_err());
+                api.payments[0]["is_paid"] = json!(true);
+                block_on(loaded.procurement_resume(&mut api, false)).unwrap();
+                assert!(reopen(&loaded).poc_target("machine-a").is_some());
+                assert_eq!(
+                    api.count(if custom {
+                        "POST /api/v1/vm/custom-template"
+                    } else {
+                        "POST /api/v1/vm"
+                    }),
+                    1
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn provisioning_outside_clock_evidence_preserves_uncertain_intent_without_resend() {
+    for lost in [false, true] {
+        for skew in [-121i64, 61] {
+            let mut s = ready();
+            let mut api = Fixture::new(false);
+            api.clock = api.clock.checked_add_signed(skew).unwrap();
+            approve(&mut s, &mut api);
+            api.lose_create = lost;
+            assert!(block_on(s.procurement_resume(&mut api, false)).is_err());
+            let original = s.procurement.clone();
+            let mut loaded = reopen(&s);
+            for _ in 0..2 {
+                assert!(block_on(loaded.procurement_resume(&mut api, false)).is_err());
+            }
+            assert_eq!(loaded.procurement, original);
+            assert!(loaded.procurement.as_ref().unwrap().vm.is_none());
+            assert_eq!(api.count("POST /api/v1/vm"), 1);
+        }
+    }
+}
+
+#[test]
+fn provisioning_actual_request_signature_encodings_never_reach_response_journal_or_output() {
+    use zeroize::Zeroizing;
+    let input = Zeroizing::new(hex::encode([7; 32]));
+    let account = protocol::Account::parse(input.as_bytes()).unwrap();
+    let auth = account
+        .authorization(
+            "https://api.lnvps.net/api/v1/vm/templates",
+            "GET",
+            None,
+            42,
+            &[5; 32],
+        )
+        .unwrap();
+    let event = Zeroizing::new(
+        base64::engine::general_purpose::STANDARD
+            .decode(auth.strip_prefix("Nostr ").unwrap())
+            .unwrap(),
+    );
+    let signed: Value = serde_json::from_slice(&event).unwrap();
+    let signature = signed["sig"].as_str().unwrap();
+    let raw = Zeroizing::new(hex::decode(signature).unwrap());
+    let mixed: String = signature
+        .chars()
+        .enumerate()
+        .map(|(i, c)| {
+            if i % 2 == 0 {
+                c.to_ascii_uppercase()
+            } else {
+                c
+            }
+        })
+        .collect();
+    for form in [
+        base64::engine::general_purpose::STANDARD.encode(raw.as_slice()),
+        signature.to_uppercase(),
+        mixed,
+    ] {
+        let mut s = ready();
+        let mut api = Fixture::new(false);
+        api.response_filter = Some(protocol::request_filter(&auth).unwrap());
+        api.response_echo = Some(form.clone());
+        assert!(
+            block_on(s.procurement_catalogue(&mut api)).is_err(),
+            "Request signature echo must be refused before response publication"
+        );
+        let value = json!({"name":form});
+        assert!(
+            !crate::poc::inference::safe(&s, &value, &[]),
+            "Signature encoding must not reach model context"
+        );
+        assert!(
+            s.protect_output(&value).unwrap() != value,
+            "Signature encoding must not reach output"
+        );
+        let mut echoed = fixtures::vm(&fixtures::selection(false), 11);
+        echoed["template"]["name"] = value["name"].clone();
+        let next = s.next;
+        assert!(
+            block_on(s.commit(&Event::Procurement(Record::Associated(echoed)))).is_err(),
+            "Exact serialized journal must reject request signatures"
+        );
+        assert_eq!(s.next, next);
+        assert!(
+            s.poc_credential_filters.is_empty(),
+            "Provider request custody is separate from inference admission"
+        );
+    }
+}
+
+#[test]
+fn provisioning_fiat_plan_uses_authoritative_lightning_quote_and_provider_period() {
+    for currency in ["EUR", "USD"] {
+        let mut s = ready();
+        let mut api = Fixture::new(true);
+        api.current_selection.charge.currency = currency.into();
+        api.current_selection.charge.amount = 1500;
+        api.billing_terms.time = 2678400;
+        api.billing_terms.amount = 2345678;
+        approve(&mut s, &mut api);
+        assert!(
+            block_on(s.procurement_resume(&mut api, true))
+                .unwrap_err()
+                .contains("Review the current initial Lightning quote")
+        );
+        assert!(s.procurement.as_ref().unwrap().invoice.is_none());
+        let billing = s.procurement.as_ref().unwrap().billing.clone().unwrap();
+        assert_eq!(billing.terms.time, 2678400);
+        assert_eq!(billing.terms.currency, "BTC");
+        let mut loaded = reopen(&s);
+        assert!(
+            block_on(loaded.procurement_resume(&mut api, true))
+                .unwrap_err()
+                .contains("external payment")
+        );
+        assert_eq!(loaded.procurement.as_ref().unwrap().billing, Some(billing));
+        assert_eq!(
+            loaded
+                .procurement
+                .as_ref()
+                .unwrap()
+                .selected
+                .charge
+                .currency,
+            currency
+        );
+        api.payments[0]["is_paid"] = json!(true);
+        block_on(loaded.procurement_resume(&mut api, false)).unwrap();
+        assert!(reopen(&loaded).poc_target("machine-a").is_some());
+        assert_eq!(
+            api.count("GET /api/v1/vm/11/renew?method=lightning&intervals=1"),
+            1
+        );
+    }
+}
+
+#[test]
+fn provisioning_changed_or_unavailable_initial_quote_requires_review_and_never_resets_sent_invoice()
+{
+    let mut s = ready();
+    let mut api = Fixture::new(false);
+    approve(&mut s, &mut api);
+    assert!(block_on(s.procurement_resume(&mut api, false)).is_err());
+    let original = s.procurement.as_ref().unwrap().billing.clone().unwrap();
+    api.billing_terms.amount += 1;
+    api.billing_terms.tax += 1;
+    api.billing_terms.processing_fee += 1;
+    api.billing_terms.time += 86400;
+    assert!(
+        block_on(s.procurement_resume(&mut api, true))
+            .unwrap_err()
+            .contains("Review the current initial Lightning quote")
+    );
+    assert_eq!(
+        api.count("GET /api/v1/vm/11/renew?method=lightning&intervals=1"),
+        0
+    );
+    assert!(s.procurement.as_ref().unwrap().billing.as_ref() != Some(&original));
+    let mut loaded = reopen(&s);
+    api.fail_quote = true;
+    assert!(block_on(loaded.procurement_resume(&mut api, true)).is_err());
+    assert!(loaded.procurement.as_ref().unwrap().invoice.is_none());
+    assert_eq!(
+        api.count("GET /api/v1/vm/11/renew?method=lightning&intervals=1"),
+        0
+    );
+    api.fail_quote = false;
+    api.lose_invoice = true;
+    assert!(block_on(loaded.procurement_resume(&mut api, true)).is_err());
+    let saved = loaded
+        .procurement
+        .as_ref()
+        .unwrap()
+        .billing
+        .clone()
+        .unwrap();
+    let mut sent_replacement = saved.clone();
+    sent_replacement.terms.amount += 1;
+    assert!(
+        loaded
+            .procurement_projection(&Record::BillingQuoted(sent_replacement))
+            .is_err()
+    );
+    let quotes = api.count("GET /api/v1/vm/11/renew/quote?method=lightning&intervals=1");
+    api.billing_terms.amount += 99;
+    let mut loaded = reopen(&loaded);
+    assert!(
+        block_on(loaded.procurement_resume(&mut api, false))
+            .unwrap_err()
+            .contains("external payment")
+    );
+    assert_eq!(
+        loaded.procurement.as_ref().unwrap().billing,
+        Some(saved.clone())
+    );
+    assert_eq!(
+        api.count("GET /api/v1/vm/11/renew/quote?method=lightning&intervals=1"),
+        quotes
+    );
+    let mut replacement = saved;
+    replacement.terms.amount += 1;
+    assert!(
+        loaded
+            .procurement_projection(&Record::BillingQuoted(replacement))
+            .is_err()
+    );
+    assert_eq!(
+        api.count("GET /api/v1/vm/11/renew?method=lightning&intervals=1"),
+        1
+    );
+}
+
+#[test]
+fn provisioning_existing_paid_or_unpaid_initial_history_reuses_authoritative_quote_without_issuance()
+ {
+    for paid in [false, true] {
+        let mut s = ready();
+        let mut api = Fixture::new(false);
+        approve(&mut s, &mut api);
+        api.fault_after = Some((
+            "POST /api/v1/vm".into(),
+            s.storage.clone(),
+            Fault::LandThenFail(3),
+        ));
+        assert!(block_on(s.procurement_resume(&mut api, false)).is_err());
+        let mut loaded = reopen(&s);
+        let mut payment = fixtures::payment(11);
+        payment["is_paid"] = json!(paid);
+        api.payments.push(payment);
+        let result = block_on(loaded.procurement_resume(&mut api, false));
+        assert_eq!(loaded.procurement_view()["payment"]["id"], "aabb");
+        if paid {
+            result.unwrap();
+            assert!(loaded.poc_target("machine-a").is_some());
+        } else {
+            assert!(result.unwrap_err().contains("external payment"));
+        }
+        assert_eq!(
+            api.count("GET /api/v1/vm/11/renew?method=lightning&intervals=1"),
+            0
+        );
+        assert_eq!(
+            api.count("GET /api/v1/vm/11/renew/quote?method=lightning&intervals=1"),
+            1
+        );
+    }
+}
+
+#[test]
+fn provisioning_billing_intent_requires_saved_terms_and_failed_quote_append_sends_no_invoice() {
+    let mut s = ready();
+    let mut api = Fixture::new(false);
+    approve(&mut s, &mut api);
+    api.fault_after = Some((
+        "POST /api/v1/vm".into(),
+        s.storage.clone(),
+        Fault::LandThenFail(3),
+    ));
+    assert!(block_on(s.procurement_resume(&mut api, false)).is_err());
+    let mut loaded = reopen(&s);
+    assert!(loaded.procurement.as_ref().unwrap().vm.is_some());
+    assert!(loaded.procurement.as_ref().unwrap().billing.is_none());
+    assert!(
+        loaded
+            .procurement_projection(&Record::BillingQuoted(Billing {
+                vm_id: 12,
+                terms: fixtures::billing_terms()
+            }))
+            .is_err()
+    );
+    assert!(
+        loaded
+            .procurement_projection(&Record::InvoiceSent(Invoice {
+                before: vec![],
+                started: api.clock
+            }))
+            .is_err()
+    );
+    api.fault_after = Some((
+        "GET /api/v1/vm/11/renew/quote?method=lightning&intervals=1".into(),
+        loaded.storage.clone(),
+        Fault::Fail(1),
+    ));
+    assert!(block_on(loaded.procurement_resume(&mut api, true)).is_err());
+    assert_eq!(
+        api.count("GET /api/v1/vm/11/renew?method=lightning&intervals=1"),
+        0
+    );
+    let mut loaded = reopen(&loaded);
+    assert!(loaded.procurement.as_ref().unwrap().billing.is_none());
+    assert!(
+        block_on(loaded.procurement_resume(&mut api, true))
+            .unwrap_err()
+            .contains("Review the current initial Lightning quote")
+    );
+    assert!(loaded.procurement.as_ref().unwrap().invoice.is_none());
+    assert_eq!(
+        api.count("GET /api/v1/vm/11/renew?method=lightning&intervals=1"),
+        0
+    );
+}
+
+#[test]
+fn provisioning_delayed_creation_evidence_within_action_and_clock_bounds_replays_same_machine() {
+    for custom in [false, true] {
+        for lost in [false, true] {
+            let mut s = ready();
+            let mut api = Fixture::new(custom);
+            approve(&mut s, &mut api);
+            // Model 30s intent/dispatch latency and a provider clock 60s ahead at dispatch.
+            api.advance_before_create = 30;
+            api.created = Some("2026-11-06T14:01:30Z".into());
+            api.lose_create = lost;
+            assert!(block_on(s.procurement_resume(&mut api, false)).is_err());
+            let mut loaded = reopen(&s);
+            assert!(block_on(loaded.procurement_resume(&mut api, false)).is_err());
+            assert_eq!(loaded.procurement_view()["vm_id"], 11);
+            assert!(issue_invoice(&mut loaded, &mut api).is_err());
+            api.payments[0]["is_paid"] = json!(true);
+            block_on(loaded.procurement_resume(&mut api, false)).unwrap();
+            let target = loaded.poc_target("machine-a").cloned();
+            assert!(target.is_some());
+            assert_eq!(reopen(&loaded).poc_target("machine-a").cloned(), target);
+            let mut outside = api.machines[0].clone();
+            outside["created"] = json!("2026-11-06T14:02:01Z");
+            assert!(
+                loaded
+                    .procurement_projection(&Record::Observation(outside))
+                    .is_err()
+            );
+            assert_eq!(
+                api.count(if custom {
+                    "POST /api/v1/vm/custom-template"
+                } else {
+                    "POST /api/v1/vm"
+                }),
+                1
+            );
+        }
+    }
+}
+
+#[test]
+fn provisioning_approval_credential_admission_precedes_durable_change() {
+    let old = b"fixture~inference~key~482700";
+    let current = b"current-inference-key-9751";
+    for key in [old.as_slice(), current.as_slice()] {
+        for alias in [
+            hex::encode(key),
+            String::from_utf8(key.to_vec()).unwrap(),
+            hex::encode_upper(key),
+            base64::engine::general_purpose::STANDARD.encode(key),
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key),
+            key.iter().map(|b| format!("%{b:02X}")).collect(),
+        ] {
+            for field in ["machine", "relay"] {
+                let mut s = ready();
+                let mut api = Fixture::new(false);
+                block_on(s.procurement_select(
+                    &mut api,
+                    Choice {
+                        offer_id: 1,
+                        image_id: 3,
+                        resources: None,
+                    },
+                ))
+                .unwrap();
+                s.remember_poc_credential(old);
+                s.remember_poc_credential(current);
+                let mut request = approval();
+                if field == "machine" {
+                    request.machine = alias.clone();
+                } else {
+                    request.relay = format!("wss://relay.invalid/{alias}/");
+                }
+                let files = s.storage.files();
+                let allocation = s.allocation().clone();
+                let end = s.records().end;
+                let calls = api.calls.clone();
+                let error = block_on(s.procurement_approve(&mut api, request)).unwrap_err();
+                assert!(
+                    error.contains("protected or unscannable"),
+                    "{field}: {alias}"
+                );
+                assert_eq!(s.storage.files(), files, "approval must not append");
+                assert_eq!(s.records().end, end);
+                assert_eq!(s.allocation(), &allocation);
+                assert_eq!(api.calls, calls, "refusal precedes provider traffic");
+                assert!(s.procurement.is_none());
+                assert!(s.dispatch.approved_entries.is_empty());
+                let replayed = reopen(&s);
+                assert!(replayed.procurement.is_none());
+                assert_eq!(replayed.allocation(), &allocation);
+                assert_eq!(replayed.storage.files(), files);
+            }
+        }
+    }
+    let mut safe = ready();
+    safe.remember_poc_credential(old);
+    safe.remember_poc_credential(current);
+    approve(&mut safe, &mut Fixture::new(false));
+    assert!(reopen(&safe).procurement.is_some());
+}
+
+#[test]
+fn provisioning_approval_unscannable_authority_preserves_state() {
+    let mut s = ready();
+    let mut api = Fixture::new(false);
+    block_on(s.procurement_select(
+        &mut api,
+        Choice {
+            offer_id: 1,
+            image_id: 3,
+            resources: None,
+        },
+    ))
+    .unwrap();
+    block_on(s.synthetic_scan_fixture(
+        "credential".into(),
+        Zeroizing::new(b"required-secret-1234".to_vec()),
+    ))
+    .unwrap();
+    s.clear_scan_working_copies();
+    let files = s.storage.files();
+    let allocation = s.allocation().clone();
+    let calls = api.calls.clone();
+    assert!(
+        block_on(s.procurement_approve(&mut api, approval()))
+            .unwrap_err()
+            .contains("protected or unscannable")
+    );
+    assert_eq!(s.storage.files(), files);
+    assert_eq!(s.allocation(), &allocation);
+    assert_eq!(api.calls, calls);
+    assert!(s.procurement.is_none());
+}
+
+#[test]
+fn provisioning_custom_caps_gate_direct_reconciliation_status_and_authenticated_replay() {
+    for mode in ["direct", "lost", "later"] {
+        for missing in [false, true] {
+            let mut s = ready();
+            let mut api = Fixture::new(true);
+            api.current_selection = fixtures::capped_selection();
+            approve(&mut s, &mut api);
+            let approved = s.procurement.clone().unwrap();
+            let mut bad = fixtures::vm(&approved.selected, 11);
+            if missing {
+                bad["template"]["limits"] = json!({"network_mbps":500});
+            } else {
+                bad["template"]["limits"]["cpu_limit"] = json!(0.25);
+                bad["template"]["limits"]["disk_iops_read"] = json!(2500);
+            }
+            if mode != "later" {
+                api.vm_change =
+                    Some(("/template/limits".into(), bad["template"]["limits"].clone()));
+            }
+            api.lose_create = mode == "lost";
+            assert!(block_on(s.procurement_resume(&mut api, false)).is_err());
+            if mode == "later" {
+                assert!(issue_invoice(&mut s, &mut api).is_err());
+                api.payments[0]["is_paid"] = json!(true);
+                api.machines[0] = bad.clone();
+            }
+            let invalid = if mode == "later" {
+                Record::Observation(bad.clone())
+            } else {
+                Record::Associated(bad.clone())
+            };
+            assert!(
+                s.procurement_projection(&invalid).is_err(),
+                "shared replay projection refuses caps"
+            );
+            let mut forged = reopen(&s);
+            block_on(forged.commit(&Event::Procurement(invalid))).unwrap();
+            assert!(
+                block_on(unlock(
+                    MemoryStorage::with_files(forged.storage.files()),
+                    &Fixed,
+                    pass()
+                ))
+                .is_err(),
+                "authenticated journal replay must refuse conflicting caps"
+            );
+            for _ in 0..2 {
+                let mut loaded = reopen(&s);
+                assert!(block_on(loaded.procurement_resume(&mut api, false)).is_err());
+                let p = loaded.procurement.as_ref().unwrap();
+                assert_eq!(p.identity, approved.identity);
+                assert_eq!(p.relay_identity, approved.relay_identity);
+                assert_eq!(p.selected, approved.selected);
+                assert_eq!(p.account, approved.account);
+                assert!(p.create.is_some());
+                assert!(p.target.is_none());
+                assert_eq!(p.vm.is_some(), mode == "later");
+                assert_eq!(api.count("POST /api/v1/vm/custom-template"), 1);
+                assert_eq!(
+                    api.count("GET /api/v1/vm/11/renew?method=lightning&intervals=1"),
+                    usize::from(mode == "later")
+                );
+                assert!(loaded.poc_target("machine-a").is_none());
+                s = loaded;
+            }
+            api.machines[0] = fixtures::vm(&approved.selected, 11);
+            if mode == "later" {
+                block_on(s.procurement_resume(&mut api, false)).unwrap();
+                assert!(reopen(&s).poc_target("machine-a").is_some());
+            } else {
+                assert!(
+                    block_on(s.procurement_resume(&mut api, false))
+                        .unwrap_err()
+                        .contains("initial Lightning")
+                );
+                assert_eq!(reopen(&s).procurement_view()["vm_id"], 11);
+            }
+            assert_eq!(api.count("POST /api/v1/vm/custom-template"), 1);
+        }
+    }
+}
+
+#[test]
+fn provisioning_unmetered_transfer_gates_direct_reconciliation_status_and_authenticated_replay() {
+    for custom in [false, true] {
+        for mode in ["direct", "lost", "later"] {
+            let mut s = ready();
+            let mut api = Fixture::new(custom);
+            if custom {
+                api.current_selection
+                    .offer
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("transfer");
+                api.current_selection
+                    .resources
+                    .as_mut()
+                    .unwrap()
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("transfer_gb");
+            }
+            approve(&mut s, &mut api);
+            let approved = s.procurement.clone().unwrap();
+            let mut bad = fixtures::vm(&approved.selected, 11);
+            bad["template"]["transfer_gb"] = json!(1);
+            if mode != "later" {
+                api.vm_change = Some(("/template".into(), bad["template"].clone()));
+            }
+            api.lose_create = mode == "lost";
+            assert!(block_on(s.procurement_resume(&mut api, false)).is_err());
+            if mode == "later" {
+                assert!(issue_invoice(&mut s, &mut api).is_err());
+                api.payments[0]["is_paid"] = json!(true);
+                api.machines[0] = bad.clone();
+            }
+            let invalid = if mode == "later" {
+                Record::Observation(bad.clone())
+            } else {
+                Record::Associated(bad.clone())
+            };
+            assert!(
+                s.procurement_projection(&invalid).is_err(),
+                "shared projection refuses an unapproved transfer cap"
+            );
+            let mut forged = reopen(&s);
+            block_on(forged.commit(&Event::Procurement(invalid))).unwrap();
+            assert!(
+                block_on(unlock(
+                    MemoryStorage::with_files(forged.storage.files()),
+                    &Fixed,
+                    pass()
+                ))
+                .is_err(),
+                "authenticated replay refuses an unapproved transfer cap"
+            );
+            for _ in 0..2 {
+                let mut loaded = reopen(&s);
+                assert!(block_on(loaded.procurement_resume(&mut api, false)).is_err());
+                let p = loaded.procurement.as_ref().unwrap();
+                assert_eq!(p.identity, approved.identity);
+                assert_eq!(p.relay_identity, approved.relay_identity);
+                assert_eq!(p.selected, approved.selected);
+                assert_eq!(p.account, approved.account);
+                assert!(p.create.is_some() && p.target.is_none());
+                assert_eq!(p.vm.is_some(), mode == "later");
+                assert_eq!(
+                    api.count(if custom {
+                        "POST /api/v1/vm/custom-template"
+                    } else {
+                        "POST /api/v1/vm"
+                    }),
+                    1
+                );
+                assert_eq!(
+                    api.count("GET /api/v1/vm/11/renew?method=lightning&intervals=1"),
+                    usize::from(mode == "later")
+                );
+                s = loaded;
+            }
+            api.machines[0] = fixtures::vm(&approved.selected, 11);
+            if mode == "later" {
+                block_on(s.procurement_resume(&mut api, false)).unwrap();
+                assert!(reopen(&s).poc_target("machine-a").is_some());
+            } else {
+                assert!(
+                    block_on(s.procurement_resume(&mut api, false))
+                        .unwrap_err()
+                        .contains("initial Lightning")
+                );
+                assert_eq!(reopen(&s).procurement_view()["vm_id"], 11);
+            }
+            assert_eq!(
+                api.count(if custom {
+                    "POST /api/v1/vm/custom-template"
+                } else {
+                    "POST /api/v1/vm"
+                }),
+                1
+            );
+        }
+    }
+}
+
+#[test]
+fn provisioning_missing_limits_refuse_before_approval_and_authenticated_replay() {
+    for custom in [false, true] {
+        let mut s = ready();
+        let original_files = s.storage.files();
+        let allocation = s.allocation().clone();
+        let mut api = Fixture::new(custom);
+        api.current_selection
+            .offer
+            .as_object_mut()
+            .unwrap()
+            .remove("limits");
+        assert!(
+            block_on(s.procurement_select(
+                &mut api,
+                Choice {
+                    offer_id: if custom { 2 } else { 1 },
+                    image_id: 3,
+                    resources: custom.then(fixtures::custom_resources),
+                }
+            ))
+            .is_err()
+        );
+        assert!(s.procurement.is_none());
+        assert_eq!(s.storage.files(), original_files);
+        assert_eq!(s.allocation(), &allocation);
+        assert!(api.calls.iter().all(|call| call.starts_with("GET ")));
+        api.current_selection = fixtures::selection(custom);
+        approve(&mut s, &mut api);
+        let mut invalid = s.procurement.clone().unwrap();
+        invalid
+            .selected
+            .offer
+            .as_object_mut()
+            .unwrap()
+            .remove("limits");
+        let mut before = block_on(unlock(
+            MemoryStorage::with_files(original_files),
+            &Fixed,
+            pass(),
+        ))
+        .unwrap();
+        assert!(
+            before
+                .procurement_projection(&Record::Approved(Box::new(invalid.clone())))
+                .is_err()
+        );
+        block_on(before.commit(&Event::Procurement(Record::Approved(Box::new(invalid))))).unwrap();
+        assert!(
+            block_on(unlock(
+                MemoryStorage::with_files(before.storage.files()),
+                &Fixed,
+                pass()
+            ))
+            .is_err(),
+            "authenticated approval cannot replay without limits evidence"
+        );
+        assert!(s.procurement.as_ref().unwrap().create.is_none());
+    }
+}
+
+#[test]
+fn provisioning_request_protection_survives_worker_loss_before_response() {
+    let input = Zeroizing::new(hex::encode([7; 32]));
+    let account = protocol::Account::parse(input.as_bytes()).unwrap();
+    let auth = account
+        .authorization(
+            "https://api.lnvps.net/api/v1/vm/templates",
+            "GET",
+            None,
+            42,
+            &[5; 32],
+        )
+        .unwrap();
+    let signed: Value = serde_json::from_slice(
+        &base64::engine::general_purpose::STANDARD
+            .decode(auth.strip_prefix("Nostr ").unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    let signature = signed["sig"].as_str().unwrap();
+    let forms = [
+        signature.to_string(),
+        signature.to_uppercase(),
+        base64::engine::general_purpose::STANDARD.encode(hex::decode(signature).unwrap()),
+        signed.to_string(),
+        auth.to_string(),
+    ];
+    let mut s = ready();
+    let mut api = Fixture::new(false);
+    api.prepared_protection = Some(protocol::request_filter(&auth).unwrap().fingerprints());
+    api.fail_catalogue = true;
+    assert!(block_on(s.procurement_catalogue(&mut api)).is_err());
+    assert_eq!(api.count("GET /api/v1/vm/templates"), 1);
+    let mut loaded = reopen(&s);
+    loaded.remember_provider_filter(account.filter(input.as_bytes()));
+    for form in forms {
+        let next = loaded.next;
+        api.fail_catalogue = false;
+        api.response_echo = Some(form.clone());
+        assert!(
+            block_on(loaded.procurement_catalogue(&mut api)).is_err(),
+            "prior request material must not be published after reload"
+        );
+        let value = json!({"name":form});
+        assert!(!crate::poc::inference::safe(&loaded, &value, &[]));
+        assert_ne!(loaded.protect_output(&value).unwrap(), value);
+        let mut vm = fixtures::vm(&fixtures::selection(false), 11);
+        vm["template"]["name"] = value["name"].clone();
+        assert!(block_on(loaded.commit(&Event::Procurement(Record::Associated(vm)))).is_err());
+        assert_eq!(
+            loaded.next, next,
+            "refused evidence never enters the journal"
+        );
+        let mut reader = Store::new(
+            loaded.storage.clone(),
+            DataKey(loaded.key.0),
+            loaded.id.clone(),
+        );
+        for number in 0..loaded.next {
+            let bytes = block_on(loaded.storage.read(&number.to_string())).unwrap();
+            let event = reader.open(number, &bytes).unwrap();
+            assert!(
+                !serde_json::to_string(&event)
+                    .unwrap()
+                    .contains(value["name"].as_str().unwrap())
+            );
+            reader.previous = Address(Sha256::digest(&bytes).into());
+        }
+    }
+    assert!(loaded.poc_credential_filters.is_empty());
+}
+
+#[test]
+fn provisioning_failed_protection_append_dispatches_nothing() {
+    for fault in [Fault::Fail(1), Fault::LandThenFail(3)] {
+        let mut s = ready();
+        let mut api = Fixture::new(false);
+        api.prepared_protection = Some(
+            crate::poc::inference::EchoFilter::new(&[b"synthetic request scan material"])
+                .fingerprints(),
+        );
+        s.storage.fault(fault);
+        assert!(block_on(s.procurement_catalogue(&mut api)).is_err());
+        assert!(
+            api.calls.is_empty(),
+            "no transport before protection commit succeeds"
+        );
+    }
+}
+
+#[test]
+fn provisioning_failed_mutation_protection_keeps_intent_without_dispatch_or_retry() {
+    for route in [
+        "POST /api/v1/ssh-key",
+        "POST /api/v1/vm",
+        "GET /api/v1/vm/11/renew?method=lightning&intervals=1",
+    ] {
+        for fault in [Fault::Fail(1), Fault::LandThenFail(3)] {
+            let mut s = ready();
+            let mut api = Fixture::new(false);
+            approve(&mut s, &mut api);
+            let invoice = route.contains("/renew?");
+            if invoice {
+                assert!(
+                    block_on(s.procurement_resume(&mut api, false))
+                        .unwrap_err()
+                        .contains("Review the current initial Lightning quote")
+                );
+                assert!(s.procurement.as_ref().unwrap().billing.is_some());
+                assert!(s.procurement.as_ref().unwrap().invoice.is_none());
+            }
+            api.protection_fault = Some((route.into(), s.storage.clone(), fault));
+            assert!(block_on(s.procurement_resume(&mut api, invoice)).is_err());
+            assert_eq!(
+                api.count(route),
+                0,
+                "failed protection append sends no mutation"
+            );
+            let purchase = s.procurement.clone();
+            let mut loaded = reopen(&s);
+            for _ in 0..2 {
+                assert!(block_on(loaded.procurement_resume(&mut api, invoice)).is_err());
+                assert_eq!(
+                    api.count(route),
+                    0,
+                    "persisted intent never dispatches after recovery"
+                );
+                assert_eq!(loaded.procurement, purchase);
+            }
+        }
+    }
+}
+
+#[test]
+fn provisioning_request_fingerprint_wire_format_roundtrips_fixed_length_digests() {
+    let filter = crate::poc::inference::EchoFilter::new(&[b"synthetic public request material"]);
+    let snapshot = filter.fingerprints();
+    let encoded = serde_json::to_value(&snapshot).unwrap();
+    for pattern in encoded["patterns"].as_array().unwrap() {
+        assert_eq!(pattern[2].as_array().unwrap().len(), 32);
+        assert_eq!(pattern[3].as_array().unwrap().len(), 32);
+    }
+    let restored: crate::poc::inference::EchoFingerprints =
+        serde_json::from_value(encoded.clone()).unwrap();
+    assert_eq!(snapshot, restored);
+    for input in [
+        b"synthetic public request material".as_slice(),
+        b"ordinary harmless output".as_slice(),
+    ] {
+        assert_eq!(
+            filter.protect_bytes(input).unwrap(),
+            restored.filter().protect_bytes(input).unwrap()
+        );
+    }
+    for length in [0, 31, 33] {
+        let mut malformed = encoded.clone();
+        malformed["patterns"][0][2] = json!(vec![0u8; length]);
+        assert!(
+            serde_json::from_value::<crate::poc::inference::EchoFingerprints>(malformed).is_err()
+        );
+    }
+}

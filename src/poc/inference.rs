@@ -11,6 +11,7 @@ use crate::goals::Tool;
 use crate::redaction::Redacted;
 use crate::store::{Storage, Store};
 use base64::Engine;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
@@ -180,6 +181,58 @@ pub(crate) struct EchoFilter {
     hex_only: bool,
 }
 
+/// Scan fingerprints and coarse prefilters; no key or request bytes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct EchoFingerprints {
+    #[serde(with = "fingerprint_patterns")]
+    patterns: Vec<EchoPattern>,
+}
+impl EchoFingerprints {
+    pub(crate) fn filter(&self) -> EchoFilter {
+        EchoFilter {
+            representations: self.patterns.clone(),
+            literal: Vec::new(),
+            decimal_free: Vec::new(),
+            decimal_only: false,
+            hex_free: Vec::new(),
+            hex_only: false,
+        }
+    }
+}
+
+// Keep digest semantics in memory and the fixed-length byte-array journal format.
+mod fingerprint_patterns {
+    use super::*;
+
+    pub fn serialize<S: serde::Serializer>(
+        patterns: &[EchoPattern],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        patterns
+            .iter()
+            .map(|(len, rolling, hash, digest, sum)| {
+                (len, rolling, hash.as_slice(), digest.as_slice(), sum)
+            })
+            .collect::<Vec<_>>()
+            .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<EchoPattern>, D::Error> {
+        let patterns = Vec::<(usize, Option<u16>, [u8; 32], [u8; 32], Option<u16>)>::deserialize(
+            deserializer,
+        )?;
+        Ok(patterns
+            .into_iter()
+            .map(|(len, rolling, hash, digest, sum)| {
+                (len, rolling, hash.into(), digest.into(), sum)
+            })
+            .collect())
+    }
+}
+
 fn echo_pattern(form: &[u8]) -> EchoPattern {
     (
         form.len(),
@@ -272,6 +325,12 @@ impl EchoFilter {
             decimal_only,
             hex_free,
             hex_only,
+        }
+    }
+
+    pub(crate) fn fingerprints(&self) -> EchoFingerprints {
+        EchoFingerprints {
+            patterns: self.representations.clone(),
         }
     }
 
@@ -1023,7 +1082,7 @@ mod browser;
 )]
 pub(crate) use browser::next;
 #[cfg(target_arch = "wasm32")]
-pub(crate) use browser::{CommandResponse, configure, end, freeze, key_is_set};
+pub(crate) use browser::{CommandResponse, configure, end, freeze, key_is_set, response_pending};
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) mod tests;

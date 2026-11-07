@@ -42,6 +42,37 @@
 <p><label>Key <input id="tau-poc-key" type="password" required autocomplete="off"></label></p>
 <button type="submit">Set inference configuration</button>
 </form>
+<h2>New machine</h2>
+<p>Use a dedicated, already verified provider account. This PoC uses an operator-supplied account rather than seed-based vendor recovery. It supports one purchase per store, external payment of the initial period, and published Ed25519 host keys. No stock or connectivity is promised.</p>
+<p id="tau-provider-key-status" role="status">Provider key unset.</p>
+<form id="tau-provider-key-form" novalidate>
+<label>Provider account private key (64 hex) <input id="tau-provider-key" type="password" autocomplete="off" spellcheck="false" autocapitalize="none"></label>
+<button type="submit">Set provider account</button>
+</form>
+<p>App Lock, reload and worker loss clear the provider key. Re-enter the same account to resume the saved purchase.</p>
+<button id="tau-provider-catalogue" type="button">Fetch offers and images</button>
+<div id="tau-provider-catalogue-view"></div>
+<form id="tau-provider-selection-form">
+<p><label>Fetched offer <select id="tau-provider-offer" required><option value="">Choose a fetched offer</option></select></label></p>
+<p><label>Fetched Arch image <select id="tau-provider-image" required><option value="">Choose a fetched image</option></select></label></p>
+<p><label>Custom resources JSON (custom offers only; bytes for memory/disk) <textarea id="tau-provider-resources" autocomplete="off" spellcheck="false">{}</textarea></label></p>
+<button type="submit">Review selected configuration and price</button>
+</form>
+<div id="tau-provider-selection-view"></div>
+<form id="tau-provider-approval-form">
+<p><label>Machine name <input id="tau-provider-machine" required autocomplete="off"></label></p>
+<p><label>Existing v1 relay URL (wss://, ending in /) <input id="tau-provider-relay" type="url" required autocomplete="off"></label></p>
+<p>Will this machine serve people you have never met? If unsure, choose Not sure.</p>
+<p><label>Class answer <select id="tau-provider-class" required><option value="">Choose an answer</option><option value="yes">Yes</option><option value="no">No, only me and people I know</option><option value="not_sure">Not sure</option></select></label></p>
+<p><label><input id="tau-provider-approve-charge" type="checkbox" required>Approve the exact displayed machine configuration, region, image, resources and recurring charge terms.</label></p>
+<p><label><input id="tau-provider-approve-access" type="checkbox" required>Approve maintained, ad-hoc access, Arch user and whole-script sudo -n.</label></p>
+<button type="submit">Approve these exact purchase terms</button>
+</form>
+<button id="tau-provider-resume" type="button">Create approved machine / Refresh saved purchase</button>
+<button id="tau-provider-invoice" type="button">Issue initial Lightning invoice for one approved period</button>
+<div id="tau-provider-progress" aria-live="polite"></div>
+<p>The published pin comes from the provider’s hypervisor scan, rather than attestation. It trusts the provider and whoever can answer the machine address inside its network at scan time.</p>
+<p>Registering the machine SSH public key at the provider does not enroll the relay. Copy the separate relay public key below and enroll it with your relay operator before configuration. Published pins and ordinary goal, class, access and declaration approvals are required by the existing runner.</p>
 <h2>Existing machine</h2>
 <p>This PoC supports one existing machine per fresh local store. Each machine name permanently binds these connection fields, pin, profile and elevation. To change them, use a fresh local store and a new name; keep the current store for its task history. Obtain the host fingerprint independently; a presented SSH key is never accepted here.</p>
 <form id="tau-poc-target-form">

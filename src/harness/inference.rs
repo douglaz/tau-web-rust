@@ -122,6 +122,12 @@ async fn publication(generation: u64, session: String, report: String, post: boo
                 if let Some(keys) = safe.get("poc_keys") {
                     current["poc_keys"] = keys.clone();
                 }
+                if let Some(catalogue) = safe.get("provider_catalogue") {
+                    current["provider_catalogue"] = catalogue.clone();
+                }
+                if safe["provider_selection_reviewed"] == true {
+                    current["provider_selection_reviewed"] = true.into();
+                }
             }
             Ok(current)
         } else {
@@ -140,6 +146,8 @@ async fn publication(generation: u64, session: String, report: String, post: boo
         // Read-only custody survives suspension/reconciliation. It grants no authority,
         // and is taken from the holder rather than trusting a page-supplied status.
         value["poc_configuration"] = json!({"key_set":crate::poc::inference::key_is_set()});
+        value["provider_configuration"] =
+            json!({"key_set":crate::poc::provisioning::browser::key_is_set()});
         let encoded = value.to_string();
         let message = if post {
             let mut message = value.clone();
@@ -161,6 +169,15 @@ async fn publication(generation: u64, session: String, report: String, post: boo
         // Encoding and scanning can consume lifetime too. Validate after all preparation,
         // under the same writer, immediately before the actual release.
         let final_check = (|| {
+            if value.get("provider_catalogue").is_some()
+                || value.get("provider_selection_reviewed").is_some()
+            {
+                let owner = crate::lifecycle::owner();
+                owner.ordinary()?;
+                if generation != owner.generation() {
+                    return Err("stale provider publication".into());
+                }
+            }
             if carries_result {
                 let owner = crate::lifecycle::owner();
                 owner.ordinary()?;
@@ -206,6 +223,7 @@ pub async fn lifecycle_transition(event: String) -> String {
         "freeze" => {
             owner.suspend();
             crate::poc::inference::freeze();
+            crate::poc::provisioning::browser::freeze();
             super::wait::stop_all();
             super::goals::suspend();
             FETCHES.with_borrow(|fetches| {
@@ -716,6 +734,7 @@ pub async fn end_sessions() {
     ENDING.set(true);
     crate::lifecycle::owner().end();
     crate::poc::inference::end();
+    crate::poc::provisioning::browser::end();
     authority_changed();
     super::goals::end();
     super::wait::stop_all();

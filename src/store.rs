@@ -61,6 +61,14 @@ mod goals;
 pub(crate) mod inference;
 pub mod poc;
 pub mod poc_targets;
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    allow(
+        dead_code,
+        reason = "the provider adapter is driven by the dedicated browser worker"
+    )
+)]
+pub mod provisioning;
 pub mod reinstall;
 mod scan;
 
@@ -217,6 +225,8 @@ pub(crate) enum Event {
     InferenceTerminal(crate::inference::Terminal),
     DedicatedReinstall(reinstall::Record),
     PocTarget(poc_targets::Record),
+    Procurement(provisioning::Record),
+    ProviderProtection(crate::poc::inference::EchoFingerprints),
 }
 
 impl Drop for Event {
@@ -366,6 +376,9 @@ pub struct Store<S> {
     scans: crate::scan::References,
     reinstall: reinstall::State,
     poc_targets: std::collections::BTreeMap<String, poc_targets::Record>,
+    procurement: Option<provisioning::Purchase>,
+    provider_filters: Vec<crate::poc::inference::EchoFilter>,
+    procurement_selection: Option<crate::poc::provisioning::Selection>,
     /// Memory-only credential fingerprints continue protecting late evidence after key disposal.
     poc_credential_filters: Vec<crate::poc::inference::EchoFilter>,
     authority: Rc<crate::lifecycle::Authority>,
@@ -508,6 +521,9 @@ impl<S: Storage> Store<S> {
             scans: Default::default(),
             reinstall: Default::default(),
             poc_targets: Default::default(),
+            procurement: None,
+            provider_filters: Vec::new(),
+            procurement_selection: None,
             poc_credential_filters: Vec::new(),
             authority: crate::lifecycle::owner(),
             response_calls: std::collections::BTreeSet::new(),
@@ -1470,6 +1486,10 @@ impl<S: Storage> Store<S> {
                     self.replay_poc_target(number, record)
                         .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
                 }
+                (_, Event::Procurement(record)) => self.replay_procurement(number, record)?,
+                (_, Event::ProviderProtection(fingerprints)) => {
+                    self.remember_provider_filter(fingerprints.filter());
+                }
                 (_, Event::DedicatedReinstall(record)) => {
                     self.replay_reinstall(number, record)?;
                 }
@@ -1814,6 +1834,11 @@ impl<S: Storage> Store<S> {
         }
         let previous = hex::encode(self.previous.0);
         let plaintext = Zeroizing::new(serde_json::to_vec(event).expect("an event serializes"));
+        for filter in &self.provider_filters {
+            if filter.protect_bytes(&plaintext)?.as_slice() != plaintext.as_slice() {
+                return Err("protected provider material refused before encryption".into());
+            }
+        }
         for filter in &self.poc_credential_filters {
             if filter
                 .literal_match(&plaintext)
@@ -2264,6 +2289,9 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
             State::Refused(why) => json!({ "state": "refused", "reason": why }),
         };
         if let State::Unlocked(store) = &self.state {
+            if store.procurement.is_some() || store.procurement_selection.is_some() {
+                report["procurement"] = store.procurement_view();
+            }
             if !store.poc_targets.is_empty() {
                 report["poc_targets"] = store.poc_targets_view();
                 report["poc_declaration_candidate"] =
