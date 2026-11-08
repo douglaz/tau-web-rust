@@ -181,7 +181,7 @@ fn poc_journal_creation_checks_future_goal_before_create_for_retained_generation
 }
 
 #[test]
-fn poc_journal_continuation_adoption_is_checked_before_goal_or_authorize() {
+fn poc_journal_restoration_keeps_original_goal_without_new_admission() {
     // Fix every generated identifier so configuration and later adoption cannot vary with the seed.
     let _identifiers = FixedIdentifiers::new();
     let mut s = ready();
@@ -195,10 +195,10 @@ fn poc_journal_continuation_adoption_is_checked_before_goal_or_authorize() {
     let files = s.storage.files();
     let next = s.next;
     let previous = s.previous.0;
-    assert!(block_on(s.poc_authorize(&task.id, &session)).is_err());
+    assert!(s.poc_authority(&task.id, &session).is_ok());
     unchanged(&s, &files, next, previous);
     assert_eq!(s.poc_task(&task.id).unwrap(), task);
-    assert!(s.goal(&session).is_none());
+    assert_eq!(s.goal(&session).unwrap().text, task.goal);
     assert_eq!(
         change(&mut s, &task, Change::Abandon).status,
         Status::Abandoned

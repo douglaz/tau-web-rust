@@ -361,7 +361,7 @@ fn poc_wait_real_collection_producers_reach_resume() {
         store.remember_poc_credential(b"safe~resume~credential~QZ");
         // Rebinding is the actual adoption route, with every retained generation checked.
         let fresh = fresh(&mut store);
-        block_on(store.poc_authorize(&task.id, &fresh)).unwrap();
+        store.poc_authority(&task.id, &fresh).map(|_| ()).unwrap();
         let mut runtime = WaitRuntime {
             store,
             reason: why.clone(),

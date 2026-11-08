@@ -67,7 +67,7 @@ fn journal_findings(store: &Store<MemoryStorage>, needles: &[(String, Vec<u8>)])
     let mut found = Vec::new();
     for number in store.records() {
         let plaintext = plaintext(store, number);
-        let value: Value = serde_json::from_slice(&plaintext).unwrap();
+        let value = serde_json::from_slice::<Value>(&plaintext).unwrap()["event"].take();
         let mut haystacks = vec![("plaintext", plaintext)];
         if let Some(body) = value.get("operation_response") {
             haystacks.push((
@@ -119,7 +119,8 @@ fn cnf14_journal_contains_no_root_password() {
     let found = journal_findings(&store, &needles);
     assert!(found.is_empty(), "{}", found.join("; "));
     let number = store.next - 1;
-    let event: Value = serde_json::from_slice(&plaintext(&store, number)).unwrap();
+    let event =
+        serde_json::from_slice::<Value>(&plaintext(&store, number)).unwrap()["event"].take();
     assert_eq!(event["operation_response"]["call"], call);
     assert_eq!(
         hex::decode(event["operation_response"]["body"].as_str().unwrap()).unwrap(),
@@ -357,7 +358,7 @@ fn append_value(store: &Store<MemoryStorage>, value: Value) {
         .encrypt(
             &nonce.into(),
             Payload {
-                msg: &serde_json::to_vec(&value).unwrap(),
+                msg: &serde_json::to_vec(&journal::journal(&value)).unwrap(),
                 aad: record_aad(&store.id, EVENT, number, &previous).as_bytes(),
             },
         )

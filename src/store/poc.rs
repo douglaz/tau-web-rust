@@ -55,8 +55,6 @@ pub struct Verification {
 pub struct Task {
     pub id: String,
     pub start_session: String,
-    #[serde(default)]
-    pub continuation_sessions: Vec<String>,
     pub goal: String,
     pub machine: String,
     pub approved_plan: Option<String>,
@@ -150,11 +148,6 @@ pub(crate) enum Record {
         checks: Vec<String>,
         limits: Limits,
     },
-    Authorize {
-        id: String,
-        expected: u64,
-        session: String,
-    },
     Change {
         id: String,
         expected: u64,
@@ -167,6 +160,91 @@ pub(crate) enum Record {
 }
 
 impl<S: Storage> Store<S> {
+    pub(crate) fn poc_inference_facts(&self, machine: &str, goal: &str) -> Option<Value> {
+        let task = self.poc.values().find(|t| {
+            t.machine == machine
+                && t.goal == goal
+                && !self.ended_sessions.contains(&t.start_session)
+        })?;
+        let exposure = self
+            .exposure_ledger
+            .iter()
+            .find(|e| e.session == task.start_session)?;
+        let approved = self.dispatch.approved_entries.get(machine)?;
+        Some(json!({
+            "session":task.start_session,
+            "task":task.id,
+            "goal_source":self.goal(&task.start_session),
+            "bound_set":exposure.bound_set.iter().map(|bound| &bound.machine).collect::<Vec<_>>(),
+            "approved_entry":{"entry":approved.approved.entry,"access":approved.approved.access},
+            "class":approved.class,
+            "requirements":approved.requirements.iter().filter(|r| r.session == task.start_session).collect::<Vec<_>>(),
+            "requests_consumed":task.requests,
+            "steps_consumed":task.steps,
+            "limits":task.limits,
+            "uncertainty":"Earlier requests without a committed proposal may have lost their responses. Counts are not refunded and imply no machine outcome.",
+            "unresolved_commands":self.dispatch.calls.values().filter(|c| c.intent.machine == machine && matches!(c.state, crate::dispatch::CallState::Unresolved)).map(|c| json!({"call":c.intent.call,"job":c.intent.job})).collect::<Vec<_>>()
+        }))
+    }
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn eligible_tasks(&self) -> Vec<Task> {
+        self.poc
+            .values()
+            .filter(|t| {
+                matches!(
+                    t.status,
+                    Status::Running | Status::Verifying | Status::Waiting
+                ) && !self.ended_sessions.contains(&t.start_session)
+                    && (t.status != Status::Waiting
+                        || t.pending.is_some()
+                            && (t.pause_reason.is_none()
+                                || t.pause_reason.as_deref() == Some(crate::poc::wait::RUNNING)
+                                || t.pause_reason.as_deref().is_some_and(|why| {
+                                    why.starts_with("inspecting the recorded job")
+                                })))
+            })
+            .cloned()
+            .collect()
+    }
+    #[cfg(all(target_arch = "wasm32", feature = "tracer"))]
+    pub(crate) async fn test_poc_inference_request(
+        &mut self,
+        machine: &str,
+        goal: String,
+        completed: Vec<Step>,
+    ) -> Result<(Task, String), String> {
+        let session = self
+            .sessions
+            .iter()
+            .find(|s| !s.ended.get() && s.bound_set == [machine])
+            .ok_or("no admitted fixture session")?
+            .identity
+            .clone();
+        if self.goal(&session).is_none() {
+            self.enter_goal(&session, goal.clone(), None).await?;
+        }
+        let task = match self.poc_session_task(&session) {
+            Some(task) => task.clone(),
+            None => self.poc_start(&session, vec![]).await?,
+        };
+        let task = self
+            .poc_change(
+                &task.id,
+                task.revision,
+                Change::Raise(Limits {
+                    requests: 1000,
+                    steps: 2000,
+                }),
+            )
+            .await?;
+        let mut task = self
+            .poc_change(&task.id, task.revision, Change::Request)
+            .await?;
+        task.goal = goal;
+        task.completed = completed;
+        Ok((task, session))
+    }
+
     fn poc_safe(&self, value: &impl Serialize) -> Result<(), String> {
         let value = serde_json::to_value(value).map_err(|_| crate::poc::wait::TASK_ENCODING)?;
         if !crate::redaction::Redacted::inference_value_is_safe(self, &value, &[]) {
@@ -178,7 +256,7 @@ impl<S: Storage> Store<S> {
         let event = Event::Poc(record.clone());
         self.poc_safe(&event)?;
         let encoded = Zeroizing::new(
-            serde_json::to_vec(&event).map_err(|_| crate::poc::wait::TASK_ENCODING)?,
+            serde_json::to_vec(&journal(&event)).map_err(|_| crate::poc::wait::TASK_ENCODING)?,
         );
         if crate::redaction::Redacted::for_store(self, &encoded, &[])
             .is_ok_and(|safe| safe.as_bytes() == encoded.as_slice())
@@ -192,7 +270,22 @@ impl<S: Storage> Store<S> {
     pub(crate) fn poc_configuration_key(&self, key: &[u8]) -> Result<(), String> {
         let filter = crate::poc::inference::EchoFilter::new(&[key]);
         self.poc_admission(&filter, None, None)?;
-        for task in self.poc.values().filter(|task| !task.ended()) {
+        for exposure in self
+            .exposure_ledger
+            .iter()
+            .filter(|e| !self.ended_sessions.contains(&e.session))
+        {
+            let task = self
+                .poc
+                .values()
+                .find(|t| t.start_session == exposure.session && !t.ended());
+            self.poc_admission(&filter, task, Some(exposure))?;
+        }
+        for task in self
+            .poc
+            .values()
+            .filter(|task| !task.ended() && self.ended_sessions.contains(&task.start_session))
+        {
             self.poc_admission(&filter, Some(task), None)?;
         }
         Ok(())
@@ -216,10 +309,37 @@ impl<S: Storage> Store<S> {
         // Reports and inference independently scan their payloads against current custody.
         Ok(task.clone())
     }
+    pub(crate) fn check_task_session(&self, task: &Task, session: &str) -> Result<(), String> {
+        let current = self
+            .poc
+            .get(&task.id)
+            .ok_or(crate::poc::wait::UNKNOWN_TASK)?;
+        if current.revision != task.revision || current.start_session != session || current.ended()
+        {
+            return Err("stale task session or revision".into());
+        }
+        let live = self.live_goal_session(session)?;
+        if live.bound_set != [task.machine.as_str()] {
+            return Err("task binding differs".into());
+        }
+        Ok(())
+    }
+
+    pub fn check_inference_request(&self, task: &Task, session: &str) -> Result<(), String> {
+        self.check_task_session(task, session)?;
+        self.poc_authority(&task.id, session)?;
+        if !task.requesting || task.pending.is_some() || task.proposal.is_some() {
+            return Err("no current task request".into());
+        }
+        Ok(())
+    }
     pub fn poc_authority(&self, id: &str, session: &str) -> Result<Rc<Session>, String> {
         let task = self.poc.get(id).ok_or(crate::poc::wait::UNKNOWN_TASK)?;
         if task.ended() {
             return Err(crate::poc::wait::TASK_ENDED.into());
+        }
+        if task.start_session != session {
+            return Err("task requires its original session".into());
         }
         let live = self.live_goal_session(session)?;
         if self
@@ -243,39 +363,8 @@ impl<S: Storage> Store<S> {
         }
         Ok(live)
     }
-    pub async fn poc_authorize(&mut self, id: &str, session: &str) -> Result<(), String> {
-        let task = self.poc_task(id)?;
-        if task.ended() {
-            return Err(crate::poc::wait::TASK_ENDED.into());
-        }
-        let live = self.live_goal_session(session)?;
-        if live.bound_set != [task.machine.as_str()] {
-            return Err(crate::poc::wait::BOUND_MACHINE.into());
-        }
-        if let Some(owner) = self.poc_session_task(session) {
-            if owner.id != id {
-                return Err("session already belongs to another task; bind a fresh session".into());
-            }
-            return self.poc_authority(id, session).map(|_| ());
-        }
-        let record = Record::Authorize {
-            id: id.into(),
-            expected: task.revision,
-            session: session.into(),
-        };
-        self.poc_record_safe(&record)?;
-        self.poc_adoption_safe(Some(&task), None)?;
-        if self.goal(session).is_none() {
-            self.enter_goal(session, task.goal.clone(), None).await?;
-        }
-        self.project_poc(self.next, &record)?;
-        let number = self.commit(&Event::Poc(record.clone())).await?;
-        self.apply_poc(number, &record)
-    }
     fn poc_session_task(&self, session: &str) -> Option<&Task> {
-        self.poc.values().find(|t| {
-            t.start_session == session || t.continuation_sessions.iter().any(|s| s == session)
-        })
+        self.poc.values().find(|t| t.start_session == session)
     }
     fn poc_new_acceptance(&self, session: &str) -> Result<Option<Acceptance>, String> {
         if self
@@ -376,14 +465,6 @@ impl<S: Storage> Store<S> {
 
     fn poc_check_start(&self, session: &str, checks: &[String]) -> Result<(), String> {
         let live = self.live_goal_session(session)?;
-        if let Some(task) = self.poc_session_task(session)
-            && task.start_session != session
-        {
-            return Err(format!(
-                "session is authorized to continue task {}; use Resume for that task or bind a fresh session to explicitly start new work",
-                task.id
-            ));
-        }
         self.goal(session).ok_or("missing goal")?;
         if live.bound_set.len() != 1 {
             return Err("task start requires exactly one bound machine".into());
@@ -521,9 +602,9 @@ impl<S: Storage> Store<S> {
                 report.filter(|report| report.state == crate::jobs::State::Finished)
             {
                 if !matches!(report.comparison, crate::jobs::Comparison::AdvisoryMatch) {
-                    return Err("inference configuration refused: recorded task result differs from its intent and cannot checkpoint; inspect the finding, then Abandon local orchestration before configuring; remote effects and command holds remain".into());
+                    return Err("inference configuration refused: recorded task result differs from its intent and cannot checkpoint; inspect the finding, then Stop task before configuring; remote effects and command holds remain".into());
                 }
-                return Err("inference configuration refused: recorded task result awaits recovery; bind the same machine, accept continuation and Resume before configuring; then retry configuration".into());
+                return Err("inference configuration refused: recorded task result awaits recovery; Resume collection in the original session before configuring; then retry configuration".into());
             }
         }
         Ok(())
@@ -610,7 +691,7 @@ impl<S: Storage> Store<S> {
         if let Record::Command { intent, .. } = record {
             self.apply_intent(number, intent.clone())?;
         }
-        if let Record::Start { session, .. } | Record::Authorize { session, .. } = record
+        if let Record::Start { session, .. } = record
             && let Some(acceptance) = self.poc_new_acceptance(session)?
         {
             self.conduct_acceptances.push(acceptance);
@@ -641,7 +722,8 @@ impl<S: Storage> Store<S> {
                 .iter()
                 .find(|e| e.session == *session)
                 .ok_or("task requires binding")?;
-            if id.len() != 48
+            if self.ended_sessions.contains(session)
+                || id.len() != 48
                 || hex::decode(id).is_err()
                 || self.poc.contains_key(id)
                 || self.poc_session_task(session).is_some()
@@ -661,7 +743,6 @@ impl<S: Storage> Store<S> {
             return Ok(Task {
                 id: id.clone(),
                 start_session: session.clone(),
-                continuation_sessions: vec![],
                 goal: goal.text.clone(),
                 machine: exposure.bound_set[0].machine.clone(),
                 approved_plan: None,
@@ -681,9 +762,7 @@ impl<S: Storage> Store<S> {
             });
         }
         let (id, expected) = match record {
-            Record::Change { id, expected, .. } | Record::Authorize { id, expected, .. } => {
-                (id, *expected)
-            }
+            Record::Change { id, expected, .. } => (id, *expected),
             Record::Command { binding, .. } => (&binding.task, binding.revision),
             _ => unreachable!(),
         };
@@ -695,31 +774,26 @@ impl<S: Storage> Store<S> {
         if task.revision != expected || task.ended() {
             return Err(crate::poc::wait::STALE_TASK.into());
         }
-        match record {
-            Record::Authorize { session, .. } => {
-                let exposure = self
-                    .exposure_ledger
-                    .iter()
-                    .find(|e| e.session == *session)
-                    .ok_or("task continuation requires binding")?;
-                if self.poc_session_task(session).is_some()
-                    || exposure.bound_set.len() != 1
-                    || exposure.bound_set[0].machine != task.machine
-                    || self.goal(session).is_none_or(|g| g.text != task.goal)
-                {
-                    return Err(
-                        "task continuation session differs or already belongs to a task".into(),
-                    );
+        if self.ended_sessions.contains(&task.start_session)
+            && !matches!(
+                record,
+                Record::Change {
+                    change: Change::Abandon,
+                    ..
                 }
-                self.poc_new_acceptance(session)?;
-                task.continuation_sessions.push(session.clone());
-            }
+            )
+        {
+            return Err("task session ended".into());
+        }
+        match record {
             Record::Command { binding, intent } => {
                 let proposal = task.proposal.as_ref().ok_or("missing task proposal")?;
                 let Tool::Exec { machine, command } = &proposal.tool else {
                     return Err("task command tool".into());
                 };
-                if task.pending.is_some()
+                if binding.session != task.start_session
+                    || self.ended_sessions.contains(&binding.session)
+                    || task.pending.is_some()
                     || task.requesting
                     || intent.call != number
                     || intent.machine != task.machine

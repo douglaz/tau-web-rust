@@ -23,6 +23,9 @@ fn seed_id(words: &str) -> Option<String> {
         &bytes,
     )))
 }
+pub(crate) fn synthetic_approval() -> Value {
+    json!({"approved":true,"configuration":{"endpoint":"https://fixture.invalid/completions","model":"fixture"}})
+}
 fn base(words: &str, machines: &[&str], classes: bool) -> Option<Vec<Value>> {
     let seed = seed_id(words)?;
     let entries:Vec<_>=machines.iter().enumerate().map(|(index,machine)|json!({"entry":{"machine":machine,"vendor":"Fixture vendor","product":"Fixture machine","region":"Fixture region","cost":{"amount":1000,"unit":"sat","period":"month"}},"identity":{"seed":seed,"derivation_version":1,"family":"machines","index":index},"access":{"model":"maintained","profile":"ad-hoc","revision":3}})).collect();
@@ -51,7 +54,7 @@ fn original_base(site: &str, pass: &str, machines: &[&str], classes: bool) -> Op
 }
 fn expose(events: &mut Vec<Value>) {
     let identity = events[2]["setup"]["approval"]["entries"][0]["identity"].clone();
-    events.push(json!({"exposure":{"session":format!("session-{}",events.len()),"bound_set":[{"machine":"fixture","identity":identity}],"accepted_modes":["no_artifact_pin"]}}));
+    events.push(json!({"exposure":{"inference_approval":synthetic_approval(),"session":format!("session-{}",events.len()),"bound_set":[{"machine":"fixture","identity":identity}],"accepted_modes":["no_artifact_pin"]}}));
 }
 fn pin() -> Option<&'static str> {
     crate::PINS
@@ -390,7 +393,7 @@ pub fn output_matches(files: &crate::Files, pass: &str, events: &[Value]) -> boo
                 &format!("tau-web/local/v1/{id}/event/{number}/{previous}"),
                 record["ciphertext"].as_str()?,
             )?;
-            if plain != event.to_string().as_bytes() {
+            if plain != crate::journal::wrap(event).to_string().as_bytes() {
                 return None;
             }
             previous = hex::encode(ring::digest::digest(&ring::digest::SHA256, bytes));

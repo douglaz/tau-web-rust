@@ -34,10 +34,20 @@ fn reopen(s: &Store<MemoryStorage>) -> Store<MemoryStorage> {
     .unwrap()
 }
 fn fresh(s: &mut Store<MemoryStorage>) -> String {
-    block_on(s.bind("fixture")).unwrap();
-    let session = s.sessions.last().unwrap().identity.clone();
+    let session = s
+        .sessions
+        .iter()
+        .find(|session| !session.ended.get() && session.bound_set == ["fixture"])
+        .map(|session| session.identity.clone())
+        .unwrap_or_else(|| block_on(s.admit_fixture("fixture")).unwrap());
     s.synthetic_confirm_limits(100).unwrap();
-    block_on(s.accept_mode(&session, Mode::NoBrief)).unwrap();
+    if !s
+        .conduct_acceptances
+        .iter()
+        .any(|a| a.session == session && a.mode == Mode::NoBrief)
+    {
+        block_on(s.accept_mode(&session, Mode::NoBrief)).unwrap();
+    }
     session
 }
 fn exec(command: &str) -> Tool {
@@ -121,6 +131,95 @@ fn evidence(s: &mut Store<MemoryStorage>, task: &Task, record: crate::jobs::Reco
     .unwrap();
 }
 
+#[test]
+fn poc_request_restores_useful_facts_without_seed_allocation_associations() {
+    use base64::Engine;
+    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
+
+    let mut s = ready_without_requirements();
+    let task = create_task(&mut s);
+    let declaration = crate::declaration::Proposal::parse(&json!({
+        "kind":"declaration", "machine":task.machine,
+        "declaration":crate::declaration::ad_hoc_minimum()
+    }))
+    .unwrap();
+    s.propose_requirements(&task.start_session, 7, declaration, &done())
+        .unwrap();
+    block_on(s.approve_requirements(&task.start_session, &task.machine, 7)).unwrap();
+    let task = proposal(&mut s, &task);
+    append(&mut s, &task, &task.start_session);
+    let task = s.poc_task(&task.id).unwrap();
+    evidence(&mut s, &task, record(&task, Some(0), "service installed"));
+    let task = change(&mut s, &task, Change::Settle);
+    let approved = &s.dispatch.approved_entries[&task.machine];
+    let seed = &approved.approved.identity.seed;
+    assert_eq!(s.exposure_ledger[0].bound_set[0].identity.seed, *seed);
+    let config = crate::poc::inference::Configuration::new(
+        "https://fixture.invalid/completion".into(),
+        "fixture".into(),
+    )
+    .unwrap();
+    let body = crate::poc::inference::request(
+        &s,
+        &config,
+        &task.goal,
+        &task.machine,
+        &task.completed,
+        &[],
+    )
+    .unwrap();
+    let text = std::str::from_utf8(&body).unwrap();
+    for form in [
+        seed.clone(),
+        hex::encode(seed),
+        hex::encode_upper(seed),
+        STANDARD.encode(seed),
+        STANDARD_NO_PAD.encode(seed),
+        URL_SAFE.encode(seed),
+        URL_SAFE_NO_PAD.encode(seed),
+        seed.bytes().map(|b| format!("%{b:02X}")).collect(),
+        seed.bytes().map(|b| format!("\\u{b:04x}")).collect(),
+    ] {
+        assert!(!text.contains(&form), "allocation association in request");
+    }
+    let request: Value = serde_json::from_slice(&body).unwrap();
+    let facts: Value =
+        serde_json::from_str(request["messages"][2]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(facts["session"], task.start_session);
+    assert_eq!(facts["task"], task.id);
+    assert_eq!(facts["goal_source"], json!(s.goal(&task.start_session)));
+    assert_eq!(facts["bound_set"], json!([task.machine]));
+    assert_eq!(
+        facts["approved_entry"],
+        json!({"entry":approved.approved.entry,"access":approved.approved.access})
+    );
+    assert_eq!(facts["class"], json!(approved.class));
+    assert_eq!(facts["requirements"], json!(approved.requirements));
+    assert_eq!(facts["limits"], json!(task.limits));
+    assert_eq!(facts["requests_consumed"], task.requests);
+    assert_eq!(facts["steps_consumed"], task.steps);
+    assert!(facts["uncertainty"].as_str().is_some_and(|v| !v.is_empty()));
+    assert!(request["messages"].as_array().unwrap().iter().any(|m| {
+        m["role"] == "tool"
+            && m["content"]
+                .as_str()
+                .is_some_and(|v| v.contains("service installed"))
+    }));
+    // Canonical associations remain available to replay and derivation.
+    let restored = reopen(&s);
+    assert_eq!(
+        restored.dispatch.approved_entries[&task.machine]
+            .approved
+            .identity
+            .seed,
+        *seed
+    );
+    assert_eq!(
+        restored.exposure_ledger[0].bound_set[0].identity.seed,
+        *seed
+    );
+}
+
 #[derive(Default)]
 struct Script {
     calls: VecDeque<Result<(String, Tool), String>>,
@@ -137,15 +236,10 @@ impl Script {
     }
 }
 impl Model for Script {
-    async fn next(
-        &mut self,
-        goal: &str,
-        machine: &str,
-        completed: &[Step],
-    ) -> Result<(String, Tool), String> {
-        assert_eq!(goal, "install and run a small service");
-        assert_eq!(machine, "fixture");
-        self.seen.push(completed.to_vec());
+    async fn next(&mut self, task: &Task, _session: &str) -> Result<(String, Tool), String> {
+        assert_eq!(task.goal, "install and run a small service");
+        assert_eq!(task.machine, "fixture");
+        self.seen.push(task.completed.to_vec());
         if self.hold {
             if let Some(release) = &self.release {
                 std::future::poll_fn(|_| {
@@ -1057,9 +1151,10 @@ fn poc_credential_boundaries_cover_creation_commands_results_pauses_transcripts_
     assert!(!serde_json::to_string(&settled).unwrap().contains(secret));
     let mut store = reopen(&f.store.borrow());
     let session = fresh(&mut store);
-    assert!(
-        store.goal(&session).is_none(),
-        "continuation grants no legacy goal import"
+    assert_eq!(
+        store.goal(&session).unwrap().text,
+        task.goal,
+        "same-session replay retains the original goal"
     );
     assert_eq!(store.poc_task(&task.id).unwrap(), settled);
     let mut local = Local::new(store.storage.clone(), Fixed);
@@ -1082,14 +1177,15 @@ fn poc_no_fresh_acceptance_or_lost_authority_sends_nothing() {
     assert_eq!(result.requests, 0);
     assert_eq!(result.status, Status::Paused);
     let mut store = reopen(&f.store.borrow());
-    block_on(store.bind("fixture")).unwrap();
-    let session = store.sessions.last().unwrap().identity.clone();
+    assert_eq!(store.sessions[0].identity, session);
+    block_on(store.end_session(&session)).unwrap();
+    let session = block_on(store.admit_fixture("fixture")).unwrap();
     store.synthetic_confirm_limits(100).unwrap();
     assert!(
         store.poc_authority(&task.id, &session).is_err(),
         "recorded old acceptance is not current acceptance"
     );
-    block_on(store.bind("fixture-other")).unwrap();
+    block_on(store.admit_fixture("fixture-other")).unwrap();
     let other = store.sessions.last().unwrap().identity.clone();
     block_on(store.accept_mode(&other, Mode::NoBrief)).unwrap();
     assert!(store.poc_authority(&task.id, &other).is_err());
@@ -1612,7 +1708,7 @@ fn poc_raise_request_cannot_invalidate_an_active_model_execute_or_collection() {
 }
 
 #[test]
-fn poc_authorize_ended_tasks_writes_no_goal_or_acceptance() {
+fn poc_ended_task_cannot_resume_or_start_a_second_task_in_its_session() {
     for complete in [false, true] {
         let (mut f, task, session) = Fixture::new();
         let ended = if complete {
@@ -1628,30 +1724,17 @@ fn poc_authorize_ended_tasks_writes_no_goal_or_acceptance() {
         };
         assert!(ended.ended());
         let mut store = reopen(&f.store.borrow());
-        block_on(store.bind("fixture")).unwrap();
-        let fresh = store.sessions.last().unwrap().identity.clone();
-        store.synthetic_confirm_limits(100).unwrap();
         let files = store.storage.files();
-        let acceptances = store.conduct_acceptances.len();
-        assert!(store.goal(&fresh).is_none());
-        assert_eq!(
-            block_on(store.poc_authorize(&task.id, &fresh)),
-            Err("task ended".into())
-        );
-        assert!(store.goal(&fresh).is_none());
-        assert_eq!(store.conduct_acceptances.len(), acceptances);
+        assert!(store.poc_authority(&task.id, &session).is_err());
+        assert!(block_on(store.poc_start(&session, vec![])).is_err());
         assert_eq!(store.storage.files(), files);
+        assert_eq!(store.goal(&session).unwrap().text, task.goal);
         assert_eq!(reopen(&store).poc_task(&task.id).unwrap(), ended);
+        assert!(
+            !store.sessions[0].ended.get(),
+            "task completion does not End the session"
+        );
     }
-    let (f, task, _) = Fixture::new();
-    let mut store = reopen(&f.store.borrow());
-    block_on(store.bind("fixture")).unwrap();
-    let fresh = store.sessions.last().unwrap().identity.clone();
-    store.synthetic_confirm_limits(100).unwrap();
-    block_on(store.poc_authorize(&task.id, &fresh)).unwrap();
-    assert_eq!(store.goal(&fresh).unwrap().text, task.goal);
-    assert!(store.poc_authority(&task.id, &fresh).is_ok());
-    assert!(reopen(&store).goal(&fresh).is_some());
 }
 
 #[test]
@@ -2200,10 +2283,7 @@ fn poc_repeated_page_start_after_send_keeps_the_original_task_and_job() {
 }
 
 fn bind_fresh(s: &mut Store<MemoryStorage>) -> String {
-    block_on(s.bind("fixture")).unwrap();
-    let session = s.sessions.last().unwrap().identity.clone();
-    s.synthetic_confirm_limits(100).unwrap();
-    session
+    fresh(s)
 }
 
 fn assert_continuation_page(s: &Store<MemoryStorage>, task: &Task) {
@@ -2233,7 +2313,7 @@ fn assert_continuation_page(s: &Store<MemoryStorage>, task: &Task) {
 }
 
 #[test]
-fn poc_reload_continuation_approval_cannot_start_another_task_pending_or_settled() {
+fn poc_reload_original_session_cannot_start_another_task_pending_or_settled() {
     for pending in [true, false] {
         let (mut f, task, session) = Fixture::new();
         block_on(run::resume(
@@ -2267,20 +2347,17 @@ fn poc_reload_continuation_approval_cannot_start_another_task_pending_or_settled
         assert_eq!(before.pending.is_some(), pending);
         assert!(!before.completed.is_empty());
         let mut store = reopen(&f.store.borrow());
-        assert!(
-            store.sessions.is_empty(),
-            "reopen never restores runtime authority"
+        assert_eq!(
+            store.sessions[0].identity, session,
+            "replay restores original session"
         );
         let fresh = bind_fresh(&mut store);
-        assert!(store.poc_authority(&task.id, &fresh).is_err());
-        block_on(store.poc_authorize(&task.id, &fresh)).unwrap();
+        assert!(store.poc_authority(&task.id, &fresh).is_ok());
+        store.poc_authority(&task.id, &fresh).map(|_| ()).unwrap();
         let continued = store.poc_task(&task.id).unwrap();
         assert_eq!(continued.id, before.id);
         assert_eq!(continued.start_session, session);
-        assert_eq!(
-            continued.continuation_sessions,
-            std::slice::from_ref(&fresh)
-        );
+        assert_eq!(continued.start_session, fresh);
         assert_eq!(continued.completed, before.completed);
         assert_eq!(
             (continued.requests, continued.steps),
@@ -2291,13 +2368,26 @@ fn poc_reload_continuation_approval_cannot_start_another_task_pending_or_settled
         assert_continuation_page(&store, &continued);
         let files = store.storage.files();
         for checks in [continued.checks.clone(), vec!["different-check".into()]] {
-            assert!(
-                block_on(store.poc_start(&fresh, checks.clone()))
-                    .unwrap_err()
-                    .contains("use Resume")
+            if checks == continued.checks {
+                assert_eq!(
+                    block_on(store.poc_start(&fresh, checks.clone())).unwrap(),
+                    continued
+                );
+            } else {
+                assert!(block_on(store.poc_start(&fresh, checks.clone())).is_err());
+            }
+            if checks == continued.checks {
+                assert_eq!(
+                    block_on(store.poc_create(&fresh, checks.clone())).unwrap(),
+                    continued
+                );
+            } else {
+                assert!(block_on(store.poc_create(&fresh, checks.clone())).is_err());
+            }
+            assert_eq!(
+                block_on(store.poc_accept_start(&fresh, &checks)).is_ok(),
+                checks == continued.checks
             );
-            assert!(block_on(store.poc_create(&fresh, checks.clone())).is_err());
-            assert!(block_on(store.poc_accept_start(&fresh, &checks)).is_err());
         }
         assert_eq!(store.storage.files(), files);
         assert_eq!(store.poc.len(), 1);
@@ -2316,10 +2406,13 @@ fn poc_reload_continuation_approval_cannot_start_another_task_pending_or_settled
         assert_eq!(f.remote.borrow().sends.values().sum::<u32>(), 1);
         assert_eq!(f.store.borrow().poc.len(), 1);
         assert_eq!(result.steps, before.steps);
-        // A different explicit start on a fresh session may intentionally use the same goal.
+        // A new explicit session starts with no inherited goal.
         let mut next = reopen(&f.store.borrow());
+        block_on(next.end_session(&session)).unwrap();
         let new_session = bind_fresh(&mut next);
-        block_on(next.enter_goal(&new_session, before.goal, None)).unwrap();
+        assert_ne!(new_session, session);
+        assert!(!next.goals.iter().any(|goal| goal.session == new_session));
+        block_on(next.enter_goal(&new_session, "check another service".into(), None)).unwrap();
         let new_task = block_on(next.poc_start(&new_session, before.checks)).unwrap();
         assert_ne!(new_task.id, task.id);
         assert_eq!(next.poc.len(), 2);
@@ -2327,7 +2420,7 @@ fn poc_reload_continuation_approval_cannot_start_another_task_pending_or_settled
             next.poc_authority(&task.id, &new_session)
                 .err()
                 .unwrap()
-                .contains("another task")
+                .contains("original session")
         );
     }
 }
@@ -2366,7 +2459,7 @@ fn poc_start_acceptance_and_inputs_replay_atomically_even_when_append_reply_is_l
             );
         }
         let mut replay = reopen(&store);
-        assert!(replay.sessions.is_empty());
+        assert_eq!(replay.sessions[0].identity, session);
         assert!(replay.dispatch.calls.is_empty());
         if matches!(fault, Some(Fault::Fail(_))) {
             assert!(replay.poc.is_empty());
@@ -2386,10 +2479,13 @@ fn poc_start_acceptance_and_inputs_replay_atomically_even_when_append_reply_is_l
         assert_eq!(recovered.checks, checks);
         assert_eq!(recovered.goal, "install and run a small service");
         assert_eq!((recovered.requests, recovered.steps), (0, 0));
-        assert!(replay.poc_authority(&recovered.id, &session).is_err());
+        assert!(replay.poc_authority(&recovered.id, &session).is_ok());
         let fresh = bind_fresh(&mut replay);
-        assert!(replay.poc_authority(&recovered.id, &fresh).is_err());
-        block_on(replay.poc_authorize(&recovered.id, &fresh)).unwrap();
+        assert!(replay.poc_authority(&recovered.id, &fresh).is_ok());
+        replay
+            .poc_authority(&recovered.id, &fresh)
+            .map(|_| ())
+            .unwrap();
         let (mut f, _, _) = Fixture::new();
         *f.store.borrow_mut() = replay;
         let settled = block_on(run::resume(
@@ -2529,7 +2625,7 @@ fn poc_production_collector_reports_preserve_observed_causes_and_uncertainty() {
         let mut replay = reopen(&f.store.borrow());
         assert_eq!(replay.poc_task(&task.id).unwrap(), paused);
         let fresh = bind_fresh(&mut replay);
-        block_on(replay.poc_authorize(&task.id, &fresh)).unwrap();
+        replay.poc_authority(&task.id, &fresh).map(|_| ()).unwrap();
         *f.store.borrow_mut() = replay;
         // Repeated Resume reads the same record and never authorizes another intent/send.
         f.observe_error = true;
@@ -2673,7 +2769,10 @@ fn poc_collector_checkpoint_failures_preserve_pending_jobs_and_verification() {
                 let mut replay = reopen(&f.store.borrow());
                 assert_eq!(replay.poc_task(&task.id).unwrap(), paused);
                 session = bind_fresh(&mut replay);
-                block_on(replay.poc_authorize(&task.id, &session)).unwrap();
+                replay
+                    .poc_authority(&task.id, &session)
+                    .map(|_| ())
+                    .unwrap();
                 *f.store.borrow_mut() = replay;
             }
         }
@@ -2903,7 +3002,7 @@ fn poc_metadata_remains_usable_with_later_credential_but_sinks_protect_history()
 fn poc_new_metadata_events_refuse_protected_envelope_before_append() {
     // Fix every generated identifier so configuration and later adoption cannot vary with the seed.
     let _identifiers = FixedIdentifiers::new();
-    for authorize in [false, true] {
+    for ending in [false, true] {
         for protect_session in [false, true] {
             let mut store = ready();
             let task = create_task(&mut store);
@@ -2913,13 +3012,13 @@ fn poc_new_metadata_events_refuse_protected_envelope_before_append() {
             store.remember_poc_credential(secret.as_bytes());
             let files = store.storage.files();
             let next = store.next;
-            let result = if authorize {
-                block_on(store.poc_authorize(&task.id, &session))
+            let result = if ending {
+                block_on(store.end_session(&session))
             } else {
                 block_on(store.poc_change(&task.id, task.revision, Change::Abandon)).map(|_| ())
             };
-            if authorize || !protect_session {
-                assert_eq!(result, Err("task credential boundary".into()));
+            if ending && protect_session || !ending && !protect_session {
+                assert!(result.is_err());
                 assert_eq!(store.storage.files(), files, "refuse before any append");
                 assert_eq!(store.next, next);
                 assert_eq!(store.poc_task(&task.id).unwrap(), task);
@@ -2938,8 +3037,13 @@ fn poc_configuration_rejects_reference_collisions_without_changing_inventory() {
     let task = create_task(&mut store);
     let mut store = reopen(&store);
     let session = fresh(&mut store);
-    block_on(store.poc_authorize(&task.id, &session)).unwrap();
-    let references = [task.id, task.start_session, session];
+    store.poc_authority(&task.id, &session).map(|_| ()).unwrap();
+    let references = [
+        task.id,
+        task.start_session,
+        session,
+        "endable_sessions".into(),
+    ];
     let files = store.storage.files();
     for reference in references {
         for key in [&reference, &reference[..reference.len().min(16)]] {
@@ -2983,7 +3087,7 @@ fn poc_mismatched_terminal_configuration_requires_abandon_and_preserves_hold() {
     .unwrap();
     let mut recovered = reopen(&store);
     let why = recovered.poc_configuration_ready().unwrap_err();
-    assert!(why.contains("Abandon") && why.contains("holds remain"));
+    assert!(why.contains("Stop task") && why.contains("holds remain"));
     let files = recovered.storage.files();
     assert!(block_on(recovered.poc_change(&task.id, pending.revision, Change::Settle)).is_err());
     assert_eq!(recovered.storage.files(), files);

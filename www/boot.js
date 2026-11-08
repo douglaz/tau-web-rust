@@ -13,6 +13,7 @@ const texts = {
   'in-use': 'Waiting for the local store: another tab, or this page\'s previous harness worker, still holds it.',
   none: 'There is no local store yet.',
   locked: 'The local store is locked.',
+  locking: 'Locking: waiting for the worker to finish any begun write and clear working secrets…',
   unlocked: 'The local store is unlocked.',
 };
 const clearWords = () => $('seed-backup-words-slot').replaceChildren();
@@ -21,6 +22,11 @@ let ceremony = false;
 let suspended = false;
 const goalOutcomes = new Map();
 const pocDeclarationDrafts = new Map();
+const snapshotWorker = () => {
+  const current = worker;
+  const generation = current?.generation;
+  return { postMessage: (data, transfer) => current?.sendAt ? current.sendAt(data, transfer, generation) : current?.postMessage(data, transfer) };
+};
 const render = (store) => {
   const { state } = store;
   if (state !== 'unlocked') $('task-results')?.replaceChildren();
@@ -89,10 +95,24 @@ const renderDeclaration = (parent, d) => {
   else list('Default credentials to change', d.default_credentials, 'none declared', e => e);
 };
 const renderSetup = (store) => {
+  const worker = snapshotWorker();
   const slot = $('setup');
   slot.replaceChildren();
   slot.hidden = store.state !== 'unlocked' || store.seed_backup_stage !== 'inactive';
   if (slot.hidden) return;
+  const addEnd = (parent, identity) => {
+    const end = document.createElement('button');
+    end.type = 'button'; end.textContent = 'End session'; end.dataset.endSession = identity;
+    end.addEventListener('click', () => { end.disabled = true; worker.postMessage({task: {action: 'end-session', session: identity}}); });
+    parent.append(end);
+  };
+  if (store.lifecycle_state === 'reconciling') {
+    for (const session of store.endable_sessions ?? []) {
+      paragraph(slot, `Session ${session.identity}: waiting for revalidation; bound machine ${session.bound_set.join(', ')}.`);
+      addEnd(slot, session.identity);
+    }
+    return;
+  }
   const approved = store.setup ?? [];
   const entries = approved.length ? approved.map(m => m.entry) : store.setup_offer ?? [];
   if (!entries.length) return;
@@ -109,7 +129,7 @@ const renderSetup = (store) => {
     paragraph(slot, `Setup total: ${monthly} sat per month; ${monthly * 12n} sat per year.`);
   }
   paragraph(slot, 'Each machine will be bound alone in its own session.');
-  paragraph(slot, purchase ? 'The purchase card records the approved billing interval and currency. App Lock and task Abandon do not cancel the VM or its billing. Payment remains external, and this page does not change automatic renewal.' : "Recurring means each machine is billed by its vendor every month from the moment it is created until it is destroyed or abandoned, whether or not setup finishes. tau-web never pays for a machine and cannot stop a vendor's billing; only you can.");
+  paragraph(slot, purchase ? 'The purchase card records the approved billing interval and currency. App Lock and Stop task do not cancel the VM or its billing. Payment remains external, and this page does not change automatic renewal.' : "Recurring means each machine is billed by its vendor every month from the moment it is created until it is destroyed or abandoned, whether or not setup finishes. tau-web never pays for a machine and cannot stop a vendor's billing; only you can.");
   if (!approved.length) {
     if (store.lifecycle_state === 'ended') return;
     const button = document.createElement('button');
@@ -173,6 +193,9 @@ const renderSetup = (store) => {
     const session = (store.sessions ?? []).find(s => s.session_state !== 'ended' && s.bound_set.includes(machine.entry.machine));
     if (session) {
       paragraph(section, `Session ${session.identity}: bound set ${session.bound_set.join(', ')}; ${session.inference_limits?.state ?? session.session_state ?? 'running'}.`);
+      if (session.readiness_reason) paragraph(section, session.readiness_reason);
+      paragraph(section, `Inference model: ${session.inference_configuration?.model ?? 'unavailable'}; machine: ${machine.entry.machine}.`);
+      addEnd(section, session.identity);
       const limits = session.inference_limits;
       if (limits) {
         paragraph(section, `Confirmed limit: ${(BigInt(limits.confirmed.cap_hundredths) / 100n)}.${String(BigInt(limits.confirmed.cap_hundredths) % 100n).padStart(2, '0')} ${limits.confirmed.unit}; lifetime ${limits.confirmed.lifetime_seconds / 60} minutes. No renewal; observed spend ${limits.observed_spend}. Unaccounted spend is not zero or refunded.`);
@@ -195,10 +218,9 @@ const renderSetup = (store) => {
         paragraph(card, `Source: ${session.goal.source}.`);
         if (session.goal.document_source) paragraph(card, `Document source: ${session.goal.document_source}.`);
         const accepted = (session.standing_modes ?? []).includes('Acting on a goal with no brief');
-        const continuation = (store.tasks ?? []).find(task => (task.continuation_sessions ?? []).includes(session.identity));
-        const started = (store.tasks ?? []).some(task => task.start_session === session.identity);
-        if (continuation) {
-          paragraph(card, `This session continues task ${continuation.id}. Use Resume on that task.`);
+        const started = (store.tasks ?? []).find(task => task.start_session === session.identity);
+        if (started) {
+          paragraph(card, `Session task ${started.id}. Use Resume on that task.`);
         } else if (!accepted || !started) {
           paragraph(card, accepted ? 'Start was accepted. Continue with verification commands for this same goal and machine.' : 'No brief is available.');
           const checks = document.createElement('textarea');
@@ -273,14 +295,14 @@ const renderSetup = (store) => {
       if (spend?.count) paragraph(section, `${spend.count} unresolved inference requests: unaccounted spend against cap ${spend.cap}.`);
       for (const label of session.standing_modes ?? []) paragraph(section, `Standing mode: ${label}.`);
     }
-    else if (machine.class !== null && access) {
+    else if (machine.class !== null && access && store.fixture_admission) {
       const button = document.createElement('button');
       button.type = 'button';
       button.dataset.bind = machine.entry.machine;
-      button.textContent = `Bind ${machine.entry.machine}`;
+      button.textContent = `Start session ${machine.entry.machine}`;
       button.addEventListener('click', () => {
         button.disabled = true;
-        worker.postMessage({ bind: { machine: machine.entry.machine } });
+        worker.postMessage({ bind: { machine: machine.entry.machine, inference_approval: store.fixture_admission } });
       });
       section.append(button);
     }
@@ -311,6 +333,7 @@ const renderCommandResult = (result) => {
 };
 
 const renderTasks = (store) => {
+  const worker = snapshotWorker();
   let slot = $('tasks');
   if (!slot) {
     slot = document.createElement('section');
@@ -332,8 +355,8 @@ const renderTasks = (store) => {
     if (task.pause_reason) paragraph(card, task.pause_reason);
     for (const check of task.verification) paragraph(card, `Verification: ${check.command}; job ${check.job}; exit ${check.exit_status ?? 'unknown'}; ${check.excerpt}`);
     if (['complete', 'abandoned'].includes(task.status)) { slot.append(card); continue; }
-    const session = (store.sessions ?? []).find(s => s.session_state !== 'ended' && s.bound_set.length === 1 && s.bound_set[0] === task.machine);
-    paragraph(card, 'Resume needs fresh binding and acceptance for this same machine. Progress is history, not current authority. Missing inference and target configuration must be supplied before live execution.');
+    const session = (store.sessions ?? []).find(s => s.identity === task.start_session && s.session_state !== 'ended' && s.bound_set.length === 1 && s.bound_set[0] === task.machine);
+    paragraph(card, 'This task retains its original session, machine, approvals and budgets. Eligible interrupted work continues after unlock and any required key resupply. Resume continues a genuine pause.');
     const action = (text, request) => {
       const button = document.createElement('button');
       button.type = 'button'; button.textContent = text;
@@ -341,13 +364,14 @@ const renderTasks = (store) => {
       card.append(button);
     };
     if (session && store.lifecycle_state !== 'ended') {
-      if (!(session.standing_modes ?? []).includes('Acting on a goal with no brief')) action('Accept Acting on a goal with no brief for this task', { action: 'authorize', session: session.identity });
-      else action('Resume', { action: 'resume', session: session.identity });
-    } else paragraph(card, `Bind ${task.machine} after unlock to Resume.`);
+      action('Resume', { action: 'resume', session: session.identity });
+    } else if ((store.sessions ?? []).some(s => s.identity === task.start_session && s.session_state === 'ended')) paragraph(card, `Session ${task.start_session} is ended. This task remains history and cannot continue.`);
+    else paragraph(card, `Unlock to restore session ${task.start_session}.`);
     if (session && task.verification.some(check => check.exit_status !== null && check.exit_status !== 0)) {
       action('Prepare verification retry', { action: 'retry-checks', session: session.identity });
     }
-    action('Abandon', { action: 'abandon' });
+    paragraph(card, 'Stop task stops local orchestration; remote effects and billing continue.');
+    action('Stop task', { action: 'abandon' });
     const requests = document.createElement('input'); requests.type = 'number'; requests.min = task.limits.requests; requests.max = 1000; requests.value = task.limits.requests; requests.setAttribute('aria-label', 'Task request limit');
     const steps = document.createElement('input'); steps.type = 'number'; steps.min = task.limits.steps; steps.max = 2000; steps.value = task.limits.steps; steps.setAttribute('aria-label', 'Task step limit');
     const raise = document.createElement('button'); raise.type = 'button'; raise.textContent = 'Raise limits';
@@ -358,6 +382,7 @@ const renderTasks = (store) => {
 };
 
 const renderDelivery = (section, machine, store) => {
+  const worker = snapshotWorker();
   const delivery = (store.delivery ?? []).find(d => d.machine === machine);
   if (!delivery) return;
   const card = document.createElement('section');
@@ -420,6 +445,7 @@ let providerDisplayedSelection = null;
 let providerDisplayedOrigin = null;
 const providerRequest = action => worker.postMessage({provider_request: action});
 const renderProvider = (store, enabled) => {
+  const worker = snapshotWorker();
   $('provider-key-status').textContent = store.provider_configuration?.key_set ? 'Provider key set.' : 'Provider key unset; re-entry is required.';
   const purchase = store.procurement ?? {};
   if (!$('provider-origin').value && (store.provider_configuration?.origin ?? purchase.origin)) $('provider-origin').value = store.provider_configuration?.origin ?? purchase.origin;
@@ -542,11 +568,14 @@ const clearPocInputs = () => {
   $('poc-public-keys').replaceChildren();
 };
 const renderPoc = (store) => {
+  const worker = snapshotWorker();
   const enabled = store.state === 'unlocked' && !ceremony &&
     !['suspended', 'reconciling', 'ended'].includes(store.lifecycle_state);
   $('poc').hidden = store.state !== 'unlocked';
   for (const control of $('poc').querySelectorAll('input, select, button')) control.disabled = !enabled;
   renderProvider(store, enabled);
+  const restored = (store.sessions ?? []).find(s => s.session_state !== 'ended')?.inference_configuration;
+  if (restored && store.poc_configuration?.key_set !== true) { $('poc-endpoint').value = restored.endpoint; $('poc-model').value = restored.model; }
   $('poc-key-status').textContent = store.poc_configuration?.key_set === true ? 'Key set.' : store.poc_configuration?.key_set === false ? 'Key unset.' : 'Key status unavailable.';
   if (['locked', 'none', 'refused', 'lost', 'starting'].includes(store.state) || store.lifecycle_state === 'ended') clearPocInputs();
   // Working/lifecycle reports can omit sessions. Prune only a full unlocked report;
@@ -564,10 +593,11 @@ const renderPoc = (store) => {
     paragraph(row, `${target.machine}: relay profile ${target.profile}; elevation ${target.elevation}.`);
     paragraph(row, `Host ${target.host}, port ${target.port}, user ${target.user}; relay ${target.relay}.`);
     paragraph(row, `Independent host pin: ${target.pin}`);
-    for (const [kind, label] of [['poc_bind', 'Bind'], ['poc_public_keys', 'Show public keys']]) {
+    paragraph(row, `Start session approves inference using ${store.poc_configuration?.configuration?.model || 'the configured model'} on ${target.machine}.`);
+    for (const [kind, label] of [['poc_bind', 'Start session'], ['poc_public_keys', 'Show public keys']]) {
       const button = document.createElement('button');
       button.type = 'button';
-      button.disabled = !enabled;
+      button.disabled = !enabled || (kind === 'poc_bind' && !store.poc_configuration?.configuration);
       button.textContent = `${label} ${target.machine}`;
       button.addEventListener('click', () => {
         button.disabled = true;
@@ -653,6 +683,7 @@ $('poc-target-form').addEventListener('submit', event => {
   } });
 });
 let worker;
+
 const start = () => {
   goalOutcomes.clear();
   show('starting', 'Starting the harness…');
@@ -661,12 +692,20 @@ const start = () => {
   ceremony = false;
   worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
   const current = worker;
+  const incarnation = crypto.randomUUID();
+  current.generation = '0';
+  const nativePost = current.postMessage.bind(current);
+  current.sendAt = (request, transfer, generation) => nativePost({incarnation, generation, request}, transfer);
+  current.postMessage = (request, transfer) => current.sendAt(request, transfer, current.generation);
+  nativePost({initialize: incarnation});
   worker.onmessage = ({ data }) => {
+    if (worker !== current) return;
     if (data.requirements_store) {
       const { state, error, reason, ...rest } = JSON.parse(data.requirements_store);
       data = { store: { store_state: state, ...(error ? { store_error: error } : {}), ...(reason ? { store_reason: reason } : {}), ...rest } };
     }
     if (worker !== current) return;
+    if (typeof data.store?.lifecycle_generation === 'string') current.generation = data.store.lifecycle_generation;
     if (data.harness_ready) show('ready', `Harness ready (spec ${data.harness_ready}).`);
     else if (data.store) {
       const { store_state: state, store_error: error, store_reason: reason, ...rest } = data.store;
@@ -699,44 +738,43 @@ const start = () => {
   };
 };
 
-// Stop dispatch and clear the page at once. The worker drops session holdings, records each
-// revoke and answers; termination follows that answer or this implementation bound. Expiry
-// and the next-unlock sweep cover a killed worker without relying on an unload append.
-const END_SESSIONS_BOUND_MS = 5000;
-const endingWorkers = new WeakSet();
+// Retirement acknowledges only after a begun append and secret disposal finish.
+const RETIRE_EXPLANATION_MS = 5000;
 const lock = () => {
   const previous = worker;
-  if (!endingWorkers.has(previous)) {
-    endingWorkers.add(previous);
-    const timer = setTimeout(() => previous.terminate(), END_SESSIONS_BOUND_MS);
-    previous.addEventListener('message', ({ data }) => {
-      if (data?.sessions_ended === true && Object.keys(data).length === 1) {
-        clearTimeout(timer);
-        previous.terminate();
-      }
-    });
-    previous.postMessage({ end_sessions: true });
-  }
+  if (!previous) return;
+  worker = undefined;
   clearWords();
   clearPocInputs();
   $('seed-backup-input').value = '';
   redisplay = false;
   $('passphrase').value = '';
   $('confirm').value = '';
-  start();
+  render({state: 'locking'});
+  const timer = setTimeout(() => {
+    if (!worker) $('store-state').textContent = 'Still locking while the worker finishes a write. You can reload or close the page to stop it and recover at the next unlock.';
+  }, RETIRE_EXPLANATION_MS);
+  previous.addEventListener('message', ({data}) => {
+    if (data?.runtime_retired === true) {
+      clearTimeout(timer);
+      previous.terminate();
+      start();
+    }
+  });
+  previous.postMessage({retire_runtime: true});
 };
 document.addEventListener('visibilitychange', () => {
   const hidden = document.visibilityState === 'hidden';
   if (hidden && ceremony) { lock(); return; }
-  worker.postMessage({ lifecycle: hidden ? 'hidden' : 'visible' });
+  worker?.postMessage({ lifecycle: hidden ? 'hidden' : 'visible' });
 });
 document.addEventListener('freeze', () => {
   if (ceremony) { lock(); return; }
   suspended = true;
-  worker.postMessage({ lifecycle: 'freeze' });
+  worker?.postMessage({ lifecycle: 'freeze' });
 });
 document.addEventListener('resume', () => {
-  if (suspended) { suspended = false; worker.postMessage({ lifecycle: 'resume' }); }
+  if (suspended) { suspended = false; worker?.postMessage({ lifecycle: 'resume' }); }
 });
 addEventListener('pagehide', lock);
 addEventListener('pageshow', (event) => {

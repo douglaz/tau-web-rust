@@ -53,7 +53,16 @@ fn bind_entries(store: &mut Store<MemoryStorage>) {
         if store.dispatch().approved_entries[machine].class.is_none() {
             block_on(store.answer_class(machine.into(), ClassAnswer::No)).unwrap();
         }
-        block_on(store.bind(machine)).unwrap();
+        if !store.sessions().iter().any(|s| {
+            s["session_state"] != "ended"
+                && s["bound_set"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|m| m == machine)
+        }) {
+            block_on(store.admit_fixture(machine)).unwrap();
+        }
     }
 }
 
@@ -174,7 +183,7 @@ const CHOICES: [Continuation; 4] = [
 ];
 
 #[test]
-fn typed_record_before_send_survives_every_kill_boundary() {
+fn poc_typed_record_before_send_survives_every_kill_boundary() {
     let (storage, _, extra_index) = bound_fresh();
     let files = storage.files();
     for at in 1..=4 {
@@ -196,7 +205,7 @@ fn typed_record_before_send_survives_every_kill_boundary() {
         assert_eq!(result.is_ok(), at == 4);
         drop(store);
         let replayed = bound_reopen(&active, extra_index);
-        assert_eq!(replayed.records(), 0..call + if at == 4 { 3 } else { 2 });
+        assert_eq!(replayed.records(), 0..call + u64::from(at == 4));
         assert_eq!(replayed.dispatch().typed_calls.len(), usize::from(at == 4));
         if at == 4 {
             let recorded = &replayed.dispatch().typed_calls[&call];
@@ -524,7 +533,7 @@ fn disposition_matrix_reads_and_commands_in_core_store_and_replay() {
                             .unwrap()
                             .contains(&serde_json::json!("fixture"))
                     }) {
-                        block_on(store.bind("fixture")).unwrap();
+                        block_on(store.admit_fixture("fixture")).unwrap();
                     }
                     block_on(store.set_inference_account(
                         crate::credential::InferenceAccountCredential::new(

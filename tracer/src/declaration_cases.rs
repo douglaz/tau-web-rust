@@ -448,7 +448,7 @@ pub(super) async fn run(
     let records: Vec<Value> = read
         .records
         .iter()
-        .map(|(_, b)| serde_json::from_slice(b).unwrap())
+        .map(|(_, b)| crate::journal::event(b).unwrap())
         .collect();
     case.check(
         "declaration_cases.a009",
@@ -787,7 +787,7 @@ file_inputs::equal_primary("declaration_cases.a018.1", "declaration_cases.a018",
         let files = store_files(&run.dump_at("file.declaration_cases.dump.009", tab).await?);
         let opened = reader::read_at("reader.call.declaration.lifecycle", &files, PASSPHRASE)?;
         let approved = opened.records.iter().any(|(_, b)| {
-            serde_json::from_slice::<Value>(b)
+            crate::journal::event(b)
                 .unwrap()
                 .pointer("/setup/requirements")
                 .is_some()

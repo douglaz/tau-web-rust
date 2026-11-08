@@ -40,6 +40,7 @@ async function releaseCases(api, init, name) {
     return {checks,events};
   }
   const normal = 'normal-synthetic-key-482700';
+  api.test_poc_configuration('https://inference.invalid/v1/chat/completions', 'model-a');
   const rotation = name.includes('rotation') || name.includes('echo');
   if (rotation) check(!JSON.parse(await configure(normal)).error && api.poc_key_is_set(), 'initial credential configured');
   const packageOutput = size => 'Package abc012345 xyz789 installed successfully.\n'.repeat(Math.ceil(size/47)).slice(0,size);
@@ -194,6 +195,9 @@ async function cases(api, init) {
   check(created.state === 'unlocked', 'store created');
   await api.seed_backup_answer();
   await api.seed_backup_skip();
+  const target = {machine:'machine-a',relay:'wss://relay.invalid/base/',profile:'v1',host:'192.0.2.1',port:22,user:'arch',elevation:'sudo -n',pin:'SHA256:' + btoa(String.fromCharCode(...new Uint8Array(32).fill(7))).replace(/=+$/, '')};
+  const enroll = candidate => api.poc_enroll(JSON.stringify({target:candidate,approve_existing:true,class_answer:'no',approve_maintained_access:true}));
+  check(!JSON.parse(await enroll(target)).error, 'direct inference fixture has an approved target');
   check((await next()).pause?.includes('endpoint missing'), 'configuration missing pauses');
   const empty = new Uint8Array();
   await api.poc_configure('https://inference.invalid/v1/chat/completions', 'model-a', empty);
@@ -214,6 +218,7 @@ async function cases(api, init) {
   check(failedReplacement.error?.includes('at least 16 bytes') && api.poc_key_is_set(),
     'short replacement preserves prior usable custody');
   expectedKey = boundaryKey;
+  check(!JSON.parse(await api.poc_bind('machine-a')).error, 'direct inference fixture explicitly admits its original session');
   check((await next()).tool?.name === 'exec' && requests.at(-1).transport,
     'refused replacement leaves original authorization active');
   check(JSON.stringify(JSON.parse(await api.test_poc_protect_output(JSON.stringify(shortProbe)))) ===
@@ -223,8 +228,7 @@ async function cases(api, init) {
   await api.poc_configure('https://inference.invalid/v1/chat/completions', 'model-a', bytes);
   check(bytes.every(byte => byte === 0) && api.poc_key_is_set(), 'key transfer cleared');
 
-  const target = {machine:'machine-a',relay:'wss://relay.invalid/base/',profile:'v1',host:'192.0.2.1',port:22,user:'arch',elevation:'sudo -n',pin:'SHA256:' + btoa(String.fromCharCode(...new Uint8Array(32).fill(7))).replace(/=+$/, '')};
-  const enroll = candidate => api.poc_enroll(JSON.stringify({target:candidate,approve_existing:true,class_answer:'no',approve_maintained_access:true}));
+
   const journal = async () => JSON.parse(await api.test_poc_journal(key));
   const beforeAdmission = await journal();
   for (const candidate of [{...target,machine:key}, {...target,user:key},
@@ -356,7 +360,9 @@ async function cases(api, init) {
   mode = { body: JSON.stringify(response('done', '', 'call-b')) };
   const second = await next([[first.id, first.tool, { stdout: JSON.stringify({ nested: key }) }]]);
   check(second.tool?.name === 'done' && second.tool.arguments.machine === 'machine-a', 'done normalized');
-  const transcript = requests.at(-1).body.messages;
+  const messages = requests.at(-1).body.messages;
+  const transcript = [...messages.slice(0,2), ...messages.filter(message=>message.tool_calls || message.tool_call_id)];
+  check(transcript.length===4, 'one completed call retains one paired result beside restored facts');
   check(transcript[2].role === 'assistant' && transcript[2].tool_calls[0].id === first.id &&
     typeof transcript[2].tool_calls[0].function.arguments === 'string' &&
     transcript[3].role === 'tool' && transcript[3].tool_call_id === first.id,
@@ -402,7 +408,7 @@ async function cases(api, init) {
       mode = undefined;
       const r = await measured('request ' + size, () => next([['prior',{name:'exec',arguments:{machine:'machine-a',command:'true'}},value]]));
       check(r.tool?.name === 'exec', 'ordinary request ' + size + ' usable: ' + r.pause);
-      const excerpt = requests.at(-1).body.messages[3].content;
+      const excerpt = requests.at(-1).body.messages.at(-1).content;
       check(r.tool?.name === 'exec' && excerpt.includes(output.slice(0,40)), 'ordinary transcript reaches model with useful excerpt');
     }
   }
@@ -533,8 +539,11 @@ async function cases(api, init) {
   // The dedicated served exports use the ordinary approval journal and real harness
   // admission paths. WebSocket is a throwing contact spy; no host is reached.
   check(!JSON.parse(await enroll(target)).error, 'safe existing-machine enrollment passes');
+  const existing=JSON.parse(await api.open()).sessions.find(s=>s.session_state!=='ended');
+  const endPublication=new api.TaskPublication();
+  await endPublication.request(JSON.stringify({action:'end-session',session:existing.identity}));endPublication.free();
   const bound = JSON.parse(await api.poc_bind('machine-a'));
-  const session = bound.sessions.find(s => s.bound_set.includes('machine-a')).identity;
+  const session = bound.sessions.find(s => s.session_state!=='ended' && s.bound_set.includes('machine-a')).identity;
   const proposed = {kind:'declaration',machine:'machine-a',declaration:bound.poc_declaration_candidate};
   check(Boolean(JSON.parse(await api.poc_propose_requirements(JSON.stringify({session,proposal:proposed}))).error), 'declaration refuses without goal and acting authority');
   await api.goal_request(JSON.stringify({session,text:'Install a small service',document_source:null}));
@@ -584,7 +593,9 @@ async function cases(api, init) {
   await awaitPending();
   const lateEnd = pending;
   const beforeEnd = aborted;
-  await api.end_sessions();
+  const closing=new api.TaskPublication();
+  await closing.request(JSON.stringify({action:'end-session',session}));closing.free();
+  await api.retire_runtime();
   check((await ended).pause?.includes('incomplete') && aborted > beforeEnd && !api.poc_key_is_set(),
     'session end aborts and clears key');
   lateEnd.resolve(good());
@@ -618,7 +629,7 @@ async function pageCases() {
   await until(() => $('poc-key-status').textContent === 'Key set.', 'configured key reported by real page publication');
   if ($('poc-key').value !== '') throw Error('page key input was retained');
   // Exercise the dedicated declaration controls, without entering the old goal loop.
-  [...$('poc-targets').querySelectorAll('button')].find(b=>b.textContent==='Bind machine-a').click();
+  [...$('poc-targets').querySelectorAll('button')].find(b=>b.textContent==='Start session machine-a').click();
   await until(() => document.querySelector('[data-goal-text]'), 'bound session exposes goal form');
   document.querySelector('[data-goal-text]').value = 'Inspect a small service';
   document.querySelector('[data-goal-enter]').click();
@@ -671,7 +682,7 @@ async function pageCases() {
   setDraft(draft);
   document.querySelector('[data-poc-propose]').click();
   await until(() => document.querySelector('[data-requirements-decision="approve"]'), 'custom proposal displayed for explicit approval');
-  const sent = window.__pocMessages.filter(m=>m.poc_propose_requirements).at(-1).poc_propose_requirements;
+  const sent = window.__pocMessages.map(m=>m.request).filter(m=>m?.poc_propose_requirements).at(-1).poc_propose_requirements;
   if (JSON.stringify(sent.proposal.declaration)!==JSON.stringify(custom))throw Error('next proposal discarded custom draft');
   if (!document.querySelector('[data-requirements-card]').textContent.includes('draft-check'))throw Error('approval card lost submitted candidate');
   document.querySelector('[data-requirements-decision="approve"]').click();
@@ -681,15 +692,11 @@ async function pageCases() {
   await until(() => $('store').dataset.state === 'locked' && $('poc-key-status').textContent === 'Key unset.', 'Lock ends custody on real page');
   $('passphrase').value = 'fixture passphrase for browser checks'; $('unlock').click();
   await until(() => $('store').dataset.state === 'unlocked', 'unlock after Lock');
-  [...$('poc-targets').querySelectorAll('button')].find(b=>b.textContent==='Bind machine-a').click();
-  await until(() => document.querySelector('[data-goal-text]'), 'new session after Lock');
-  document.querySelector('[data-goal-text]').value='Inspect the new session';document.querySelector('[data-goal-enter]').click();
-  await until(() => document.querySelector('[data-poc-accept]'), 'new session goal entered');
-  document.querySelector('[data-poc-accept]').click();
-  await until(() => document.querySelector('[data-poc-declaration]'), 'new session declaration candidate');
-  if(document.querySelector('[data-poc-declaration]').value !== initial)throw Error('Lock reused prior session draft');
+  await until(() => document.querySelector('[data-poc-declaration]'), 'same session after Lock');
+  if(document.querySelector('[data-poc-declaration]').value !== initial)throw Error('Lock retained unsubmitted declaration text');
+  checks.push('Lock restores the admitted session and clears unsubmitted declaration text');
   setDraft(draft);
-  checks.push('Lock/new session clears old declaration draft');
+  checks.push('Lock preserves the session while clearing page drafts');
   $('poc-endpoint').value = 'https://inference.invalid/v1/chat/completions';
   $('poc-model').value = 'model-a'; $('poc-key').value = 'fixture-worker-loss-key-9751';
   $('poc-inference-form').requestSubmit();
@@ -872,7 +879,7 @@ try {
         });
       }
       postMessage(data,...args){
-        if(data.lifecycle || data.poc_propose_requirements)window.__pocMessages.push(structuredClone(data));
+        if(data.request?.lifecycle || data.request?.poc_propose_requirements)window.__pocMessages.push(structuredClone(data));
         return super.postMessage(data,...args);
       }
     };`},sessionId);

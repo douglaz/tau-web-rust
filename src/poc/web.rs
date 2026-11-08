@@ -11,6 +11,58 @@ use std::rc::Rc;
 use wasm_bindgen::JsCast;
 pub(crate) type Response = Rc<RefCell<Option<crate::poc::inference::CommandResponse>>>;
 
+thread_local! {
+    static WAKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static WAKE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub fn wake_tasks() {
+    wake();
+}
+
+pub(crate) fn wake() {
+    WAKE.set(true);
+    if WAKING.replace(true) {
+        return;
+    }
+    wasm_bindgen_futures::spawn_local(async {
+        while WAKE.replace(false) {
+            let candidates = {
+                let local = local();
+                let mut writer = local.lock().await;
+                if writer.dispatch_refusal().is_some()
+                    || crate::lifecycle::owner().ordinary().is_err()
+                {
+                    Vec::new()
+                } else if let Some(store) = writer.store() {
+                    store.eligible_tasks()
+                } else {
+                    Vec::new()
+                }
+            };
+            for task in candidates {
+                if run::defer_if_active(&task.id) {
+                    continue;
+                }
+                let generation = crate::harness::inference::publication_generation();
+                let session = task.start_session.clone();
+                let response = Response::default();
+                let report = request_with_mode(
+                    serde_json::json!({"action":"resume","id":task.id,"session":session})
+                        .to_string(),
+                    response.clone(),
+                    true,
+                )
+                .await;
+                let _response = response.borrow_mut().take();
+                crate::harness::inference::publish_report(generation, session, report).await;
+            }
+        }
+        WAKING.set(false);
+    });
+}
+
 pub(crate) async fn publish_progress(session: &str) {
     let generation = crate::harness::inference::publication_generation();
     let report = local().lock().await.report(None).to_string();
@@ -20,21 +72,31 @@ pub(crate) async fn publish_progress(session: &str) {
 }
 
 pub(crate) async fn resume_with(
-    id: &str,
+    task: &Task,
     session: &str,
     target: &Target,
     pins: &impl PinSource,
     model: &mut impl run::Model,
     response: Response,
+    continuation: crate::lifecycle::Continuation,
 ) -> Result<Task, String> {
+    {
+        let local = local();
+        let mut writer = local.lock().await;
+        continuation.check()?;
+        writer
+            .store()
+            .ok_or(crate::poc::wait::LOCKED)?
+            .check_task_session(task, session)?;
+    }
     let mut runtime = Web {
         target,
         pins,
         response,
         session,
-        continuation: crate::lifecycle::owner().continuation()?,
+        continuation,
     };
-    run::drive(&mut runtime, model, id, session).await
+    run::drive(&mut runtime, model, &task.id, session).await
 }
 
 struct Web<'a, P> {
@@ -46,6 +108,9 @@ struct Web<'a, P> {
 }
 impl<P: PinSource> Runtime for Web<'_, P> {
     async fn progress(&mut self, task: &Task) {
+        if self.continuation.check().is_err() {
+            return;
+        }
         if task.pending.is_some() {
             self.response
                 .borrow_mut()
@@ -75,13 +140,14 @@ impl<P: PinSource> Runtime for Web<'_, P> {
             .map(|_| ())
     }
     async fn change(&mut self, task: &Task, change: Change) -> Result<Task, String> {
-        local()
-            .lock()
-            .await
-            .store()
-            .ok_or(crate::poc::wait::LOCKED)?
-            .poc_change(&task.id, task.revision, change)
-            .await
+        let local = local();
+        let mut writer = local.lock().await;
+        self.continuation.check()?;
+        let store = writer.store().ok_or(crate::poc::wait::LOCKED)?;
+        store.check_task_session(task, self.session)?;
+        let changed = store.poc_change(&task.id, task.revision, change).await?;
+        self.continuation.check()?;
+        Ok(changed)
     }
     async fn propose(
         &mut self,
@@ -431,6 +497,13 @@ pub(crate) async fn request(request: String) -> String {
     request_with(request, Response::default()).await
 }
 pub(crate) async fn request_with(request: String, response: Response) -> String {
+    request_with_mode(request, response, false).await
+}
+async fn request_with_mode(request: String, response: Response, automatic: bool) -> String {
+    let owner = crate::lifecycle::owner();
+    let continuation = owner.continuation();
+    // End shares the suspension-capable lifecycle fence; no issuer readiness is needed.
+    let ending = owner.clock_continuation();
     #[derive(serde::Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Request {
@@ -446,21 +519,34 @@ pub(crate) async fn request_with(request: String, response: Response) -> String 
             return Err("task request".into());
         }
         let request: Request = serde_json::from_value(value).map_err(|_| "task request")?;
+        if request.action == "end-session" {
+            ending.as_ref().map_err(Clone::clone)?.check()?;
+        } else {
+            continuation.as_ref().map_err(Clone::clone)?.check()?;
+        }
         if request.action == "resume" {
+            let continuation = continuation.as_ref().map_err(Clone::clone)?;
             let id = request.id.as_deref().ok_or("task ID required")?;
-            let session = request.session.as_deref().ok_or("fresh session required")?;
-            let machine = local()
-                .lock()
-                .await
-                .store()
-                .ok_or(crate::poc::wait::LOCKED)?
-                .poc_task(id)?
-                .machine;
+            let session = request
+                .session
+                .as_deref()
+                .ok_or("original session required")?;
+            let task = {
+                let local = local();
+                let mut writer = local.lock().await;
+                continuation.check()?;
+                let store = writer.store().ok_or(crate::poc::wait::LOCKED)?;
+                let task = store.poc_task(id)?;
+                store.check_task_session(&task, session)?;
+                task
+            };
             let resolved = {
                 let local = local();
                 let mut writer = local.lock().await;
+                continuation.check()?;
                 let store = writer.store().ok_or(crate::poc::wait::LOCKED)?;
-                match crate::poc::targets::resolve(store, &machine) {
+                store.check_task_session(&task, session)?;
+                match crate::poc::targets::resolve(store, &task.machine) {
                     Ok(resolved) => Ok(resolved),
                     Err(reason) => {
                         store.ensure_scan_references().await?;
@@ -483,30 +569,33 @@ pub(crate) async fn request_with(request: String, response: Response) -> String 
             match resolved {
                 Ok((target, pins)) => {
                     resume_with(
-                        id,
+                        &task,
                         session,
                         &target,
                         &pins,
                         &mut Configured {
                             response: response.clone(),
+                            automatic,
                         },
                         response.clone(),
+                        continuation.clone(),
                     )
                     .await?;
                 }
-                Err(reason) => {
-                    let local = local();
-                    let mut writer = local.lock().await;
-                    let store = writer.store().ok_or(crate::poc::wait::LOCKED)?;
-                    let task = store.poc_task(id)?;
-                    store
-                        .poc_change(id, task.revision, Change::Pause(reason))
-                        .await?;
-                }
+                Err(reason) => return Err(reason),
             }
         } else {
             let local = local();
+            #[cfg(feature = "tracer")]
+            if request.action == "end-session" {
+                crate::testonly::session_point("poc_end_writer").await;
+            }
             let mut writer = local.lock().await;
+            if request.action == "end-session" {
+                ending.as_ref().map_err(Clone::clone)?.check()?;
+            } else {
+                continuation.as_ref().map_err(Clone::clone)?.check()?;
+            }
             let store = writer.store().ok_or(crate::poc::wait::LOCKED)?;
             match request.action.as_str() {
                 "start" => {
@@ -517,10 +606,10 @@ pub(crate) async fn request_with(request: String, response: Response) -> String 
                         )
                         .await?;
                 }
-                "authorize" => {
-                    let id = request.id.as_deref().ok_or("task ID required")?;
-                    let session = request.session.as_deref().ok_or("fresh session required")?;
-                    store.poc_authorize(id, session).await?;
+                "end-session" => {
+                    store
+                        .end_session(request.session.as_deref().ok_or("session required")?)
+                        .await?;
                 }
                 "retry-checks" => {
                     let id = request.id.as_deref().ok_or("task ID required")?;
@@ -558,23 +647,45 @@ pub(crate) async fn request_with(request: String, response: Response) -> String 
 
 struct Configured {
     response: Response,
+    automatic: bool,
 }
 impl run::Model for Configured {
+    async fn ready(&mut self, task: &Task, session: &str) -> Result<(), String> {
+        #[cfg(feature = "tracer")]
+        if crate::testonly::poc_model_configured() {
+            return Ok(());
+        }
+        let _ = task;
+        if !crate::poc::inference::key_is_set() {
+            return Err("waiting for the admitted inference key; no request consumed".into());
+        }
+        if self.automatic {
+            let local = local();
+            let mut writer = local.lock().await;
+            let admitted = writer
+                .store()
+                .ok_or("locked")?
+                .session_configuration(session)?;
+            if crate::poc::inference::configuration().as_ref() != Some(&admitted) {
+                return Err("automatic continuation waits for the admitted endpoint and model; restore them or explicitly Resume with the displayed configuration; no request consumed".into());
+            }
+        }
+        Ok(())
+    }
     async fn next(
         &mut self,
-        goal: &str,
-        machine: &str,
-        completed: &[(String, crate::goals::Tool, Value)],
+        task: &Task,
+        session: &str,
     ) -> Result<(String, crate::goals::Tool), String> {
         // Progress has released the preceding result. Configuration may change during
         // the next request, whose adapter detects changes and aborts honestly.
         self.response.borrow_mut().take();
         #[cfg(feature = "tracer")]
-        if let Some(next) = crate::testonly::poc_model_next(machine) {
+        if let Some(next) = crate::testonly::poc_model_next(&task.machine) {
             *self.response.borrow_mut() = Some(crate::poc::inference::CommandResponse::reserve());
             return Ok(next);
         }
-        let next = crate::poc::inference::next(goal, machine, completed).await;
+        let next = crate::poc::inference::next(task, session).await;
         // A failed request has no new command result to release. In particular, let
         // the operator configure an endpoint/key while its pause is being recorded.
         if next.is_ok() {

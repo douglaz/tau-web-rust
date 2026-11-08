@@ -51,7 +51,7 @@ async fn holding_job(
     let mut events = Vec::new();
     let mut removed = false;
     for (_, bytes) in opened.records {
-        let event: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        let event: Value = crate::journal::event(&bytes).map_err(|e| e.to_string())?;
         if event["job_terminal"]["call"] == call {
             removed = true;
             break;
@@ -231,7 +231,7 @@ pub(super) async fn run(
                 )?;
                 case.check("goal_admission_cases.a009", "independent journal reader sees only permitted inference cleanup after end, with no stale-tool append",
                     opened.records.iter().skip(record_count).all(|(_, bytes)| {
-                        serde_json::from_slice::<Value>(bytes).is_ok_and(|event| {
+                        crate::journal::event(bytes).is_ok_and(|event| {
                             event.get("inference_intent").is_some() || event.get("inference_terminal").is_some()
                         })
                     }));

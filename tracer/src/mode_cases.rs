@@ -162,7 +162,7 @@ pub(super) async fn run(
             pass,
         )?;
         let event: Value =
-            serde_json::from_slice(&opened.records.last().unwrap().1).map_err(|e| e.to_string())?;
+            crate::journal::event(&opened.records.last().unwrap().1).map_err(|e| e.to_string())?;
         case.check(
             "mode_cases.a007",
             "independent reader reads the exact refusal record",

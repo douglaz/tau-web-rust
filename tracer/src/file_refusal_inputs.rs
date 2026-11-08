@@ -8,7 +8,7 @@ const ANSWER: &str = "(async()=>{const m=await import(new URL('./pkg/tau_web.js'
 const PAGE: &str = "(async()=>{await onmessage({data:__TAU_MESSAGE__}); return true})()";
 const RUN: &str = "(async () => {\n            const module = await import(new URL('./pkg/tau_web.js', self.location.href).href);\n            return JSON.parse(await module.run_command(__TAU_INPUT__));\n        })()";
 const COLLECT: &str = "(async () => {\n            const module = await import(new URL('./pkg/tau_web.js', self.location.href).href);\n            return JSON.parse(await module.collect_jobs(__TAU_INPUT__));\n        })()";
-const BIND_AGAIN: &str = "(async()=>{const m=await import(new URL('./pkg/tau_web.js',self.location.href).href);return JSON.parse(await m.bind(JSON.stringify({machine:'fixture'})));})()";
+const BIND_AGAIN: &str = "(async()=>{const m=await import(new URL('./pkg/tau_web.js',self.location.href).href);return JSON.parse(await m.bind(JSON.stringify({machine:'fixture',inference_approval:{approved:true,configuration:{endpoint:'https://fixture.invalid/completions',model:'fixture'}}})));})()";
 const BIND_INVALID: &str = "(async()=>{const m=await import(new URL('./pkg/tau_web.js',self.location.href).href);return JSON.parse(await m.bind(__TAU_INPUT__));})()";
 fn bad_bind(n: usize) -> Option<Value> {
     [

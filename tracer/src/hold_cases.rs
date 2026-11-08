@@ -30,7 +30,7 @@ fn events(site: &'static str, files: &Files) -> Result<Vec<Value>, String> {
     reader::read_at(site, files, PASSPHRASE)?
         .records
         .iter()
-        .map(|(_, p)| serde_json::from_slice(p).map_err(|e| e.to_string()))
+        .map(|(_, p)| crate::journal::event(p).map_err(|e| e.to_string()))
         .collect()
 }
 

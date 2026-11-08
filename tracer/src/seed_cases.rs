@@ -571,7 +571,7 @@ pub(super) async fn run(
                     .records
                     .iter()
                     .filter_map(|(_, p)| {
-                        serde_json::from_slice::<Value>(p)
+                        crate::journal::event(p)
                             .ok()?
                             .pointer("/allocation/reserve")
                             .cloned()
@@ -897,7 +897,7 @@ file_inputs::equal_primary("seed_cases.a032.1", "seed_cases.a032", &(store_files
                 case.finish(cases);
             }
         }
-        // Sessions end with the harness worker; goals and tools run in it.
+        // Re-display retires execution while preserving logical sessions and unresolved effects.
         let mut case = Case::new(
             "seed_cases.c007",
             if tracer {

@@ -330,6 +330,7 @@ impl<S: Storage> Store<S> {
     }
 
     /// Stops dispatch before any await. Dropping the row-2 holdings zeroizes their buffers.
+    #[cfg(any(test, feature = "tracer"))]
     pub fn end_inference_sessions(&mut self) -> Vec<String> {
         self.inference.ended = true;
         self.clear_scan_working_copies();

@@ -149,10 +149,7 @@ impl Opened {
             "reader.mnemonic.first_record",
             self.records.first().ok_or("no record"),
         )?;
-        let event: Value = semantic::result(
-            "reader.mnemonic.json",
-            serde_json::from_slice(first).map_err(|e| e.to_string()),
-        )?;
+        let event: Value = semantic::result("reader.mnemonic.json", crate::journal::event(first))?;
         semantic::result(
             "reader.mnemonic.seed_text",
             event["seed"]["mnemonic"]
@@ -187,10 +184,8 @@ impl Opened {
         let mut completions = Vec::new();
         for (source_index, (_, bytes)) in self.records.iter().enumerate() {
             let _source_slot = semantic::Slot::new("reader.aux.backup_record", source_index);
-            let event: Value = semantic::result(
-                "reader.backup.record_json",
-                serde_json::from_slice(bytes).map_err(|e| e.to_string()),
-            )?;
+            let event: Value =
+                semantic::result("reader.backup.record_json", crate::journal::event(bytes))?;
             if let Some(record) = event.pointer("/allocation/seed_backup") {
                 if semantic::rejects("reader.backup.own_seed", record["seed"] != id) {
                     return Err("completion names another seed".into());
@@ -221,7 +216,7 @@ impl Opened {
         self.records
             .iter()
             .filter_map(|(number, plaintext)| {
-                let event: Value = serde_json::from_slice(plaintext).ok()?;
+                let event: Value = crate::journal::event(plaintext).ok()?;
                 let command = if event.get("intent").is_some() {
                     &event["intent"]
                 } else {
@@ -238,6 +233,36 @@ impl Opened {
 }
 
 /// Reads the documented plaintext shapes independently of the harness's event types.
+fn check_inference_approval(value: &Value) -> Result<(), String> {
+    exact(value, &["approved", "configuration"])?;
+    let config = &value["configuration"];
+    exact(config, &["endpoint", "model"])?;
+    let endpoint = config["endpoint"].as_str().ok_or("approval endpoint")?;
+    let model = config["model"].as_str().ok_or("approval model")?;
+    let path = endpoint
+        .strip_prefix("https://")
+        .unwrap_or_default()
+        .split_once('/')
+        .map_or("", |(_, path)| path);
+    if !path
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b"/-._~!$&'()*+,;=:".contains(&b))
+        || value["approved"] != true
+        || !document_url(endpoint)
+        || endpoint.len() > 2048
+        || endpoint.contains(['?', '#', '@', '%'])
+        || endpoint.bytes().any(|b| !b.is_ascii() || b < 0x21)
+        || model.is_empty()
+        || model.len() > 128
+        || !model
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-._/:".contains(&b))
+    {
+        return Err("invalid inference approval".into());
+    }
+    Ok(())
+}
+
 fn check_event(number: u64, event: &Value) -> Result<(), String> {
     semantic::entered("reader.semantic.event");
 
@@ -314,8 +339,19 @@ fn check_event(number: u64, event: &Value) -> Result<(), String> {
             }
             semantic::entered("reader.semantic.g008");
         }
+        "end" => {
+            exact(body, &["session", "reason"])?;
+            if text("session")?.is_empty() || text("reason")? != "explicit" {
+                return Err("invalid End".into());
+            }
+        }
         "exposure" => {
-            exact_optional(body, &["session", "bound_set"], "accepted_modes")?;
+            exact_optional(
+                body,
+                &["session", "bound_set", "inference_approval"],
+                "accepted_modes",
+            )?;
+            check_inference_approval(&body["inference_approval"])?;
             if semantic::rejects(
                 "reader.semantic.g009",
                 body.get("accepted_modes").is_some()
@@ -1061,6 +1097,8 @@ fn mode_list(value: &Value) -> Result<(), String> {
 /// Facts from earlier checked records, parsed once and independent of production's projections.
 #[derive(Default)]
 struct ModeHistory {
+    bindings: BTreeMap<String, String>,
+    ended: BTreeSet<String>,
     exposed_machines: BTreeSet<String>,
     exposed_sessions: BTreeSet<String>,
     goals: BTreeSet<String>,
@@ -1072,10 +1110,24 @@ impl ModeHistory {
     fn check_and_apply(&mut self, event: &Value) -> Result<(), String> {
         semantic::entered("reader.semantic.mode_history");
 
+        if let Some(end) = event.get("end") {
+            let session = end["session"].as_str().ok_or("End session")?;
+            if !self.exposed_sessions.contains(session) {
+                return Err("End names no session".into());
+            }
+            self.ended.insert(session.into());
+            self.closed_conduct_windows.insert(session.into());
+            self.bindings.retain(|_, owner| owner != session);
+        }
         if let Some(exposure) = event.get("exposure") {
             let machine = exposure["bound_set"][0]["machine"]
                 .as_str()
                 .expect("checked exposure");
+            let session = exposure["session"].as_str().ok_or("session")?;
+            if self.bindings.contains_key(machine) || self.exposed_sessions.contains(session) {
+                return Err("session binding or identity already owned".into());
+            }
+            self.bindings.insert(machine.into(), session.into());
             let accepted = exposure
                 .get("accepted_modes")
                 .is_some_and(|m| m != &json!([]));
@@ -1100,7 +1152,9 @@ impl ModeHistory {
             let session = goal["session"].as_str().expect("checked goal");
             if semantic::rejects(
                 "reader.semantic.g075",
-                !self.exposed_sessions.contains(session) || !self.goals.insert(session.into()),
+                !self.exposed_sessions.contains(session)
+                    || self.ended.contains(session)
+                    || !self.goals.insert(session.into()),
             ) {
                 return Err("goal names no exposure or repeats a session".into());
             }
@@ -1321,7 +1375,7 @@ pub fn read_at(site: &'static str, files: &Files, passphrase: &str) -> Result<Op
         .map_err(|e| format!("record {number}: {e}"))?;
         let event: Value = root_checks::result(
             "reader.record.plaintext_json",
-            serde_json::from_slice(&plaintext).map_err(|e| format!("record {number}: {e}")),
+            crate::journal::event(&plaintext).map_err(|e| format!("record {number}: {e}")),
         )?;
         let _record_slot = semantic::Slot::new("reader.record", number as usize);
         root_checks::input_domain(json!({
@@ -1422,7 +1476,12 @@ pub fn build_at(site: &'static str, passphrase: &str, events: &[Value]) -> Files
     for (number, event) in events.iter().enumerate() {
         let record_nonce: [u8; 12] = random(12).try_into().expect("12 bytes");
         let aad = format!("tau-web/local/v1/{id}/event/{number}/{previous}");
-        let sealed = seal(&data_key, &record_nonce, &aad, event.to_string().as_bytes());
+        let sealed = seal(
+            &data_key,
+            &record_nonce,
+            &aad,
+            crate::journal::wrap(event).to_string().as_bytes(),
+        );
         let bytes = record_bytes(&json!({
             "id": id,
             "type": "event",
@@ -1762,7 +1821,7 @@ pub fn record_findings<'a>(
     bytes: &[u8],
     seed_id: &str,
 ) -> Vec<&'a str> {
-    let mut event: Value = serde_json::from_slice(bytes).expect("reader checked JSON");
+    let mut event: Value = crate::journal::event(bytes).expect("reader checked JSON");
     let mut credential_findings = Vec::new();
     if event.as_object().is_some_and(|o| o.len() == 1)
         && let Some(account) = event.get_mut("inference_account")
@@ -1830,7 +1889,10 @@ pub fn record_findings<'a>(
             }
         }
     }
-    credential_findings.extend(found(needles, event.to_string().as_bytes()));
+    credential_findings.extend(found(
+        needles,
+        crate::journal::wrap(&event).to_string().as_bytes(),
+    ));
     credential_findings.sort_unstable();
     credential_findings.dedup();
     credential_findings
@@ -1849,7 +1911,7 @@ pub(crate) async fn approve_fixture_contract<S: tau_web::store::Storage>(
             .await
             .unwrap();
     }
-    let session = store.bind(machine).await.unwrap();
+    let session = store.admit_fixture(machine).await.unwrap();
     store
         .enter_goal(&session, "fixture contract".into(), None)
         .await
@@ -1912,7 +1974,7 @@ mod tests {
         block_on(store.seed_backup(tau_web::allocation::Completion::Skipped)).unwrap();
         block_on(store.approve_setup(tau_web::dispatch::fixture_setup())).unwrap();
         block_on(store.answer_class("fixture".into(), tau_web::dispatch::ClassAnswer::No)).unwrap();
-        block_on(store.bind("fixture")).unwrap();
+        block_on(store.admit_fixture("fixture")).unwrap();
         block_on(
             store.set_inference_account(InferenceAccountCredential::new(
                 b"fixture-account".to_vec(),
@@ -1948,8 +2010,7 @@ mod tests {
             ));
             assert_eq!(result["finished"], true, "{result}");
             let opened = read(&storage.files(), PASS).unwrap();
-            let terminal: Value =
-                serde_json::from_slice(&opened.records.last().unwrap().1).unwrap();
+            let terminal: Value = crate::journal::event(&opened.records.last().unwrap().1).unwrap();
             assert!(
                 terminal["inference_terminal"].get(absent).is_none(),
                 "{terminal}"
@@ -1976,7 +2037,8 @@ mod tests {
         block_on(store.seed_backup(tau_web::allocation::Completion::Skipped)).unwrap();
         block_on(store.approve_setup(fixture_setup())).unwrap();
         block_on(store.answer_class("fixture".into(), ClassAnswer::No)).unwrap();
-        let session = block_on(store.bind_with_modes("fixture", &[Mode::NoArtifactPin])).unwrap();
+        let session =
+            block_on(store.admit_fixture_with_modes("fixture", &[Mode::NoArtifactPin])).unwrap();
         block_on(store.accept_mode(&session, Mode::NoBrief)).unwrap();
         assert!(
             block_on(store.append(
@@ -2018,7 +2080,7 @@ mod tests {
         let events: Vec<Value> = opened
             .records
             .iter()
-            .map(|(_, p)| serde_json::from_slice(p).unwrap())
+            .map(|(_, p)| crate::journal::event(p).unwrap())
             .collect();
         assert_eq!(
             events[4]["exposure"]["accepted_modes"],
@@ -2122,6 +2184,97 @@ mod tests {
     }
 
     #[test]
+    fn poc_reader_end_releases_only_its_binding_and_refuses_old_approvals() {
+        let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let mut events = vec![json!({"seed":{"mnemonic":mnemonic}})];
+        events.extend(setup_events(mnemonic, &["fixture", "fixture-other"]));
+        for machine in ["fixture", "fixture-other"] {
+            events.push(json!({"setup":{"class":{"machine":machine,"answer":"no","class":"single_purpose"}}}));
+        }
+        let mut sessions = Vec::new();
+        for (index, machine) in ["fixture", "fixture-other"].iter().enumerate() {
+            let session = format!("session-{}", events.len());
+            sessions.push(session.clone());
+            events.push(json!({"exposure":{"session":session,"inference_approval":crate::file_recipes::synthetic_approval(),"bound_set":[{"machine":machine,"identity":events[2]["setup"]["approval"]["entries"][index]["identity"]}]}}));
+        }
+        events.push(json!({"end":{"session":sessions[0],"reason":"explicit"}}));
+        let mut history = ModeHistory::default();
+        for (number, event) in events.iter().enumerate() {
+            check_event(number as u64, event).unwrap();
+            history.check_and_apply(event).unwrap();
+        }
+        assert!(!history.bindings.contains_key("fixture"));
+        assert_eq!(history.bindings["fixture-other"], sessions[1]);
+        assert!(
+            history
+                .check_and_apply(
+                    &json!({"mode_acceptance":{"session":sessions[0],"mode":"no_brief"}})
+                )
+                .is_err()
+        );
+        let files = build(PASS, &events);
+        read(&files, PASS).unwrap();
+        let restored = block_on(unlock(
+            MemoryStorage::with_files(files.into()),
+            &Pbkdf2,
+            tau_web::credential::LocalPassphrase::new(PASS.as_bytes().to_vec()),
+        ))
+        .unwrap();
+        assert_eq!(restored.sessions()[0]["identity"], sessions[0]);
+        assert_eq!(restored.sessions()[0]["session_state"], "ended");
+        assert_eq!(restored.sessions()[1]["identity"], sessions[1]);
+        assert_ne!(restored.sessions()[1]["session_state"], "ended");
+    }
+
+    #[test]
+    fn poc_reader_approval_is_closed_and_configuration_remains_strict() {
+        let valid = crate::file_recipes::synthetic_approval();
+        check_inference_approval(&valid).unwrap();
+        for path in [
+            "/approved",
+            "/configuration/endpoint",
+            "/configuration/model",
+        ] {
+            let mut absent = valid.clone();
+            let (parent, member) = path.rsplit_once('/').unwrap();
+            absent
+                .pointer_mut(parent)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .remove(member);
+            assert!(check_inference_approval(&absent).is_err());
+        }
+        for (path, value) in [
+            ("/approved", json!(false)),
+            (
+                "/configuration/endpoint",
+                json!("https://fixture.invalid/[bad]"),
+            ),
+            (
+                "/configuration/endpoint",
+                json!("https://fixture.invalid/path?key=value"),
+            ),
+            ("/configuration/model", json!("model with spaces")),
+            (
+                "/configuration",
+                json!(["https://fixture.invalid/completions", "fixture"]),
+            ),
+        ] {
+            let mut bad = valid.clone();
+            *bad.pointer_mut(path).unwrap() = value;
+            assert!(check_inference_approval(&bad).is_err());
+        }
+        let mut extra = valid;
+        extra["configuration"]["unrecognized"] = true.into();
+        assert!(check_inference_approval(&extra).is_err());
+        let wrapper =
+            crate::journal::wrap(&json!({"command":{"machine":"fixture","command":"74727565"}}));
+        let needles = encodings("protected wrapper", b"journal_version");
+        assert!(!record_findings(&needles, wrapper.to_string().as_bytes(), "").is_empty());
+    }
+
+    #[test]
     fn exposure_and_connection_refusal_shapes_are_exact_and_builder_readable() {
         let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
         let mut events = vec![json!({"seed":{"mnemonic":mnemonic}})];
@@ -2130,16 +2283,16 @@ mod tests {
         events.push(
             json!({"setup":{"class":{"machine":"fixture","answer":"no","class":"single_purpose"}}}),
         );
-        let exposure = json!({"exposure":{"session":"session-4","bound_set":[{"machine":"fixture","identity":identity}]}});
+        let exposure = json!({"exposure":{"session":"session-4","inference_approval":crate::file_recipes::synthetic_approval(),"bound_set":[{"machine":"fixture","identity":identity}]}});
         let refusal = json!({"connection_refusal":{"machine":"fixture","reason":"unbound"}});
         events.extend([exposure.clone(), refusal.clone()]);
         let opened = read(&build(PASS, &events), PASS).unwrap();
         assert_eq!(
-            serde_json::from_slice::<Value>(&opened.records[4].1).unwrap(),
+            crate::journal::event(&opened.records[4].1).unwrap(),
             exposure
         );
         assert_eq!(
-            serde_json::from_slice::<Value>(&opened.records[5].1).unwrap(),
+            crate::journal::event(&opened.records[5].1).unwrap(),
             refusal
         );
         for (number, valid, field) in [
@@ -2179,7 +2332,7 @@ mod tests {
             );
             let opened = read(&build(PASS, &events), PASS).unwrap();
             for index in [2, 3] {
-                let actual: Value = serde_json::from_slice(&opened.records[index].1).unwrap();
+                let actual: Value = crate::journal::event(&opened.records[index].1).unwrap();
                 assert_eq!(actual, events[index]);
             }
         }
@@ -2269,8 +2422,12 @@ mod tests {
             *bad.pointer_mut(path).unwrap() = value;
             if path.ends_with("vendor") {
                 assert!(
-                    !record_findings(&needles, &serde_json::to_vec(&bad).unwrap(), &seed)
-                        .is_empty()
+                    !record_findings(
+                        &needles,
+                        &serde_json::to_vec(&crate::journal::wrap(&bad)).unwrap(),
+                        &seed
+                    )
+                    .is_empty()
                 );
             } else {
                 assert!(check_event(index as u64, &bad).is_err(), "{path}");
@@ -2306,12 +2463,9 @@ mod tests {
                 ],
             );
             let opened = read(&files, PASS).unwrap();
+            assert_eq!(crate::journal::event(&opened.records[1].1).unwrap(), intent);
             assert_eq!(
-                serde_json::from_slice::<Value>(&opened.records[1].1).unwrap(),
-                intent
-            );
-            assert_eq!(
-                serde_json::from_slice::<Value>(&opened.records[2].1).unwrap(),
+                crate::journal::event(&opened.records[2].1).unwrap(),
                 observation
             );
             let replayed = block_on(unlock(
@@ -2349,7 +2503,7 @@ mod tests {
         let files = build(PASS, &events);
         let opened = read(&files, PASS).unwrap();
         assert_eq!(
-            serde_json::from_slice::<Value>(&opened.records[2].1).unwrap(),
+            crate::journal::event(&opened.records[2].1).unwrap(),
             response
         );
         for bad in [
@@ -2401,7 +2555,7 @@ mod tests {
         assert_eq!(block_on(store.check("fixture")), Ok(()));
         let call = block_on(store.append(&entry, &admission)).unwrap();
         let opened = read(&storage.files(), PASS).unwrap();
-        let intent: Value = serde_json::from_slice(&opened.records[call as usize].1).unwrap();
+        let intent: Value = crate::journal::event(&opened.records[call as usize].1).unwrap();
         assert_eq!(
             intent["intent"]["provenance"],
             json!({"target":{"allocation_index":index},
@@ -2442,8 +2596,7 @@ mod tests {
         block_on(store.job_evidence(&evidence)).unwrap();
         let opened = read(&store.storage().files(), PASS).unwrap();
         assert_eq!(
-            serde_json::from_slice::<Value>(&opened.records.last().unwrap().1).unwrap()["job_terminal"]
-                ["call"],
+            crate::journal::event(&opened.records.last().unwrap().1).unwrap()["job_terminal"]["call"],
             call
         );
     }
@@ -2532,8 +2685,12 @@ mod tests {
             let mut id_leak = events[4].clone();
             id_leak["other"] = json!(id);
             assert!(
-                record_findings(&needles, id_leak.to_string().as_bytes(), &id)
-                    .contains(&"the seed identifier, raw")
+                record_findings(
+                    &needles,
+                    crate::journal::wrap(&id_leak).to_string().as_bytes(),
+                    &id
+                )
+                .contains(&"the seed identifier, raw")
             );
             let mut leak = events[1].clone();
             leak["intent"]["words"] = json!(mnemonic.split(' ').collect::<Vec<_>>());
@@ -2548,7 +2705,14 @@ mod tests {
                 json!({"call":"machine","other":"family"}),
                 json!({"match":"this","try":"again"}),
             ] {
-                assert!(record_findings(&needles, shape.to_string().as_bytes(), &id).is_empty());
+                assert!(
+                    record_findings(
+                        &needles,
+                        crate::journal::wrap(&shape).to_string().as_bytes(),
+                        &id
+                    )
+                    .is_empty()
+                );
             }
         }
     }
@@ -2581,8 +2745,12 @@ mod tests {
                 let mut leak = event.clone();
                 leak["allocation"]["other"] = json!(id);
                 assert!(
-                    record_findings(&needles, leak.to_string().as_bytes(), &id)
-                        .contains(&"the seed identifier, raw"),
+                    record_findings(
+                        &needles,
+                        crate::journal::wrap(&leak).to_string().as_bytes(),
+                        &id
+                    )
+                    .contains(&"the seed identifier, raw"),
                     "{leak}"
                 );
             }
@@ -2590,8 +2758,12 @@ mod tests {
                 let mut leak = json!({"seed":null,"identity":{"seed":null},"allocation":{"other":{"seed":null}}});
                 *leak.pointer_mut(path).unwrap() = json!(id);
                 assert!(
-                    record_findings(&needles, leak.to_string().as_bytes(), &id)
-                        .contains(&"the seed identifier, raw"),
+                    record_findings(
+                        &needles,
+                        crate::journal::wrap(&leak).to_string().as_bytes(),
+                        &id
+                    )
+                    .contains(&"the seed identifier, raw"),
                     "{path}"
                 );
             }
@@ -2676,11 +2848,11 @@ mod tests {
             ]
         );
         assert_eq!(
-            serde_json::from_slice::<Value>(&opened.records[15].1).unwrap(),
+            crate::journal::event(&opened.records[15].1).unwrap(),
             json!({"terminal":{"call":calls[0],"exit_status":7}})
         );
         assert_eq!(
-            serde_json::from_slice::<Value>(&opened.records[16].1).unwrap()["disposition"]["continuation"],
+            crate::journal::event(&opened.records[16].1).unwrap()["disposition"]["continuation"],
             "as_if_not_done"
         );
         let mnemonic = opened.mnemonic().unwrap();
@@ -2843,7 +3015,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             refused,
-            "record 1: its event is not one this version reads; replay stopped"
+            "record 1: journal decoding failed. Data was left unchanged. Clearing site data permanently deletes the store, including its seed record.; replay stopped"
         );
     }
 }
@@ -2856,12 +3028,23 @@ mod inference_secret_tests {
         let mut needles = encodings("inference account credential", b"account-private");
         needles.extend(encodings("session inference key", b"session-private"));
         let account = json!({"inference_account":{"credential":"account-private"}});
-        assert!(record_findings(&needles, account.to_string().as_bytes(), "").is_empty());
+        assert!(
+            record_findings(
+                &needles,
+                crate::journal::wrap(&account).to_string().as_bytes(),
+                ""
+            )
+            .is_empty()
+        );
         let leak = json!({"inference_account":{"credential":"session-private"}});
         assert!(
-            record_findings(&needles, leak.to_string().as_bytes(), "")
-                .iter()
-                .any(|name| name.starts_with("session inference key"))
+            record_findings(
+                &needles,
+                crate::journal::wrap(&leak).to_string().as_bytes(),
+                ""
+            )
+            .iter()
+            .any(|name| name.starts_with("session inference key"))
         );
     }
     #[test]
@@ -2987,7 +3170,7 @@ pub fn with_contracts(mut files: Files, passphrase: &str) -> Result<Files, Strin
     let events: Vec<Value> = opened
         .records
         .iter()
-        .map(|(_, bytes)| serde_json::from_slice(bytes).unwrap())
+        .map(|(_, bytes)| crate::journal::event(bytes).unwrap())
         .collect();
     let mut access = BTreeMap::new();
     let mut declared = BTreeSet::new();
@@ -3032,7 +3215,7 @@ pub fn with_contracts(mut files: Files, passphrase: &str) -> Result<Files, Strin
             &opened.data_key,
             &nonce,
             &format!("tau-web/local/v1/{id}/event/{number}/{previous}"),
-            &serde_json::to_vec(&event).unwrap(),
+            &serde_json::to_vec(&crate::journal::wrap(&event)).unwrap(),
         );
         let bytes = format!("{{\"id\":{},\"type\":\"event\",\"number\":{number},\"previous\":{},\"nonce\":{},\"ciphertext\":{}}}", json!(id), json!(previous), json!(URL_SAFE_NO_PAD.encode(nonce)), json!(URL_SAFE_NO_PAD.encode(ciphertext))).into_bytes();
         previous = address(&bytes);
@@ -3102,10 +3285,7 @@ mod receipt_tests {
             let files = build(PASS, &events);
             let opened = read(&files, PASS).unwrap();
             for ((_, plaintext), expected) in opened.records.iter().zip(&events) {
-                assert_eq!(
-                    serde_json::from_slice::<Value>(plaintext).unwrap(),
-                    *expected
-                );
+                assert_eq!(crate::journal::event(plaintext).unwrap(), *expected);
             }
             let reopened = block_on(unlock(
                 MemoryStorage::with_files(files.clone().into()),

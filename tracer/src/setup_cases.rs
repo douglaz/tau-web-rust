@@ -175,8 +175,7 @@ pub(super) async fn run(
         &store_files(&run.dump_at("file.setup_cases.dump.007", tab).await?),
         pass,
     )?;
-    let approval: Value =
-        serde_json::from_slice(&opened.records[2].1).map_err(|e| e.to_string())?;
+    let approval: Value = crate::journal::event(&opened.records[2].1).map_err(|e| e.to_string())?;
     let approval = &approval["setup"]["approval"];
     card.check(
         "setup_cases.a006",
@@ -321,7 +320,7 @@ pub(super) async fn run(
     let values: Vec<Value> = opened
         .records
         .iter()
-        .map(|(_, p)| serde_json::from_slice(p).unwrap())
+        .map(|(_, p)| crate::journal::event(p).unwrap())
         .collect();
     class.check(
         "setup_cases.a012",

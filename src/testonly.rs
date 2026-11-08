@@ -326,3 +326,19 @@ pub(crate) fn poc_model_next(machine: &str) -> Option<(String, crate::goals::Too
         Some((format!("fixture-call-{count}"), tool))
     })
 }
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn poc_model_configured() -> bool {
+    POC_MODEL.with_borrow(Option::is_some)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub fn test_poc_configuration(
+    endpoint: String,
+    model: String,
+) -> Result<(), wasm_bindgen::JsValue> {
+    let config = crate::poc::inference::Configuration::new(endpoint, model)?;
+    crate::poc::inference::restore(config);
+    Ok(())
+}

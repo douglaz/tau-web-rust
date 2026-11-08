@@ -79,10 +79,12 @@ fn stale_read_changed_binding_failed_withdrawal_and_rendering_end_do_not_invent_
         "standing",
         "failed append is not withdrawal"
     );
-    s.end_inference_sessions();
+    // Resolve the failed append through replay before durably ending the original session.
+    let mut s = reopen(&storage, extra);
+    block_on(s.end_session(&a.session)).unwrap();
     assert_eq!(s.reinstall_approvals()[0]["state"], "no longer usable");
     assert_eq!(s.reinstall_approvals()[0]["withdrawal_offer"], false);
-    let mut successor = reopen(&storage, extra);
+    let mut successor = reopen(s.storage(), extra);
     assert_eq!(
         successor.reinstall_approvals()[0]["state"],
         "no longer usable"
@@ -162,7 +164,7 @@ fn dedicated_replay_requires_original_binding_and_canonical_object_shape() {
             .encrypt(
                 &nonce.into(),
                 Payload {
-                    msg: &serde_json::to_vec(value).unwrap(),
+                    msg: &serde_json::to_vec(&journal::journal(value)).unwrap(),
                     aad: record_aad(&s.id, EVENT, n, &previous).as_bytes(),
                 },
             )

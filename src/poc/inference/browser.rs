@@ -37,6 +37,7 @@ impl Drop for CommandResponse {
 }
 
 struct Pending {
+    session: String,
     controller: web_sys::AbortController,
     stopped: Cell<bool>,
     ready: Notify,
@@ -72,11 +73,40 @@ pub(crate) fn freeze() {
         });
     });
 }
+pub(crate) fn stop_session(session: &str) {
+    REQUESTS.with_borrow(|requests| {
+        for pending in requests.iter().filter_map(std::rc::Weak::upgrade) {
+            if pending.session == session {
+                pending.stop();
+            }
+        }
+    });
+}
+pub(crate) fn configuration() -> Option<Configuration> {
+    CONFIG.with_borrow(Clone::clone)
+}
 pub(crate) fn end() {
     freeze();
     KEY.with_borrow_mut(|key| *key = None);
+    CONFIG.with_borrow_mut(|config| *config = None);
     REVISION.set(REVISION.get().wrapping_add(1));
 }
+pub(crate) fn approval() -> Result<crate::binding::InferenceApproval, String> {
+    let configuration = CONFIG.with_borrow(Clone::clone);
+    #[cfg(feature = "tracer")]
+    if configuration.is_none() {
+        return Ok(crate::binding::InferenceApproval::synthetic());
+    }
+    Ok(crate::binding::InferenceApproval {
+        approved: true,
+        configuration: configuration.ok_or("configure inference before Start session")?,
+    })
+}
+
+pub(crate) fn restore(configuration: Configuration) {
+    CONFIG.with_borrow_mut(|current| *current = Some(configuration));
+}
+
 pub(crate) fn key_is_set() -> bool {
     KEY.with_borrow(Option::is_some)
 }
@@ -106,6 +136,19 @@ pub(crate) async fn configure(
     valid_key(&key)?;
     let store = local.store().ok_or("locked")?;
     store.poc_configuration_ready()?;
+    for session in store
+        .sessions()
+        .iter()
+        .filter(|s| s["session_state"] != "ended")
+    {
+        if store
+            .session_configuration(session["identity"].as_str().ok_or("session identity")?)?
+            .model
+            != config.model
+        {
+            return Err("restore the admitted inference model for this session".into());
+        }
+    }
     store.poc_configuration_key(&key)?;
     if !safe(
         store,
@@ -194,17 +237,22 @@ async fn body(
 
 /// One request, never retried here. Completed steps remain owned by the durable caller.
 pub(crate) async fn next(
-    goal: &str,
-    machine: &str,
-    steps: &[(String, crate::goals::Tool, serde_json::Value)],
+    task: &crate::store::poc::Task,
+    session: &str,
 ) -> Result<(String, crate::goals::Tool), String> {
+    let goal = task.goal.as_str();
+    let machine = task.machine.as_str();
+    let steps = task.completed.as_slice();
     let continuation = crate::lifecycle::owner().continuation()?;
     let revision = REVISION.get();
     let config = CONFIG
         .with_borrow(Clone::clone)
         .ok_or("inference endpoint missing")?;
     let local = crate::worker::local();
+    #[cfg(feature = "tracer")]
+    crate::testonly::session_point("poc_inference_writer").await;
     let pending = Rc::new(Pending {
+        session: session.into(),
         controller: web_sys::AbortController::new().map_err(|_| INCOMPLETE)?,
         stopped: Cell::new(false),
         ready: Notify::new(),
@@ -240,7 +288,9 @@ pub(crate) async fn next(
             return Err(why.into());
         }
         let store = local.store().ok_or("locked")?;
+        store.check_inference_request(task, session)?;
         store.ensure_scan_references().await?;
+        store.check_inference_request(task, session)?;
         continuation.check()?;
         if revision != REVISION.get() || pending.stopped.get() {
             return Err(INCOMPLETE.into());
@@ -275,6 +325,7 @@ pub(crate) async fn next(
             body.fill(0, 0, body.length());
             let _ = headers.delete("Authorization");
             continuation.check()?;
+            store.check_inference_request(task, session)?;
             Ok::<_, String>((worker.fetch_with_request(&request), filter))
         })?
     };
@@ -348,6 +399,7 @@ pub(crate) async fn next(
             return Err(INCOMPLETE.into());
         }
         let store = local.store().ok_or(INCOMPLETE)?;
+        store.check_inference_request(task, session)?;
         KEY.with_borrow(|key| {
             let key = key.as_ref().ok_or("inference key missing")?;
             // The shared completion boundary classifies HTTP failures before JSON decoding.

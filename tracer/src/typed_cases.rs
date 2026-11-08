@@ -37,7 +37,7 @@ pub(super) async fn run(
     let events = reader::read_at("reader.call.typed.original", &saved, PASSPHRASE)?
         .records
         .iter()
-        .map(|(_, p)| serde_json::from_slice(p).map_err(|e| e.to_string()))
+        .map(|(_, p)| crate::journal::event(p).map_err(|e| e.to_string()))
         .collect::<Result<Vec<Value>, _>>()?;
     let original = events[..3].to_vec();
     let mut events = original.clone();

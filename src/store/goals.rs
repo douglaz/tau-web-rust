@@ -135,8 +135,8 @@ impl<S: Storage> Store<S> {
             .await
         }
         .await;
-        if result.as_ref().err().map(String::as_str) != Some(crate::poc::wait::JOURNAL_REFUSED)
-            || self.failed.is_some()
+        if self.failed.is_none()
+            && result.as_ref().err().map(String::as_str) != Some(crate::poc::wait::JOURNAL_REFUSED)
         {
             self.pending_requirements.remove(session);
         }
@@ -144,7 +144,8 @@ impl<S: Storage> Store<S> {
     }
 
     pub(super) fn check_goal(&self, goal: &Goal) -> Result<(), String> {
-        if !goal.valid()
+        if self.ended_sessions.contains(&goal.session)
+            || !goal.valid()
             || !self
                 .exposure_ledger
                 .iter()
@@ -326,7 +327,7 @@ mod tests {
     }
 
     #[test]
-    fn goal_commits_session_source_once_and_replay_never_reuses_it() {
+    fn goal_commits_original_session_and_successor_never_reuses_it() {
         let mut s = ready();
         let files = s.storage.files();
         assert!(block_on(s.enter_goal("another-session", "text".into(), None)).is_err());
@@ -351,8 +352,10 @@ mod tests {
         let pass = || LocalPassphrase::new(b"inference fixture passphrase".to_vec());
         let mut reopened =
             block_on(unlock(MemoryStorage::with_files(files), &Fixed, pass())).unwrap();
-        assert!(reopened.sessions.is_empty());
-        let fresh = block_on(reopened.bind("fixture")).unwrap();
+        assert_eq!(reopened.sessions[0].identity, goal.session);
+        assert_eq!(reopened.sessions()[0]["goal"], value["goal"]);
+        block_on(reopened.end_session(&goal.session)).unwrap();
+        let fresh = block_on(reopened.admit_fixture("fixture")).unwrap();
         assert!(reopened.goal(&fresh).is_none());
         assert!(block_on(reopened.enter_goal(&goal.session, "reuse".into(), None)).is_err());
         assert_eq!(reopened.goal(&goal.session), Some(&goal));
@@ -383,7 +386,8 @@ mod tests {
                 reopened.goal(&identity).is_some(),
                 matches!(fault, Fault::LandThenFail(3))
             );
-            assert!(reopened.sessions.is_empty());
+            assert_eq!(reopened.sessions.len(), 1);
+            assert_eq!(reopened.sessions[0].identity, identity);
         }
     }
 
@@ -719,7 +723,7 @@ mod tests {
             let identity = if machine == "fixture" {
                 session(&store)
             } else {
-                block_on(store.bind(machine)).unwrap()
+                block_on(store.admit_fixture(machine)).unwrap()
             };
             store.synthetic_confirm_limits(100).unwrap();
             block_on(store.enter_goal(&identity, "Report this machine's status".into(), None))
@@ -1078,7 +1082,7 @@ mod tests {
             .encrypt(
                 &nonce.into(),
                 Payload {
-                    msg: &serde_json::to_vec(&json!({"goal":goal})).unwrap(),
+                    msg: &serde_json::to_vec(&journal::journal(json!({"goal":goal}))).unwrap(),
                     aad: record_aad(&store.id, EVENT, number, &previous).as_bytes(),
                 },
             )

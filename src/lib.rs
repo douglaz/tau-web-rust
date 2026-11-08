@@ -77,6 +77,13 @@ mod worker {
         local().lock().await.open().await.to_string()
     }
 
+    #[wasm_bindgen]
+    pub fn identify_execution(identity: String) -> Result<(), wasm_bindgen::JsValue> {
+        crate::lifecycle::owner()
+            .identify(identity)
+            .map_err(Into::into)
+    }
+
     /// Creates the store with the passphrase's UTF-8 bytes, which are zero-filled at once.
     #[wasm_bindgen]
     pub async fn create(passphrase: Uint8Array) -> String {
@@ -245,7 +252,23 @@ mod worker {
         else {
             return serde_json::json!({"pause":"invalid completed steps"}).to_string();
         };
-        match crate::poc::inference::next(&goal, &machine, &steps).await {
+        let context = async {
+            if !crate::poc::inference::key_is_set() {
+                return Err("inference endpoint missing or key missing".to_string());
+            }
+            let local = local();
+            let mut writer = local.lock().await;
+            let store = writer.store().ok_or("locked")?;
+            store
+                .test_poc_inference_request(&machine, goal, steps)
+                .await
+        }
+        .await;
+        let (task, session) = match context {
+            Ok(context) => context,
+            Err(pause) => return serde_json::json!({"pause":pause}).to_string(),
+        };
+        match crate::poc::inference::next(&task, &session).await {
             Ok((id, tool)) => serde_json::json!({"id":id,"tool":tool}).to_string(),
             Err(reason) => serde_json::json!({"pause":reason}).to_string(),
         }
@@ -499,7 +522,7 @@ mod worker {
             origin.clone()
         } else {
             store.synthetic_session_transition(&session, &transition)?;
-            store.bind(&origin.bound_set[0]).await?;
+            store.admit_fixture(&origin.bound_set[0]).await?;
             store
                 .connection_session(&origin.bound_set[0])
                 .await

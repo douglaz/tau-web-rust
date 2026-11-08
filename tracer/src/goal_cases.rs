@@ -508,12 +508,7 @@ pub(super) async fn run(
     let record = opened
         .records
         .iter()
-        .find_map(|(_, b)| {
-            serde_json::from_slice::<Value>(b)
-                .ok()?
-                .get("goal")
-                .cloned()
-        })
+        .find_map(|(_, b)| crate::journal::event(b).ok()?.get("goal").cloned())
         .ok_or("missing goal record")
         .checked("goal.record.present")?;
     let state = run.inspect(worker).await?;
@@ -725,7 +720,7 @@ pub(super) async fn run(
         .records
         .iter()
         .skip(before_records)
-        .map(|(_, b)| serde_json::from_slice(b).unwrap())
+        .map(|(_, b)| crate::journal::event(b).unwrap())
         .collect();
     let mut kinds: Vec<&str> = own_records
         .iter()

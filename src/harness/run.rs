@@ -867,6 +867,7 @@ async fn connect(
     ),
     Refusal,
 > {
+    stop.associate(&session.identity);
     let (target, _, stored_pin) = access(target).await.map_err(Refusal::Failed)?;
     let target = &target;
     // CHN-R4: with no pin there is nothing to check a key against, so nothing is contacted.

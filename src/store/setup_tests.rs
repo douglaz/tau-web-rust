@@ -120,7 +120,7 @@ fn batch_indices_precede_any_create_and_match_the_card() {
     );
     block_on(store.answer_class("fixture".into(), ClassAnswer::No)).unwrap();
     store.fixture_requirements("fixture");
-    let caller = block_on(store.bind("fixture")).unwrap();
+    let caller = block_on(store.admit_fixture("fixture")).unwrap();
     let mut request = request;
     request.session = caller.clone();
     request.approved.as_mut().unwrap().session = caller.clone();
@@ -185,7 +185,9 @@ fn replay_refuses_second_setup_approval_with_distinct_names_naming_only_the_reco
     .expect("a second setup approval must refuse replay");
     assert_eq!(
         why,
-        format!("record {number}: setup already approved or empty; replay stopped")
+        journal::refusal(format!(
+            "record {number}: setup already approved or empty; replay stopped"
+        ))
     );
 }
 
@@ -703,7 +705,7 @@ fn replay_refuses_invalid_setup_records_naming_only_the_record() {
                 .encrypt(
                     &nonce.into(),
                     Payload {
-                        msg: event.to_string().as_bytes(),
+                        msg: &serde_json::to_vec(&journal::journal(&event)).unwrap(),
                         aad: record_aad(&store.id, EVENT, number, &previous).as_bytes(),
                     },
                 )

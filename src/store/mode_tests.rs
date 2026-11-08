@@ -31,7 +31,8 @@ fn reopen(store: &Store<MemoryStorage>) -> Store<MemoryStorage> {
 }
 fn both() -> (Store<MemoryStorage>, String) {
     let mut store = approved();
-    let session = block_on(store.bind_with_modes("fixture", &[Mode::NoArtifactPin])).unwrap();
+    let session =
+        block_on(store.admit_fixture_with_modes("fixture", &[Mode::NoArtifactPin])).unwrap();
     block_on(store.accept_mode(&session, Mode::NoBrief)).unwrap();
     (store, session)
 }
@@ -99,7 +100,7 @@ fn acceptance_events(store: &Store<MemoryStorage>) -> Vec<Value> {
                     },
                 )
                 .unwrap();
-            let event: Value = serde_json::from_slice(&bytes).unwrap();
+            let event = serde_json::from_slice::<Value>(&bytes).unwrap()["event"].take();
             if event.get("mode_acceptance").is_some()
                 || event.pointer("/exposure/accepted_modes").is_some()
             {
@@ -115,28 +116,35 @@ fn acceptance_events(store: &Store<MemoryStorage>) -> Vec<Value> {
 fn mode_acceptance_windows_and_atomic_binding() {
     for first in [vec![], vec![Mode::NoArtifactPin]] {
         let mut store = approved();
-        let session = block_on(store.bind_with_modes("fixture", &first)).unwrap();
+        let session = block_on(store.admit_fixture_with_modes("fixture", &first)).unwrap();
         let files = store.storage.files();
-        assert!(block_on(store.bind_with_modes("fixture", &[Mode::NoArtifactPin])).is_err());
-        assert!(block_on(store.accept_mode(&session, Mode::NoArtifactPin)).is_err());
-        assert!(block_on(store.bind_with_modes("fixture-other", &[Mode::NoBrief])).is_err());
         assert!(
-            block_on(
-                store.bind_with_modes("fixture-other", &[Mode::NoArtifactPin, Mode::NoArtifactPin])
-            )
+            block_on(store.admit_fixture_with_modes("fixture", &[Mode::NoArtifactPin])).is_err()
+        );
+        assert!(block_on(store.accept_mode(&session, Mode::NoArtifactPin)).is_err());
+        assert!(
+            block_on(store.admit_fixture_with_modes("fixture-other", &[Mode::NoBrief])).is_err()
+        );
+        assert!(
+            block_on(store.admit_fixture_with_modes(
+                "fixture-other",
+                &[Mode::NoArtifactPin, Mode::NoArtifactPin]
+            ))
             .is_err()
         );
         assert_eq!(store.storage.files(), files);
         let mut store = reopen(&store);
         let files = store.storage.files();
         assert!(
-            block_on(store.bind_with_modes("fixture", &[Mode::NoArtifactPin])).is_err(),
+            block_on(store.admit_fixture_with_modes("fixture", &[Mode::NoArtifactPin])).is_err(),
             "late installation acceptance"
         );
-        assert!(block_on(store.accept_mode(&session, Mode::NoBrief)).is_err());
-        assert!(store.sessions().is_empty());
+        assert_eq!(store.sessions()[0]["identity"], session);
         assert_eq!(store.storage.files(), files);
-        let session = block_on(store.bind("fixture")).unwrap();
+        block_on(store.accept_mode(&session, Mode::NoBrief)).unwrap();
+        assert!(block_on(store.accept_mode(&session, Mode::NoBrief)).is_err());
+        block_on(store.end_session(&session)).unwrap();
+        let session = block_on(store.admit_fixture("fixture")).unwrap();
         block_on(store.append(&command("fixture", Some(&session), b"echo ok"), &approval()))
             .unwrap();
         let files = store.storage.files();
@@ -154,11 +162,16 @@ fn mode_acceptance_windows_and_atomic_binding() {
     for fault in [Fault::Fail(1), Fault::Fail(3), Fault::LandThenFail(3)] {
         let mut store = approved();
         store.storage.fault(fault);
-        assert!(block_on(store.bind_with_modes("fixture", &[Mode::NoArtifactPin])).is_err());
+        assert!(
+            block_on(store.admit_fixture_with_modes("fixture", &[Mode::NoArtifactPin])).is_err()
+        );
         assert!(store.sessions().is_empty());
         assert!(store.mode_acceptances().is_empty());
         let restored = reopen(&store);
-        assert!(restored.sessions().is_empty());
+        assert_eq!(
+            restored.sessions().len(),
+            usize::from(matches!(fault, Fault::LandThenFail(_)))
+        );
         assert_eq!(
             restored.installation_unpinned("fixture"),
             matches!(fault, Fault::LandThenFail(_))
@@ -234,7 +247,7 @@ fn mode_trust_display_lists_every_mode_without_artifact_claims() {
     }
     let (store, _) = both();
     let mut replayed = reopen(&store);
-    block_on(replayed.bind("fixture")).unwrap();
+    block_on(replayed.admit_fixture("fixture")).unwrap();
     assert_eq!(
         replayed.sessions()[0]["standing_modes"],
         json!(["An installation with no artifact pin"])
@@ -624,7 +637,7 @@ fn mode_lowering_refuses_each_form_before_intent_and_records_it() {
         let (mut store, _) = both();
         if restarted {
             store = reopen(&store);
-            block_on(store.bind("fixture")).unwrap();
+            block_on(store.admit_fixture("fixture")).unwrap();
         }
         assert!(matches!(
             block_on(store.append(&command("fixture", None, b"SigLevel=Never"), &approval())),
@@ -668,9 +681,9 @@ fn modes_never_entered_by_failing() {
         );
         assert_eq!(store.standing_modes("fixture"), standing);
     };
-    assert!(block_on(store.bind("fixture")).is_err());
+    assert!(block_on(store.admit_fixture("fixture")).is_err());
     unchanged(&store);
-    assert!(block_on(store.bind("missing")).is_err());
+    assert!(block_on(store.admit_fixture("missing")).is_err());
     unchanged(&store);
     assert!(block_on(store.connection_session("fixture-other")).is_err());
     unchanged(&store);
@@ -739,7 +752,7 @@ fn modes_never_entered_by_failing() {
         }
         let before = store.mode_acceptances();
         let mode_records = acceptance_events(&store);
-        assert!(block_on(store.bind("fixture-other")).is_err());
+        assert!(block_on(store.admit_fixture("fixture-other")).is_err());
         assert_eq!(acceptance_events(&store), mode_records);
         assert_eq!(store.mode_acceptances(), before);
         assert_eq!(
@@ -788,7 +801,8 @@ fn mode_replay_refuses_misplaced_acceptances_and_unknown_labels() {
             if kind == "after_command" {
                 // Separate session with no previous acceptance, so the intent is the only invalidating fact.
                 let mut reopened = reopen(&store);
-                let new_session = block_on(reopened.bind("fixture")).unwrap();
+                block_on(reopened.end_session(&session)).unwrap();
+                let new_session = block_on(reopened.admit_fixture("fixture")).unwrap();
                 block_on(reopened.append(
                     &command("fixture", Some(&new_session), b"true"),
                     &approval(),

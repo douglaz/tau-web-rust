@@ -233,14 +233,19 @@ impl<S: Storage> Store<S> {
 
     pub async fn poc_bind(&mut self, machine: &str) -> Result<String, String> {
         self.authority.ordinary()?;
-        crate::poc::targets::resolve(self, machine)?;
         if let Some(session) = self.sessions.iter().find(|session| {
             !session.ended.get() && session.bound_set.iter().any(|name| name == machine)
         }) {
-            self.check_current_session(session)?;
             return Ok(session.identity.clone());
         }
-        self.bind(machine).await
+        crate::poc::targets::resolve(self, machine)?;
+        #[cfg(target_arch = "wasm32")]
+        let approval = crate::poc::inference::approval()?;
+        #[cfg(all(not(target_arch = "wasm32"), any(test, feature = "tracer")))]
+        let approval = crate::binding::InferenceApproval::synthetic();
+        #[cfg(all(not(target_arch = "wasm32"), not(any(test, feature = "tracer"))))]
+        let approval = native_approval()?;
+        self.admit(machine, &[], approval).await
     }
 
     /// Operator-authored declaration candidate. It uses the ordinary goal/session,
@@ -383,17 +388,25 @@ impl<S: Storage + Clone> Store<S> {
         let mut reader = Store::new(self.storage.clone(), DataKey(self.key.0), self.id.clone());
         let mut contains = false;
         let mut provider_protection = 0;
+        let mut poc_pauses = 0;
         for number in 0..self.next {
             let bytes = self.storage.read(&number.to_string()).await?;
             let event = reader.open(number, &bytes)?;
             provider_protection += usize::from(matches!(event, Event::ProviderProtection(_)));
+            poc_pauses += usize::from(matches!(
+                &event,
+                Event::Poc(poc::Record::Change {
+                    change: poc::Change::Pause(_),
+                    ..
+                })
+            ));
             contains |= serde_json::to_string(&event)
                 .map_err(|_| "fixture event encoding")?
                 .contains(needle);
             reader.previous = Address(Sha256::digest(&bytes).into());
         }
         Ok(
-            json!({"contains":contains,"records":self.next,"provider_protection":provider_protection,"machines":self.allocation().next_unused().machines,"passes":self.allocation().next_unused().passes,"targets":self.poc_targets.len()}),
+            json!({"contains":contains,"records":self.next,"provider_protection":provider_protection,"poc_pauses":poc_pauses,"machines":self.allocation().next_unused().machines,"passes":self.allocation().next_unused().passes,"targets":self.poc_targets.len()}),
         )
     }
 }
@@ -692,4 +705,9 @@ pub(crate) async fn test_poc_job_evidence(
         "terminals":store.dispatch.terminals.len(),"launches":store.dispatch.calls.len(),
         "duplicate_refused":duplicate_refused}),
     )
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(any(test, feature = "tracer"))))]
+fn native_approval() -> Result<crate::binding::InferenceApproval, String> {
+    Err("explicit inference approval required".into())
 }

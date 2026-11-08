@@ -29,7 +29,7 @@ pub(crate) fn ready() -> Store<MemoryStorage> {
     for m in ["fixture", "fixture-other"] {
         block_on(s.answer_class(m.into(), crate::dispatch::ClassAnswer::No)).unwrap();
     }
-    block_on(s.bind("fixture")).unwrap();
+    block_on(s.admit_fixture("fixture")).unwrap();
     block_on(s.set_inference_account(InferenceAccountCredential::new(
         b"fixture-account-private-value".to_vec(),
     )))
@@ -319,7 +319,7 @@ fn refused_probe_top_up_and_lost_mint_contact_nothing_further() {
             .contains("No revoke can name")
     );
     assert_eq!(s.inference_sweep(), Vec::<String>::new());
-    block_on(s.bind("fixture-other")).unwrap();
+    block_on(s.admit_fixture("fixture-other")).unwrap();
     s.synthetic_confirm_limits(100).unwrap();
     let mut r = request();
     r["machine"] = "fixture-other".into();
@@ -342,7 +342,7 @@ fn refused_probe_top_up_and_lost_mint_contact_nothing_further() {
 }
 
 #[test]
-fn unresolved_is_unaccounted_never_resent_and_next_request_dispatches_after_reopen() {
+fn poc_unresolved_is_unaccounted_never_resent_and_next_request_dispatches_after_reopen() {
     let mut s = ready();
     let mut f = Fake {
         lose: Some("/completion"),
@@ -361,7 +361,29 @@ fn unresolved_is_unaccounted_never_resent_and_next_request_dispatches_after_reop
     assert_eq!(infer(&mut s, &mut f)["finished"], true);
     let mut reopened = reopen(&s);
     assert!(reopened.inference.calls[&call].terminal.is_none());
-    block_on(reopened.bind("fixture")).unwrap();
+    let retired = reopened.sessions[0].identity.clone();
+    let sent = f.seen.len();
+    let withheld = block_on(inference::infer(
+        &mut reopened,
+        &mut f,
+        "https://127.0.0.1:1",
+        Some(&candidate()),
+        &request(),
+        || 100,
+    ));
+    assert!(
+        withheld["refused"]
+            .as_str()
+            .unwrap()
+            .contains("readiness withheld")
+    );
+    assert_eq!(f.seen.len(), sent);
+    block_on(reopened.end_session(&retired)).unwrap();
+    assert_ne!(
+        block_on(reopened.admit_fixture("fixture")).unwrap(),
+        retired
+    );
+    f.key_id = Some("current-worker-key-id");
     assert_eq!(infer(&mut reopened, &mut f)["finished"], true);
     assert_eq!(f.seen.iter().filter(|r| r.0 == "/completion").count(), 3);
     assert!(reopened.inference.calls[&call].terminal.is_none());
@@ -723,7 +745,7 @@ fn readable_completion_after_session_end_commits_terminal_without_handback() {
 fn mint_requires_the_latest_account_read_for_its_own_session_live_and_replayed() {
     let mut s = ready();
     infer(&mut s, &mut Fake::default());
-    let session = block_on(s.bind("fixture-other")).unwrap();
+    let session = block_on(s.admit_fixture("fixture-other")).unwrap();
     // Another session's successful read cannot authorize this session's mint.
     for top_up in [Some(true), None] {
         let (call, sent) = block_on(s.inference_prepare(
@@ -1156,7 +1178,10 @@ fn delayed_unlock_sweep_only_revokes_replayed_identifiers() {
     let mut original = ready();
     infer(&mut original, &mut Fake::default());
     let mut s = reopen(&original);
-    block_on(s.bind("fixture")).unwrap();
+    let retired = s.sessions[0].identity.clone();
+    block_on(s.end_session(&retired)).unwrap();
+    block_on(s.admit_fixture("fixture")).unwrap();
+    s.synthetic_confirm_limits(100).unwrap();
     let mut f = Fake {
         key_id: Some("current-worker-key-id"),
         ..Fake::default()
@@ -1594,7 +1619,8 @@ fn connection_admission_after_end_records_no_refusal_live_or_replayed() {
 #[test]
 fn signature_check_after_end_records_no_refusal_live_or_replayed() {
     let mut store = ready();
-    block_on(store.bind_with_modes("fixture-other", &[crate::modes::Mode::NoArtifactPin])).unwrap();
+    block_on(store.admit_fixture_with_modes("fixture-other", &[crate::modes::Mode::NoArtifactPin]))
+        .unwrap();
     assert!(store.installation_unpinned("fixture-other"));
     // End both sessions before checking the unpinned installation's lowering form.
     store.end_inference_sessions();
@@ -1742,7 +1768,7 @@ fn independently_observed_mint_metadata_is_protected_before_append_and_replay() 
         ] {
             for escaped in [false, true] {
                 let mut s = ready();
-                let other = block_on(s.bind("fixture-other")).unwrap();
+                let other = block_on(s.admit_fixture("fixture-other")).unwrap();
                 s.live(&other)
                     .unwrap()
                     .given

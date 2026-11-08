@@ -12,7 +12,6 @@ use crate::poc::targets::TargetRecord;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Purchase {
-    #[serde(default = "protocol::default_origin")]
     pub origin: String,
     pub machine: String,
     pub identity: Identity,

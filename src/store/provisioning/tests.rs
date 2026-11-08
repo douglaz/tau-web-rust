@@ -2286,7 +2286,7 @@ fn origin_journal(s: &Store<MemoryStorage>, mut edit: impl FnMut(&mut Value)) ->
             )
             .unwrap();
         let mut value: Value = serde_json::from_slice(&plaintext).unwrap();
-        edit(&mut value);
+        edit(&mut value["event"]);
         let nonce: [u8; 12] = random().unwrap();
         record.previous = previous;
         record.nonce = URL_SAFE_NO_PAD.encode(nonce);
@@ -2306,31 +2306,6 @@ fn origin_journal(s: &Store<MemoryStorage>, mut edit: impl FnMut(&mut Value)) ->
         previous = hex::encode(Sha256::digest(bytes));
     }
     storage
-}
-
-#[test]
-fn provisioning_origin_legacy_missing_field_replays_complete_old_handoff() {
-    let mut s = ready();
-    let mut api = Fixture::new(false);
-    approve(&mut s, &mut api);
-    assert!(issue_invoice(&mut s, &mut api).is_err());
-    api.payments[0]["is_paid"] = json!(true);
-    block_on(s.procurement_resume(&mut api, false)).unwrap();
-    let mut removed = 0;
-    let storage = origin_journal(&s, |event| {
-        if let Some(p) = event.pointer_mut("/procurement/approved") {
-            assert_eq!(
-                p.as_object_mut().unwrap().remove("origin").unwrap(),
-                protocol::ORIGIN
-            );
-            removed += 1;
-        }
-    });
-    assert_eq!(removed, 1);
-    let loaded = block_on(unlock(storage, &Fixed, pass())).unwrap();
-    assert_eq!(loaded.procurement, s.procurement);
-    assert_eq!(loaded.procurement_origin(), protocol::ORIGIN);
-    assert_eq!(loaded.poc_target("machine-a"), s.poc_target("machine-a"));
 }
 
 #[test]

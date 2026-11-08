@@ -918,12 +918,10 @@ async fn dedicated_approvals(
         "lifecycle_cases.a041",
         "independent journal reader sees original approval and actual reset boundary",
         history.records.iter().any(|(_, bytes)| {
-            serde_json::from_slice::<Value>(bytes)
-                .ok()
-                .is_some_and(|e| {
-                    e.pointer("/dedicated_reinstall/dispatch/reset")
-                        == Some(&json!("synthetic-reset-a"))
-                })
+            crate::journal::event(bytes).ok().is_some_and(|e| {
+                e.pointer("/dedicated_reinstall/dispatch/reset")
+                    == Some(&json!("synthetic-reset-a"))
+            })
         }),
     );
     case.finish(cases);

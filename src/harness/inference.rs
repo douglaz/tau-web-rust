@@ -145,7 +145,11 @@ async fn publication(generation: u64, session: String, report: String, post: boo
         }
         // Read-only custody survives suspension/reconciliation. It grants no authority,
         // and is taken from the holder rather than trusting a page-supplied status.
-        value["poc_configuration"] = json!({"key_set":crate::poc::inference::key_is_set()});
+        let configuration = json!({"key_set":crate::poc::inference::key_is_set(),"configuration":crate::poc::inference::configuration()});
+        value["poc_configuration"] = local
+            .store()
+            .and_then(|store| store.protect_output(&configuration).ok())
+            .unwrap_or_else(|| json!({"key_set":crate::poc::inference::key_is_set()}));
         let provider_configuration =
             json!({"key_set":crate::poc::provisioning::browser::key_is_set()});
         value["provider_configuration"] = if let Some(store) = local.store() {
@@ -739,6 +743,26 @@ pub async fn sweep_inference() {
     .await;
 }
 
+#[wasm_bindgen]
+pub async fn retire_runtime() {
+    ENDING.set(true);
+    crate::lifecycle::owner().end();
+    crate::poc::inference::end();
+    crate::poc::provisioning::browser::end();
+    authority_changed();
+    super::goals::end();
+    super::wait::stop_all();
+    // A begun append owns this mutex until it completes whole, even if its reply is lost.
+    crate::worker::local().lock().await.retire();
+}
+
+pub(crate) fn session_ended(session: &str) {
+    crate::poc::inference::stop_session(session);
+    super::goals::end_session(session);
+    super::wait::stop_session(session);
+}
+
+#[cfg(feature = "tracer")]
 #[wasm_bindgen]
 pub async fn end_sessions() {
     ENDING.set(true);

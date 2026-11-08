@@ -8,12 +8,25 @@ use std::future::Future;
 
 thread_local! {
     static ACTIVE: RefCell<BTreeSet<String>> = const { RefCell::new(BTreeSet::new()) };
+    static WAKE_PENDING: RefCell<BTreeSet<String>> = const { RefCell::new(BTreeSet::new()) };
 }
 struct Active(String);
 impl Drop for Active {
     fn drop(&mut self) {
         ACTIVE.with_borrow_mut(|set| set.remove(&self.0));
+        if WAKE_PENDING.with_borrow_mut(|set| set.remove(&self.0)) {
+            #[cfg(target_arch = "wasm32")]
+            crate::poc::web::wake();
+        }
     }
+}
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn defer_if_active(id: &str) -> bool {
+    let active = ACTIVE.with_borrow(|set| set.contains(id));
+    if active {
+        WAKE_PENDING.with_borrow_mut(|set| set.insert(id.into()));
+    }
+    active
 }
 pub(crate) fn check_raise(id: &str) -> Result<(), String> {
     if ACTIVE.with_borrow(|set| set.contains(id)) {
@@ -44,22 +57,15 @@ pub fn page_outcome(id: &str, report: &Value) -> Value {
 
 #[allow(async_fn_in_trait, reason = "single worker or host fixture")]
 pub trait Model {
-    async fn next(
-        &mut self,
-        goal: &str,
-        machine: &str,
-        completed: &[(String, Tool, Value)],
-    ) -> Result<(String, Tool), String>;
+    async fn ready(&mut self, _task: &Task, _session: &str) -> Result<(), String> {
+        Ok(())
+    }
+    async fn next(&mut self, task: &Task, session: &str) -> Result<(String, Tool), String>;
 }
 
 pub struct Unconfigured;
 impl Model for Unconfigured {
-    async fn next(
-        &mut self,
-        _: &str,
-        _: &str,
-        _: &[(String, Tool, Value)],
-    ) -> Result<(String, Tool), String> {
+    async fn next(&mut self, _: &Task, _: &str) -> Result<(String, Tool), String> {
         Err("no inference endpoint configured".into())
     }
 }
@@ -147,12 +153,13 @@ pub async fn resume(
         if task.verifying {
             task = runtime.change(&task, Change::PrepareCheck).await?;
         } else {
+            model.ready(&task, session).await?;
             task = runtime.change(&task, Change::Request).await?;
             if !task.requesting {
                 return Ok(task);
             }
             // The durable request count is consumed even if this future is lost.
-            let next = model.next(&task.goal, &task.machine, &task.completed).await;
+            let next = model.next(&task, session).await;
             if let Err(why) = runtime.authority(id, session).await {
                 return pause_authority(runtime, &task, why).await;
             }
@@ -273,7 +280,7 @@ async fn pause_authority(
                 why
             } else {
                 format!(
-                    "fresh accepted session authority for the task machine is required: {}",
+                    "original accepted session authority for the task machine is required: {}",
                     concrete_pause(why)
                 )
             }),

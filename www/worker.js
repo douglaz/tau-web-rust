@@ -1,11 +1,39 @@
 // The harness worker alone holds the seed and keys. Only the dedicated seed-backup display
 // carries words to the page; re-entry and passphrase buffers are zero-filled by the module.
-import init, { spec_commit, open, create, unlock, seed_backup_display, seed_backup_answer, seed_backup_reentry, seed_backup_skip, seed_backup_redisplay, setup_approve, setup_answer, bind, goal_request, accept_page_goal, TaskPublication, requirements_answer, delivery_request, end_sessions, sweep_inference, lifecycle_transition, publication_generation, publish_report, verify_inference_clock, withdraw_reinstall } from './pkg/tau_web.js';
-import { poc_configure, poc_key_is_set, poc_enroll, poc_bind, poc_public_keys, poc_accept, poc_propose_requirements } from './pkg/tau_web.js';
+import init, { spec_commit, open, create, unlock, seed_backup_display, seed_backup_answer, seed_backup_reentry, seed_backup_skip, seed_backup_redisplay, setup_approve, setup_answer, bind, goal_request, accept_page_goal, TaskPublication, requirements_answer, delivery_request, retire_runtime, sweep_inference, lifecycle_transition, publication_generation, publish_report, verify_inference_clock, withdraw_reinstall } from './pkg/tau_web.js';
+import { identify_execution, wake_tasks, poc_configure, poc_key_is_set, poc_enroll, poc_bind, poc_public_keys, poc_accept, poc_propose_requirements } from './pkg/tau_web.js';
 import { provider_configure, provider_key_is_set, provider_request } from './pkg/tau_web.js';
 
+const clearInput = request => {
+  for (const field of ['create','unlock','seed_backup_redisplay','seed_backup_reentry']) {
+    if (request?.[field] instanceof Uint8Array) request[field].fill(0);
+  }
+  for (const field of ['poc_configure','provider_configure']) {
+    if (request?.[field]?.key instanceof Uint8Array) request[field].key.fill(0);
+  }
+};
+// A fresh page worker gets one execution identity before it can receive authority.
+let incarnation;
+let retirementRequested = false;
+const lockWait = new AbortController();
+await new Promise(resolve => {
+  onmessage = ({data}) => {
+    if (!incarnation && data && Object.keys(data).length === 1 && typeof data.initialize === 'string') {
+      incarnation = data.initialize;
+      resolve();
+    } else {
+      if (incarnation && data?.incarnation === incarnation && typeof data.generation === 'string' &&
+          data.request && Object.keys(data.request).length === 1 && data.request.retire_runtime === true) {
+        retirementRequested = true;
+        lockWait.abort();
+      }
+      clearInput(data?.request ?? data);
+    }
+  };
+});
 try {
   await init();
+  identify_execution(incarnation);
   postMessage({ harness_ready: spec_commit() });
 } catch (error) {
   postMessage({ harness_error: String(error) });
@@ -15,14 +43,24 @@ try {
 // STA-1 and STA-7: one writer. The lock is exclusive and store-wide, taken before the store is
 // read and held for this worker's whole life; while another worker holds it, this one queues.
 const held = (options) =>
-  new Promise((acquired) =>
+  new Promise((acquired, refused) =>
     navigator.locks.request('tau-web-store', options, (lock) => {
       acquired(lock !== null);
       return lock && new Promise(() => {});
-    }));
-if (!(await held({ ifAvailable: true }))) {
-  postMessage({ store: { store_state: 'in-use' } });
-  await held({});
+    }).catch(refused));
+try {
+  if (!retirementRequested && !(await held({ ifAvailable: true }))) {
+    postMessage({ store: { store_state: 'in-use' } });
+    await held({ signal: lockWait.signal });
+  }
+} catch (error) {
+  if (!retirementRequested || error.name !== 'AbortError') throw error;
+}
+if (retirementRequested) {
+  await retire_runtime();
+  postMessage({ runtime_retired: true });
+  // The page terminates this incarnation. It never opens the store or grants authority.
+  await new Promise(() => {});
 }
 const reportStore = (report, generation = publication_generation(), session = '') => {
   const value = JSON.parse(report);
@@ -34,15 +72,18 @@ const exactMembers = (value, names) => value && typeof value === 'object' &&
   !Array.isArray(value) && Object.keys(value).length === names.length &&
   names.every(name => Object.hasOwn(value, name));
 
-onmessage = async ({ data }) => {
+onmessage = async ({ data: envelope }) => {
+  if (!envelope || envelope.incarnation !== incarnation || typeof envelope.generation !== 'string') { clearInput(envelope?.request ?? envelope); return; }
+  const data = envelope.request;
+  if (envelope.generation !== publication_generation().toString() && data?.retire_runtime !== true && typeof data?.lifecycle !== 'string') { clearInput(data); return; }
+  try {
   if (!data || typeof data !== 'object' || Object.keys(data).length !== 1) {
-    if (data?.poc_configure?.key instanceof Uint8Array) data.poc_configure.key.fill(0);
-    if (data?.provider_configure?.key instanceof Uint8Array) data.provider_configure.key.fill(0);
+    clearInput(data);
     return;
   }
-  if (data.end_sessions === true) {
-    await end_sessions();
-    postMessage({ sessions_ended: true });
+  if (data.retire_runtime === true) {
+    await retire_runtime();
+    postMessage({ runtime_retired: true });
     return;
   }
   if (typeof data.lifecycle === 'string') {
@@ -51,7 +92,7 @@ onmessage = async ({ data }) => {
   }
   const generation = publication_generation();
   let report;
-  const session = data.goal?.session ?? data.goal_accept?.session ?? data.requirements_answer?.session ?? data.delivery?.session ?? data.task?.session ?? '';
+  const session = data.task?.action === 'end-session' ? '' : data.goal?.session ?? data.goal_accept?.session ?? data.requirements_answer?.session ?? data.delivery?.session ?? data.task?.session ?? '';
   if (data.create instanceof Uint8Array) report = await create(data.create);
   else if (data.unlock instanceof Uint8Array) report = await unlock(data.unlock);
   else if (data.seed_backup_redisplay instanceof Uint8Array) report = await seed_backup_redisplay(data.seed_backup_redisplay);
@@ -155,5 +196,10 @@ onmessage = async ({ data }) => {
   }
   const display = JSON.parse(await seed_backup_display());
   if (display) postMessage(display);
+  } finally {
+    // Prerequisite changes wake interrupted work; task controls retain their explicit workflow.
+    if (data && (data.unlock instanceof Uint8Array || data.poc_configure || data.lifecycle === 'resume' ||
+        Object.keys(data).some(name => name.startsWith('seed_backup_')))) wake_tasks();
+  }
 };
 await reportStore(await open());

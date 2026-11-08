@@ -210,7 +210,7 @@ async fn clock_terminal(
             "lifecycle_repairs.a004",
             "independent reader retains late measured time terminal",
             opened.records.iter().any(|(_, b)| {
-                serde_json::from_slice::<Value>(b).is_ok_and(|v| {
+                crate::journal::event(b).is_ok_and(|v| {
                     v["inference_terminal"]["call"] == result["call"]
                         && v["inference_terminal"]["issuer_time"].is_u64()
                         && v["inference_terminal"]["clock_received"].is_object()
@@ -653,7 +653,7 @@ async fn command_release(
             "independent reader retains original final job evidence",
             opened.records.iter().any(|(n, b)| {
                 Some(*n) == outcome["terminal"].as_u64()
-                    && serde_json::from_slice::<Value>(b).is_ok_and(|v| {
+                    && crate::journal::event(b).is_ok_and(|v| {
                         v["job_terminal"]["call"] == outcome["call"]
                             && v["job_terminal"]["record"] == outcome["job_record"]["record"]
                     })

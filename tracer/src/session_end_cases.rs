@@ -1011,7 +1011,7 @@ async fn rekey_append(
             .records
             .iter()
             .find(|(number, _)| Some(*number) == evidence["number"].as_u64())
-            .and_then(|(_, bytes)| serde_json::from_slice::<Value>(bytes).ok());
+            .and_then(|(_, bytes)| crate::journal::event(bytes).ok());
         case.check(
             "session_end_cases.a032",
             "independent reader proves exact original call job boot record and terminal",

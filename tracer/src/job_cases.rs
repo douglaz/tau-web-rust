@@ -656,7 +656,7 @@ e["call"] == call
         let mut events = opened
             .records
             .iter()
-            .map(|(_, p)| serde_json::from_slice::<Value>(p).map_err(|e| e.to_string()))
+            .map(|(_, p)| crate::journal::event(p).map_err(|e| e.to_string()))
             .collect::<Result<Vec<_>, _>>()?;
         events.push(json!({"disposition":{"machine":"fixture","calls":[call],"continuation":continuation,"uncertainty":"the command outcome is unknown"}}));
         run.put(
@@ -864,7 +864,7 @@ pub(super) async fn restore_older_journal(
     let mut events: Vec<Value> = opened
         .records
         .iter()
-        .map(|(_, p)| serde_json::from_slice(p).map_err(|e| e.to_string()))
+        .map(|(_, p)| crate::journal::event(p).map_err(|e| e.to_string()))
         .collect::<Result<_, _>>()?;
     for &slot in slots {
         assert!(completion::prerequisite(

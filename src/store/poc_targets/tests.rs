@@ -149,7 +149,7 @@ fn poc_targets_idempotent_immutable_and_replayed_rebinding() {
     let mut successor = reopen(&store).unwrap();
     enroll(&mut successor);
     let next = block_on(successor.poc_bind("machine-a")).unwrap();
-    assert_ne!(first, next);
+    assert_eq!(first, next);
     assert_eq!(successor.allocation().next_unused().machines, 1);
     assert_eq!(successor.allocation().next_unused().passes, 1);
 }

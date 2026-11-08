@@ -389,11 +389,11 @@ pub(super) async fn run(
         "delivery_cases.a008",
         "independent encrypted reader observes check and exact names",
         opened.records.iter().any(|(_, b)| {
-            serde_json::from_slice::<Value>(b).unwrap()["delivery"]["check"]["result"]["delivered"]
-                == true
-        }) && opened.records.iter().any(|(_, b)| {
-            serde_json::from_slice::<Value>(b).unwrap()["delivery"]["name"] == "Hermes"
-        }),
+            crate::journal::event(b).unwrap()["delivery"]["check"]["result"]["delivered"] == true
+        }) && opened
+            .records
+            .iter()
+            .any(|(_, b)| crate::journal::event(b).unwrap()["delivery"]["name"] == "Hermes"),
     );
     *worker = run
         .reload("delivery_cases.rs::reload#4", tab, worker)
@@ -782,12 +782,7 @@ pub(super) async fn run(
         let count = opened
             .records
             .iter()
-            .filter(|(_, b)| {
-                serde_json::from_slice::<Value>(b)
-                    .unwrap()
-                    .get("delivery")
-                    .is_some()
-            })
+            .filter(|(_, b)| crate::journal::event(b).unwrap().get("delivery").is_some())
             .count();
         case.check(
             "delivery_cases.a023",
@@ -927,7 +922,7 @@ async fn incomplete_attempts(
                 .records
                 .iter()
                 .filter_map(|(_, bytes)| {
-                    let v: Value = serde_json::from_slice(bytes).unwrap();
+                    let v: Value = crate::journal::event(bytes).unwrap();
                     v["delivery"]["check"]
                         .as_object()
                         .map(|_| v["delivery"]["check"].clone())

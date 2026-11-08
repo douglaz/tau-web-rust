@@ -45,6 +45,7 @@ mod inference_reader;
 mod inputs;
 mod inventory;
 mod job_cases;
+mod journal;
 mod key_inputs;
 mod keys;
 mod logical_checks;
@@ -1370,7 +1371,7 @@ async fn run_cases(
     case.check("main.a018",
         "the worker's replayed state is record 0 alone",
         run.inspect(&worker).await?
-            == json!({ "state": "unlocked", "seed_backup_owed": true, "seed_backup_completion": null, "seed_backup_stage": "showing_words", "locked": false, "records": [0], "commands": [], "calls": [], "terminals": [], "dispositions": [], "standing": {}, "jobs": [], "typed_calls": [], "inference_calls": [], "observations": [], "receipts": [], "association_records": [], "current_installations": {}, "setup": [], "delivery": [], "setup_offer": tau_web::dispatch::fixture_setup(), "sessions":[],"goals":[],"exposure_ledger":[],"connection_refusals":[],"mode_acceptances":[],"signature_refusals":[],"installations":[] }),
+            == json!({ "state": "unlocked", "lifecycle_state":"running", "lifecycle_generation":"0", "fixture_admission":tau_web::binding::InferenceApproval::synthetic(), "seed_backup_owed": true, "seed_backup_completion": null, "seed_backup_stage": "showing_words", "locked": false, "records": [0], "commands": [], "calls": [], "terminals": [], "dispositions": [], "standing": {}, "jobs": [], "typed_calls": [], "inference_calls": [], "observations": [], "receipts": [], "association_records": [], "current_installations": {}, "setup": [], "delivery": [], "setup_offer": tau_web::dispatch::fixture_setup(), "sessions":[],"goals":[],"exposure_ledger":[],"connection_refusals":[],"mode_acceptances":[],"signature_refusals":[],"installations":[] }),
     );
     let host = reader::build_at(
         "file.main.build.002",
@@ -2073,7 +2074,7 @@ async fn run_cases(
     let mut events: Vec<Value> = opened
         .records
         .iter()
-        .map(|(_, plaintext)| serde_json::from_slice(plaintext).map_err(|e| e.to_string()))
+        .map(|(_, plaintext)| crate::journal::event(plaintext).map_err(|e| e.to_string()))
         .collect::<Result<_, _>>()?;
     let call = events.len() as u64;
     events.push(json!({"intent":{"call":call,"machine":"fixture","command":hex::encode(COMMAND),"approval":{"harness_pin":{"machine":"fixture","fingerprint":pinned}}}}));
@@ -3628,7 +3629,7 @@ async fn settle_unresolved(
     let mut events: Vec<Value> = opened
         .records
         .iter()
-        .map(|(_, p)| serde_json::from_slice(p).map_err(|e| e.to_string()))
+        .map(|(_, p)| crate::journal::event(p).map_err(|e| e.to_string()))
         .collect::<Result<_, _>>()?;
     events.push(calls.disposition());
     run.put(

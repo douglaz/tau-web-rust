@@ -89,11 +89,15 @@ This bounded flow selects one supported published key; full family/history quali
 CHN-R7 is deferred, alongside vendor-account recovery and renewal-policy mutation.
 
 Enroll the displayed relay public key separately with the relay operator. Provider SSH-key
-registration does not enroll a relay pass. Bind the handed-off machine, enter the goal and
+registration does not enroll a relay pass. Configure inference and Start session for the handed-off machine, enter the goal and
 verification commands, accept it, propose the installation declaration, approve its requirements
 card and Resume. The existing task, verification and detached-job collection path remains in use.
 Only successful verification completes a task. Procurement and task state are separate; task
-Abandon cannot erase an uncertain create. Handoff reload replays the target without ordering.
+Stop task cannot erase an uncertain create or stop remote effects or billing. Handoff reload
+replays the target without ordering. Lock retires the execution and clears working keys; an
+unended configuration session retains its machine. Unlock restores that original session and
+collects any recorded job before further inference. Selected End stops future session-authorized
+browser work after its durable append; already accepted remote work may continue.
 
 ## Protocol and bounds
 
@@ -106,8 +110,7 @@ changes or provider contact. No origin probe is made. The provider must serve th
 its origin root without redirects; IPv6 origin syntax does not add IPv6 machine targets.
 Approval saves the reviewed origin in the Purchase. Every subsequent provider read or mutation,
 including catalogue refresh and published-key provenance, uses that bound origin. Editing the
-entry, key re-entry, reload, Resume and reapproval cannot redirect it. Old journals without an
-origin field retain `https://api.lnvps.net`; explicitly invalid stored origins are refused.
+entry, key re-entry, reload, Resume and reapproval cannot redirect it. Missing or explicitly invalid stored origins are refused.
 There is no proxy.
 NIP-98 events bind the exact URL, method and SHA-256 of each transmitted body. A fresh random
 nonce makes same-second reads distinct. Private key, header, event and signature protection is

@@ -107,7 +107,7 @@ fn auxiliary_records(records: &[(u64, Vec<u8>)]) -> Vec<Value> {
             // This independent input projection precedes the actual auxiliary parser loop.
             // Its parse result never supplies an actual guard result; malformed input still
             // reaches original mnemonic/backups/passes errors in the actual helper.
-            let raw = serde_json::from_slice::<Value>(bytes).unwrap_or(Value::Null);
+            let raw = serde_json::from_slice::<Value>(bytes).unwrap_or(Value::Null)["event"].take();
             json!({
                 "backup":raw.pointer("/allocation/seed_backup").is_some(),
                 "pass":raw.pointer("/allocation/reserve/family").is_some_and(|v|v == "passes"),
@@ -194,7 +194,7 @@ impl AuxiliaryDisplayedInputs {
     fn fields(&self, records: &[(u64, Vec<u8>)]) -> (Vec<Value>, Vec<Value>, &'static str) {
         let first = records
             .first()
-            .and_then(|(_, b)| serde_json::from_slice::<Value>(b).ok());
+            .and_then(|(_, b)| crate::journal::event(b).ok());
         let current = first
             .as_ref()
             .and_then(|v| v.pointer("/seed/mnemonic"))

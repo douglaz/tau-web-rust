@@ -58,6 +58,9 @@ pub mod opfs;
 pub(crate) mod authority;
 pub mod delivery;
 mod goals;
+mod journal;
+mod sessions;
+use journal::journal;
 pub(crate) mod inference;
 pub mod poc;
 pub mod poc_targets;
@@ -213,6 +216,7 @@ pub(crate) enum Event {
     Setup(crate::dispatch::SetupRecord),
     Delivery(delivery::Record),
     Exposure(Exposure),
+    End(crate::binding::End),
     ModeAcceptance(Acceptance),
     Goal(crate::goals::Goal),
     Poc(poc::Record),
@@ -385,6 +389,7 @@ pub struct Store<S> {
     authority: Rc<crate::lifecycle::Authority>,
     response_calls: std::collections::BTreeSet<u64>,
     exposure_ledger: Vec<Exposure>,
+    ended_sessions: std::collections::BTreeSet<String>,
     conduct_acceptances: Vec<Acceptance>,
     goals: Vec<crate::goals::Goal>,
     poc: std::collections::BTreeMap<String, poc::Task>,
@@ -496,7 +501,7 @@ pub async fn unlock<S: Storage>(
     let mut key = DataKey([0; 32]);
     key.0.copy_from_slice(&unwrapped);
     let mut store = Store::new(storage, key, envelope.id);
-    store.replay().await?;
+    store.replay().await.map_err(journal::refusal)?;
     store.inference.recovered = store.inference_revocations().into_iter().collect();
     if store.next == FIRST {
         store.finish_creation().await?;
@@ -506,6 +511,8 @@ pub async fn unlock<S: Storage>(
 
 impl<S: Storage> Store<S> {
     fn new(storage: S, key: DataKey, id: String) -> Store<S> {
+        let authority = crate::lifecycle::owner();
+        authority.seal_identity();
         Store {
             storage,
             key,
@@ -527,9 +534,10 @@ impl<S: Storage> Store<S> {
             procurement_selection: None,
             provider_origin: crate::poc::provisioning::default_origin(),
             poc_credential_filters: Vec::new(),
-            authority: crate::lifecycle::owner(),
+            authority,
             response_calls: std::collections::BTreeSet::new(),
             exposure_ledger: Vec::new(),
+            ended_sessions: Default::default(),
             conduct_acceptances: Vec::new(),
             goals: Vec::new(),
             poc: Default::default(),
@@ -689,16 +697,48 @@ impl<S: Storage> Store<S> {
         Ok(())
     }
 
-    /// Binding allocates nothing. The key uses the approved entry's journaled identity.
-    pub async fn bind(&mut self, machine: &str) -> Result<String, String> {
-        self.bind_with_modes(machine, &[]).await
+    /// Bare binding grants no session authority.
+    pub async fn bind(&mut self, _machine: &str) -> Result<String, String> {
+        Err("explicit inference approval required".into())
     }
 
-    pub async fn bind_with_modes(
+    #[cfg(any(test, feature = "tracer"))]
+    pub async fn admit_fixture(&mut self, machine: &str) -> Result<String, String> {
+        self.admit(machine, &[], crate::binding::InferenceApproval::synthetic())
+            .await
+    }
+
+    #[cfg(any(test, feature = "tracer"))]
+    pub async fn admit_fixture_with_modes(
         &mut self,
         machine: &str,
         modes: &[Mode],
     ) -> Result<String, String> {
+        self.admit(
+            machine,
+            modes,
+            crate::binding::InferenceApproval::synthetic(),
+        )
+        .await
+    }
+
+    /// Admission allocates nothing. The key uses the approved entry's journaled identity.
+    pub async fn admit(
+        &mut self,
+        machine: &str,
+        modes: &[Mode],
+        inference_approval: crate::binding::InferenceApproval,
+    ) -> Result<String, String> {
+        self.authority.ordinary()?;
+        inference_approval.validate()?;
+        self.ensure_scan_references().await?;
+        if !crate::poc::inference::safe(
+            self,
+            &serde_json::to_value(&inference_approval).map_err(|_| "approval encoding")?,
+            &[],
+        ) {
+            return Err("inference approval contains protected or unscannable material".into());
+        }
         if self.inference.ended {
             return Err(crate::poc::wait::SESSIONS_ENDED.into());
         }
@@ -706,14 +746,12 @@ impl<S: Storage> Store<S> {
         self.dispatch
             .check_binding(machine)
             .map_err(|e| format!("{e:?}"))?;
-        if self
-            .sessions
-            .iter()
-            .any(|s| !s.ended.get() && s.bound_set.iter().any(|m| m == machine))
-        {
+        if self.exposure_ledger.iter().any(|e| {
+            !self.ended_sessions.contains(&e.session)
+                && e.bound_set.iter().any(|bound| bound.machine == machine)
+        }) {
             return Err("already bound".into());
         }
-        self.ensure_scan_references().await?;
         let identity = self.dispatch.approved_entries[machine]
             .approved
             .identity
@@ -726,6 +764,7 @@ impl<S: Storage> Store<S> {
             .map_err(|_| "client key derivation refused")?;
         let session = format!("session-{}", self.next);
         let exposure = Exposure {
+            inference_approval,
             accepted_modes: modes.to_vec(),
             session: session.clone(),
             bound_set: vec![BoundMachine {
@@ -750,14 +789,36 @@ impl<S: Storage> Store<S> {
         self.sessions
             .iter()
             .map(|s| {
-                let _ = self.check_session_authority(&s.identity, self.session_pair(&s.identity));
+                let readiness =
+                    self.check_session_authority(&s.identity, self.session_pair(&s.identity));
                 let mut view = s.inspect();
+                view["inference_configuration"] =
+                    serde_json::to_value(self.session_configuration(&s.identity).ok())
+                        .expect("configuration serializes");
                 view["inference_limits"] = self.limit_state(&s.identity);
                 view["session_state"] = if s.ended.get() {
                     json!("ended")
+                } else if readiness.is_err() {
+                    json!("waiting")
                 } else {
                     json!("running")
                 };
+                view["readiness_reason"] = readiness.err().into();
+                #[cfg(target_arch = "wasm32")]
+                if !s.ended.get() && self.poc_targets.contains_key(&s.bound_set[0]) && !crate::poc::inference::key_is_set() {
+                    view["session_state"] = "waiting".into();
+                    if view["readiness_reason"].is_null() {
+                        view["readiness_reason"] = "Inference key required for another request; existing job collection remains available.".into();
+                    }
+                }
+                #[cfg(target_arch = "wasm32")]
+                if !s.ended.get() && self.poc_target(&s.bound_set[0]).is_some()
+                    && crate::poc::inference::key_is_set()
+                    && crate::poc::inference::configuration().as_ref() != self.session_configuration(&s.identity).ok().as_ref()
+                {
+                    view["session_state"] = "waiting".into();
+                    view["readiness_reason"] = "Automatic inference waits for the admitted endpoint and model. Restore them, or explicitly Resume with the displayed configuration. Existing job collection remains available.".into();
+                }
                 view["goal"] =
                     serde_json::to_value(self.goals.iter().find(|g| g.session == s.identity))
                         .expect("goal serializes");
@@ -790,7 +851,8 @@ impl<S: Storage> Store<S> {
     }
 
     fn check_acceptance(&self, acceptance: &Acceptance) -> Result<(), String> {
-        if acceptance.mode != Mode::NoBrief
+        if self.ended_sessions.contains(&acceptance.session)
+            || acceptance.mode != Mode::NoBrief
             || !self
                 .exposure_ledger
                 .iter()
@@ -1021,6 +1083,19 @@ impl<S: Storage> Store<S> {
     }
 
     fn replay_exposure(&mut self, number: u64, exposure: &Exposure) -> Result<(), String> {
+        exposure.inference_approval.validate()?;
+        if self.exposure_ledger.iter().any(|e| {
+            e.session == exposure.session
+                || (!self.ended_sessions.contains(&e.session)
+                    && e.bound_set.iter().any(|b| {
+                        exposure
+                            .bound_set
+                            .iter()
+                            .any(|new| new.machine == b.machine)
+                    }))
+        }) {
+            return Err("session identity or binding already owned".into());
+        }
         if exposure.session != format!("session-{number}") || exposure.bound_set.len() != 1 {
             return Err("invalid exposure ledger entry".into());
         }
@@ -1456,6 +1531,7 @@ impl<S: Storage> Store<S> {
             }
         }
         numbers.sort_unstable();
+        let mut records = Vec::new();
         for (expected, number) in (FIRST..).zip(numbers) {
             if number != expected {
                 return Err(format!(
@@ -1466,6 +1542,11 @@ impl<S: Storage> Store<S> {
             let event = self
                 .open(number, &bytes)
                 .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
+            self.previous = Address(Sha256::digest(&bytes).into());
+            records.push((number, bytes, event));
+        }
+        self.previous = Address([0; 32]);
+        for (number, bytes, event) in records {
             match (number, &event) {
                 (FIRST, Event::Seed { mnemonic }) => {
                     let seed = Seed::import(mnemonic).map_err(|e| {
@@ -1495,6 +1576,7 @@ impl<S: Storage> Store<S> {
                 (_, Event::DedicatedReinstall(record)) => {
                     self.replay_reinstall(number, record)?;
                 }
+                (_, Event::End(end)) => self.apply_end(end)?,
                 (_, Event::Exposure(exposure)) => {
                     self.replay_exposure(number, exposure)
                         .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
@@ -1655,6 +1737,7 @@ impl<S: Storage> Store<S> {
             self.next = number + 1;
             self.previous = Address(Sha256::digest(&bytes).into());
         }
+        self.restore_sessions()?;
         Ok(())
     }
 
@@ -1699,31 +1782,34 @@ impl<S: Storage> Store<S> {
         );
         // Parser errors must never quote decrypted plaintext. Parse directly into Event so
         // duplicate members are rejected and mnemonic buffers retain Event's zeroization.
-        let event: Event = serde_json::from_slice(&plaintext)
-            .map_err(|_| "its event is not one this version reads".to_string())?;
+        let event = journal::decode(&plaintext)?;
         if let Event::Poc(_) = &event {
-            let value: Value =
-                serde_json::from_slice(&plaintext).map_err(|_| "task record shape")?;
+            let value: Value = serde_json::from_slice::<Value>(&plaintext)
+                .map(|mut wrapper| wrapper["event"].take())
+                .map_err(|_| "task record shape")?;
             if serde_json::to_value(&event).map_err(|_| "task record shape")? != value {
                 return Err("task record shape".into());
             }
         }
         if matches!(&event, Event::DedicatedReinstall(_) | Event::PocTarget(_)) {
-            let value: Value =
-                serde_json::from_slice(&plaintext).map_err(|_| "dedicated record shape")?;
+            let value: Value = serde_json::from_slice::<Value>(&plaintext)
+                .map(|mut wrapper| wrapper["event"].take())
+                .map_err(|_| "dedicated record shape")?;
             if serde_json::to_value(&event).map_err(|_| "dedicated record shape")? != value {
                 return Err("dedicated record shape".into());
             }
         }
         if let Event::Delivery(_) = &event {
-            let value: Value =
-                serde_json::from_slice(&plaintext).map_err(|_| "delivery record shape")?;
+            let value: Value = serde_json::from_slice::<Value>(&plaintext)
+                .map(|mut wrapper| wrapper["event"].take())
+                .map_err(|_| "delivery record shape")?;
             if serde_json::to_value(&event).map_err(|_| "delivery record shape")? != value {
                 return Err("delivery record shape".into());
             }
         }
         if matches!(event, Event::OperationReceipt(_) | Event::Association(_)) {
-            let value: Value = serde_json::from_slice(&plaintext)
+            let value: Value = serde_json::from_slice::<Value>(&plaintext)
+                .map(|mut wrapper| wrapper["event"].take())
                 .map_err(|_| "invalid receipt or association shape")?;
             if serde_json::to_value(&event).map_err(|_| "invalid receipt or association shape")?
                 != value
@@ -1732,8 +1818,9 @@ impl<S: Storage> Store<S> {
             }
         }
         if let Event::Setup(crate::dispatch::SetupRecord::Requirements(_)) = &event {
-            let value: Value =
-                serde_json::from_slice(&plaintext).map_err(|_| "requirements record shape")?;
+            let value: Value = serde_json::from_slice::<Value>(&plaintext)
+                .map(|mut wrapper| wrapper["event"].take())
+                .map_err(|_| "requirements record shape")?;
             let record = &value["setup"]["requirements"];
             if !record.is_object() || !record["access"].is_object() {
                 return Err("requirements record shape".into());
@@ -1743,13 +1830,15 @@ impl<S: Storage> Store<S> {
         if matches!(
             event,
             Event::Exposure(_)
+                | Event::End(_)
                 | Event::ConnectionRefusal(_)
                 | Event::Goal(_)
                 | Event::ModeAcceptance(_)
                 | Event::SignatureRefusal(_)
                 | Event::OperationResponse { .. }
         ) {
-            let value: Value = serde_json::from_slice(&plaintext)
+            let value: Value = serde_json::from_slice::<Value>(&plaintext)
+                .map(|mut wrapper| wrapper["event"].take())
                 .map_err(|_| "invalid binding record shape".to_string())?;
             if value.get("goal").is_some_and(|g| {
                 g.as_object()
@@ -1768,8 +1857,14 @@ impl<S: Storage> Store<S> {
             {
                 return Err("invalid operation response shape".into());
             }
+            if value.get("end").is_some_and(|end| !end.is_object()) {
+                return Err("invalid End record shape".into());
+            }
             if let Some(exposure) = value.get("exposure") {
                 let objects = exposure.is_object()
+                    && exposure.get("inference_approval").is_some_and(|a| {
+                        a.is_object() && a.get("configuration").is_some_and(Value::is_object)
+                    })
                     && exposure
                         .get("bound_set")
                         .and_then(Value::as_array)
@@ -1810,7 +1905,9 @@ impl<S: Storage> Store<S> {
                 }
             }
             let original = ClearedValue(
-                serde_json::from_slice(&plaintext).map_err(|_| "invalid inference shape")?,
+                serde_json::from_slice::<Value>(&plaintext)
+                    .map(|mut wrapper| wrapper["event"].take())
+                    .map_err(|_| "invalid inference shape")?,
             );
             let encoded =
                 ClearedValue(serde_json::to_value(&event).map_err(|_| "invalid inference shape")?);
@@ -1835,7 +1932,8 @@ impl<S: Storage> Store<S> {
             return Err(crate::poc::wait::ENCRYPTION_CAP.render(number, "", ""));
         }
         let previous = hex::encode(self.previous.0);
-        let plaintext = Zeroizing::new(serde_json::to_vec(event).expect("an event serializes"));
+        let plaintext =
+            Zeroizing::new(serde_json::to_vec(&journal(event)).expect("an event serializes"));
         for filter in &self.provider_filters {
             if filter.protect_bytes(&plaintext)?.as_slice() != plaintext.as_slice() {
                 return Err("protected provider material refused before encryption".into());
@@ -1875,6 +1973,10 @@ impl<S: Storage> Store<S> {
         if let Err(e) = written {
             self.failed = Some(e.clone());
             return Err(e);
+        }
+        #[cfg(all(target_arch = "wasm32", feature = "tracer"))]
+        if matches!(event, Event::End(_)) {
+            crate::testonly::session_point("poc_end_committed").await;
         }
         self.next = number + 1;
         self.previous = Address(Sha256::digest(&bytes).into());
@@ -2052,6 +2154,18 @@ pub struct Local<S, K> {
 }
 
 impl<S: Storage + Clone, K: Kdf> Local<S, K> {
+    /// Called after the runtime fence, with the writer acquired after any begun append.
+    pub fn retire(&mut self) {
+        if let State::Unlocked(store) = &mut self.state {
+            for session in &store.sessions {
+                session.given.borrow_mut().clear();
+            }
+            store.clear_scan_working_copies();
+        }
+        self.seed_backup = BackupStage::Inactive;
+        self.state = State::Locked;
+    }
+
     pub fn new(storage: S, kdf: K) -> Local<S, K> {
         Local {
             storage,
@@ -2105,6 +2219,15 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
             }
             Err(why) => State::Refused(why),
         };
+        #[cfg(target_arch = "wasm32")]
+        if let State::Unlocked(store) = &self.state
+            && let Some(exposure) = store
+                .exposure_ledger
+                .iter()
+                .find(|e| !store.ended_sessions.contains(&e.session))
+        {
+            crate::poc::inference::restore(exposure.inference_approval.configuration.clone());
+        }
         self.report(None)
     }
 
@@ -2240,6 +2363,7 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
         #[serde(deny_unknown_fields)]
         struct Bind {
             machine: String,
+            inference_approval: crate::binding::InferenceApproval,
         }
         if let Some(reason) = self.dispatch_refusal() {
             return self.report(Some(reason));
@@ -2253,7 +2377,11 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
         let Ok(bind) = serde_json::from_str::<Bind>(request) else {
             return self.report(Some("invalid binding"));
         };
-        let result = self.store().expect("unlocked").bind(&bind.machine).await;
+        let result = self
+            .store()
+            .expect("unlocked")
+            .admit(&bind.machine, &[], bind.inference_approval)
+            .await;
         self.report(result.as_ref().err().map(String::as_str))
     }
 
@@ -2291,6 +2419,12 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
             State::Refused(why) => json!({ "state": "refused", "reason": why }),
         };
         if let State::Unlocked(store) = &self.state {
+            #[cfg(feature = "tracer")]
+            {
+                report["fixture_admission"] =
+                    serde_json::to_value(crate::binding::InferenceApproval::synthetic())
+                        .expect("fixture approval");
+            }
             if store.procurement.is_some() || store.procurement_selection.is_some() {
                 report["procurement"] = store.procurement_view();
             }
@@ -2313,6 +2447,14 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
         }
         if let Some(error) = error {
             report["error"] = error.into();
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            report["lifecycle_generation"] =
+                crate::lifecycle::owner().generation().to_string().into();
+            if matches!(self.state, State::Unlocked(_)) {
+                report["lifecycle_state"] = crate::lifecycle::owner().state().into();
+            }
         }
         self.protect_report(report)
     }
@@ -2345,7 +2487,17 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
                 store.protect_output(&history).unwrap_or_else(|_| json!({"state":"unlocked","lifecycle_state":"ended","seed_backup_stage":"inactive","error":"sessions ended; protected history unavailable"}))
             }
             State::Unlocked(store) if store.authority.state() == "reconciling" => {
-                json!({"state":"unlocked","lifecycle_state":"reconciling","error":"Reconciliation or clock verification required after suspension."})
+                let endable = store.exposure_ledger.iter()
+                    .filter(|exposure| !store.ended_sessions.contains(&exposure.session))
+                    .map(|exposure| json!({"identity":exposure.session,
+                        "bound_set":exposure.bound_set.iter().map(|bound| &bound.machine).collect::<Vec<_>>()}))
+                    .collect::<Vec<_>>();
+                let controls = json!({"state":"unlocked","lifecycle_state":"reconciling",
+                    "lifecycle_generation":store.authority.generation().to_string(),
+                    "seed_backup_stage":self.seed_backup,"endable_sessions":endable,
+                    "error":"Reconciliation or clock verification required after suspension."});
+                store.protect_output(&controls).unwrap_or_else(|_| json!({"state":"unlocked",
+                    "lifecycle_state":"reconciling","error":"Protected session controls unavailable."}))
             }
             State::Unlocked(store) => store.protect_output(&report).map(|mut protected| {
                 // Keep durable delivery facts distinct from the current caller's ability to act.
@@ -3039,7 +3191,10 @@ mod tests {
         assert_eq!(storage.files(), no_envelope);
         for (what, modified) in cases {
             let (reason, calls) = refused(&modified, PASS);
-            assert!(reason.ends_with("replay stopped"), "{what}: {reason}");
+            assert!(
+                reason.contains("replay stopped. Data was left unchanged."),
+                "{what}: {reason}"
+            );
             assert_eq!(calls, 1, "{what}");
         }
     }
@@ -3056,7 +3211,7 @@ mod tests {
         let (reason, _) = refused(&files, PASS);
         assert_eq!(
             reason,
-            "record 1: snapshots are not supported; replay stopped"
+            journal::refusal("record 1: snapshots are not supported; replay stopped".into())
         );
     }
 
@@ -3070,7 +3225,7 @@ mod tests {
         let (reason, _) = refused(&files, PASS);
         assert_eq!(
             reason,
-            "record 2: it belongs to another store; replay stopped"
+            journal::refusal("record 2: it belongs to another store; replay stopped".into())
         );
         // The same data key and another ID, the header's ID rewritten to ours and its
         // predecessor the same: only the ID in the AAD refuses it.
@@ -3087,7 +3242,10 @@ mod tests {
         record["id"] = json(&files, ENVELOPE)["id"].clone();
         set_json(&mut files, "0", &record);
         let (reason, _) = refused(&files, PASS);
-        assert_eq!(reason, "record 0: authentication failed; replay stopped");
+        assert_eq!(
+            reason,
+            journal::refusal("record 0: authentication failed; replay stopped".into())
+        );
     }
 
     #[test]
@@ -3099,7 +3257,7 @@ mod tests {
         assert_eq!(refused(&files, PASS).0, WRONG);
         assert_eq!(
             refused(&files, OTHER).0,
-            "record 0: it belongs to another store; replay stopped"
+            journal::refusal("record 0: it belongs to another store; replay stopped".into())
         );
     }
 
@@ -4462,7 +4620,10 @@ mod tests {
             .err()
             .expect("invalid exit must refuse replay");
         assert!(why.contains("invalid boot identity or exit code"), "{why}");
-        assert!(why.ends_with("replay stopped"), "{why}");
+        assert!(
+            why.contains("replay stopped. Data was left unchanged."),
+            "{why}"
+        );
     }
 
     #[test]
@@ -5128,7 +5289,10 @@ mod tests {
             for event in events {
                 craft_dispatch(&mut store, event);
             }
-            assert_eq!(refused(&storage.files(), PASS).0, reason);
+            assert_eq!(
+                refused(&storage.files(), PASS).0,
+                journal::refusal(reason.into())
+            );
         }
     }
 
@@ -5148,7 +5312,7 @@ mod tests {
         );
         assert_eq!(
             refused(&storage.files(), PASS).0,
-            "record 1: its event is not one this version reads; replay stopped"
+            "record 1: journal decoding failed. Data was left unchanged. Clearing site data permanently deletes the store, including its seed record.; replay stopped"
         );
     }
 

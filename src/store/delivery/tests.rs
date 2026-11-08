@@ -15,7 +15,7 @@ fn ready() -> (Store<MemoryStorage>, String) {
     for m in ["fixture", "fixture-other"] {
         block_on(s.answer_class(m.into(), crate::dispatch::ClassAnswer::No)).unwrap();
     }
-    let session = block_on(s.bind("fixture")).unwrap();
+    let session = block_on(s.admit_fixture("fixture")).unwrap();
     block_on(s.enter_goal(&session, "fixture delivery".into(), None)).unwrap();
     block_on(s.accept_mode(&session, Mode::NoBrief)).unwrap();
     (s, session)
@@ -119,7 +119,10 @@ fn delivery_journals_replays_all_findings_and_amendment_requires_recheck() {
     assert_eq!(view(&s)["verdict"], "Delivered");
     let reopened = reopen(&s);
     assert_eq!(view(&reopened)["verdict"], "Delivered");
-    assert!(reopened.sessions.is_empty(), "replay resumes no session");
+    assert_eq!(
+        reopened.sessions[0].identity, session,
+        "replay retains delivery session identity"
+    );
     approve(&mut s, &session, ad_hoc_minimum(), 3);
     assert_ne!(
         view(&s)["verdict"],
@@ -526,7 +529,7 @@ fn craft(s: &mut Store<MemoryStorage>, event: Value) {
     let n = s.next;
     let previous = hex::encode(s.previous.0);
     let nonce = [44u8; 12];
-    let bytes = serde_json::to_vec(&event).unwrap();
+    let bytes = serde_json::to_vec(&journal::journal(&event)).unwrap();
     let ciphertext = cipher(&s.key.0)
         .encrypt(
             &nonce.into(),

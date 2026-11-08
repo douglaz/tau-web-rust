@@ -392,7 +392,7 @@ async fn sent_job_read_during_end(
         &saved,
         PASSPHRASE,
     )?;
-    let seed: Value = serde_json::from_slice(&opened.records[0].1).map_err(|e| e.to_string())?;
+    let seed: Value = crate::journal::event(&opened.records[0].1).map_err(|e| e.to_string())?;
     let mnemonic = seed["seed"]["mnemonic"].as_str().ok_or("fixture seed")?;
     let mut initial = vec![seed.clone()];
     initial.extend(reader::setup_events_at(
@@ -592,7 +592,7 @@ pub(super) async fn run(
         .records
         .iter()
         .filter_map(|(_, b)| {
-            serde_json::from_slice::<Value>(b)
+            crate::journal::event(b)
                 .ok()?
                 .get("inference_terminal")
                 .cloned()
@@ -1052,7 +1052,7 @@ pub(super) async fn run(
             let intents: Vec<Value> = opened
                 .records
                 .iter()
-                .filter_map(|(_, b)| serde_json::from_slice::<Value>(b).ok())
+                .filter_map(|(_, b)| crate::journal::event(b).ok())
                 .collect();
             let raw_revoke = intents
                 .iter()

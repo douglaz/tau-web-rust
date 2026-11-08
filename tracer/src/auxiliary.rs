@@ -322,7 +322,7 @@ pub fn register(
 ) {
     let phrase = records
         .first()
-        .and_then(|(_, bytes)| serde_json::from_slice::<Value>(bytes).ok())
+        .and_then(|(_, bytes)| crate::journal::event(bytes).ok())
         .and_then(|v| {
             v.pointer("/seed/mnemonic")
                 .and_then(Value::as_str)
@@ -1022,7 +1022,11 @@ pub fn contracts_output_matches(
                     &mut ciphertext,
                 )
                 .ok()?;
-            if plain != serde_json::to_vec(&expected).ok()?.as_slice() {
+            if plain
+                != serde_json::to_vec(&crate::journal::wrap(&expected))
+                    .ok()?
+                    .as_slice()
+            {
                 return None;
             }
             previous = hash(bytes);

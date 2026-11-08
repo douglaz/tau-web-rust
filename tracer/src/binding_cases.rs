@@ -112,7 +112,7 @@ async fn prepare_with_enrolment(
             let _source_record = semantic::Slot::new("reader.aux.prepare_record", record);
             let event: Value = semantic::result(
                 "binding.prepare.record_json",
-                serde_json::from_slice(bytes).map_err(|e| e.to_string()),
+                crate::journal::event(bytes).map_err(|e| e.to_string()),
             )?;
             if let Some(entries) = event
                 .pointer("/setup/approval/entries")
@@ -178,7 +178,16 @@ async fn prepare_with_enrolment(
         if bound {
             continue;
         }
-        setup_cases::click(run, tab, &format!("[data-bind={name:?}]")).await?;
+        if tracer {
+            setup_cases::click(run, tab, &format!("[data-bind={name:?}]")).await?;
+        } else {
+            // The served page has no fixture card; this fixture supplies explicit admission evidence.
+            let request = json!({"machine":name,"inference_approval":{"approved":true,"configuration":{"endpoint":"https://fixture.invalid/completions","model":"fixture"}}});
+            let report = run.browser.evaluate(&worker.session, &format!("(async()=>{{const m=await import(new URL('./pkg/tau_web.js',self.location.href).href);const report=await m.bind(JSON.stringify({request}));await m.publish_report(m.publication_generation(),'',report);return JSON.parse(report);}})()")).await?;
+            if report.get("error").is_some() {
+                return Err("served fixture admission refused".into());
+            }
+        }
         wait(run, worker, "binding.page.bound", |s| {
             s["sessions"]
                 .as_array()
@@ -199,7 +208,7 @@ fn passes_at(caller: &'static str, opened: &reader::Opened) -> Result<Vec<u32>, 
         let _source_slot = semantic::Slot::new("reader.aux.pass_record", source_index);
         let event: Value = semantic::result(
             "binding.passes.record_json",
-            serde_json::from_slice(bytes).map_err(|e| e.to_string()),
+            crate::journal::event(bytes).map_err(|e| e.to_string()),
         )?;
         if let Some(id) = event.pointer("/allocation/reserve")
             && id["family"] == "passes"
@@ -312,7 +321,7 @@ pub(super) async fn run(
         "independent reader verifies the refusal append boundary",
         if tracer {
             let refusal: Value =
-                serde_json::from_slice(&opened.records[3].1).map_err(|e| e.to_string())?;
+                crate::journal::event(&opened.records[3].1).map_err(|e| e.to_string())?;
             refusal == json!({"connection_refusal":{"machine":"fixture","reason":"unbound"}})
         } else {
             opened.records.len() == 3
@@ -445,7 +454,7 @@ pub(super) async fn run(
             )?;
             let intent: Value = semantic::result(
                 "binding.authentication.intent_json",
-                serde_json::from_slice(&opened.records[call as usize].1).map_err(|e| e.to_string()),
+                crate::journal::event(&opened.records[call as usize].1).map_err(|e| e.to_string()),
             )?;
             let session = state["sessions"]
                 .as_array()
@@ -477,7 +486,7 @@ pub(super) async fn run(
 
     let mut case = Case::new(
         "binding_cases.c003",
-        &format!("exposure ledger survives restart without live bindings: {build}"),
+        &format!("exposure ledger and original bindings survive restart: {build}"),
     );
     let opened = reader::read_at(
         "reader.call.binding.exposure_ledger",
@@ -487,12 +496,7 @@ pub(super) async fn run(
     let ledger = opened
         .records
         .iter()
-        .filter_map(|(_, bytes)| {
-            serde_json::from_slice::<Value>(bytes)
-                .ok()?
-                .get("exposure")
-                .cloned()
-        })
+        .filter_map(|(_, bytes)| crate::journal::event(bytes).ok()?.get("exposure").cloned())
         .collect::<Vec<_>>();
     case.check(
         "binding_cases.a009",
@@ -516,10 +520,10 @@ pub(super) async fn run(
         .await?;
     case.check(
         "binding_cases.a010",
-        "replay preserves the ledger and never revives sessions",
+        "replay preserves the ledger and original session identities",
         crate::state_inputs::all!(
             after.same_at("binding_cases.a010", &before, &["/exposure_ledger"]),
-            after["sessions"] == json!([])
+            after["sessions"] == before["sessions"]
         ),
     );
     take(run.seen);
@@ -529,22 +533,26 @@ pub(super) async fn run(
     let seen = take(run.seen);
     case.check(
         "binding_cases.a011",
-        "an attempt after restart is unbound until another operator binding",
-        report["outcome"] == refusal_outcome
-            && seen.relay_accepted == 0
-            && seen.ssh_connections == 0,
+        "the original binding permits the same pinned command after restart",
+        if tracer {
+            report["outcome"]["done"] == true && seen.ssh_connections == 1
+        } else {
+            report["outcome"] == refusal_outcome
+                && seen.relay_accepted == 0
+                && seen.ssh_connections == 0
+        },
     );
     prepare(run, tab, &mut worker, pass).await?;
     case.check(
         "binding_cases.a012",
-        "re-entry creates new session identities and ledger entries",
+        "re-entry keeps original identities without another admission",
         crate::state_inputs::all!(
             run.inspect(&worker).await?["exposure_ledger"]
                 .as_array()
                 .unwrap()
                 .len()
-                == 4,
-            !run.inspect_state_at("state.binding.rebind.after", &worker)
+                == 2,
+            run.inspect_state_at("state.binding.rebind.after", &worker)
                 .await?
                 .same_at("binding_cases.a012", &before, &["/sessions"])
         ),
@@ -553,7 +561,7 @@ pub(super) async fn run(
 
     let mut case = Case::new(
         "binding_cases.c004",
-        &format!("seed-backup re-display ends bindings: {build}"),
+        &format!("seed-backup re-display retires execution and retains bindings: {build}"),
     );
     setup_cases::click(run, tab, "#tau-redisplay").await?;
     worker = run.worker(tab, Some(&worker), false).await?;
@@ -566,16 +574,20 @@ pub(super) async fn run(
     let seen = take(run.seen);
     case.check(
         "binding_cases.a013",
-        "after re-display completes the session remains ended until rebinding",
-        report["outcome"] == refusal_outcome
-            && run.inspect(&worker).await?["sessions"] == json!([])
-            && seen.relay_accepted == 0
-            && seen.ssh_connections == 0,
+        "after re-display completes the original session and binding remain",
+        run.inspect(&worker).await?["sessions"] == before["sessions"]
+            && if tracer {
+                report["outcome"]["done"] == true && seen.ssh_connections == 1
+            } else {
+                report["outcome"] == refusal_outcome
+                    && seen.relay_accepted == 0
+                    && seen.ssh_connections == 0
+            },
     );
     prepare(run, tab, &mut worker, pass).await?;
     case.check(
         "binding_cases.a014",
-        "the page can bind again",
+        "the page keeps both original sessions",
         run.inspect(&worker).await?["sessions"]
             .as_array()
             .unwrap()
@@ -591,9 +603,7 @@ pub(super) async fn run(
 }
 
 pub(super) fn replayed(before: &Value) -> Value {
-    let mut expected = before.clone();
-    expected["sessions"] = json!([]);
-    expected
+    before.clone()
 }
 
 fn machine_index(opened: &reader::Opened, machine: &str) -> Result<u32, String> {
@@ -612,7 +622,7 @@ fn machine_index(opened: &reader::Opened, machine: &str) -> Result<u32, String> 
         let _source_record = semantic::Slot::new("reader.aux.machine_index_record", record);
         let event: Value = semantic::result(
             "binding.machine_index.record_json",
-            serde_json::from_slice(bytes).map_err(|e| e.to_string()),
+            crate::journal::event(bytes).map_err(|e| e.to_string()),
         )?;
         if let Some(entries) = event
             .pointer("/setup/approval/entries")

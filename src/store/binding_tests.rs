@@ -35,7 +35,10 @@ fn approved() -> Store<MemoryStorage> {
 fn binding_act_requires_an_approved_entry() {
     let mut store = fresh();
     let before = store.storage.files();
-    assert_eq!(block_on(store.bind("fixture")), Err("NoEntry".into()));
+    assert_eq!(
+        block_on(store.admit_fixture("fixture")),
+        Err("NoEntry".into())
+    );
     assert_eq!(store.storage.files(), before);
 }
 
@@ -45,7 +48,10 @@ fn binding_act_requires_journaled_class() {
     block_on(store.seed_backup(allocation::Completion::Skipped)).unwrap();
     block_on(store.approve_setup(fixture_setup())).unwrap();
     let files = store.storage.files();
-    assert_eq!(block_on(store.bind("fixture")), Err("ClassMissing".into()));
+    assert_eq!(
+        block_on(store.admit_fixture("fixture")),
+        Err("ClassMissing".into())
+    );
     assert_eq!(store.storage.files(), files);
     assert!(store.sessions().is_empty());
 }
@@ -81,7 +87,7 @@ fn binding_act_requires_journaled_access() {
     block_on(missing.answer_class("fixture".into(), ClassAnswer::No)).unwrap();
     let files = missing.storage.files();
     assert_eq!(
-        block_on(missing.bind("fixture")),
+        block_on(missing.admit_fixture("fixture")),
         Err("AccessMissing".into())
     );
     assert!(missing.sessions().is_empty());
@@ -91,7 +97,7 @@ fn binding_act_requires_journaled_access() {
 #[test]
 fn session_inspection_enumerates_only_its_machine_client_key() {
     let mut store = approved();
-    let id = block_on(store.bind("fixture-other")).unwrap();
+    let id = block_on(store.admit_fixture("fixture-other")).unwrap();
     let session = block_on(store.connection_session("fixture-other")).unwrap();
     assert_eq!(
         session.inspect(),
@@ -148,34 +154,44 @@ fn unbound_attempt_records_refusal_and_never_binds() {
 #[test]
 fn a_machine_has_at_most_one_live_binding() {
     let mut store = approved();
-    let id = block_on(store.bind("fixture")).unwrap();
+    let id = block_on(store.admit_fixture("fixture")).unwrap();
     let files = store.storage.files();
-    assert_eq!(block_on(store.bind("fixture")), Err("already bound".into()));
+    assert_eq!(
+        block_on(store.admit_fixture("fixture")),
+        Err("already bound".into())
+    );
     assert_eq!(store.storage.files(), files);
     assert_eq!(store.sessions().len(), 1);
     assert_eq!(store.sessions()[0]["identity"], id);
 }
 
 #[test]
-fn exposure_replays_but_live_sessions_do_not_and_failed_append_binds_nothing() {
+fn exposure_restores_original_session_and_failed_append_binds_nothing() {
     let mut store = approved();
-    let first = block_on(store.bind("fixture")).unwrap();
+    let first = block_on(store.admit_fixture("fixture")).unwrap();
     let expected = store.exposure_ledger().to_vec();
     assert_eq!(expected.len(), 1);
     assert_eq!(expected[0].bound_set[0].machine, "fixture");
     let mut replayed = reopen(&store);
     assert_eq!(replayed.exposure_ledger(), expected);
-    assert!(replayed.sessions().is_empty());
-    assert!(matches!(
-        block_on(replayed.connection_session("fixture")),
-        Err(AdmissionRefusal::Unbound)
-    ));
-    let second = block_on(replayed.bind("fixture")).unwrap();
+    assert_eq!(replayed.sessions()[0]["identity"], first);
+    assert_eq!(
+        block_on(replayed.connection_session("fixture"))
+            .unwrap()
+            .identity,
+        first
+    );
+    assert_eq!(
+        block_on(replayed.admit_fixture("fixture")),
+        Err("already bound".into())
+    );
+    block_on(replayed.end_session(&first)).unwrap();
+    let second = block_on(replayed.admit_fixture("fixture")).unwrap();
     assert_ne!(first, second);
     assert_eq!(replayed.exposure_ledger().len(), 2);
     let mut failed = approved();
     failed.storage.fault(Fault::Fail(1));
-    assert!(block_on(failed.bind("fixture")).is_err());
+    assert!(block_on(failed.admit_fixture("fixture")).is_err());
     assert!(failed.sessions().is_empty());
     assert!(failed.exposure_ledger().is_empty());
 }
@@ -183,8 +199,8 @@ fn exposure_replays_but_live_sessions_do_not_and_failed_append_binds_nothing() {
 #[test]
 fn adapter_refuses_outside_bound_set_before_any_approval() {
     let mut store = approved();
-    let caller = block_on(store.bind("fixture")).unwrap();
-    let other = block_on(store.bind("fixture-other")).unwrap();
+    let caller = block_on(store.admit_fixture("fixture")).unwrap();
+    let other = block_on(store.admit_fixture("fixture-other")).unwrap();
     block_on(store.associate(Association {
         target: Target::VendorMachine("other-id".into()),
         entry: "fixture-other".into(),
@@ -250,7 +266,7 @@ fn adapter_refuses_outside_bound_set_before_any_approval() {
 #[test]
 fn adapter_refuses_caller_present_requester_relabelling() {
     let mut store = approved();
-    let caller = block_on(store.bind("fixture")).unwrap();
+    let caller = block_on(store.admit_fixture("fixture")).unwrap();
     let mut vendor = crate::dispatch::fixture::Vendor::default();
     let files = store.storage.files();
     for requester in [Requester::Operator, Requester::HarnessFlow] {
@@ -338,14 +354,21 @@ fn tombstone_binding_refuses_without_effects(status: allocation::Status) {
             // authorize the tombstoned machine. Preserve another machine's prior acceptance.
             let pass_identity = block_on(store.allocate(Family::Passes)).unwrap();
             assert_eq!(pass_identity.index, 0);
-            block_on(store.bind_with_modes("fixture-other", &[Mode::NoArtifactPin])).unwrap();
+            block_on(store.admit_fixture_with_modes("fixture-other", &[Mode::NoArtifactPin]))
+                .unwrap();
             set_binding_status(&mut store, status);
             if recovery == "restore" {
                 restore_binding_metadata(&mut store);
             }
             if recovery != "live" {
                 store = reopen(&store);
-                assert!(store.sessions().is_empty());
+                assert_eq!(store.sessions()[0]["bound_set"], json!(["fixture-other"]));
+                assert!(
+                    store
+                        .sessions
+                        .iter()
+                        .all(|s| s.client_key("fixture").is_none())
+                );
             }
             assert_eq!(store.dispatch.check_binding("fixture"), Ok(()));
             assert_eq!(store.scan_readiness(), Ok(()));
@@ -364,9 +387,9 @@ fn tombstone_binding_refuses_without_effects(status: allocation::Status) {
             assert!(!acceptances.is_empty());
             let next = store.records().end;
             let result = if explicit_modes {
-                block_on(store.bind_with_modes("fixture", &[Mode::NoArtifactPin]))
+                block_on(store.admit_fixture_with_modes("fixture", &[Mode::NoArtifactPin]))
             } else {
-                block_on(store.bind("fixture"))
+                block_on(store.admit_fixture("fixture"))
             };
             assert_eq!(
                 result,
@@ -389,7 +412,18 @@ fn tombstone_binding_refuses_without_effects(status: allocation::Status) {
             assert_eq!(store.allocation(), &allocation);
             assert!(store.failed.is_none());
             let restarted = reopen(&store);
-            assert!(restarted.sessions().is_empty());
+            assert_eq!(
+                restarted
+                    .sessions
+                    .iter()
+                    .map(|s| &s.identity)
+                    .collect::<Vec<_>>(),
+                restarted
+                    .exposure_ledger()
+                    .iter()
+                    .map(|e| &e.session)
+                    .collect::<Vec<_>>()
+            );
             assert_eq!(restarted.allocation(), &allocation);
             assert_eq!(restarted.exposure_ledger(), exposures);
             assert_eq!(restarted.storage.files(), files);
@@ -424,7 +458,8 @@ fn reserved_and_created_bindings_give_the_machine_key_and_exposure() {
                 .identity
                 .clone();
             let number = store.records().end;
-            let result = block_on(store.bind_with_modes("fixture", &[Mode::NoArtifactPin]));
+            let result =
+                block_on(store.admit_fixture_with_modes("fixture", &[Mode::NoArtifactPin]));
             assert!(
                 result.is_ok(),
                 "{status:?} must remain bindable, restored={restored}: {result:?}"
@@ -445,6 +480,7 @@ fn reserved_and_created_bindings_give_the_machine_key_and_exposure() {
             assert_eq!(
                 store.exposure_ledger(),
                 &[Exposure {
+                    inference_approval: crate::binding::InferenceApproval::synthetic(),
                     session: id,
                     bound_set: vec![BoundMachine {
                         machine: "fixture".into(),
@@ -457,16 +493,27 @@ fn reserved_and_created_bindings_give_the_machine_key_and_exposure() {
             let restarted = reopen(&store);
             assert_eq!(restarted.exposure_ledger(), store.exposure_ledger());
             assert_eq!(restarted.allocation(), &allocation);
-            assert!(restarted.sessions().is_empty());
+            assert_eq!(
+                restarted
+                    .sessions
+                    .iter()
+                    .map(|s| &s.identity)
+                    .collect::<Vec<_>>(),
+                restarted
+                    .exposure_ledger()
+                    .iter()
+                    .map(|e| &e.session)
+                    .collect::<Vec<_>>()
+            );
         }
     }
 }
 
 #[test]
-fn exposure_before_later_tombstone_survives_replay_without_sessions() {
+fn exposure_before_later_tombstone_restores_original_binding() {
     for status in [allocation::Status::Failed, allocation::Status::Destroyed] {
         let mut store = approved();
-        block_on(store.bind_with_modes("fixture", &[Mode::NoArtifactPin])).unwrap();
+        block_on(store.admit_fixture_with_modes("fixture", &[Mode::NoArtifactPin])).unwrap();
         let exposures = store.exposure_ledger().to_vec();
         set_binding_status(&mut store, status);
         let allocation = store.allocation().clone();
@@ -488,7 +535,8 @@ fn exposure_before_later_tombstone_survives_replay_without_sessions() {
         assert_eq!(restarted.allocation(), &allocation);
         assert_eq!(restarted.storage.files(), files);
         assert_eq!(restarted.records().end, store.records().end);
-        assert!(restarted.sessions().is_empty());
+        assert_eq!(restarted.sessions()[0]["identity"], exposures[0].session);
+        assert_eq!(restarted.sessions()[0]["bound_set"], json!(["fixture"]));
         assert_eq!(restarted.mode_acceptances().len(), 1);
     }
 }
@@ -512,6 +560,7 @@ fn tombstone_before_exposure_refuses_replay(status: allocation::Status) {
         assert_eq!(allocation.next_unused().machines, 2);
         let number = store.records().end;
         let exposure = Exposure {
+            inference_approval: crate::binding::InferenceApproval::synthetic(),
             session: format!("session-{number}"),
             bound_set: vec![BoundMachine {
                 machine: "fixture".into(),
@@ -534,7 +583,7 @@ fn tombstone_before_exposure_refuses_replay(status: allocation::Status) {
         assert_eq!(
             why,
             format!(
-                "record {number}: exposure identity is a tombstoned allocation; replay stopped"
+                "record {number}: exposure identity is a tombstoned allocation; replay stopped. Data was left unchanged. Clearing site data permanently deletes the store, including its seed record."
             ),
             "{status:?}, restored={restored}"
         );
@@ -562,6 +611,7 @@ fn replay_refuses_exposure_for_an_unlisted_identity() {
         .identity
         .clone();
     let exposure = Exposure {
+        inference_approval: crate::binding::InferenceApproval::synthetic(),
         accepted_modes: Vec::new(),
         session: format!("session-{number}"),
         bound_set: vec![BoundMachine {
@@ -580,7 +630,7 @@ fn replay_refuses_exposure_for_an_unlisted_identity() {
     assert_eq!(
         why,
         format!(
-            "record {number}: exposure identity is not listed under the current seed; replay stopped"
+            "record {number}: exposure identity is not listed under the current seed; replay stopped. Data was left unchanged. Clearing site data permanently deletes the store, including its seed record."
         )
     );
 }
@@ -590,19 +640,19 @@ fn binding_uses_ceremony_allocated_and_restored_listed_identities_only() {
     let mut restored = restored_only_other();
     let files = restored.storage.files();
     assert_eq!(
-        block_on(restored.bind("fixture")),
+        block_on(restored.admit_fixture("fixture")),
         Err("binding identity is not listed under the current seed".into())
     );
     assert_eq!(restored.storage.files(), files);
     assert!(restored.sessions().is_empty());
-    block_on(restored.bind("fixture-other")).unwrap();
+    block_on(restored.admit_fixture("fixture-other")).unwrap();
     assert_eq!(
         reopen(&restored).exposure_ledger(),
         restored.exposure_ledger()
     );
     let mut store = fresh();
     assert!(block_on(store.approve_setup(fixture_setup())).is_err());
-    assert!(block_on(store.bind("fixture")).is_err());
+    assert!(block_on(store.admit_fixture("fixture")).is_err());
     assert!(block_on(store.allocate(Family::Passes)).is_err());
     for completion in [
         allocation::Completion::Skipped,
@@ -618,7 +668,7 @@ fn binding_uses_ceremony_allocated_and_restored_listed_identities_only() {
         block_on(store.approve_setup(fixture_setup())).unwrap();
         for machine in ["fixture", "fixture-other"] {
             block_on(store.answer_class(machine.into(), ClassAnswer::No)).unwrap();
-            block_on(store.bind(machine)).unwrap();
+            block_on(store.admit_fixture(machine)).unwrap();
             let session = block_on(store.connection_session(machine)).unwrap();
             let identity = &store.dispatch.approved_entries[machine].approved.identity;
             assert_eq!(
@@ -643,7 +693,21 @@ fn binding_uses_ceremony_allocated_and_restored_listed_identities_only() {
             .unwrap();
             let mut restored = reopen(&source);
             for machine in ["fixture", "fixture-other"] {
-                block_on(restored.bind(machine)).unwrap();
+                let original = store
+                    .sessions
+                    .iter()
+                    .find(|s| s.bound_set == [machine])
+                    .unwrap();
+                assert_eq!(
+                    block_on(restored.connection_session(machine))
+                        .unwrap()
+                        .identity,
+                    original.identity
+                );
+                assert_eq!(
+                    block_on(restored.admit_fixture(machine)),
+                    Err("already bound".into())
+                );
             }
             assert_eq!(restored.allocation().entries(), export.entries());
             assert_eq!(restored.allocation().next_unused(), export.next_unused());
@@ -676,7 +740,7 @@ fn replay_refuses_malformed_or_unapproved_binding_records_without_plaintext() {
         .approved
         .identity;
     let number = source.records().end;
-    let valid = json!({"exposure":{"session":format!("session-{number}"),"bound_set":[{"machine":"fixture","identity":identity}]}});
+    let valid = json!({"exposure":{"session":format!("session-{number}"),"inference_approval":crate::binding::InferenceApproval::synthetic(),"accepted_modes":[],"bound_set":[{"machine":"fixture","identity":identity}]}});
     let mut unknown = valid.clone();
     unknown["exposure"]["bound_set"][0]["machine"] = "unknown private fixture text".into();
     let mut wrong_index = valid.clone();
@@ -700,7 +764,7 @@ fn replay_refuses_malformed_or_unapproved_binding_records_without_plaintext() {
             source.id.clone(),
         );
         block_on(crafted.replay()).unwrap();
-        let plaintext = serde_json::to_vec(&event).unwrap();
+        let plaintext = serde_json::to_vec(&journal::journal(&event)).unwrap();
         // Write authenticated malformed plaintext at the real commit boundary, without using
         // Event deserialization to pre-filter the fixture.
         let previous = hex::encode(crafted.previous.0);
@@ -762,7 +826,7 @@ fn page_binding_is_refused_while_locked_or_in_seed_backup() {
 #[test]
 fn originating_connection_admission_requires_the_current_runtime_object_without_writes() {
     let mut store = approved();
-    let id = block_on(store.bind("fixture")).unwrap();
+    let id = block_on(store.admit_fixture("fixture")).unwrap();
     let origin = block_on(store.connection_session("fixture")).unwrap();
     let copied = Rc::new(Session::new(
         id.clone(),
@@ -788,13 +852,12 @@ fn originating_connection_admission_requires_the_current_runtime_object_without_
     assert!(Rc::ptr_eq(&admitted, &origin));
     assert_eq!(store.storage.files(), files);
 
-    // No inference limits object is needed for irreversible runtime end.
-    origin.ended.set(true);
-    origin.given.borrow_mut().clear();
+    // Explicit durable End needs no inference limits object.
+    block_on(store.end_session(&origin.identity)).unwrap();
     let ended_files = store.storage.files();
     assert!(block_on(store.connection_session_for("fixture", Some(&origin))).is_err());
     assert_eq!(store.storage.files(), ended_files);
-    let successor_id = block_on(store.bind("fixture")).unwrap();
+    let successor_id = block_on(store.admit_fixture("fixture")).unwrap();
     assert_ne!(id, successor_id);
     let successor = block_on(store.connection_session("fixture")).unwrap();
     let files = store.storage.files();

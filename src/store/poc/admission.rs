@@ -68,8 +68,13 @@ impl<S: Storage> Store<S> {
         emit(
             &mut accept,
             &json!({"seed":self.seed().ok_or(REFUSAL)?.id(), "id":id,
-            "machine":machine, "goal":goal, "checks":checks}),
+            "machine":machine, "goal":goal, "checks":checks,"executions":self.authority.references()}),
         )?;
+        emit(
+            &mut accept,
+            &json!({"lifecycle_generation":domains.decimal::<u64>().to_string()}),
+        )?;
+        emit(&mut accept, &json!({"runtime_retired":true}))?;
         // The synthetic session represents every generated decimal suffix, without enumerating
         // revisions or relying on the current record number. Actual retained sessions also run
         // through each envelope, preserving spans at both ends of their serialized strings.
@@ -77,12 +82,21 @@ impl<S: Storage> Store<S> {
         let mut sessions = vec![symbolic_session.as_str()];
         if let Some(task) = task {
             sessions.push(&task.start_session);
-            sessions.extend(task.continuation_sessions.iter().map(String::as_str));
         }
-        if let Some(exposure) = exposure {
+        if let Some(exposure) = exposure
+            && !sessions.contains(&exposure.session.as_str())
+        {
             sessions.push(&exposure.session);
         }
         for session in sessions {
+            emit(
+                &mut accept,
+                &json!({"state":"unlocked","lifecycle_state":"reconciling",
+                    "lifecycle_generation":domains.decimal::<u64>().to_string(),
+                    "seed_backup_stage":"inactive",
+                    "endable_sessions":[{"identity":session,"bound_set":[machine]}],
+                    "error":"Reconciliation or clock verification required after suspension."}),
+            )?;
             emit(
                 &mut accept,
                 &Event::Goal(crate::goals::Goal {
@@ -117,7 +131,8 @@ impl<S: Storage> Store<S> {
                     }),
                 },
             });
-            let bytes = Zeroizing::new(serde_json::to_vec(&command).map_err(|_| REFUSAL)?);
+            let bytes =
+                Zeroizing::new(serde_json::to_vec(&journal(&command)).map_err(|_| REFUSAL)?);
             accept(&bytes, true)?;
             for mode in [Mode::NoBrief, Mode::NoArtifactPin] {
                 emit(
@@ -137,16 +152,31 @@ impl<S: Storage> Store<S> {
                             machine: machine.into(),
                             identity: identity.clone(),
                         }],
+                        inference_approval: exposure
+                            .map(|e| e.inference_approval.clone())
+                            .or_else(|| {
+                                task.and_then(|t| self.session_configuration(&t.start_session).ok())
+                                    .map(|configuration| crate::binding::InferenceApproval {
+                                        approved: true,
+                                        configuration,
+                                    })
+                            })
+                            .unwrap_or(crate::binding::InferenceApproval {
+                                approved: true,
+                                configuration: crate::poc::inference::Configuration {
+                                    endpoint: String::new(),
+                                    model: String::new(),
+                                },
+                            }),
                         accepted_modes,
                     }),
                 )?;
             }
             emit(
                 &mut accept,
-                &Event::Poc(Record::Authorize {
-                    id: id.into(),
-                    expected: domains.decimal(),
+                &Event::End(crate::binding::End {
                     session: session.into(),
+                    reason: crate::binding::EndReason::Explicit,
                 }),
             )?;
             emit(
@@ -230,7 +260,8 @@ impl<S: Storage> Store<S> {
                 },
             });
             result = (|| {
-                let bytes = Zeroizing::new(serde_json::to_vec(&event).map_err(|_| REFUSAL)?);
+                let bytes =
+                    Zeroizing::new(serde_json::to_vec(&journal(&event)).map_err(|_| REFUSAL)?);
                 // A payload is a hole. Scan each fixed side with its own adjacent envelope;
                 // never invent known bytes by concatenating across an unknown remote detail.
                 for part in std::str::from_utf8(&bytes)
@@ -278,7 +309,7 @@ fn emit(
     accept: &mut impl FnMut(&[u8], bool) -> Result<(), String>,
     value: &impl Serialize,
 ) -> Result<(), String> {
-    let bytes = Zeroizing::new(serde_json::to_vec(value).map_err(|_| REFUSAL)?);
+    let bytes = Zeroizing::new(serde_json::to_vec(&journal(value)).map_err(|_| REFUSAL)?);
     accept(&bytes, false)
 }
 
@@ -373,7 +404,10 @@ mod tests {
                                     "untracked or signed decimal {n}"
                                 ),
                                 Value::Array(a) => a.iter().for_each(numbers),
-                                Value::Object(o) => o.values().for_each(numbers),
+                                Value::Object(o) => o
+                                    .iter()
+                                    .filter(|(k, _)| k.as_str() != "journal_version")
+                                    .for_each(|(_, v)| numbers(v)),
                                 _ => (),
                             }
                         }

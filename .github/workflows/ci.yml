@@ -100,6 +100,11 @@ jobs:
           else
             CHROME="$chrome" scripts/tracer.sh targeted TAU_TRACER_HOLD_CASE=drop
           fi
+      - name: original-session interruption and stale-work proofs
+        run: |
+          for case in resume-lock resume-reload resume-loss resume-stale-fetch resume-freeze resume-approval resume-append resume-end resume-configuration; do
+            CHROME="${CHROME:-$(command -v google-chrome)}" TMPDIR="${RUNNER_TEMP:-${TMPDIR:?}}" node scripts/check-poc-page.mjs "$case"
+          done
       - name: admit this invocation's bounded diagnostics
         id: tracer-diagnostics
         if: ${{ always() && (steps.tracer.outcome == 'failure' || steps.tracer.outcome == 'cancelled') && steps.tracer.outputs.diagnostic_invocation != '' }}

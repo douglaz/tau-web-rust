@@ -272,6 +272,7 @@ pub async fn accept_page_goal(session: String, checks: String) -> String {
 
 #[wasm_bindgen]
 pub async fn requirements_answer(request: String) -> String {
+    let continuation = crate::lifecycle::owner().continuation();
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Answer {
@@ -295,6 +296,7 @@ pub async fn requirements_answer(request: String) -> String {
         crate::testonly::session_point("requirements_writer").await;
         let local = local();
         let mut local = local.lock().await;
+        continuation.as_ref().map_err(Clone::clone)?.check()?;
         if super::inference::ending() {
             return Err("sessions ended".into());
         }

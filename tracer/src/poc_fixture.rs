@@ -7,6 +7,8 @@ use std::time::{Duration, SystemTime};
 pub async fn run() -> Result<(), String> {
     let seen = fixtures::Observed::default();
     let tls = fixtures::tls();
+    let inference =
+        crate::aggregator::Aggregator::start(tls.acceptor.clone(), tls.cert.clone()).await;
     let sshd = fixtures::sshd(seen.clone()).await;
     let relay = fixtures::relay(seen.clone(), tls.acceptor, vec![], false).await;
     let size = |n| tau_web::jobs::launch(&"0".repeat(48), "machine-a", &vec![b'x'; n]).len();
@@ -23,7 +25,7 @@ pub async fn run() -> Result<(), String> {
     println!(
         "{}",
         json!({"relay":relay.url,"port":sshd.port,"spki":tls.spki_sha256,"host_key":crate::keys::ed25519(&crate::keys::HOST_KEY_PINNED).public_key().to_openssh().expect("public host key"),
-        "pin":tau_web::testonly::PINS[0].1,"largest":largest,"directory":sshd.machine.root})
+        "pin":tau_web::testonly::PINS[0].1,"largest":largest,"directory":sshd.machine.root,"inference":format!("{}/completion",inference.origin),"relay_spacing_ms":fixtures::Limits::bundle().min_spacing.as_millis()})
     );
     std::io::stdout().flush().map_err(|e| e.to_string())?;
     let (send, mut receive) = tokio::sync::mpsc::unbounded_channel();
@@ -40,7 +42,37 @@ pub async fn run() -> Result<(), String> {
         if value["stop"] == true {
             break;
         }
-        let result = if value["provisioning"] == true {
+        let result = if let Some(config) = value.get("inference") {
+            let mut state = inference.state.lock().unwrap();
+            if let Some(key) = config["key"].as_str()
+                && !state.keys.iter().any(|k| k.value == key)
+            {
+                state.keys.push(crate::aggregator::Key {
+                    id: "byo-fixture".into(),
+                    value: key.into(),
+                    cap: None,
+                    expires: None,
+                    spent: 0,
+                    revoked: false,
+                });
+            }
+            if let Some(commands) = config["commands"].as_array() {
+                state.script.clear();
+                for (n, command) in commands.iter().enumerate() {
+                    let (name, arguments) = if let Some(command) = command.as_str() {
+                        ("exec", json!({"machine":"machine-a","command":command}))
+                    } else {
+                        ("done", json!({"machine":"machine-a"}))
+                    };
+                    state
+                        .script
+                        .push_back(json!({"id":format!("loopback-call-{n}"),"type":"function",
+                        "function":{"name":name,"arguments":arguments.to_string()}}));
+                }
+            }
+            state.hold_completion = config["hold"] == true;
+            json!({"inference_configured":true})
+        } else if value["provisioning"] == true {
             use std::os::unix::fs::PermissionsExt;
             std::fs::write(sshd.machine.root.join("provisioning"), "fixture")
                 .map_err(|e| e.to_string())?;
@@ -102,7 +134,14 @@ pub async fn run() -> Result<(), String> {
                 .map(|(id, job)| json!({"job":id,"command":String::from_utf8_lossy(&job.command)}))
                 .collect::<Vec<_>>();
             let observed = seen.lock().unwrap();
-            json!({"launches":launches,"execs":observed.ssh_exec.iter().map(|e|String::from_utf8_lossy(e).into_owned()).collect::<Vec<_>>(),"contacts":observed.relay_accepted,"authentication":observed.ssh_auth,"wire_errors":observed.relay_wire_errors,"binary_sizes":observed.relay_binary_sizes})
+            let inference_requests = inference
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.starts_with(b"POST /completion "))
+                .count();
+            json!({"launches":launches,"inference_requests":inference_requests,"ssh_connections":observed.ssh_connections,"ssh_ends":observed.ssh_ends.len(),"execs":observed.ssh_exec.iter().map(|e|String::from_utf8_lossy(e).into_owned()).collect::<Vec<_>>(),"contacts":observed.relay_accepted,"authentication":observed.ssh_auth,"wire_errors":observed.relay_wire_errors,"binary_sizes":observed.relay_binary_sizes})
         };
         println!("{result}");
         std::io::stdout().flush().map_err(|e| e.to_string())?;

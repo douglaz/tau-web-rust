@@ -72,6 +72,7 @@ pub fn reader_event(event: &Value) -> Value {
         match raw_kind {
             "dedicated_reinstall" => "dedicated_reinstall",
             "exposure" => "exposure",
+            "end" => "end",
             "goal" => "goal",
             "mode_acceptance" => "mode_acceptance",
             "signature_refusal" => "signature_refusal",
@@ -120,7 +121,8 @@ pub fn reader_event(event: &Value) -> Value {
         "dedicated":{"kind":dedicated_alias,"modes":reader_modes(&dedicated_body["modes"]),"intent":dedicated_intent},
         "exposure":{
             "exact":{"shape":if body.get("accepted_modes").is_some() {"exposure.accepted"} else {"exposure"}},
-            "bounds":reader_items(&body["bound_set"])
+            "bounds":reader_items(&body["bound_set"]),
+            "approval_document":super::url::document_url_domain(&body["inference_approval"]["configuration"]["endpoint"])
         },
         "command":{
             "intent":raw_kind=="intent",
@@ -183,6 +185,9 @@ impl ReaderModeInputs {
             "acceptance_window_closed":self.closed_windows.contains(accepted_session),
             "signature_installation_unpinned":self.unpinned.contains(refused_machine)
         });
+        if let Some(session) = event.pointer("/end/session").and_then(Value::as_str) {
+            self.closed_windows.insert(session.to_owned());
+        }
         if exposure.is_some() {
             self.exposed_machines.insert(machine.to_owned());
             self.exposed_sessions.insert(exposed_session.to_owned());

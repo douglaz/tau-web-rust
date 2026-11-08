@@ -680,7 +680,7 @@ fn raw_record(s: &Store<MemoryStorage>, value: &Value) {
         .encrypt(
             &nonce.into(),
             Payload {
-                msg: &serde_json::to_vec(value).unwrap(),
+                msg: &serde_json::to_vec(&journal::journal(value)).unwrap(),
                 aad: record_aad(&s.id, EVENT, number, &previous).as_bytes(),
             },
         )
@@ -848,7 +848,9 @@ fn ended_pending_owner_does_not_bar_fresh_binding_but_uncertain_live_owner_still
         matches!(s.check_operation(&request),Err(crate::dispatch::RequestRefusal::InstallationFacts{why}) if why=="proposal approval pending")
     );
     s.synthetic_session_transition(&old, "ended").unwrap();
-    let fresh = block_on(s.bind("fixture")).unwrap();
+    assert!(block_on(s.admit_fixture("fixture")).is_err());
+    block_on(s.end_session(&old)).unwrap();
+    let fresh = block_on(s.admit_fixture("fixture")).unwrap();
     s.synthetic_confirm_limits(100).unwrap();
     assert!(s.pending_requirements.is_empty());
     assert!(block_on(s.approve_requirements(&old, "fixture", 42)).is_err());

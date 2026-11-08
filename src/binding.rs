@@ -1,4 +1,4 @@
-//! Live bindings and their durable exposure ledger. Replay restores the ledger alone.
+//! Session bindings and their durable admission and End records.
 
 use crate::allocation::Identity;
 use crate::credential::{Credential, SshClientKey};
@@ -103,8 +103,54 @@ pub struct BoundMachine {
 pub struct Exposure {
     pub session: String,
     pub bound_set: Vec<BoundMachine>,
+    pub inference_approval: InferenceApproval,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accepted_modes: Vec<crate::modes::Mode>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InferenceApproval {
+    pub approved: bool,
+    pub configuration: crate::poc::inference::Configuration,
+}
+
+impl InferenceApproval {
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.approved {
+            return Err("inference approval required".into());
+        }
+        crate::poc::inference::Configuration::new(
+            self.configuration.endpoint.clone(),
+            self.configuration.model.clone(),
+        )
+        .map(|_| ())
+    }
+
+    #[cfg(any(test, feature = "tracer"))]
+    pub fn synthetic() -> Self {
+        Self {
+            approved: true,
+            configuration: crate::poc::inference::Configuration::new(
+                "https://fixture.invalid/completions".into(),
+                "fixture".into(),
+            )
+            .expect("synthetic configuration"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct End {
+    pub session: String,
+    pub reason: EndReason,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EndReason {
+    Explicit,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

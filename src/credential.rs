@@ -355,6 +355,10 @@ mod tests {
             "Address",
             "a record's content address, SHA-256 of its stored ciphertext record: persisted in the next record",
         ),
+        (
+            "ExecutionIdentity",
+            "a public random execution discriminator, included in reference admission checks; never used as a signing/encryption key or a credential",
+        ),
     ];
 
     /// Every type implementing `Credential`: its bare name, row and `NAME`.

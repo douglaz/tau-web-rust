@@ -26,7 +26,7 @@ fn observation(seconds: u64) -> Observation {
 #[test]
 fn original_expiry_fences_real_inference_send_and_ends_only_affected_session() {
     let mut store = ready();
-    let other = block_on(store.bind("fixture-other")).unwrap();
+    let other = block_on(store.admit_fixture("fixture-other")).unwrap();
     store
         .consume_confirmed_limits(
             Confirmed {
@@ -270,7 +270,8 @@ fn confirmed_profile_rates_and_historical_choice_generation_are_not_invented() {
         LocalPassphrase::new(b"inference fixture passphrase".to_vec()),
     ))
     .unwrap();
-    let fresh = block_on(reopened.bind("fixture")).unwrap();
+    block_on(reopened.end_session(&session)).unwrap();
+    let fresh = block_on(reopened.admit_fixture("fixture")).unwrap();
     let mut choice = original.clone();
     choice.session = fresh;
     assert!(
@@ -297,7 +298,7 @@ fn confirmed_profile_rates_and_historical_choice_generation_are_not_invented() {
 #[test]
 fn affected_session_end_retains_original_scan_material_for_another_entitled_session() {
     let mut s = ready();
-    let other = block_on(s.bind("fixture-other")).unwrap();
+    let other = block_on(s.admit_fixture("fixture-other")).unwrap();
     s.consume_confirmed_limits(
         Confirmed {
             session: other.clone(),
@@ -379,7 +380,7 @@ fn affected_session_end_retains_original_scan_material_for_another_entitled_sess
 }
 
 #[test]
-fn ended_predecessor_does_not_shadow_fresh_binding_and_original_scan_reload() {
+fn poc_withheld_predecessor_keeps_binding_until_durable_end_and_scan_reload() {
     for reason in ["expiry", "exhaustion", "end"] {
         let mut store = ready();
         let secret = b"original-rebind-scan-value-1234";
@@ -392,7 +393,7 @@ fn ended_predecessor_does_not_shadow_fresh_binding_and_original_scan_reload() {
         let material = store.scans.working_material_bytes(&identity).unwrap();
         let old = store.sessions[0].clone();
         assert!(
-            block_on(store.bind("fixture")).is_err(),
+            block_on(store.admit_fixture("fixture")).is_err(),
             "live duplicate refused"
         );
         let mut transport = Fake::default();
@@ -419,7 +420,13 @@ fn ended_predecessor_does_not_shadow_fresh_binding_and_original_scan_reload() {
         assert_eq!(store.storage.files(), files);
         assert!(old.ended.get());
         assert!(store.scans.working_material_bytes(&identity).is_none());
-        let fresh = block_on(store.bind("fixture")).unwrap();
+        assert_eq!(
+            block_on(store.admit_fixture("fixture")),
+            Err("already bound".into()),
+            "runtime readiness never releases durable ownership"
+        );
+        block_on(store.end_session(&old.identity)).unwrap();
+        let fresh = block_on(store.admit_fixture("fixture")).unwrap();
         assert_ne!(fresh, old.identity);
         store.synthetic_confirm_limits(100).unwrap();
         assert_eq!(
@@ -471,7 +478,7 @@ fn established_late_exhaustion_ends_while_clock_and_worker_authority_are_withhel
         "issuer-exhausted",
     ] {
         let mut store = ready();
-        let other = block_on(store.bind("fixture-other")).unwrap();
+        let other = block_on(store.admit_fixture("fixture-other")).unwrap();
         store.synthetic_confirm_limits(100).unwrap();
         let live = store.sessions[0].clone();
         let mut transport = Fake {

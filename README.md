@@ -49,7 +49,9 @@ still under construction.
 See [the source-delta and open-citation inventory](docs/spec-9086166-uptake.md) for this pin's wider contracts and remaining owners. Shared receipt fixtures below establish no live
 adapter, complete protected-finalizer, native-policy or publisher-hosting
 acceptance. Ordinary visibility-only hide preserves eligible sessions in `www/boot.js`;
-explicit app Lock and pagehide end them.
+explicit app Lock and processed pagehide retire the execution while preserving logical sessions.
+See [same-session recovery](docs/same-session-resume.md) for the current PoC behavior,
+reviewed against b6d1252 (4d991cde plus ADR-0072) while the compiled pin remains 9086166b.
 
 ## The harness
 
@@ -148,7 +150,7 @@ type, empty text, non-https source, second goal or ended session changes nothing
 journals an encrypted `goal` event before applying it. `store_state.goals` shows history;
 `sessions[].goal` and the page show that live session's text and provenance without keys.
 There is no import, export, sharing, stored-goal selector or reuse control. Fresh bindings have
-no goal and empty input fields, even after replay of earlier goals.
+no goal and empty input fields. Replay restores each original session’s own goal and approvals.
 
 **Implementation reading: provenance and lifetime.** The source is the fixed
 `operator_session_goal_card` marker; a session accepts exactly one goal. `document_source` is
@@ -179,8 +181,9 @@ the model then decides again. Delivering a result arms no dispatch or retry. **I
 reading: invalid calls.** An unknown tool, invalid arguments or an out-of-set machine ends
 the loop before dispatch or any tool record. A 2xx turn also ends the loop when its body
 does not parse, has zero tool calls or has more than one tool call. No turn is retried and
-replay resumes nothing. The served build has no session-start selection and refuses its turn
-before contact.
+the older paid fixture loop does not resume a turn. The served BYO task runner restores
+eligible work in the original session after unlock and credential resupply, with a new counted
+Request for an interrupted inference turn and collection of pending jobs first.
 
 | Tool | Arguments and dispatch |
 |---|---|
@@ -357,7 +360,8 @@ The following are **implementation readings**, not claims about the real account
   Nothing writes account configuration.
 - **Bounds:** `SESSION_CAP` is `0.10` fixture account units and `SESSION_LIFETIME_SECONDS` is
   900 seconds, measured from the injected host clock or worker clock at mint. The page's
-  `END_SESSIONS_BOUND_MS` is 5000. The pin assigns no cap or expiry values or owner; twr-ggw.83
+  locking explanation appears after 5000 milliseconds without terminating a worker. The pin
+  assigns no cap or expiry values or owner; twr-ggw.83
   asks for that decision. These constants add no bundle field.
 - **Route:** worker memory records direct routes by exact origin. Before the first credentialed
   request, a dedicated unauthenticated OPTIONS request asks for the same headers using fixed
@@ -400,7 +404,7 @@ The following are **implementation readings**, not claims about the real account
   the recorded case-I envelope with a reported provider and cost, case-H without either, and
   case-C's readable routing refusal, with fixture values and leading whitespace on successes.
   The fixture enforces requested caps, expiry, revocation and management-endpoint separation.
-- **Served refusal:** the served build compiles the bundle's origin but has no candidate.
+- **Served procured-inference refusal:** the served build compiles the bundle's origin but has no candidate.
   An inference request refuses for missing session-start selection before contact. Only the
   tracer build carries `fixture-model`, `fixture-maker`, `fixture-provider` and the worker-state
   origin switch. In the served no-plaintext case, both new credential needles are vacuous by
@@ -408,19 +412,19 @@ The following are **implementation readings**, not claims about the real account
 - **Comparison:** inference remains core-only in the companion comparison; no witness changes
   or typed-inference records are introduced.
 
-| End | What happens |
+The following runtime behavior applies to the served BYO path. The older paid cleanup controls
+above are synthetic regressions; Lock does not invoke their global End/revocation helper.
+
+| Runtime action | What happens |
 |---|---|
-| Lock button | revoked at once |
-| ordinary `visibilitychange` hidden, document alive | same eligible session/key/limits continue while scheduled; no revoke or hidden deadline |
-| processed freeze | cancel safe ordinary transport; retain writer/bindings and original limits; verify before further work hidden or visible |
-| visibility hidden during seed ceremony | full local Lock; words/input cleared; interrupted completion remains owed |
-| `pagehide` dispatched while the document lives | revoked at once (synthetic in the tracer) |
-| bfcache restore | revoked at once (synthetic in the tracer) |
-| seed-backup re-display | revoked at once |
-| real unload: reload, navigation away, tab close | refused at once if its revoke completed; otherwise next-unlock sweep or expiry; if the unload cut off a recorded revoke, expiry only |
-| crash | next-unlock sweep or expiry |
-| revoke cut off by the bound | expiry only |
-| lost mint response | expiry only |
+| Lock button | wait visibly for any begun append, clear working secrets, retire execution; preserve the logical session and binding |
+| ordinary `visibilitychange` hidden, document alive | same eligible authority and approvals continue while scheduled; no hidden deadline |
+| processed freeze | cancel safe ordinary transport; retain writer/bindings; revalidate before further work |
+| visibility hidden during seed ceremony | local Lock; words/input clear; interrupted completion remains owed |
+| processed `pagehide` or bfcache return | retire execution and reopen locked without End |
+| seed-backup re-display | retire execution, then require a fresh unlock for the ceremony; preserve the session |
+| reload, navigation away, close or crash | replacement starts locked; full replay restores the original session; uncertain effects remain unresolved |
+| selected End session | append before permanent fencing and binding release; already accepted remote work may continue |
 
 **Inference record shapes.** These are compact encrypted event objects with exact members;
 optional terminal members are absent, never null. Empty decoded optional text is omitted for
@@ -441,7 +445,8 @@ its own field when decrypted records are searched. No session inference key is e
 
 Replay and the tracer's independently written reader reject extra members, wrong types,
 unknown intent references, repeated terminals and selections inconsistent with the intent.
-Old journals continue to replay. Host tests exercise each storage kill boundary, metadata,
+Only complete format-2 journals replay; earlier or malformed journals are refused unchanged
+as described in [same-session recovery](docs/same-session-resume.md). Host tests exercise each storage kill boundary, metadata,
 redaction, top-up and routing refusals, unresolved spend and the disposition matrix.
 
 In `targeted` mode, the focused browser selectors are `TAU_TRACER_INFERENCE`, `TAU_TRACER_INFERENCE_PHASE` and
@@ -978,28 +983,29 @@ children's PID and start time and end them only while that identity still matche
 
 ### Binding and the exposure ledger
 
-The page's exact-member `{"bind":{"machine":"fixture"}}` message names one approved
-machine. Locked stores and active seed-backup ceremonies refuse first; `Dispatch::check_binding`
-then checks the entry, class and access. A second live binding refuses without journaling.
-Binding also requires that exact identity to be listed under the current seed in allocation
-metadata, including after Restore, with Reserved or Created status. Failed and Destroyed
-tombstones refuse before key derivation, exposure, mode acceptance or session creation.
-Replay checks eligibility at each exposure's journal position, so a later tombstone preserves
-earlier exposure without restoring a live session. The client key derives at
-the entry's journaled identity, the exposure entry commits, and only
-then does a live session receive the key. A failed append creates no session.
+The page’s **Start session** action displays the configured model and machine and records
+explicit inference approval with the public endpoint/model in the Exposure payload. Admission
+checks the entry, class, access, identity and credential scans before appending the exact
+format-2 envelope, then constructs authority. Bare binding refuses. Synthetic fixtures supply
+explicit approval through that same admission code. A failed append creates no session.
+
+An unended session retains its immutable machine binding through Lock, reload and worker loss,
+even without credentials or a working connection. Validated full replay restores its original
+identity, goal, approvals, task and counters. A later tombstone preserves the earlier exposure
+and original binding history. A second admission cannot take a dormant session’s machine.
+Selected **End session** appends before fencing that session and releasing its binding; failure
+or uncertain acknowledgement releases nothing until replay establishes the durable result.
+Ended identities cannot be reused, and history remains available. Lock pauses execution and
+clears working secrets after any begun append finishes; it does not append End.
 
 **Implementation readings:**
 
-- A session lives in the harness worker's memory. Its identity uses its exposure record's
-  number and is never reused after restart. Lock, pagehide, reload, crash, bfcache restore and
-  seed-backup re-display end it. There is no separate end-session act. A bound set has one
-  machine; larger sets belong to twr-ggw.22.
-- Replay restores the exposure ledger, never live bindings. Re-entry after a worker ends needs
-  another operator binding, a fresh session identity and another ledger entry. Exposure does
-  not disappear when a session ends.
-- The configured model is recorded at session start by twr-ggw.18; until then the entry names
-  none. No model is guessed.
+- A bound set has one machine. Session identity uses the original Exposure record number.
+- Full replay validates every record before materializing sessions, including later Ends.
+  Automatic continuation is limited to eligible running/waiting/verifying work; genuine pauses
+  retain Resume, limit and verification controls. A successor session never inherits a goal.
+- The public inference configuration is recorded at admission; key re-entry does not approve
+  another session. The key remains memory-only.
 - An attempt uses the oldest journaled passes-family identity under the current seed whose
   status is reserved or created, including a listed Restore identity. No production act here
   allocates a pass: enrolment is twr-ggw.26's. With no listed pass there is no relay key. The
@@ -1041,14 +1047,14 @@ The acceptance surfaces and windows are **implementation readings**:
 
 - Acceptance is a store act, following the dispositions precedent. Both builds now expose
   no-brief acceptance on the goal card through `goal_accept`; installation acceptance stays
-  store-only. The binding message retains exactly
-  `{"bind":{"machine":"fixture"}}`.
-- `Store::bind_with_modes(machine, &[Mode::NoArtifactPin])` accepts the installation mode only
+  store-only. Fixture binding uses explicit synthetic inference approval through the same
+  admission code; served Start session records the configured endpoint/model approval.
+- Admission with `Mode::NoArtifactPin` accepts the installation mode only
   on the machine's first binding, before any exposure record names it. The binding act stands
   in for before first contact: connection admission requires a live binding. Acceptance and
   binding share one encrypted exposure record. A failed append binds and accepts nothing;
-  a move that lands and reports failure restores the exposure and mode on replay, with no
-  live session. Asking for an invalid mode refuses the entire binding without a record.
+  a move that lands and reports failure restores the exposure, session and mode on validated
+  replay. Asking for an invalid mode refuses the entire binding without a record.
 - `Store::accept_mode(session, Mode::NoBrief)` requires a live session and precedes its first
   journaled command intent, identified by `provenance.session`. The model tool path requires
   this acceptance for its goal before acting. A duplicate, unknown or ended session,
@@ -1058,9 +1064,9 @@ The acceptance surfaces and windows are **implementation readings**:
 
 Installation history stands for the life of this store, through restarts, later sessions,
 fixture destroy and fixture reinstall. A later binding shows it and refuses to accept it
-again. No-brief is conduct of its accepting live session alone: ending the worker ends the
-mode, while its journal record remains inspectable. Replay restores no session. Full re-entry
-and what earlier conduct left live belong to twr-ggw.24. **Never entered by failing** means only
+again. No-brief is conduct of its accepting session alone: runtime retirement preserves it;
+selected durable End makes it unusable while retaining its record. Validated replay restores
+the original unended session and its acceptance. **Never entered by failing** means only
 these two acceptance acts write acceptances; a host-key halt, failed admission, hold,
 disposition, barrier, restatement refusal or signature refusal adds no mode.
 
@@ -1253,11 +1259,12 @@ An imported seed with no earlier record remains exempt. Inspection exposes `seed
 contact while the seed-backup ceremony runs. Allocation's independent gate still checks the
 durable completion in all three families.
 
-Re-display terminates the worker through the ordinary lock, ending its live sessions, connections
-and held waits. The local passphrase must unwrap a fresh worker's store before the same seed-backup
-ceremony shows words. It journals another completion; a failed append preserves the previous
-record. Nothing stopped resumes: a cut-off call stays unresolved and a held request records no
-intent. Tab close, worker death, pagehide, bfcache restore and explicit lock remove
+Re-display retires the worker through ordinary Lock, preserving logical sessions while closing
+connections and held waits. The local passphrase must unwrap a fresh worker's store before the
+same seed-backup ceremony shows words. It journals another completion; a failed append preserves
+the previous record. A cut-off call stays unresolved and a held request records no intent;
+eligible task recovery waits until the ceremony completes. Tab close, worker death, pagehide,
+bfcache restore and explicit Lock remove
 words and input; an incomplete generated seed still owes its seed-backup ceremony at unlock.
 
 The custody exceptions are exactly worker-to-page `{seed_backup_display: "<twelve words>"}`
@@ -1284,8 +1291,8 @@ word elements changes the document and is reported; phrase, array and binary lea
 The Replace flow and a second store seed belong to twr-ggw.29; the core already clears the
 record for a fresh seed and gates its allocations, while store replay refuses Replace today.
 Sheet import belongs to twr-ggw.27. Sessions, goals and tools run in the harness worker.
-Seed-backup re-display ends sessions, waits and
-connections, and requires a fresh binding after the ceremony completes.
+Seed-backup re-display retires execution, waits and connections; the original unended
+session and binding remain available after unlock and ceremony completion.
 
 ### The local store
 
@@ -1491,16 +1498,17 @@ the host tests run.
   - The passphrase is zeroized once the derivation has run, and the wrapping key right after
     the unwrap. The data key lives until the worker ends.
   - The harness never persists the passphrase.
-- **Lock ends sessions before termination.** On the Lock button, seed-ceremony hide, pagehide,
+- **Lock retires execution before termination.** On the Lock button, seed-ceremony hide, pagehide,
   bfcache restore and seed-backup re-display, the page clears words and inputs immediately and
-  posts the exact-member `{end_sessions:true}` message. Channels close when this end step
-  begins, before the store writer is acquired. The worker stops dispatch, clears
-  session holdings, and independently records and sends each owed revoke. The page terminates
-  it on its answer or the named 5000 ms bound, then the fresh worker loads locked. A detached
-  machine job continues and can be collected after unlock.
-  A killed worker cannot act. After a crash or real unload, the next-unlock sweep revokes a
-  recorded minted identifier with no revoke intent, or expiry bounds the key. A revoke whose
-  intent committed but whose terminal was cut off stays unresolved and is never retried.
+  posts the exact-member `{retire_runtime:true}` request inside its execution envelope.
+  The worker stops dispatch and closes channels, lets any begun append finish whole, then
+  clears working secrets and acknowledges retirement. The page terminates it only after that
+  acknowledgement; the 5000 ms timer explains continued waiting. The replacement loads locked.
+  A worker still initializing or waiting for the store lock accepts retirement too, cancels
+  its queued lock acquisition and never opens the store. Logical sessions, approvals and
+  bindings survive. A detached machine job continues and can be collected after unlock.
+  A killed worker cannot act; the replacement must acquire the existing exclusive writer lock.
+  BYO retirement invokes no global End or paid-key revocation cleanup.
 - **The single writer.** `worker.js` takes an exclusive Web Lock, `tau-web-store`, before the
   module reads the store, and holds it for the worker's whole life (`STA-1`, `STA-7`).
   - A worker that cannot get the lock queues for it, and the page says "Waiting for the local
@@ -2483,8 +2491,8 @@ The cases:
 | destructive replacement with unnamed command (`STA-24`) | a continuing disposition releases A, B runs, replacement of A is destructive. A held request collects B only and names the standing restriction; collection of disposed A remains permitted and never removes that restriction |
 | operator binding before contact, in both builds | approved unbound command and collection journal refusals with no intent, binding or contact; page binding enumerates only row 3 for each bound machine; duplicate and malformed binds write nothing |
 | bound credentials and authorized keys, in both builds | read each machine's authorized_keys for exactly its derived key; tracer commands to both `fixture` and `fixture-other` complete, authenticate with each independently derived fingerprint and record each bound session in `provenance.session`; bound served command refuses for no pin |
-| exposure ledger restart, in both builds | independent reader reads the bound sets; reload/unlock preserves the ledger with no live sessions; an unbound attempt refuses, and page re-entry gives fresh session identities |
-| seed-backup re-display ends bindings, in both builds | completing re-display leaves the machine unbound until the page binds again |
+| exposure ledger restart, in both builds | independent reader reads the bound sets; format-2 replay preserves original session identities and bindings; selected durable End releases its binding, while dormant sessions retain ownership |
+| seed-backup re-display preserves bindings, in both builds | completing re-display retains the original session and machine after runtime retirement |
 | no plaintext (twr-ggw.5 AC4 and AC5, `CNF-15`, `STG-10`), in each build | from the passphrase the tracer typed, the independent reader learns the wrapping key, the data key and the seed. None of these appears, raw, hex, HEX, base64 or base64url (whole, or inside a longer value at any byte alignment), in any OPFS file: the passphrase, the wrapping and data keys, the mnemonic, the entropy, the 64-byte seed, the seed identifier, and roles 0–4's private and public keys at indices 0 and 1. Local storage, session storage, IndexedDB and Cache Storage hold nothing, and no service worker is registered. Passphrase bytes appear only in exact create, unlock or re-display messages. Only the displayed seeds' mnemonic needles are exempt in the exact directed display and re-entry messages described above; other secrets remain findings in those shapes. Non-seed decrypted records are checked, retaining only canonical allocation and exposure seed associations. In the tracer build's case, the sixteen negative controls listed under "The messages" run first, through the same guarded serializer and the same check, and each must be reported for its own reason. Four seed message controls run for the final seed and each collision-control mnemonic in each build: phrase, array, wrong-direction re-entry and binary. Further controls report a passphrase and a data key in the re-entry shape, an earlier store's seed identifier, and mnemonic and passphrase console property names. Fields are empty after every submit. The HTTPS fixtures' requests and the console hold none |
 
 For case 6's relay refusal and cases 7–8 the relay fixture accepted exactly one connection, dialed nothing, and its log

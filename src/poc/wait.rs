@@ -41,12 +41,12 @@ fixed! {
     PIN_REQUIRED: Direct = "trusted host pin missing; configure it before Resume";
     RESULT_ENCODING: Direct = "task result encoding";
     RESULT_PUBLICATION: Direct = "task result publication";
-    COMMITTED_MISMATCH: Direct = "committed job record differs from its intent and cannot checkpoint; pending identity retained for inspection; to configure, Abandon local orchestration; remote effects and command holds remain";
+    COMMITTED_MISMATCH: Direct = "committed job record differs from its intent and cannot checkpoint; pending identity retained for inspection; to configure, Stop task; remote effects and command holds remain";
     TASK_ENDED: Direct = "task ended";
-    SESSION_OWNER: Direct = "session authority belongs to another task; bind a fresh session";
+    SESSION_OWNER: Direct = "session authority belongs to another task; use the task’s original session";
     BOUND_MACHINE: Direct = "fresh authority must bind only the task machine";
     APPROVAL_PENDING: Direct = "proposal approval pending; review the open requirements card and approve explicitly or reject before Resume";
-    ACCEPTANCE: Direct = "fresh session requires acceptance of Acting on a goal with no brief";
+    ACCEPTANCE: Direct = "original session requires acceptance of Acting on a goal with no brief";
     SESSIONS_ENDED: Direct = "sessions ended";
     NO_SESSION: Direct = "no live session";
     SESSION_ENDED: Direct = "session ended";
