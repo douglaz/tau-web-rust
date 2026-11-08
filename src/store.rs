@@ -379,6 +379,7 @@ pub struct Store<S> {
     procurement: Option<provisioning::Purchase>,
     provider_filters: Vec<crate::poc::inference::EchoFilter>,
     procurement_selection: Option<crate::poc::provisioning::Selection>,
+    provider_origin: String,
     /// Memory-only credential fingerprints continue protecting late evidence after key disposal.
     poc_credential_filters: Vec<crate::poc::inference::EchoFilter>,
     authority: Rc<crate::lifecycle::Authority>,
@@ -524,6 +525,7 @@ impl<S: Storage> Store<S> {
             procurement: None,
             provider_filters: Vec::new(),
             procurement_selection: None,
+            provider_origin: crate::poc::provisioning::default_origin(),
             poc_credential_filters: Vec::new(),
             authority: crate::lifecycle::owner(),
             response_calls: std::collections::BTreeSet::new(),

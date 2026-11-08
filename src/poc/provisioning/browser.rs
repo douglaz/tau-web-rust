@@ -1,4 +1,4 @@
-//! Actual browser fetch. Only a compiled fixture capability can replace the fixed origin.
+//! Actual browser fetch of the exact absolute URL supplied by Purchase authority.
 use super::*;
 use crate::poc::inference::EchoFilter;
 use std::cell::{Cell, RefCell};
@@ -48,13 +48,6 @@ pub fn test_procurement_origin(origin: String) -> Result<(), JsValue> {
     TEST_ORIGIN.with_borrow_mut(|o| *o = Some(format!("https://127.0.0.1:{port}")));
     Ok(())
 }
-fn origin() -> String {
-    #[cfg(feature = "tracer")]
-    if let Some(origin) = TEST_ORIGIN.with_borrow(Clone::clone) {
-        return origin;
-    }
-    ORIGIN.into()
-}
 struct Active;
 impl Active {
     fn acquire() -> Result<Self, String> {
@@ -71,7 +64,7 @@ impl Drop for Active {
 }
 
 #[wasm_bindgen]
-pub async fn provider_configure(bytes: js_sys::Uint8Array) -> String {
+pub async fn provider_configure(bytes: js_sys::Uint8Array, origin: String) -> String {
     let mut secret = Zeroizing::new(bytes.to_vec());
     bytes.fill(0, 0, bytes.length());
     let result = async {
@@ -89,9 +82,9 @@ pub async fn provider_configure(bytes: js_sys::Uint8Array) -> String {
         let store = local
             .store()
             .ok_or("Unlock before setting the provider account.")?;
-        store.procurement_account(&account.public())?;
-        // Never register this key with inference structural-admission filters.
-        store.remember_provider_filter(account.filter(&secret));
+        #[cfg(feature = "tracer")]
+        let origin = TEST_ORIGIN.with_borrow(Clone::clone).unwrap_or(origin);
+        store.procurement_configure(&account, &secret, &origin)?;
         ACCOUNT.with_borrow_mut(|a| *a = Some(account));
         Ok::<(), String>(())
     }
@@ -254,18 +247,14 @@ impl Api for Browser {
     fn prepare(
         &mut self,
         method: &str,
-        path: &str,
+        url: &str,
         body: Option<&Value>,
     ) -> Result<Option<crate::poc::inference::EchoFingerprints>, String> {
         self.current()?;
-        if self.prepared.is_some()
-            || !path.starts_with("/api/v1/")
-            || path.contains(['#', '%', '\\', '\r', '\n'])
-            || !matches!(method, "GET" | "POST")
-        {
+        if self.prepared.is_some() || !matches!(method, "GET" | "POST") {
             return Err(REFUSED.into());
         }
-        let url = format!("{}{path}", origin());
+        let url = url.to_string();
         let body = body.map(|b| Zeroizing::new(b.to_string()));
         let mut nonce = [0; 32];
         getrandom::fill(&mut nonce).map_err(|_| REFUSED)?;
@@ -309,7 +298,7 @@ impl Api for Browser {
     async fn request(
         &mut self,
         method: &str,
-        path: &str,
+        url: &str,
         body: Option<Value>,
     ) -> Result<Value, String> {
         self.current()?;
@@ -317,13 +306,9 @@ impl Api for Browser {
         if self.requests > 16 {
             return Err("Provider work paused at the local read bound; Refresh later.".into());
         }
-        if !path.starts_with("/api/v1/")
-            || path.contains(['#', '%', '\\', '\r', '\n'])
-            || !matches!(method, "GET" | "POST")
-        {
+        if !matches!(method, "GET" | "POST") {
             return Err(REFUSED.into());
         }
-        let url = format!("{}{path}", origin());
         let pending = Rc::new(Pending {
             controller: web_sys::AbortController::new().map_err(|_| INCOMPLETE)?,
             stopped: Cell::new(false),
@@ -387,11 +372,11 @@ impl Api for Browser {
             init.set_body(&JsValue::from_str(body));
         }
         let request =
-            web_sys::Request::new_with_str_and_init(&url, &init).map_err(|_| INCOMPLETE)?;
+            web_sys::Request::new_with_str_and_init(url, &init).map_err(|_| INCOMPLETE)?;
         let _ = headers.delete("Authorization");
         self.current()?;
-        let mutation = method == "POST" && path != "/api/v1/vm/custom-template/price"
-            || path.contains("/renew?");
+        let mutation = method == "POST" && !url.ends_with("/api/v1/vm/custom-template/price")
+            || url.contains("/renew?");
         let exchange = async {
             let response: web_sys::Response = JsFuture::from(worker.fetch_with_request(&request))
                 .await

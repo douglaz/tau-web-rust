@@ -11,6 +11,102 @@ pub const REFUSED: &str = "Provider response refused; saved identities remain un
 pub const INCOMPLETE: &str = "Provider request incomplete or browser access unavailable; unlock, re-enter the same account and Refresh. Uncertain operations are never resent.";
 pub const BODY_LIMIT: usize = 256 * 1024;
 
+/// Strict origin grammar, checked before any URL parser can repair forbidden input.
+pub(crate) fn provider_origin(input: &str) -> Result<String, String> {
+    const INVALID: &str = "Enter an HTTPS provider origin with a DNS or IP host and optional port; no credentials, path, query, fragment, whitespace or backslash.";
+    let refuse = || INVALID.to_string();
+    if input.len() > 320
+        || input.chars().any(|c| c.is_whitespace() || c.is_control())
+        || input.contains(['@', '?', '#', '\\', '%'])
+    {
+        return Err(refuse());
+    }
+    let authority = input.strip_prefix("https://").ok_or_else(refuse)?;
+    let authority = authority.strip_suffix('/').unwrap_or(authority);
+    if authority.is_empty() || authority.contains('/') {
+        return Err(refuse());
+    }
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+        let (host, suffix) = rest.split_once(']').ok_or_else(refuse)?;
+        let ip = host.parse::<std::net::Ipv6Addr>().map_err(|_| refuse())?;
+        // Browsers serialize mapped IPv6 using hexadecimal segments as well.
+        let host = if let Some(ip4) = ip.to_ipv4_mapped() {
+            let bytes = ip4.octets();
+            format!(
+                "::ffff:{:x}:{:x}",
+                u16::from_be_bytes([bytes[0], bytes[1]]),
+                u16::from_be_bytes([bytes[2], bytes[3]])
+            )
+        } else {
+            ip.to_string()
+        };
+        let port = if suffix.is_empty() {
+            None
+        } else {
+            Some(suffix.strip_prefix(':').ok_or_else(refuse)?)
+        };
+        (format!("[{host}]"), port)
+    } else {
+        let (host, port) = authority
+            .split_once(':')
+            .map_or((authority, None), |(h, p)| (h, Some(p)));
+        let host = host.to_ascii_lowercase();
+        let dns = host.strip_suffix('.').unwrap_or(&host);
+        if dns.is_empty()
+            || dns.len() > 253
+            || dns.split('.').any(|label| {
+                label.is_empty()
+                    || label.len() > 63
+                    || !label.as_bytes()[0].is_ascii_alphanumeric()
+                    || !label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
+                    || !label
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            })
+        {
+            return Err(refuse());
+        }
+        let last = dns.rsplit('.').next().ok_or_else(refuse)?;
+        // Refuse alternative numeric IPv4 forms that fetch would reinterpret.
+        if (last.bytes().all(|b| b.is_ascii_digit())
+            || last
+                .strip_prefix("0x")
+                .is_some_and(|s| s.bytes().all(|b| b.is_ascii_hexdigit())))
+            && (host.parse::<std::net::Ipv4Addr>().is_err() || host != dns)
+        {
+            return Err(refuse());
+        }
+        (host, port)
+    };
+    let port = port
+        .map(|p| {
+            if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(refuse());
+            }
+            p.parse::<u16>().map_err(|_| refuse())
+        })
+        .transpose()?;
+    Ok(match port {
+        Some(port) if port != 443 => format!("https://{host}:{port}"),
+        _ => format!("https://{host}"),
+    })
+}
+
+pub(crate) fn default_origin() -> String {
+    ORIGIN.into()
+}
+
+/// Store authority supplies the entire URL to both preparation and dispatch.
+pub(crate) fn request_url(origin: &str, path: &str) -> Result<String, String> {
+    if provider_origin(origin)? != origin
+        || !path.starts_with("/api/v1/")
+        || path.contains(['#', '%', '\\', '\r', '\n'])
+    {
+        return Err(REFUSED.into());
+    }
+    Ok(format!("{origin}{path}"))
+}
+
 /// Separate from inference credential admission: a hexadecimal scalar is required here.
 pub struct Account(Zeroizing<[u8; 32]>);
 impl Account {

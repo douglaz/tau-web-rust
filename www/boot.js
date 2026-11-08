@@ -417,14 +417,17 @@ let providerSelectionDirty = true;
 let providerReviewToken = null;
 let providerDisplayedBilling = null;
 let providerDisplayedSelection = null;
+let providerDisplayedOrigin = null;
 const providerRequest = action => worker.postMessage({provider_request: action});
 const renderProvider = (store, enabled) => {
   $('provider-key-status').textContent = store.provider_configuration?.key_set ? 'Provider key set.' : 'Provider key unset; re-entry is required.';
   const purchase = store.procurement ?? {};
+  if (!$('provider-origin').value && (store.provider_configuration?.origin ?? purchase.origin)) $('provider-origin').value = store.provider_configuration?.origin ?? purchase.origin;
+  providerDisplayedOrigin = purchase.origin ?? null;
   providerDisplayedBilling = purchase.billing ? structuredClone(purchase.billing) : null;
   providerDisplayedSelection = purchase.selection ? structuredClone(purchase.selection) : null;
   const renewal = purchase.phase === 'terms_changed';
-  const reviewToken = purchase.selection ? JSON.stringify(purchase.selection) : null;
+  const reviewToken = purchase.selection ? JSON.stringify([purchase.origin, purchase.selection]) : null;
   if (providerReviewToken !== reviewToken) {
     $('provider-approve-charge').checked = false;
     $('provider-approve-access').checked = false;
@@ -460,6 +463,7 @@ const renderProvider = (store, enabled) => {
   if (store.provider_selection_reviewed || renewal) providerSelectionDirty = false;
   const selection = $('provider-selection-view'); selection.replaceChildren();
   if (purchase.selection) {
+    paragraph(selection, `Provider origin: ${purchase.origin}`);
     const c = purchase.selection.charge;
     paragraph(selection, `Recurring charge: ${c.amount} ${c.currency === 'BTC' ? 'millisats' : c.currency + ' cents'} per ${c.interval_amount} ${c.interval_type}. Tax and processing fee are shown on the initial invoice.`);
     const exact = document.createElement('pre'); exact.textContent = JSON.stringify(purchase.selection, null, 2); selection.append(exact);
@@ -467,6 +471,7 @@ const renderProvider = (store, enabled) => {
   const progress = $('provider-progress'); progress.replaceChildren();
   if (purchase.phase) {
     paragraph(progress, `Saved purchase ${purchase.machine}: ${purchase.phase}. VM ${purchase.vm_id ?? 'not associated'}; SSH registration ${purchase.ssh_key_id ?? 'not established'}.`);
+    paragraph(progress, `Bound provider origin: ${purchase.origin}`);
     paragraph(progress, `Provider account public identity: ${purchase.account}`);
     paragraph(progress, `Provider auto-renewal policy: ${purchase.auto_renewal_enabled === true ? 'enabled' : purchase.auto_renewal_enabled === false ? 'disabled' : 'unknown'}. This page does not change that policy.`);
     if (purchase.billing) {
@@ -496,7 +501,8 @@ const renderProvider = (store, enabled) => {
 $('provider-key-form').addEventListener('submit', event => {
   event.preventDefault();
   const field = $('provider-key'), bytes = new TextEncoder().encode(field.value); field.value = '';
-  try { worker.postMessage({provider_configure: {key: bytes}}, [bytes.buffer]); }
+  const origin = $('provider-origin').value; $('provider-origin').value = '';
+  try { worker.postMessage({provider_configure: {key: bytes, origin}}, [bytes.buffer]); }
   finally { if (bytes.byteLength) bytes.fill(0); }
 });
 $('provider-catalogue').addEventListener('click', () => providerRequest({action: 'catalogue'}));
@@ -513,7 +519,7 @@ $('provider-selection-form').addEventListener('submit', event => {
 });
 $('provider-approval-form').addEventListener('submit', event => {
   event.preventDefault(); if (providerSelectionDirty) return;
-  providerRequest({action: 'approve', selection: providerDisplayedSelection, approval: {machine: $('provider-machine').value, relay: $('provider-relay').value, class_answer: $('provider-class').value, approve_charge: $('provider-approve-charge').checked, approve_maintained_access: $('provider-approve-access').checked}});
+  providerRequest({action: 'approve', selection: providerDisplayedSelection, approval: {origin: providerDisplayedOrigin, machine: $('provider-machine').value, relay: $('provider-relay').value, class_answer: $('provider-class').value, approve_charge: $('provider-approve-charge').checked, approve_maintained_access: $('provider-approve-access').checked}});
 });
 $('provider-resume').addEventListener('click', () => providerRequest({action: 'resume'}));
 $('provider-invoice').addEventListener('click', () => providerRequest({action: 'initial_invoice', billing: providerDisplayedBilling}));

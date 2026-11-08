@@ -146,8 +146,18 @@ async fn publication(generation: u64, session: String, report: String, post: boo
         // Read-only custody survives suspension/reconciliation. It grants no authority,
         // and is taken from the holder rather than trusting a page-supplied status.
         value["poc_configuration"] = json!({"key_set":crate::poc::inference::key_is_set()});
-        value["provider_configuration"] =
+        let provider_configuration =
             json!({"key_set":crate::poc::provisioning::browser::key_is_set()});
+        value["provider_configuration"] = if let Some(store) = local.store() {
+            store
+                .protect_output(&json!({
+                    "key_set":crate::poc::provisioning::browser::key_is_set(),
+                    "origin":store.procurement_origin(),
+                }))
+                .unwrap_or(provider_configuration)
+        } else {
+            provider_configuration
+        };
         let encoded = value.to_string();
         let message = if post {
             let mut message = value.clone();

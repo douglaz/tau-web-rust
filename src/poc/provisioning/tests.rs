@@ -570,3 +570,71 @@ fn provisioning_transfer_terms_preserve_unmetered_absence_and_validate_allowance
         assert!(!metered.matches(&observed, 7, started));
     }
 }
+
+#[test]
+fn provisioning_origin_strict_grammar_and_normalization() {
+    for (input, expected) in [
+        ("https://example.invalid", "https://example.invalid"),
+        ("https://0xhost", "https://0xhost"),
+        ("https://box.0xzz", "https://box.0xzz"),
+        ("https://box.0xzz./", "https://box.0xzz."),
+        ("https://example.invalid/", "https://example.invalid"),
+        ("https://EXAMPLE.invalid:443/", "https://example.invalid"),
+        (
+            "https://example.invalid:8443",
+            "https://example.invalid:8443",
+        ),
+        ("https://127.0.0.1:18443/", "https://127.0.0.1:18443"),
+        ("https://[::1]:18443/", "https://[::1]:18443"),
+        ("https://[2001:0DB8::1]:443", "https://[2001:db8::1]"),
+        ("https://[::ffff:192.0.2.1]/", "https://[::ffff:c000:201]"),
+    ] {
+        assert_eq!(provider_origin(input).unwrap(), expected);
+    }
+    for input in [
+        "",
+        "http://example.invalid",
+        "HTTPS://example.invalid",
+        "https://",
+        "https:///",
+        "https://@example.invalid",
+        "https://user:pass@example.invalid",
+        "https://example.invalid?",
+        "https://example.invalid#",
+        "https://example.invalid/?q=1",
+        "https://example.invalid/#x",
+        "https://example.invalid/a",
+        "https://example.invalid/.",
+        "https://example.invalid/..",
+        "https://example.invalid/a/../",
+        "https://example.invalid/%2e/",
+        "https://example.invalid//",
+        "https://example.invalid\\",
+        " https://example.invalid",
+        "https://example.invalid ",
+        "https://example.\ninvalid",
+        "https://example.invalid\t/",
+        "https://example.invalid\0",
+        "https://[::1",
+        "https://::1",
+        "https://[127.0.0.1]",
+        "https://[::gg]",
+        "https://[::1]suffix",
+        "https://example.invalid:",
+        "https://example.invalid:-1",
+        "https://example.invalid:65536",
+        "https://example.invalid:443:1",
+        "https://example.invalid:+443",
+        "https://127.1",
+        "https://0177.0.0.1",
+        "https://0x7f000001",
+        "https://2130706433",
+        "https://256.0.0.1",
+        "https://example..invalid",
+        "https://-example.invalid",
+    ] {
+        let reason = provider_origin(input).expect_err("forbidden origin must refuse");
+        assert!(!reason.contains(input) || input.is_empty());
+        assert!(reason.contains("HTTPS provider origin"));
+    }
+}

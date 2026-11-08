@@ -6,14 +6,16 @@ configuration runner. This is a PoC integration, with `coverage.complete` still 
 Local fixture success does not establish production CORS, stock, reachability or a live checkpoint.
 
 Complete the local-store and seed-backup ceremony, then enter the dedicated, already verified
-provider account's 64-hex private key. The password field clears on transfer. Only the dedicated
+provider HTTPS origin and account's 64-hex private key. Entry fields clear on transfer; the admitted origin is shown again without credentials. Only the dedicated
 worker validates and holds the usable key; Lock, reload and worker loss require re-entry.
 Resume is bound to the saved public account identity. This operator-supplied account deliberately
 departs from ADR-0042: role-5 derivation, verification automation and vendor-account recovery
 are deferred.
 
 Fetch offers and images, explicitly choose a fixed or custom offer and unencrypted Arch image,
-and review the exact current configuration and charge. Custom resources use the documented JSON
+and review the normalized provider origin alongside the exact current configuration and charge.
+Changing the configured origin before approval discards the previous selection; approval carries
+the reviewed origin as well as the exact displayed terms. Custom resources use the documented JSON
 fields, with memory/disk in bytes; every requested range is checked against the fetched offer.
 Hourly credit plans and encrypted images are unsupported. Approve the charge, class and maintained
 access, and supply the existing v1 relay URL. Approval re-fetches the offer and price; a change
@@ -78,7 +80,7 @@ Refresh observes payment and running state. Empty or unusable published keys pau
 key family is Ed25519, preferred by the current SSH client; the public key's wire encoding and
 curve point are checked, its SHA-256 fingerprint is derived locally and compared with the
 publication. Multiple distinct Ed25519 keys pause rather than guess. The saved provenance names
-the fixed provider origin, VM, creation evidence and published keys. Handoff records the same
+the Purchase-bound provider origin, VM, creation evidence and published keys. Handoff records the same
 machine identity, validated allocated IPv4 with CIDR removed, port 22, user `arch`, whole-script
 `sudo -n`, relay, class and access approvals. Target/pin conflicts refuse replacement.
 The pin is retrieved from the provider's hypervisor scan, not attested. It trusts the provider
@@ -95,8 +97,18 @@ Abandon cannot erase an uncertain create. Handoff reload replays the target with
 
 ## Protocol and bounds
 
-The worker uses HTTPS fetch to the compiled origin `https://api.lnvps.net`, CORS mode, omitted
-credentials, no cache and refused redirects. There is no served origin override or proxy.
+The worker uses HTTPS fetch to the operator-entered origin, CORS mode, omitted credentials,
+no cache and refused redirects. Entry admits only `https://host[:port]` with a DNS host or IP
+literal and at most a root slash. It normalizes host spelling, removes the root slash and default
+port 443, and refuses userinfo (even empty), query/fragment delimiters, non-root paths, escapes,
+backslashes, whitespace/control repair, malformed IP literals and invalid ports before configuration
+changes or provider contact. No origin probe is made. The provider must serve the existing API at
+its origin root without redirects; IPv6 origin syntax does not add IPv6 machine targets.
+Approval saves the reviewed origin in the Purchase. Every subsequent provider read or mutation,
+including catalogue refresh and published-key provenance, uses that bound origin. Editing the
+entry, key re-entry, reload, Resume and reapproval cannot redirect it. Old journals without an
+origin field retain `https://api.lnvps.net`; explicitly invalid stored origins are refused.
+There is no proxy.
 NIP-98 events bind the exact URL, method and SHA-256 of each transmitted body. A fresh random
 nonce makes same-second reads distinct. Private key, header, event and signature protection is
 separate from inference structural admission. Account-key scan protection is memory-only and rebuilt
@@ -173,8 +185,9 @@ occurrences without exporting entries or secrets.
 Each run creates a fresh isolated profile and self-signed certificate below `target/`, pins only
 that certificate's SPKI for that browser process, and removes exactly its own temporary directory.
 No system trust is changed. Only the `tracer` build exports `test_procurement_origin`, which accepts
-loopback HTTPS origins; the fixture worker response calls it without replacing fetch or the
-provider adapter. Release absence checks reject the hook and test hold markers. The ordinary
+loopback HTTPS origins for older controls. Origin-entry scenarios omit that hook, enter the
+field through the ordinary page and observe an independent second loopback stub for wrong-origin
+non-contact. The fixture retains actual browser fetch and the provider adapter. Release absence checks reject the hook and test hold markers. The ordinary
 `served` build has none of those capabilities or fixture credentials.
 
 The local relay fixture maps only the documentation address `192.0.2.10:22` to its own ephemeral

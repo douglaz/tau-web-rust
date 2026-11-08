@@ -78,7 +78,7 @@ onmessage = async ({ data }) => {
   else if (data.provider_configure !== undefined) {
     const config = data.provider_configure;
     try {
-      if (exactMembers(config, ['key']) && config.key instanceof Uint8Array) report = await provider_configure(config.key);
+      if (exactMembers(config, ['key', 'origin']) && config.key instanceof Uint8Array && typeof config.origin === 'string') report = await provider_configure(config.key, config.origin);
       else { const current = JSON.parse(await open()); current.error = 'Invalid provider account entry.'; report = JSON.stringify(current); }
     } finally {
       if (config?.key instanceof Uint8Array) config.key.fill(0);

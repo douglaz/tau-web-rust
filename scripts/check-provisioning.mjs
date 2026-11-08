@@ -27,7 +27,7 @@ if(scenario==='protocol-controls'){
   const forms=signatureForms(event.sig);assert.deepEqual(forms.map(value=>value.length),[88,128,128]);
   console.log(JSON.stringify({scenario,identicalReplay:1,nonReplayRefusals:6,freshAccepted:1,clockSkewAccepted:2,clockSkewRefused:2,signatureEncodings:3,checks:'passed'}));process.exit(0);
 }
-const scenarios=['fixed','pending-custody','custom','lost-create','empty-create','incomplete-create','multiple-create','lost-invoice','empty-invoice','expired-invoice','publication','pre-send-reload','associated-reload','registration','failed-write','credentials','transport','refusals','mismatched-host','multiple-invoice','incomplete-invoice','conflicting-invoice','conflicting-create','popularity','popularity-lost','mismatched-image','fixed-terms','fixed-terms-reload','fixed-config','custom-terms','custom-terms-reload','custom-config','counter-identical','counter-fresh','lifecycle','fixed-unavailable','custom-unavailable','later-image','fixed-config-reload','custom-config-reload','custom-resource','fixed-cpu-direct','custom-cpu-direct','fixed-cpu-lost','custom-cpu-lost','fixed-cpu-later','custom-cpu-later','clock-ahead','custom-clock-behind','clock-lost-behind','custom-clock-lost-ahead','clock-old-evidence','custom-clock-future-evidence','fixed-eur','custom-usd','existing-paid','existing-unpaid','unknown-quote','quote-change','quote-unavailable','lost-invoice-quote-reload','signature-encodings','approval-authority','custom-caps-mismatched','custom-caps-missing','custom-caps-lost-mismatched','custom-caps-lost-missing','custom-caps-later','custom-caps-matching','custom-caps-network','custom-caps-uncapped','missing-limits','fixed-caps-mismatched','fixed-caps-missing','custom-deadline-headers','custom-deadline-body','custom-deadline-inside','custom-deadline-clock','fixed-transfer-direct','fixed-transfer-lost','fixed-transfer-later','custom-transfer-direct','custom-transfer-lost','custom-transfer-later'];
+const scenarios=['origin-entry','custom-origin-entry','origin-stale-review','origin-validation','fixed','pending-custody','custom','lost-create','empty-create','incomplete-create','multiple-create','lost-invoice','empty-invoice','expired-invoice','publication','pre-send-reload','associated-reload','registration','failed-write','credentials','transport','refusals','mismatched-host','multiple-invoice','incomplete-invoice','conflicting-invoice','conflicting-create','popularity','popularity-lost','mismatched-image','fixed-terms','fixed-terms-reload','fixed-config','custom-terms','custom-terms-reload','custom-config','counter-identical','counter-fresh','lifecycle','fixed-unavailable','custom-unavailable','later-image','fixed-config-reload','custom-config-reload','custom-resource','fixed-cpu-direct','custom-cpu-direct','fixed-cpu-lost','custom-cpu-lost','fixed-cpu-later','custom-cpu-later','clock-ahead','custom-clock-behind','clock-lost-behind','custom-clock-lost-ahead','clock-old-evidence','custom-clock-future-evidence','fixed-eur','custom-usd','existing-paid','existing-unpaid','unknown-quote','quote-change','quote-unavailable','lost-invoice-quote-reload','signature-encodings','approval-authority','custom-caps-mismatched','custom-caps-missing','custom-caps-lost-mismatched','custom-caps-lost-missing','custom-caps-later','custom-caps-matching','custom-caps-network','custom-caps-uncapped','missing-limits','fixed-caps-mismatched','fixed-caps-missing','custom-deadline-headers','custom-deadline-body','custom-deadline-inside','custom-deadline-clock','fixed-transfer-direct','fixed-transfer-lost','fixed-transfer-later','custom-transfer-direct','custom-transfer-lost','custom-transfer-later'];
 if(scenario==='list'){console.log(JSON.stringify(scenarios));process.exit(0);}
 if(!scenarios.includes(scenario))throw Error('unknown provisioning case');
 const deadlineCase=scenario.startsWith('custom-deadline-');
@@ -40,6 +40,7 @@ const capsCase=scenario.startsWith('custom-caps-')||scenario.startsWith('fixed-c
 const capsLater=scenario==='custom-caps-later';
 let inheritedCapChecks=0,missingLimitsRefusals=0;
 let capsVariant=scenario.endsWith('missing')?'missing':'mismatched',capsBad=capsCase&&!capsLater&&!['custom-caps-matching','custom-caps-network'].includes(scenario);
+const originCase=scenario.includes('origin-');
 const cpuCase=scenario.match(/^(fixed|custom)-cpu-(direct|lost|later)$/);
 const cpuPhase=cpuCase?.[2];
 let cpuVariant=scenario==='custom-cpu-direct'?'arch-missing':'arch';
@@ -54,7 +55,7 @@ const unknownQuote=scenario==='unknown-quote';
 
 const secret='31'.repeat(32), other='32'.repeat(32), inference='fixture~inference~key~482700';
 const account=publicIdentity(secret), used=new Map(), counts={}, replays={}, effects={}, refusals={}, errors=[], authForms=new Set(), dispatches=[];
-let browser,socket,provider,page,fixture,temp;const fixtureTimers=new Set();
+let browser,socket,provider,alternateProvider,page,fixture,temp;let alternateContacts=0,allowedAlternateContacts=0,originChecks=0;const fixtureTimers=new Set();
 await mkdir('target',{recursive:true});
 temp=await mkdtemp(resolve('target/provisioning-'));
 const check=(condition,label)=>assert.ok(condition,label);
@@ -112,7 +113,9 @@ try {
   const control=async value=>{fixture.stdin.write(JSON.stringify(value)+'\n');return read();};
   fixtureInfo=await read();await control({provisioning:true});
   const [algorithm,blob]=fixtureInfo.host_key.split(' ');hostPin=fixtureInfo.pin;hostKey={key_type:algorithm,public_key:blob,fingerprint_sha256:hostPin};
-  provider=createServer(tls,async(req,res)=>{
+  const providerHandler=async(req,res)=>{
+    if(req.socket.localPort!==provider.address().port)alternateContacts++;
+    const requestOrigin=`https://127.0.0.1:${req.socket.localPort}`;
     const route=req.method+' '+req.url;counts[route]=count(route)+1;
     try {
       const chunks=[];for await(const chunk of req)chunks.push(chunk);const body=Buffer.concat(chunks);
@@ -130,8 +133,8 @@ try {
         const argumentsValue=tool==='exec'?{machine:'machine-a',command:'true'}:{machine:'machine-a'};
         res.setHeader('Content-Type','application/json');res.end(JSON.stringify({choices:[{finish_reason:'tool_calls',message:{role:'assistant',content:null,tool_calls:[{id:'call-'+modelCalls,type:'function',function:{name:tool,arguments:JSON.stringify(argumentsValue)}}]}}]}));return;
       }
-      const event=verifyRequest(req.headers.authorization,providerOrigin+req.url,req.method,body,account,used,providerNow()/1000);
-      const accept=()=>acceptRequest(used,event,req.headers.authorization,providerOrigin+req.url,req.method,body);
+      const event=verifyRequest(req.headers.authorization,requestOrigin+req.url,req.method,body,account,used,providerNow()/1000);
+      const accept=()=>acceptRequest(used,event,req.headers.authorization,requestOrigin+req.url,req.method,body);
       authForms.add(req.headers.authorization);authForms.add(event.sig);authForms.add(JSON.stringify(event));for(const form of signatureForms(event.sig))authForms.add(form);
       if(failCatalogue&&req.url==='/api/v1/vm/templates'){res.writeHead(503).end();return;}
       if(transport==='delayed'&&req.url==='/api/v1/vm/templates'){heldProviderResponse=()=>{res.setHeader('Content-Type','application/json');res.end(JSON.stringify({data:{templates:[fixed],custom_template:[custom]}}));};return;}
@@ -178,10 +181,13 @@ try {
         fixtureTimers.add(timer);
       }else res.end(JSON.stringify({data:result}));
     }catch(error){if(error instanceof IdenticalReplay){const route=req.method+' '+req.url;replays[route]=(replays[route]??0)+1;res.writeHead(409).end(JSON.stringify({error:'fixture replay refused'}));return;}refusals[route]=(refusals[route]??0)+1;errors.push('provider authorization or schema failure');res.writeHead(400).end(JSON.stringify({error:'fixture refusal'}));}
-  });
+  };
+  provider=createServer(tls,providerHandler);
   provider.listen(0,'127.0.0.1');await once(provider,'listening');
   const providerOrigin=`https://127.0.0.1:${provider.address().port}`;
-  const injection=`\nimport * as fixtureApi from './pkg/tau_web.js';\nawait fixtureApi.test_procurement_origin(${JSON.stringify(providerOrigin)});\nconst fixtureSend=self.postMessage.bind(self);self.postMessage=(value,...transfer)=>{if(value?.sessions_ended===true)fixtureSend({fixture_provider_custody:fixtureApi.provider_key_is_set(),fixture_provider_custody_point:'ending_worker'});return fixtureSend(value,...transfer);};const fixtureHolds=new Map();const transportFetch=self.fetch.bind(self);let dispatchControl=null,rollbackClock=false;const fixtureDateNow=Date.now.bind(Date);const observedFetch=(input,init)=>{const request=input instanceof Request?input:new Request(input,init);const url=new URL(request.url);postMessage({fixture_dispatch:{method:request.method,path:url.pathname+url.search}});return transportFetch(input,init).then(response=>{if(rollbackClock&&url.pathname==='/api/v1/vm'&&request.method==='GET'){rollbackClock=false;Date.now=()=>fixtureDateNow()-10000;postMessage({fixture_clock_rollback:true});}return response;});};self.fetch=async(input,init)=>{const request=input instanceof Request?input:new Request(input,init);if(dispatchControl&&request.url.includes('/renew?')){const repeat=request.clone(),control=dispatchControl;dispatchControl=null;const response=await observedFetch(input,init);if(control.authorization)repeat.headers.set('Authorization',control.authorization);await observedFetch(repeat);return response;}return observedFetch(input,init);};const original=onmessage;onmessage=async e=>{const f=e.data?.fixture;if(!f){await original(e);if(e.data?.task||e.data?.goal_accept)postMessage({fixture_task_complete:true});if(e.data?.lifecycle)postMessage({fixture_lifecycle:e.data.lifecycle});return;}if(f.rollbackClock)rollbackClock=true;if(f.restoreClock)Date.now=fixtureDateNow;if(f.providerCustody)postMessage({fixture_provider_custody:fixtureApi.provider_key_is_set(),fixture_provider_custody_point:f.providerCustody});if(f.dispatchControl)dispatchControl=f.dispatchControl;if(f.hold){let release;const p=new Promise(r=>release=r);fixtureHolds.set(f.hold,release);fixtureApi.test_hold_session_point(f.hold,p,()=>postMessage({fixture_point:f.hold}));}if(f.release)fixtureHolds.get(f.release)?.();if(f.fail)await fixtureApi.test_seed_backup_fail_append();if(f.command)postMessage({fixture_command:JSON.parse(await fixtureApi.run_command(JSON.stringify({machine:'machine-a',command:'true'})))});if(f.scanRestore)postMessage({fixture_scan_restored:await fixtureApi.test_scan_reload(false)});if(f.scanUnavailable){await fixtureApi.test_scan_fixture('approval fixture',new Uint8Array(new TextEncoder().encode('required-secret-1234')));await fixtureApi.test_scan_reload(true);postMessage({fixture_scan_unavailable:true});}if(f.journalNeedles){let contains=false,available=true;for(const needle of f.journalNeedles){const result=JSON.parse(await fixtureApi.test_poc_journal(needle));available &&=typeof result.contains==='boolean'&&Number.isSafeInteger(result.records)&&result.records>0;contains ||=result.contains===true;}postMessage({fixture_journal_batch:{contains,available,checked:f.journalNeedles.length}});}if(f.journal){const result=JSON.parse(await fixtureApi.test_poc_journal(f.journal));postMessage({fixture_journal:result});}if(f.probe)postMessage({fixture_probe:JSON.parse(await fixtureApi.test_poc_protect_output(JSON.stringify(f.probe)))});postMessage({fixture_ack:true});};\n`;
+  let alternateOrigin=null;
+  if(originCase){alternateProvider=createServer(tls,providerHandler);alternateProvider.listen(0,'127.0.0.1');await once(alternateProvider,'listening');alternateOrigin=`https://127.0.0.1:${alternateProvider.address().port}`;}
+  const injection=`\nimport * as fixtureApi from './pkg/tau_web.js';\n${originCase?'':`await fixtureApi.test_procurement_origin(${JSON.stringify(providerOrigin)});`}\nconst fixtureSend=self.postMessage.bind(self);self.postMessage=(value,...transfer)=>{if(value?.sessions_ended===true)fixtureSend({fixture_provider_custody:fixtureApi.provider_key_is_set(),fixture_provider_custody_point:'ending_worker'});return fixtureSend(value,...transfer);};const fixtureHolds=new Map();const transportFetch=self.fetch.bind(self);let dispatchControl=null,rollbackClock=false;const fixtureDateNow=Date.now.bind(Date);const observedFetch=(input,init)=>{const request=input instanceof Request?input:new Request(input,init);const url=new URL(request.url);postMessage({fixture_dispatch:{method:request.method,path:url.pathname+url.search,origin:url.origin}});return transportFetch(input,init).then(response=>{if(rollbackClock&&url.pathname==='/api/v1/vm'&&request.method==='GET'){rollbackClock=false;Date.now=()=>fixtureDateNow()-10000;postMessage({fixture_clock_rollback:true});}return response;});};self.fetch=async(input,init)=>{const request=input instanceof Request?input:new Request(input,init);if(dispatchControl&&request.url.includes('/renew?')){const repeat=request.clone(),control=dispatchControl;dispatchControl=null;const response=await observedFetch(input,init);if(control.authorization)repeat.headers.set('Authorization',control.authorization);await observedFetch(repeat);return response;}return observedFetch(input,init);};const original=onmessage;onmessage=async e=>{const f=e.data?.fixture;if(!f){await original(e);if(e.data?.task||e.data?.goal_accept)postMessage({fixture_task_complete:true});if(e.data?.lifecycle)postMessage({fixture_lifecycle:e.data.lifecycle});return;}if(f.rollbackClock)rollbackClock=true;if(f.restoreClock)Date.now=fixtureDateNow;if(f.providerCustody)postMessage({fixture_provider_custody:fixtureApi.provider_key_is_set(),fixture_provider_custody_point:f.providerCustody});if(f.dispatchControl)dispatchControl=f.dispatchControl;if(f.hold){let release;const p=new Promise(r=>release=r);fixtureHolds.set(f.hold,release);fixtureApi.test_hold_session_point(f.hold,p,()=>postMessage({fixture_point:f.hold}));}if(f.release)fixtureHolds.get(f.release)?.();if(f.fail)await fixtureApi.test_seed_backup_fail_append();if(f.command)postMessage({fixture_command:JSON.parse(await fixtureApi.run_command(JSON.stringify({machine:'machine-a',command:'true'})))});if(f.scanRestore)postMessage({fixture_scan_restored:await fixtureApi.test_scan_reload(false)});if(f.scanUnavailable){await fixtureApi.test_scan_fixture('approval fixture',new Uint8Array(new TextEncoder().encode('required-secret-1234')));await fixtureApi.test_scan_reload(true);postMessage({fixture_scan_unavailable:true});}if(f.journalNeedles){let contains=false,available=true;for(const needle of f.journalNeedles){const result=JSON.parse(await fixtureApi.test_poc_journal(needle));available &&=typeof result.contains==='boolean'&&Number.isSafeInteger(result.records)&&result.records>0;contains ||=result.contains===true;}postMessage({fixture_journal_batch:{contains,available,checked:f.journalNeedles.length}});}if(f.journal){const result=JSON.parse(await fixtureApi.test_poc_journal(f.journal));postMessage({fixture_journal:result});}if(f.probe)postMessage({fixture_probe:JSON.parse(await fixtureApi.test_poc_protect_output(JSON.stringify(f.probe)))});postMessage({fixture_ack:true});};\n`;
   page=createServer(tls,async(req,res)=>{
     try{
       if(req.url==='/credential-trap'){errors.push('redirect reached credential trap');res.writeHead(400).end();return;}
@@ -205,7 +211,25 @@ try {
   const {targetId}=await call('Target.createTarget',{url:'about:blank'}),{sessionId}=await call('Target.attachToTarget',{targetId,flatten:true});
   await call('Page.enable',{},sessionId);
   await call('Page.addScriptToEvaluateOnNewDocument',{source:`window.reports=[];window.events=[];window.workers=[];window.sinkLogs=[];window.addEventListener('error',()=>sinkLogs.push('page error'));const Original=Worker;window.Worker=class extends Original{constructor(...args){super(...args);workers.push(this);this.addEventListener('message',e=>{if(e.data.store)reports.push(e.data.store);else if(Object.keys(e.data).some(k=>k.startsWith('fixture_'))){events.push(e.data);e.stopImmediatePropagation();}});}};`},sessionId);
-  const evaluate=async expression=>{const r=await call('Runtime.evaluate',{expression,awaitPromise:true,returnByValue:true},sessionId);if(r.exceptionDetails)throw Error('page evaluation failed');return r.result.value;};
+  const evaluate=async expression=>{
+    const r=await call('Runtime.evaluate',{expression,awaitPromise:true,returnByValue:true},sessionId);
+    if(r.exceptionDetails){
+      const details=r.exceptionDetails,exception=details.exception;
+      // Only fixed diagnostic text and numeric coordinates may leave the page.
+      const classes=['Error','TypeError','ReferenceError','SyntaxError','RangeError','URIError','EvalError','AggregateError','AssertionError'];
+      const kind=classes.includes(exception?.className)?exception.className:'[withheld class]';
+      const message=kind==='Error'&&exception?.description?.split('\n',1)[0]==='Error: fixture wait'?'fixture wait':'[withheld message]';
+      const frame=details.stackTrace?.callFrames?.[0];
+      const coordinate=value=>Number.isSafeInteger(value)&&value>=0&&value<10000000;
+      // Awaited rejections may carry their location only in the first anonymous stack frame.
+      const anonymous=exception?.description?.split('\n')[1]?.match(/^    at (?:[^()\r\n]+ \()?<anonymous>:([1-9][0-9]{0,6}):([1-9][0-9]{0,6})\)?$/);
+      const location=coordinate(frame?.lineNumber)&&coordinate(frame?.columnNumber)
+        ?[frame.lineNumber+1,frame.columnNumber+1]
+        :anonymous?[Number(anonymous[1]),Number(anonymous[2])]:['unknown','unknown'];
+      throw Error(`page evaluation failed: ${kind}: ${message}; throw line ${location[0]}, column ${location[1]} (source text withheld)`);
+    }
+    return r.result.value;
+  };
   const invoke=(fn,...args)=>evaluate(`(${fn.toString()})(...${JSON.stringify(args)})`);
   const wait=expression=>evaluate(`new Promise((resolve,reject)=>{const started=performance.now();const poll=()=>{const result=(${expression});if(result)return resolve(result);if(performance.now()-started>45000)return reject(Error('fixture wait'));setTimeout(poll,25);};poll();})`);
   const click=selector=>invoke(s=>document.querySelector(s).click(),selector);
@@ -215,7 +239,7 @@ try {
     const request={...value};
     if(value.action==='approve'&&!Object.hasOwn(value,'selection'))request.selection=structuredClone((await report()).procurement?.selection??null);
     if(value.action==='initial_invoice'&&!Object.hasOwn(value,'billing'))request.billing=structuredClone((await report()).procurement?.billing??null);
-    await sleep(1100);const n=await evaluate('reports.length');await message({provider_request:request});await wait(`reports.length>${n}`);return report();
+    await sleep(1100);const n=await evaluate('reports.length');await message({provider_request:request});await wait(`reports.length>${n}`);const result=await report();if(['origin-entry','custom-origin-entry'].includes(scenario)&&result.procurement?.phase)check(alternateContacts===allowedAlternateContacts,'wrong origin receives no bound-Purchase traffic');return result;
   };
   const clickInitialInvoice=async()=>{await sleep(1100);const n=await evaluate('reports.length');await click('#tau-provider-invoice');await wait(`reports.length>${n}`);return report();};
   const journalMetadata=async()=>{
@@ -225,6 +249,7 @@ try {
     check(result.contains===false&&Number.isSafeInteger(result.records)&&result.records>0&&Number.isSafeInteger(result.provider_protection)&&result.provider_protection>=0&&result.provider_protection<result.records&&Number.isSafeInteger(result.machines)&&Number.isSafeInteger(result.passes)&&result.targets===0,'authenticated unselected journal and allocation observed');
     return {records:result.records,providerProtection:result.provider_protection,machines:result.machines,passes:result.passes,targets:result.targets};
   };
+  const setOrigin=value=>invoke(value=>{document.querySelector('#tau-provider-origin').value=value;},value);
   const setKey=async keyValue=>{const n=await evaluate('reports.length');await invoke(key=>{document.querySelector('#tau-provider-key').value=key;document.querySelector('#tau-provider-key-form').requestSubmit();},keyValue);await wait(`reports.length>${n}`);check(await evaluate("document.querySelector('#tau-provider-key').value===''") ,'provider password cleared before evidence');return report();};
   const collectDispatches=async()=>{dispatches.push(...await evaluate('events.filter(e=>e.fixture_dispatch).map(e=>e.fixture_dispatch)'));await evaluate('events=events.filter(e=>!e.fixture_dispatch)');};
   const reload=async()=>{await collectDispatches();await evaluate('workers.at(-1).terminate()');await call('Page.reload',{},sessionId);await wait("reports.at(-1)?.store_state==='locked'");await invoke(()=>{document.querySelector('#tau-passphrase').value='provisioning fixture passphrase';document.querySelector('#tau-unlock').click();});await wait("reports.at(-1)?.store_state==='unlocked'");check(!(await report()).provider_configuration.key_set,'reload clears provider custody');const before=Object.values(counts).reduce((a,b)=>a+b,0);const refused=await action({action:'catalogue'});check(refused.store_error?.includes('Re-enter'),'provider reads require fresh key entry after reload');check(Object.values(counts).reduce((a,b)=>a+b,0)===before,'keyless reload sends no provider traffic');};
@@ -232,7 +257,9 @@ try {
   await invoke(()=>{document.querySelector('#tau-passphrase').value=document.querySelector('#tau-confirm').value='provisioning fixture passphrase';document.querySelector('#tau-create').click();});
   await wait("!document.querySelector('#tau-seed-backup-answer').disabled");await click('#tau-seed-backup-answer');await wait("!document.querySelector('#tau-seed-backup-skip').disabled");await click('#tau-seed-backup-skip');await wait("!document.querySelector('#tau-provider-key-form button').disabled");
   const beforeAccountEntry=await journalMetadata();
+  if(originCase)await setOrigin(providerOrigin+'/');
   check(!(await setKey(secret)).store_error,'provider key accepted');
+  if(originCase){check((await report()).provider_configuration.origin===providerOrigin,'entered origin normalized by worker');originChecks++;}
   assert.deepEqual(await journalMetadata(),beforeAccountEntry,'account entry keeps private-key scan material out of the journal');
   let current=await action({action:'catalogue'});if(scenario==='missing-limits'){check(current.store_error&&!current.provider_catalogue,'missing limits object refuses catalogue before approval');check(!Object.values(effects).some(Boolean),'missing limits creates no provider effect');missingLimitsRefusals++;fixed.limits={};current=await action({action:'catalogue'});check(current.store_error&&!current.provider_catalogue,'missing custom limits object refuses catalogue before approval');missingLimitsRefusals++;custom.limits={};current=await action({action:'catalogue'});}if(!current.provider_catalogue)throw Error(JSON.stringify({reason:current.store_error,counts,errors}));  check(current.provider_catalogue.offers.templates.length===2,'actual catalogue fetched');
   check(await evaluate("[...document.querySelectorAll('#tau-provider-offer option')].some(o=>o.textContent.includes('London'))"),'London selectable');
@@ -254,7 +281,7 @@ try {
       check(ordinaryRefusal(refused)&&!refused.provider_catalogue,'prior request signature refused after worker reload');signatureReloadChecks++;
       refused=await action({action:'select',choice:{offer_id:1,image_id:3,resources:null}});
       check(ordinaryRefusal(refused)&&noSelection(refused),'encoded request signature refused before selection or approval');
-      refused=await action({action:'approve',approval:{machine:'machine-a',relay:fixtureInfo.relay,class_answer:'no',approve_charge:true,approve_maintained_access:true}});
+      refused=await action({action:'approve',approval:{origin:(await report()).provider_configuration.origin,machine:'machine-a',relay:fixtureInfo.relay,class_answer:'no',approve_charge:true,approve_maintained_access:true}});
       check(refused.store_state==='unlocked'&&refused.store_error==='Invalid provisioning request.'&&noSelection(refused),'unsafe signature evidence cannot become an approved entry');
       assert.deepEqual(nonProtectionJournal(await journalMetadata()),beforeSignatureProbes,'signature refusals preserve every non-protection journal record and allocation');
     }
@@ -281,7 +308,38 @@ try {
     const choice={offer_id:isCustom?2:1,image_id:3,resources:isCustom?resources:null};
     await sleep(1100);let submitted=await evaluate('reports.length');
     await invoke((choice,kind)=>{document.querySelector('#tau-provider-offer').value=kind+':'+choice.offer_id;document.querySelector('#tau-provider-image').value=String(choice.image_id);document.querySelector('#tau-provider-resources').value=JSON.stringify(choice.resources??{});document.querySelector('#tau-provider-selection-form').requestSubmit();},choice,isCustom?'custom':'fixed');await wait(`reports.length>${submitted}`);current=await report();check(!current.store_error&&current.procurement.selection,'selected current price');
-    const approval={machine:'machine-a',relay:fixtureInfo.relay,class_answer:'no',approve_charge:true,approve_maintained_access:true};
+    const approval={origin:current.procurement.origin,machine:'machine-a',relay:fixtureInfo.relay,class_answer:'no',approve_charge:true,approve_maintained_access:true};
+    if(originCase){
+      check(await invoke(origin=>document.querySelector('#tau-provider-selection-view').textContent.includes(origin),providerOrigin),'plan review names normalized origin');
+      if(scenario==='origin-validation'){
+        const before=await journalMetadata(),selection=structuredClone(current.procurement.selection),requests=Object.values(counts).reduce((a,b)=>a+b,0);
+        const invalid=['','http://127.0.0.1','https://','https://@127.0.0.1','https://'+secret+'@127.0.0.1',providerOrigin+'?',providerOrigin+'#',providerOrigin+'/..',providerOrigin+'/%2e',providerOrigin+'\\',' '+providerOrigin,providerOrigin+'\t/', 'https://[::1','https://127.0.0.1:65536'];
+        for(const value of invalid){
+          await setOrigin(value);const refused=await setKey(other);
+          check(refused.store_error&&refused.procurement.origin===providerOrigin,'invalid origin preserves configured authority');
+          assert.deepEqual(refused.procurement.selection,selection,'invalid configuration preserves reviewed selection');
+          assert.deepEqual(await journalMetadata(),before,'invalid origin changes neither journal nor allocation');originChecks++;
+        }
+        const alias='a'.repeat(42)+'c',candidate=Buffer.from(alias,'base64').toString('hex');
+        await setOrigin('https://'+alias.toUpperCase()+'.invalid');const refused=await setKey(candidate);
+        check(refused.store_error?.includes('protected or unscannable')&&refused.procurement.origin===providerOrigin,'normalization cannot introduce candidate key material');
+        assert.deepEqual(await journalMetadata(),before,'normalized-key refusal preserves journal and allocation');originChecks++;
+        check(Object.values(counts).reduce((a,b)=>a+b,0)===requests&&alternateContacts===0,'invalid origins dispatch nothing');
+        check(await invoke(()=>document.querySelector('#tau-provider-origin').value===reports.at(-1).procurement.origin),'raw rejected entry cleared');
+      }
+      if(scenario==='origin-stale-review'){
+        const stale=structuredClone(approval),selection=structuredClone(current.procurement.selection);
+        await setOrigin(alternateOrigin);check(!(await setKey(secret)).store_error,'second origin configured');
+        check(!(await report()).procurement?.selection,'origin change invalidates old review');
+        current=await action({action:'select',choice});assert.deepEqual(current.procurement.selection,selection,'both origins offer identical terms');
+        const before=await journalMetadata(),requests=Object.values(counts).reduce((a,b)=>a+b,0);
+        current=await action({action:'approve',approval:stale,selection});
+        check(current.store_error?.includes('origin is stale')&&!current.procurement.phase,'stale origin consent refused at worker boundary');
+        check(Object.values(counts).reduce((a,b)=>a+b,0)===requests,'stale consent dispatches nothing');assert.deepEqual(await journalMetadata(),before);
+        await setOrigin(providerOrigin);await setKey(secret);current=await action({action:'select',choice});
+        allowedAlternateContacts=alternateContacts;check(allowedAlternateContacts>0,'second loopback provider actually observed during review');originChecks++;
+      }
+    }
     if(scenario==='approval-authority'){
       const setInference=async key=>{const n=await evaluate('reports.length');await invoke((url,key)=>{document.querySelector('#tau-poc-endpoint').value=url;document.querySelector('#tau-poc-model').value='fixture-a';document.querySelector('#tau-poc-key').value=key;document.querySelector('#tau-poc-inference-form').requestSubmit();},providerOrigin+'/inference',key);await wait(`reports.length>${n}&&reports.at(-1)?.poc_configuration?.key_set`);};
       const retained='retained-inference-key-9751';await setInference(retained);await setInference(inference);
@@ -312,6 +370,13 @@ try {
       await sleep(1100);submitted=await evaluate('reports.length');await invoke(approval=>{for(const [name,value]of Object.entries({machine:approval.machine,relay:approval.relay,class:approval.class_answer}))document.querySelector('#tau-provider-'+name).value=value;document.querySelector('#tau-provider-approve-charge').checked=document.querySelector('#tau-provider-approve-access').checked=true;document.querySelector('#tau-provider-approval-form').requestSubmit();},approval);await wait(`reports.length>${submitted}`);current=await report();check(!current.store_error&&current.procurement.phase==='approved','exact configuration durably approved');
       check((await control({inspect:true})).contacts===0,'no contact before published pin');
       const identity=current.procurement.identity;
+      if(originCase){
+        await setOrigin(alternateOrigin);await setKey(secret);
+        check((await report()).procurement.origin===providerOrigin,'entry cannot redirect approved Purchase');
+        await reload();await setOrigin(alternateOrigin);await setKey(secret);
+        current=await report();check(current.procurement.origin===providerOrigin,'reload and different field retain bound origin');
+        assert.deepEqual(current.procurement.identity,identity);originChecks++;
+      }
       const selectedAtApproval=structuredClone(current.procurement.selection);
       const publicKeys=current.procurement.public_keys;
       if(scenario.includes('-terms')||scenario.includes('-config')){
@@ -525,7 +590,10 @@ try {
             if(scenario==='publication'){check(current.store_error.includes('published host key'),'empty publication truthfully waits');check(!current.poc_targets?.length,'empty publication cannot contact');publication=true;current=await action({action:'resume'});}
             check(current.procurement.phase==='handed_off','published pin handoff');check(current.poc_targets[0].pin===hostPin&&current.poc_targets[0].host==='192.0.2.10'&&current.poc_targets[0].user==='arch'&&current.poc_targets[0].elevation==='sudo -n','actual pinned immutable target');assert.deepEqual(current.procurement.identity,identity);
             check((await control({inspect:true})).contacts===0,'no contact before ordinary relay and runner approvals');
-            await reload();await setKey(secret);current=await action({action:'resume'});check(current.procurement.phase==='handed_off','handoff reload replays same target');
+            const savedTarget=structuredClone(current.procurement.target);
+            if(originCase)check(current.procurement.publication.origin===providerOrigin,'Handoff provenance uses bound origin');
+            await reload();if(originCase)await setOrigin(alternateOrigin);await setKey(secret);current=await action({action:'resume'});check(current.procurement.phase==='handed_off','handoff reload replays same target');
+            if(originCase){assert.deepEqual(current.procurement.target,savedTarget);assert.deepEqual(current.procurement.identity,identity);check(current.procurement.origin===providerOrigin&&current.procurement.publication.origin===providerOrigin,'replayed Handoff retains authority');originChecks++;}
             await control({keys:current.procurement.public_keys});
             await invoke(()=>[...document.querySelectorAll('#tau-poc-targets button')].find(b=>b.textContent==='Bind machine-a').click());await wait("document.querySelector('[data-goal-enter]')");
             await invoke(()=>{document.querySelector('[data-goal-text]').value='Check a small service';document.querySelector('[data-goal-enter]').click();});await wait("document.querySelector('[data-goal-accept]')");
@@ -563,7 +631,7 @@ try {
   await evaluate('events=events.filter(e=>!e.fixture_journal_batch)');await message({fixture:{journalNeedles}});
   const journalResult=await wait('events.find(e=>e.fixture_journal_batch)?.fixture_journal_batch');
   check(journalResult.available===true&&journalResult.checked===journalNeedles.length&&journalResult.contains===false,'authenticated durable entries contain no credentials or encoded request material');
-  await collectDispatches();check(!errors.length,'all provider transport and schema checks passed');for(const route of mutationRoutes)check(count(route)===(effects[route]??0)+(replays[route]??0)+(refusals[route]??0),'every raw mutation has one disposition: '+route);
+  await collectDispatches();if(originCase){check(alternateContacts===allowedAlternateContacts,'wrong origin receives no bound-Purchase traffic');check(dispatches.filter(d=>mutationRoutes.includes(d.method+' '+d.path)).every(d=>d.origin===providerOrigin),'all mutations dispatched to bound origin');originChecks++;}check(!errors.length,'all provider transport and schema checks passed');for(const route of mutationRoutes)check(count(route)===(effects[route]??0)+(replays[route]??0)+(refusals[route]??0),'every raw mutation has one disposition: '+route);
   if(scenario.startsWith('counter-')){check(mutationDispatches()[invoiceRoute]===2,'second application invocation observed, including identical bytes');assert.throws(enforceCounts,/at most one application dispatch/);if(scenario==='counter-identical')check(replays[invoiceRoute]===1&&effects[invoiceRoute]===1,'identical second application invocation rejected before second effect');else check(!replays[invoiceRoute]&&effects[invoiceRoute]===2,'fresh second invocation is an independent accepted effect, never a replay');}else enforceCounts();
   const beforeLock=await report();
   await evaluate('events=events.filter(e=>!Object.hasOwn(e,"fixture_provider_custody"))');
@@ -578,7 +646,7 @@ try {
   await message({fixture:{providerCustody:'locked_worker'}});
   const lockedCustody=await wait("events.find(e=>e.fixture_provider_custody_point==='locked_worker')");
   assert.equal(lockedCustody.fixture_provider_custody,false,'new locked worker has no provider custody');
-  console.log(JSON.stringify({scenario,rawHttp:counts,applicationDispatches:mutationDispatches(),replayRejections:replays,nonReplayRefusals:refusals,acceptedEffects:effects,distinctAcceptedAuthorizations:used.size,mutationIntents:mutationRoutes.map(route=>({operation:route.includes('/ssh-key')?'registration':route.includes('/renew?')?'initial_invoice':'create',identity:beforeLock.procurement?.identity??null,route,dispatches:mutationDispatches()[route],rawTransmissions:count(route),replayRejections:replays[route]??0,acceptedEffects:effects[route]??0})),traffic:{preflight:Object.entries(counts).filter(([route])=>route.startsWith('OPTIONS ')).reduce((n,[,count])=>n+count,0),reads:Object.entries(counts).filter(([route])=>!route.startsWith('OPTIONS ')&&!mutationRoutes.includes(route)).reduce((n,[,count])=>n+count,0),mutations:mutationRoutes.reduce((n,route)=>n+count(route),0),total:Object.values(counts).reduce((n,count)=>n+count,0)},vm:beforeLock.procurement?.vm_id??null,payment:beforeLock.procurement?.payment?.id??null,phase:beforeLock.procurement?.phase??null,clockEvidence:{providerOffsetSeconds,creationOffsetSeconds},billing:beforeLock.procurement?.billing??null,deadlineMeasurement,transferChecks,missingLimitsRefusals,inheritedCapChecks,signatureEncodingChecks,signatureReloadChecks,cpuAttributeChecks:cpuCase?cpuVariants.length:0,providerCustody:{beforeLock:beforeCustody.fixture_provider_custody,endingWorker:endingCustody.fixture_provider_custody,lockedWorker:lockedCustody.fixture_provider_custody},cspPreserved:true,checks:scenario.startsWith('counter-')?'counter detected the deliberate violation':'passed'}));
+  console.log(JSON.stringify({scenario,rawHttp:counts,applicationDispatches:mutationDispatches(),replayRejections:replays,nonReplayRefusals:refusals,acceptedEffects:effects,distinctAcceptedAuthorizations:used.size,mutationIntents:mutationRoutes.map(route=>({operation:route.includes('/ssh-key')?'registration':route.includes('/renew?')?'initial_invoice':'create',identity:beforeLock.procurement?.identity??null,route,dispatches:mutationDispatches()[route],rawTransmissions:count(route),replayRejections:replays[route]??0,acceptedEffects:effects[route]??0})),traffic:{preflight:Object.entries(counts).filter(([route])=>route.startsWith('OPTIONS ')).reduce((n,[,count])=>n+count,0),reads:Object.entries(counts).filter(([route])=>!route.startsWith('OPTIONS ')&&!mutationRoutes.includes(route)).reduce((n,[,count])=>n+count,0),mutations:mutationRoutes.reduce((n,route)=>n+count(route),0),total:Object.values(counts).reduce((n,count)=>n+count,0)},vm:beforeLock.procurement?.vm_id??null,payment:beforeLock.procurement?.payment?.id??null,phase:beforeLock.procurement?.phase??null,clockEvidence:{providerOffsetSeconds,creationOffsetSeconds},billing:beforeLock.procurement?.billing??null,originEvidence:{fieldPath:originCase,legacyOverride:!originCase,checks:originChecks,bound:beforeLock.procurement?.origin,alternateContacts,allowedAlternateContacts},deadlineMeasurement,transferChecks,missingLimitsRefusals,inheritedCapChecks,signatureEncodingChecks,signatureReloadChecks,cpuAttributeChecks:cpuCase?cpuVariants.length:0,providerCustody:{beforeLock:beforeCustody.fixture_provider_custody,endingWorker:endingCustody.fixture_provider_custody,lockedWorker:lockedCustody.fixture_provider_custody},cspPreserved:true,checks:scenario.startsWith('counter-')?'counter detected the deliberate violation':'passed'}));
   await call('Browser.close');await once(browser,'exit');socket.close();
   fixture.stdin.write('{"stop":true}\n');await once(fixture,'exit');
 } finally {
@@ -586,6 +654,6 @@ try {
   if(browser?.exitCode===null){browser.kill('SIGTERM');await once(browser,'exit');}
   if(fixture?.exitCode===null){fixture.stdin.write('{"stop":true}\n');await once(fixture,'exit');}
   socket?.close();
-  for(const server of [provider,page])if(server){server.closeAllConnections();await new Promise(r=>server.close(r));}
-  await rm(temp,{recursive:true,force:true});
+  for(const server of [provider,alternateProvider,page])if(server){server.closeAllConnections();await new Promise(r=>server.close(r));}
+  await rm(temp,{recursive:true,force:true,maxRetries:5,retryDelay:100});
 }

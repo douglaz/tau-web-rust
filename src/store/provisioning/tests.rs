@@ -38,6 +38,9 @@ struct Fixture {
     created: Option<String>,
     advance_before_create: u64,
     calls: Vec<String>,
+    urls: Vec<String>,
+    signed_requests: Vec<Value>,
+    record_signatures: bool,
     machines: Vec<Value>,
     payments: Vec<Value>,
     lose_create: bool,
@@ -64,6 +67,9 @@ impl Fixture {
             created: None,
             advance_before_create: 0,
             calls: Vec::new(),
+            urls: Vec::new(),
+            signed_requests: Vec::new(),
+            record_signatures: false,
             machines: Vec::new(),
             payments: Vec::new(),
             lose_create: false,
@@ -83,8 +89,32 @@ impl Api for Fixture {
         &mut self,
         method: &str,
         path: &str,
-        _: Option<&Value>,
+        body: Option<&Value>,
     ) -> Result<Option<crate::poc::inference::EchoFingerprints>, String> {
+        if self.record_signatures {
+            let auth = protocol::Account::parse(hex::encode([7; 32]).as_bytes())
+                .unwrap()
+                .authorization(
+                    path,
+                    method,
+                    body.map(Value::to_string).as_deref().map(str::as_bytes),
+                    self.clock,
+                    &[5; 32],
+                )
+                .unwrap();
+            self.signed_requests.push(
+                serde_json::from_slice(
+                    &base64::engine::general_purpose::STANDARD
+                        .decode(auth.strip_prefix("Nostr ").unwrap())
+                        .unwrap(),
+                )
+                .unwrap(),
+            );
+        }
+        let path = path
+            .split_once("/api/v1/")
+            .map(|(_, p)| format!("/api/v1/{p}"))
+            .ok_or(REFUSED)?;
         if self
             .protection_fault
             .as_ref()
@@ -118,8 +148,19 @@ impl Api for Fixture {
         path: &str,
         _body: Option<Value>,
     ) -> Result<Value, String> {
+        self.urls.push(path.into());
+        if self.record_signatures {
+            assert_eq!(
+                self.signed_requests.last().unwrap()["tags"][0],
+                json!(["u", path])
+            );
+        }
+        let path = path
+            .split_once("/api/v1/")
+            .map(|(_, p)| format!("/api/v1/{p}"))
+            .ok_or(REFUSED)?;
         self.calls.push(format!("{method} {path}"));
-        let result = match (method, path) {
+        let result = match (method, path.as_str()) {
             ("GET", "/api/v1/vm/templates") => {
                 if self.fail_catalogue {
                     return Err("catalogue unavailable".into());
@@ -225,6 +266,7 @@ fn approve(s: &mut Store<MemoryStorage>, api: &mut Fixture) {
     block_on(s.procurement_approve(
         api,
         Approval {
+            origin: s.procurement_origin().into(),
             machine: "machine-a".into(),
             relay: "wss://relay.invalid/".into(),
             class_answer: ClassAnswer::No,
@@ -545,6 +587,7 @@ fn provisioning_fresh_store_preserves_report_shape_until_selection() {
 
 fn approval() -> Approval {
     Approval {
+        origin: protocol::ORIGIN.into(),
         machine: "machine-a".into(),
         relay: "wss://relay.invalid/".into(),
         class_answer: ClassAnswer::No,
@@ -961,7 +1004,7 @@ fn handoff(p: &Purchase) -> Record {
             elevation: crate::jobs::Elevation::SudoNoninteractive,
             pin,
         },
-        publication: json!({"origin":protocol::ORIGIN,"vm_id":vm["id"],"created":vm["created"],"selected_key":key,"host_ssh_keys":vm["host_ssh_keys"]}),
+        publication: json!({"origin":p.origin,"vm_id":vm["id"],"created":vm["created"],"selected_key":key,"host_ssh_keys":vm["host_ssh_keys"]}),
     }
 }
 
@@ -2014,4 +2057,356 @@ fn provisioning_request_fingerprint_wire_format_roundtrips_fixed_length_digests(
             serde_json::from_value::<crate::poc::inference::EchoFingerprints>(malformed).is_err()
         );
     }
+}
+
+fn configure_origin(s: &mut Store<MemoryStorage>, origin: &str) {
+    let secret = hex::encode([7; 32]);
+    let account = protocol::Account::parse(secret.as_bytes()).unwrap();
+    s.procurement_configure(&account, secret.as_bytes(), origin)
+        .unwrap();
+}
+
+#[test]
+fn provisioning_origin_invalid_configuration_is_atomic_and_credential_safe() {
+    let mut s = ready();
+    let secret = hex::encode([7; 32]);
+    let account = protocol::Account::parse(secret.as_bytes()).unwrap();
+    configure_origin(&mut s, "https://first.invalid:8443/");
+    let mut api = Fixture::new(false);
+    api.account = account.public();
+    block_on(s.procurement_select(
+        &mut api,
+        Choice {
+            offer_id: 1,
+            image_id: 3,
+            resources: None,
+        },
+    ))
+    .unwrap();
+    let selection = s.procurement_selection.clone();
+    let files = s.storage.files();
+    let allocation = s.allocation().clone();
+    let requests = api.calls.len();
+    s.poc_credential_filters
+        .push(crate::poc::inference::EchoFilter::new(&[b"guarded-origin"]));
+    for input in [
+        "https://@second.invalid",
+        "https://second.invalid?",
+        "https://second.invalid/..",
+        "https://guarded-origin.invalid",
+    ] {
+        let reason = s
+            .procurement_configure(&account, secret.as_bytes(), input)
+            .unwrap_err();
+        assert!(!reason.contains(input));
+        assert_eq!(s.procurement_origin(), "https://first.invalid:8443");
+        assert_eq!(s.procurement_selection, selection);
+        assert_eq!(s.storage.files(), files);
+        assert_eq!(s.allocation(), &allocation);
+        assert_eq!(api.calls.len(), requests);
+        assert!(s.procurement.is_none());
+    }
+    let alias = base64::engine::general_purpose::STANDARD_NO_PAD.encode([7; 32]);
+    assert!(
+        s.procurement_configure(
+            &account,
+            secret.as_bytes(),
+            &format!("https://{alias}.invalid")
+        )
+        .is_err()
+    );
+    assert_eq!(s.procurement_origin(), "https://first.invalid:8443");
+    assert_eq!(s.storage.files(), files);
+}
+
+#[test]
+fn provisioning_origin_stale_consent_cannot_cross_identical_providers() {
+    let mut s = ready();
+    let mut api = Fixture::new(false);
+    configure_origin(&mut s, "https://first.invalid");
+    let choice = || Choice {
+        offer_id: 1,
+        image_id: 3,
+        resources: None,
+    };
+    block_on(s.procurement_select(&mut api, choice())).unwrap();
+    let mut old = approval();
+    old.origin = s.procurement_origin().into();
+    let selected = s.procurement_selection.clone();
+    configure_origin(&mut s, "https://second.invalid");
+    assert!(s.procurement_selection.is_none());
+    block_on(s.procurement_select(&mut api, choice())).unwrap();
+    assert_eq!(selected, s.procurement_selection);
+    let before = s.storage.files();
+    let allocation = s.allocation().clone();
+    let calls = api.calls.len();
+    assert!(
+        block_on(s.procurement_approve(&mut api, old))
+            .unwrap_err()
+            .contains("origin is stale")
+    );
+    assert_eq!(api.calls.len(), calls);
+    assert_eq!(s.storage.files(), before);
+    assert_eq!(s.allocation(), &allocation);
+    assert!(s.procurement.is_none());
+    let mut current = approval();
+    current.origin = s.procurement_origin().into();
+    block_on(s.procurement_approve(&mut api, current)).unwrap();
+    assert_eq!(
+        s.procurement.as_ref().unwrap().origin,
+        "https://second.invalid"
+    );
+}
+
+#[test]
+fn provisioning_origin_every_route_signed_and_bound_across_resume_reapproval() {
+    for custom in [false, true] {
+        let mut s = ready();
+        let mut api = Fixture::new(custom);
+        api.record_signatures = true;
+        api.account = protocol::Account::parse(hex::encode([7; 32]).as_bytes())
+            .unwrap()
+            .public();
+        configure_origin(&mut s, "https://bound.invalid:18443/");
+        approve(&mut s, &mut api);
+        let original = s.procurement.clone().unwrap();
+        configure_origin(&mut s, "https://wrong.invalid");
+        assert_eq!(s.procurement_origin(), original.origin);
+        api.current_selection.charge.amount += 1;
+        if !custom {
+            api.current_selection.offer["cost_plan"]["amount"] =
+                json!(api.current_selection.charge.amount);
+        }
+        assert!(block_on(s.procurement_resume(&mut api, false)).is_err());
+        let mut loaded = reopen(&s);
+        configure_origin(&mut loaded, "https://another.invalid");
+        let mut renewed = approval();
+        renewed.origin = original.origin.clone();
+        block_on(loaded.procurement_approve(&mut api, renewed)).unwrap();
+        assert_eq!(
+            loaded.procurement.as_ref().unwrap().identity,
+            original.identity
+        );
+        assert_eq!(
+            loaded.procurement.as_ref().unwrap().relay_identity,
+            original.relay_identity
+        );
+        assert!(issue_invoice(&mut loaded, &mut api).is_err());
+        api.payments[0]["is_paid"] = json!(true);
+        block_on(loaded.procurement_resume(&mut api, false)).unwrap();
+        assert_eq!(
+            loaded.procurement_view()["publication"]["origin"],
+            original.origin
+        );
+        let target = loaded.poc_target("machine-a").cloned();
+        let mut replayed = reopen(&loaded);
+        configure_origin(&mut replayed, "https://wrong.invalid");
+        block_on(replayed.procurement_catalogue(&mut api)).unwrap();
+        block_on(replayed.procurement_resume(&mut api, false)).unwrap();
+        assert_eq!(replayed.poc_target("machine-a").cloned(), target);
+        assert_eq!(
+            replayed.procurement.as_ref().unwrap().origin,
+            original.origin
+        );
+        // Registration reconciliation is another bound read, with no registration resend.
+        let mut uncertain = ready();
+        configure_origin(&mut uncertain, &original.origin);
+        let mut lost = Fixture::new(custom);
+        lost.record_signatures = true;
+        lost.account = api.account.clone();
+        lost.lose_registration = true;
+        approve(&mut uncertain, &mut lost);
+        assert!(block_on(uncertain.procurement_resume(&mut lost, false)).is_err());
+        uncertain = reopen(&uncertain);
+        configure_origin(&mut uncertain, "https://wrong.invalid");
+        assert!(block_on(uncertain.procurement_resume(&mut lost, false)).is_err());
+        assert_eq!(lost.count("POST /api/v1/ssh-key"), 1);
+        assert_eq!(lost.count("GET /api/v1/ssh-key"), 1);
+        let urls: Vec<_> = api.urls.iter().chain(&lost.urls).collect();
+        for url in urls {
+            assert!(
+                url.starts_with("https://bound.invalid:18443/api/v1/"),
+                "wrong origin: {url}"
+            );
+        }
+        for event in api.signed_requests.iter().chain(&lost.signed_requests) {
+            crate::relay_auth::verify_signature(event).unwrap();
+            assert!(
+                event["tags"][0][1]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("https://bound.invalid:18443/api/v1/")
+            );
+        }
+        for route in [
+            "GET /api/v1/vm/templates",
+            "GET /api/v1/image",
+            "POST /api/v1/ssh-key",
+            "GET /api/v1/vm",
+            "GET /api/v1/vm/11",
+            "GET /api/v1/vm/11/payments?limit=100&offset=0",
+            "GET /api/v1/vm/11/renew/quote?method=lightning&intervals=1",
+            "GET /api/v1/vm/11/renew?method=lightning&intervals=1",
+            "GET /api/v1/payment/aabb",
+        ] {
+            assert!(api.count(route) > 0, "route not covered: {route}");
+        }
+        let create = if custom {
+            "POST /api/v1/vm/custom-template"
+        } else {
+            "POST /api/v1/vm"
+        };
+        assert_eq!(api.count(create), 1);
+        assert_eq!(api.count("POST /api/v1/ssh-key"), 1);
+        assert_eq!(
+            api.count("GET /api/v1/vm/11/renew?method=lightning&intervals=1"),
+            1
+        );
+        if custom {
+            assert!(api.count("POST /api/v1/vm/custom-template/price") > 0);
+        }
+    }
+}
+
+/// Rewrite authenticated fixture records with fresh nonces and a complete hash chain.
+fn origin_journal(s: &Store<MemoryStorage>, mut edit: impl FnMut(&mut Value)) -> MemoryStorage {
+    let storage = MemoryStorage::with_files(s.storage.files());
+    let mut previous = hex::encode([0u8; 32]);
+    for n in s.records() {
+        let mut record: RecordJson =
+            serde_json::from_slice(&s.storage.files()[&n.to_string()]).unwrap();
+        let nonce: [u8; 12] = decode("nonce", &record.nonce).unwrap();
+        let plaintext = cipher(&s.key.0)
+            .decrypt(
+                &nonce.into(),
+                Payload {
+                    msg: &URL_SAFE_NO_PAD.decode(&record.ciphertext).unwrap(),
+                    aad: record_aad(&s.id, EVENT, n, &record.previous).as_bytes(),
+                },
+            )
+            .unwrap();
+        let mut value: Value = serde_json::from_slice(&plaintext).unwrap();
+        edit(&mut value);
+        let nonce: [u8; 12] = random().unwrap();
+        record.previous = previous;
+        record.nonce = URL_SAFE_NO_PAD.encode(nonce);
+        record.ciphertext = URL_SAFE_NO_PAD.encode(
+            cipher(&s.key.0)
+                .encrypt(
+                    &nonce.into(),
+                    Payload {
+                        msg: &serde_json::to_vec(&value).unwrap(),
+                        aad: record_aad(&s.id, EVENT, n, &record.previous).as_bytes(),
+                    },
+                )
+                .unwrap(),
+        );
+        let bytes = serde_json::to_vec(&record).unwrap();
+        block_on(storage.write(&n.to_string(), &bytes)).unwrap();
+        previous = hex::encode(Sha256::digest(bytes));
+    }
+    storage
+}
+
+#[test]
+fn provisioning_origin_legacy_missing_field_replays_complete_old_handoff() {
+    let mut s = ready();
+    let mut api = Fixture::new(false);
+    approve(&mut s, &mut api);
+    assert!(issue_invoice(&mut s, &mut api).is_err());
+    api.payments[0]["is_paid"] = json!(true);
+    block_on(s.procurement_resume(&mut api, false)).unwrap();
+    let mut removed = 0;
+    let storage = origin_journal(&s, |event| {
+        if let Some(p) = event.pointer_mut("/procurement/approved") {
+            assert_eq!(
+                p.as_object_mut().unwrap().remove("origin").unwrap(),
+                protocol::ORIGIN
+            );
+            removed += 1;
+        }
+    });
+    assert_eq!(removed, 1);
+    let loaded = block_on(unlock(storage, &Fixed, pass())).unwrap();
+    assert_eq!(loaded.procurement, s.procurement);
+    assert_eq!(loaded.procurement_origin(), protocol::ORIGIN);
+    assert_eq!(loaded.poc_target("machine-a"), s.poc_target("machine-a"));
+}
+
+#[test]
+fn provisioning_origin_explicit_invalid_refuses_replay() {
+    let mut s = ready();
+    let mut api = Fixture::new(false);
+    configure_origin(&mut s, "https://bound.invalid:18443");
+    approve(&mut s, &mut api);
+    for origin in [
+        "",
+        "http://bad.invalid",
+        "https://bad.invalid/..",
+        "https://@bad.invalid",
+        "https://bad.invalid?",
+        "https://bound.invalid:18443/",
+    ] {
+        let storage = origin_journal(&s, |event| {
+            if let Some(p) = event.pointer_mut("/procurement/approved") {
+                p["origin"] = json!(origin);
+            }
+        });
+        assert!(
+            block_on(unlock(storage, &Fixed, pass())).is_err(),
+            "invalid stored origin admitted: {origin}"
+        );
+    }
+    assert_eq!(reopen(&s).procurement, s.procurement);
+}
+
+#[test]
+fn provisioning_origin_foreign_publication_refuses_replay() {
+    let mut s = ready();
+    let mut api = Fixture::new(false);
+    configure_origin(&mut s, "https://bound.invalid:18443");
+    approve(&mut s, &mut api);
+    assert!(issue_invoice(&mut s, &mut api).is_err());
+    api.payments[0]["is_paid"] = json!(true);
+    block_on(s.procurement_resume(&mut api, false)).unwrap();
+    let storage = origin_journal(&s, |event| {
+        if let Some(p) = event.pointer_mut("/procurement/handoff/publication") {
+            p["origin"] = json!(protocol::ORIGIN);
+        }
+    });
+    assert!(
+        block_on(unlock(storage, &Fixed, pass())).is_err(),
+        "foreign publication origin cannot establish a target"
+    );
+    assert_eq!(
+        reopen(&s).poc_target("machine-a"),
+        s.poc_target("machine-a")
+    );
+}
+
+#[test]
+fn provisioning_origin_normalization_cannot_introduce_candidate_key_material() {
+    let mut s = ready();
+    configure_origin(&mut s, "https://first.invalid:8443");
+    let before = s.storage.files();
+    let allocation = s.allocation().clone();
+    let alias = format!("{}c", "a".repeat(42));
+    let raw = base64::engine::general_purpose::STANDARD_NO_PAD
+        .decode(&alias)
+        .unwrap();
+    let secret = hex::encode(&raw);
+    let account = protocol::Account::parse(secret.as_bytes()).unwrap();
+    let input = format!("https://{}.invalid", alias.to_uppercase());
+    assert_eq!(
+        protocol::provider_origin(&input).unwrap(),
+        format!("https://{alias}.invalid")
+    );
+    let reason = s
+        .procurement_configure(&account, secret.as_bytes(), &input)
+        .expect_err("normalized origin must not introduce an encoded provider scalar");
+    assert!(reason.contains("protected or unscannable"));
+    assert_eq!(s.procurement_origin(), "https://first.invalid:8443");
+    assert_eq!(s.storage.files(), before);
+    assert_eq!(s.allocation(), &allocation);
+    assert!(s.procurement.is_none());
 }

@@ -12,6 +12,8 @@ use crate::poc::targets::TargetRecord;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Purchase {
+    #[serde(default = "protocol::default_origin")]
+    pub origin: String,
     pub machine: String,
     pub identity: Identity,
     pub relay_identity: Identity,
@@ -77,6 +79,7 @@ pub enum Record {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Approval {
+    pub origin: String,
     pub machine: String,
     pub relay: String,
     pub class_answer: ClassAnswer,
@@ -126,6 +129,36 @@ impl<S: Storage> Store<S> {
         }
         Ok(())
     }
+    pub(crate) fn procurement_origin(&self) -> &str {
+        self.procurement
+            .as_ref()
+            .map_or(&self.provider_origin, |p| &p.origin)
+    }
+    pub(crate) fn procurement_configure(
+        &mut self,
+        account: &protocol::Account,
+        secret: &[u8],
+        origin: &str,
+    ) -> Result<(), String> {
+        let normalized = protocol::provider_origin(origin)?;
+        self.procurement_account(&account.public())?;
+        let filter = account.filter(secret);
+        if !crate::poc::inference::safe(self, &json!([origin, normalized]), &[secret]) {
+            return Err("Provider origin contains protected or unscannable material.".into());
+        }
+        for value in [origin, normalized.as_str()] {
+            if filter.protect_bytes(value.as_bytes())?.as_slice() != value.as_bytes() {
+                return Err("Provider origin contains protected or unscannable material.".into());
+            }
+        }
+        // A bound Purchase always wins, including after re-entry with another field value.
+        if self.procurement.is_none() && self.provider_origin != normalized {
+            self.procurement_selection = None;
+            self.provider_origin = normalized;
+        }
+        self.remember_provider_filter(filter);
+        Ok(())
+    }
     fn check_api(&self, api: &impl Api) -> Result<(), String> {
         api.current()?;
         self.procurement_account(&api.account())
@@ -138,11 +171,12 @@ impl<S: Storage> Store<S> {
         body: Option<Value>,
     ) -> Result<Value, String> {
         self.check_api(api)?;
-        if let Some(fingerprints) = api.prepare(method, path, body.as_ref())? {
+        let url = protocol::request_url(self.procurement_origin(), path)?;
+        if let Some(fingerprints) = api.prepare(method, &url, body.as_ref())? {
             self.protect_provider_request(fingerprints).await?;
         }
         self.check_api(api)?;
-        let result = api.request(method, path, body).await;
+        let result = api.request(method, &url, body).await;
         if let Some(filter) = api.take_filter() {
             self.remember_provider_filter(filter);
         }
@@ -164,7 +198,7 @@ impl<S: Storage> Store<S> {
     }
     pub(crate) fn procurement_view(&self) -> Value {
         let Some(p) = &self.procurement else {
-            return json!({"selection":self.procurement_selection});
+            return json!({"origin":self.procurement_origin(),"selection":self.procurement_selection});
         };
         let phase = if p.pending_selection.is_some() {
             "terms_changed"
@@ -185,7 +219,7 @@ impl<S: Storage> Store<S> {
         } else {
             "approved"
         };
-        json!({"phase":phase,"machine":p.machine,"account":p.account,"selection":p.pending_selection.as_ref().unwrap_or(&p.selected),"approved_selection":p.selected,"relay":p.relay,"class_answer":p.class_answer,"identity":p.identity,"ssh_key_id":p.ssh_key.as_ref().map(|k|&k["id"]),"vm_id":p.vm.as_ref().map(|vm|&vm["id"]),"billing":p.billing,"payment":p.payment,"auto_renewal_enabled":p.vm.as_ref().and_then(|vm|vm.get("auto_renewal_enabled")),"target":p.target,"publication":p.publication,"public_keys":self.poc_identity_public_keys(&p.machine,&p.identity).ok()})
+        json!({"origin":p.origin,"phase":phase,"machine":p.machine,"account":p.account,"selection":p.pending_selection.as_ref().unwrap_or(&p.selected),"approved_selection":p.selected,"relay":p.relay,"class_answer":p.class_answer,"identity":p.identity,"ssh_key_id":p.ssh_key.as_ref().map(|k|&k["id"]),"vm_id":p.vm.as_ref().map(|vm|&vm["id"]),"billing":p.billing,"payment":p.payment,"auto_renewal_enabled":p.vm.as_ref().and_then(|vm|vm.get("auto_renewal_enabled")),"target":p.target,"publication":p.publication,"public_keys":self.poc_identity_public_keys(&p.machine,&p.identity).ok()})
     }
     pub(crate) async fn procurement_catalogue(
         &mut self,
@@ -294,6 +328,9 @@ impl<S: Storage> Store<S> {
         approval: Approval,
     ) -> Result<(), String> {
         self.check_api(api)?;
+        if approval.origin != self.procurement_origin() {
+            return Err("The displayed provider origin is stale; review the current origin and selection again.".into());
+        }
         // Refuse unsafe authority before selecting identities or recording approval.
         if !crate::poc::inference::safe(
             self,
@@ -359,6 +396,7 @@ impl<S: Storage> Store<S> {
                 .await;
         }
         let record = Purchase {
+            origin: self.procurement_origin().into(),
             machine: approval.machine,
             identity: self
                 .allocation()
@@ -401,6 +439,9 @@ impl<S: Storage> Store<S> {
                 return Err(REFUSED.into());
             }
             p.selected.validate()?;
+            if protocol::provider_origin(&p.origin)? != p.origin {
+                return Err(REFUSED.into());
+            }
             if p.account.len() != 64
                 || !p.account.bytes().all(|b| b.is_ascii_hexdigit())
                 || !crate::poc::targets::valid_relay(&p.relay)
@@ -603,7 +644,7 @@ impl<S: Storage> Store<S> {
                     || vm["status"]["state"] != "running"
                     || target != &expected
                     || publication
-                        != &json!({"origin":protocol::ORIGIN,"vm_id":vm["id"],"created":vm["created"],"selected_key":key,"host_ssh_keys":vm["host_ssh_keys"]})
+                        != &json!({"origin":p.origin,"vm_id":vm["id"],"created":vm["created"],"selected_key":key,"host_ssh_keys":vm["host_ssh_keys"]})
                 {
                     return Err(REFUSED.into());
                 }
@@ -968,7 +1009,7 @@ impl<S: Storage> Store<S> {
             elevation: crate::jobs::Elevation::SudoNoninteractive,
             pin,
         };
-        self.procurement_commit(Record::Handoff {target,publication:json!({"origin":protocol::ORIGIN,"vm_id":vm_id,"created":vm["created"],"selected_key":key,"host_ssh_keys":vm["host_ssh_keys"]})}).await
+        self.procurement_commit(Record::Handoff {target,publication:json!({"origin":p.origin,"vm_id":vm_id,"created":vm["created"],"selected_key":key,"host_ssh_keys":vm["host_ssh_keys"]})}).await
     }
 }
 
