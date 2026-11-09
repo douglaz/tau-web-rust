@@ -155,6 +155,12 @@ and `8352f114` returns `ApiResult<Vec<ApiVmPayment>>` through `ApiData::ok`, wit
 The upstream VM payments route is deprecated in favor of `/api/v1/subscriptions/{id}/payments`;
 this PoC keeps the VM route. No other route or response-envelope rule changes.
 
+LNVPS `10266e58` and `8352f114` assign the VM's `subscription_id` at creation, while vendor
+documentation says `null/omitted if never paid`. The page does not treat that field as billing
+evidence. Any payment-history row follows the existing suitability rules, a saved invoice intent
+prevents reissuance, and a present, non-null `expires` on the VM status read at the invoice click
+prevents initial issuance even with empty history.
+
 The page does not invent a payment-type field: VM linkage, creation, exact saved quote amount/currency/period/fees,
 `is_upgrade` and Lightning data establish suitability. Plan-price units are millisats for BTC and
 cents for EUR/USD. The authenticated Lightning quote supplies BTC millisats and the seconds for

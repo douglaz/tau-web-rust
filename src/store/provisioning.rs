@@ -837,9 +837,7 @@ impl<S: Storage> Store<S> {
             .as_ref()
             .and_then(|p| p.vm.as_ref())
             .ok_or(REFUSED)?;
-        if current.get("expires").is_some_and(|v| !v.is_null())
-            || current.get("subscription_id").is_some_and(|v| !v.is_null())
-        {
+        if current.get("expires").is_some_and(|v| !v.is_null()) {
             return Err("Existing billing evidence prevents initial invoice issuance.".into());
         }
         self.procurement_commit(Record::InvoiceSent(Invoice {

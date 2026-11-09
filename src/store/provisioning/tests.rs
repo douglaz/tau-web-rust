@@ -289,6 +289,97 @@ fn issue_invoice(s: &mut Store<MemoryStorage>, api: &mut Fixture) -> Result<(), 
     block_on(s.procurement_resume(api, true))
 }
 
+#[test]
+fn provisioning_initial_invoice_subscription_id_does_not_establish_billing() {
+    for subscription in [Some(json!(21)), None, Some(Value::Null)] {
+        let mut s = ready();
+        let mut api = Fixture::new(false);
+        approve(&mut s, &mut api);
+        assert!(
+            block_on(s.procurement_resume(&mut api, false))
+                .unwrap_err()
+                .contains("initial Lightning")
+        );
+        let p = s.procurement.as_ref().unwrap();
+        assert_eq!(p.vm.as_ref().unwrap()["subscription_id"], 21);
+        assert!(p.vm.as_ref().unwrap()["expires"].is_null());
+        assert_eq!(p.billing.as_ref().unwrap().terms, api.billing_terms);
+        assert!(p.invoice.is_none());
+        assert!(api.payments.is_empty());
+        match subscription {
+            Some(value) => api.machines[0]["subscription_id"] = value,
+            None => {
+                api.machines[0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("subscription_id");
+            }
+        }
+        let before = api.calls.len();
+        assert_eq!(
+            issue_invoice(&mut s, &mut api).unwrap_err(),
+            "Waiting for external payment of the displayed initial invoice; Refresh later."
+        );
+        let p = s.procurement.as_ref().unwrap();
+        assert!(p.invoice.is_some());
+        assert!(p.payment.is_some());
+        assert!(p.target.is_none());
+        assert_eq!(
+            api.count("GET /api/v1/vm/11/renew?method=lightning&intervals=1"),
+            1
+        );
+        let calls = &api.calls[before..];
+        let position = |route| calls.iter().position(|call| call == route).unwrap();
+        assert!(
+            position("GET /api/v1/vm/11/payments?limit=100&offset=0")
+                < position("GET /api/v1/vm/11/renew?method=lightning&intervals=1")
+        );
+        assert_eq!(reopen(&s).procurement, s.procurement);
+    }
+}
+
+#[test]
+fn provisioning_initial_invoice_fresh_expiry_prevents_issuance() {
+    let mut s = ready();
+    let mut api = Fixture::new(false);
+    approve(&mut s, &mut api);
+    assert!(
+        block_on(s.procurement_resume(&mut api, false))
+            .unwrap_err()
+            .contains("initial Lightning")
+    );
+    let p = s.procurement.as_ref().unwrap();
+    assert!(p.vm.as_ref().unwrap()["expires"].is_null());
+    assert_eq!(p.billing.as_ref().unwrap().terms, api.billing_terms);
+    assert!(p.invoice.is_none());
+    assert!(api.payments.is_empty());
+    api.machines[0]["expires"] = json!("2026-12-06T14:00:00Z");
+    let before_status = api.count("GET /api/v1/vm/11");
+    let before_history = api.count("GET /api/v1/vm/11/payments?limit=100&offset=0");
+    assert_eq!(
+        issue_invoice(&mut s, &mut api).unwrap_err(),
+        "Existing billing evidence prevents initial invoice issuance."
+    );
+    let p = s.procurement.as_ref().unwrap();
+    assert_eq!(
+        p.vm.as_ref().unwrap()["expires"],
+        api.machines[0]["expires"]
+    );
+    assert!(p.invoice.is_none());
+    assert!(p.payment.is_none());
+    assert!(api.payments.is_empty());
+    assert_eq!(api.count("GET /api/v1/vm/11"), before_status + 1);
+    assert_eq!(
+        api.count("GET /api/v1/vm/11/payments?limit=100&offset=0"),
+        before_history + 1
+    );
+    assert_eq!(
+        api.count("GET /api/v1/vm/11/renew?method=lightning&intervals=1"),
+        0
+    );
+    assert_eq!(reopen(&s).procurement, s.procurement);
+}
+
 fn history_rows(count: usize) -> Vec<Value> {
     (0..count)
         .map(|n| {

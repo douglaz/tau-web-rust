@@ -59,7 +59,7 @@ pub(crate) fn vm(selected: &Selection, vm_id: u64) -> Value {
             template["limits"]["network_mbps"] = network.clone();
         }
     }
-    json!({"id":vm_id,"created":"2026-11-06T14:00:00Z","image":selected.image,"template":template,"ssh_key":{"id":7,"name":"tau-0","created":"2026-11-06T14:00:00Z"},"ip_assignments":[{"id":1,"ip":"192.0.2.10/24","gateway":"192.0.2.1"}],"status":{"state":"running","timestamp":1793973600u64},"auto_renewal_enabled":true,"host_ssh_keys":[publication()]})
+    json!({"id":vm_id,"subscription_id":21,"expires":null,"created":"2026-11-06T14:00:00Z","image":selected.image,"template":template,"ssh_key":{"id":7,"name":"tau-0","created":"2026-11-06T14:00:00Z"},"ip_assignments":[{"id":1,"ip":"192.0.2.10/24","gateway":"192.0.2.1"}],"status":{"state":"running","timestamp":1793973600u64},"auto_renewal_enabled":true,"host_ssh_keys":[publication()]})
 }
 pub(crate) fn payment(vm: u64) -> Value {
     json!({"id":"aabb","vm_id":vm,"created":"2026-11-06T14:00:00Z","expires":"2026-11-07T14:00:00Z","amount":1000000,"tax":230000,"processing_fee":10000,"currency":"BTC","is_paid":false,"data":{"lightning":"lnbc1fixtureinvoice"},"time":2592000,"is_upgrade":false})
