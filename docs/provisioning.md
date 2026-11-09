@@ -161,6 +161,10 @@ evidence. Any payment-history row follows the existing suitability rules, a save
 prevents reissuance, and a present, non-null `expires` on the VM status read at the invoice click
 prevents initial issuance even with empty history.
 
+LNVPS `10266e58` returns nanosecond payment timestamps in the invoice reply and whole seconds
+in later reads. The page compares `created` and `expires` to the whole UTC second, dropping
+fractions, while payment id and invoice data remain exact.
+
 The page does not invent a payment-type field: VM linkage, creation, exact saved quote amount/currency/period/fees,
 `is_upgrade` and Lightning data establish suitability. Plan-price units are millisats for BTC and
 cents for EUR/USD. The authenticated Lightning quote supplies BTC millisats and the seconds for

@@ -46,6 +46,7 @@ struct Fixture {
     history_response: Option<Value>,
     lose_create: bool,
     lose_invoice: bool,
+    invoice_nanoseconds: bool,
     lose_registration: bool,
     account: String,
     clock: u64,
@@ -76,6 +77,7 @@ impl Fixture {
             history_response: None,
             lose_create: false,
             lose_invoice: false,
+            invoice_nanoseconds: false,
             lose_registration: false,
             account: "a".repeat(64),
             clock: timestamp("2026-11-06T14:00:00Z").unwrap(),
@@ -233,6 +235,10 @@ impl Api for Fixture {
                 for field in ["amount", "currency", "tax", "processing_fee", "time"] {
                     p[field] = serde_json::to_value(&self.billing_terms).unwrap()[field].clone();
                 }
+                if self.invoice_nanoseconds {
+                    p["created"] = json!("2026-11-06T14:00:00.999999999Z");
+                    p["expires"] = json!("2026-11-07T14:00:00.841873964Z");
+                }
                 self.payments.push(p.clone());
                 if self.lose_invoice {
                     Err("lost".into())
@@ -287,6 +293,178 @@ fn issue_invoice(s: &mut Store<MemoryStorage>, api: &mut Fixture) -> Result<(), 
         }
     }
     block_on(s.procurement_resume(api, true))
+}
+
+fn nanosecond_invoice() -> (Store<MemoryStorage>, Fixture) {
+    let mut s = ready();
+    let mut api = Fixture::new(false);
+    api.invoice_nanoseconds = true;
+    approve(&mut s, &mut api);
+    assert!(
+        issue_invoice(&mut s, &mut api)
+            .unwrap_err()
+            .contains("Waiting for external payment")
+    );
+    assert_eq!(
+        s.procurement.as_ref().unwrap().payment,
+        Some(api.payments[0].clone())
+    );
+    (s, api)
+}
+
+fn whole_second_reading(api: &mut Fixture) {
+    api.payments[0]["created"] = json!("2026-11-06T14:00:00Z");
+    api.payments[0]["expires"] = json!("2026-11-07T14:00:00Z");
+}
+
+#[test]
+fn provisioning_payment_timestamps_truncate_through_handoff_and_replay() {
+    let (mut s, mut api) = nanosecond_invoice();
+    let purchase = s.procurement.clone().unwrap();
+    whole_second_reading(&mut api);
+    assert!(
+        block_on(s.procurement_resume(&mut api, false))
+            .unwrap_err()
+            .contains("Waiting for external payment")
+    );
+    assert_eq!(
+        s.procurement.as_ref().unwrap().payment,
+        Some(api.payments[0].clone())
+    );
+    api.payments[0]["is_paid"] = json!(true);
+    block_on(s.procurement_resume(&mut api, false)).unwrap();
+    let mut loaded = reopen(&s);
+    assert_eq!(loaded.procurement, s.procurement);
+    block_on(loaded.procurement_resume(&mut api, false)).unwrap();
+    let accepted = loaded.procurement.as_ref().unwrap();
+    assert_eq!(accepted.payment, Some(api.payments[0].clone()));
+    assert_eq!(accepted.identity, purchase.identity);
+    assert_eq!(accepted.relay_identity, purchase.relay_identity);
+    assert_eq!(accepted.machine, purchase.machine);
+    assert_eq!(accepted.invoice, purchase.invoice);
+    assert_eq!(
+        accepted.vm.as_ref().unwrap()["id"],
+        purchase.vm.as_ref().unwrap()["id"]
+    );
+    assert_eq!(
+        accepted.payment.as_ref().unwrap()["id"],
+        purchase.payment.as_ref().unwrap()["id"]
+    );
+    assert_eq!(loaded.poc_target("machine-a").unwrap().host, "192.0.2.10");
+    assert_eq!(
+        loaded.dispatch.approved_entries["machine-a"]
+            .approved
+            .identity,
+        purchase.identity
+    );
+    assert_eq!(api.count("POST /api/v1/vm"), 1);
+    assert_eq!(
+        api.count("GET /api/v1/vm/11/renew?method=lightning&intervals=1"),
+        1
+    );
+}
+
+#[test]
+fn provisioning_payment_timestamps_base_shape_reopens_before_paid_reading() {
+    let (s, mut api) = nanosecond_invoice();
+    let purchase = s.procurement.clone();
+    let mut loaded = reopen(&s);
+    assert_eq!(loaded.procurement, purchase);
+    whole_second_reading(&mut api);
+    api.payments[0]["is_paid"] = json!(true);
+    block_on(loaded.procurement_resume(&mut api, false)).unwrap();
+    assert_eq!(
+        loaded.procurement.as_ref().unwrap().payment,
+        Some(api.payments[0].clone())
+    );
+    assert!(loaded.poc_target("machine-a").is_some());
+    assert_eq!(reopen(&loaded).procurement, loaded.procurement);
+    assert_eq!(api.count("POST /api/v1/vm"), 1);
+    assert_eq!(
+        api.count("GET /api/v1/vm/11/renew?method=lightning&intervals=1"),
+        1
+    );
+}
+
+#[test]
+fn provisioning_payment_timestamps_and_exact_identity_refusals_preserve_saved_state() {
+    for (field, value) in [
+        ("created", json!("2026-11-06T14:00:01Z")),
+        ("expires", json!("2026-11-07T14:00:01Z")),
+        ("id", json!("aabc")),
+        ("data", json!({"lightning":"lnbc1otherfixtureinvoice"})),
+        ("created", json!("not a timestamp")),
+        ("expires", json!("not a timestamp")),
+    ] {
+        let (mut s, mut api) = nanosecond_invoice();
+        let saved = s.procurement.clone();
+        let files = s.storage.files();
+        whole_second_reading(&mut api);
+        let mut reading = api.payments[0].clone();
+        reading[field] = value;
+        if field == "id" || field == "data" || reading[field].as_str().unwrap().ends_with('Z') {
+            assert!(protocol::suitable_payment(
+                &reading,
+                11,
+                &api.billing_terms,
+                api.clock
+            ));
+        }
+        assert_eq!(
+            block_on(s.procurement_commit(Record::Payment(reading))).unwrap_err(),
+            REFUSED
+        );
+        assert_eq!(s.procurement, saved, "{field}");
+        assert_eq!(s.storage.files(), files, "{field}");
+        assert_eq!(reopen(&s).procurement, saved);
+    }
+}
+
+#[test]
+fn provisioning_payment_timestamps_paid_cannot_regress() {
+    let (mut s, mut api) = nanosecond_invoice();
+    api.payments[0]["is_paid"] = json!(true);
+    block_on(s.procurement_commit(Record::Payment(api.payments[0].clone()))).unwrap();
+    let saved = s.procurement.clone();
+    let files = s.storage.files();
+    whole_second_reading(&mut api);
+    for paid in [json!(false), Value::Null] {
+        api.payments[0]["is_paid"] = paid;
+        assert_eq!(
+            block_on(s.procurement_commit(Record::Payment(api.payments[0].clone()))).unwrap_err(),
+            REFUSED
+        );
+        assert_eq!(s.procurement, saved);
+        assert_eq!(s.storage.files(), files);
+    }
+    assert_eq!(reopen(&s).procurement, saved);
+}
+
+#[test]
+fn provisioning_payment_timestamps_expired_unpaid_still_pauses() {
+    for elapsed in [0, 1] {
+        let (mut s, mut api) = nanosecond_invoice();
+        whole_second_reading(&mut api);
+        api.clock = timestamp(api.payments[0]["expires"].as_str().unwrap()).unwrap() + elapsed;
+        assert!(
+            block_on(s.procurement_resume(&mut api, false))
+                .unwrap_err()
+                .contains("expired")
+        );
+        assert_eq!(
+            s.procurement.as_ref().unwrap().payment,
+            Some(api.payments[0].clone())
+        );
+        assert!(s.poc_target("machine-a").is_none());
+        api.payments[0]["is_paid"] = json!(true);
+        block_on(s.procurement_resume(&mut api, false)).unwrap();
+        assert!(s.poc_target("machine-a").is_some());
+        assert_eq!(
+            api.count("GET /api/v1/vm/11/renew?method=lightning&intervals=1"),
+            1
+        );
+        assert_eq!(reopen(&s).procurement, s.procurement);
+    }
 }
 
 #[test]

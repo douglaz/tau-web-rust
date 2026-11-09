@@ -84,7 +84,7 @@ const mutationRoutes=['POST /api/v1/ssh-key',...createRoutes,invoiceRoute];
 const mutationDispatches=()=>Object.fromEntries(mutationRoutes.map(route=>[route,dispatches.filter(d=>d.method+' '+d.path===route).length]));
 const enforceCounts=()=>{for(const route of mutationRoutes){check((mutationDispatches()[route]??0)<=1,'at most one application dispatch per durable intent: '+route);check((effects[route]??0)<=1,'at most one accepted mutation per durable intent: '+route);}check(createRoutes.reduce((n,route)=>n+(mutationDispatches()[route]??0),0)<=1,'at most one application dispatch across create routes for the durable create intent');check(createRoutes.reduce((n,route)=>n+(effects[route]??0),0)<=1,'at most one accepted effect across create routes for the durable create intent');};
 const requiredCsp=(await readFile('www/index.html','utf8')).match(/<meta http-equiv="Content-Security-Policy"[^>]*>/)[0];
-const makeVm=(body,customOrder)=>({id:11,subscription_id:21,expires:null,created:new Date(providerNow()+creationOffsetSeconds*1000).toISOString(),mac_address:'02:00:00:00:00:01',image:{...image,popularity:popularityDrift?0.1001:image.popularity},template:customOrder?{...fixed,id:91,cpu:body.cpu,memory:body.memory,disk_size:body.disk,region:london,transfer_gb:body.transfer_gb,limits:{...(custom.limits??{}),network_mbps:body.network_mbps}}:structuredClone(fixed),ssh_key:{id:7,name:'tau-0',created:iso()},ip_assignments:[{id:1,ip:'192.0.2.10/24',gateway:'192.0.2.1'}],status:{timestamp:Math.floor(providerNow()/1000),state:'running',cpu_usage:0,mem_usage:0,uptime:1,net_in:0,net_out:0,disk_write:0,disk_read:0},auto_renewal_enabled:true,max_prepay_days:365,host_ssh_keys:publication?[hostKey]:[]});
+const makeVm=(body,customOrder)=>({id:11,subscription_id:21,expires:null,created:new Date(providerNow()+creationOffsetSeconds*1000).toISOString(),mac_address:'02:00:00:00:00:01',image:{...image,popularity:popularityDrift?0.1001:image.popularity},template:customOrder?{...fixed,id:91,cpu:body.cpu,memory:body.memory,disk_size:body.disk,region:london,transfer_gb:body.transfer_gb,limits:{...(custom.limits??{}),network_mbps:body.network_mbps}}:structuredClone(fixed),ssh_key:{id:7,name:'tau-0',created:iso()},ip_assignments:[{id:1,ip:'192.0.2.10/24',gateway:'192.0.2.1'}],status:{timestamp:Math.floor(providerNow()/1000),state:'running',cpu_usage:0,mem_usage:0,uptime:1,net_in:0,net_out:0,disk_write:0,disk_read:0},auto_renewal_enabled:true,max_prepay_days:365,host_ssh_keys:publication?publishedHostKeys():[]});
 const returnedTemplate=template=>{
   const returned={...template,cpu_features:['AES','AVX2','SSE2']};
   if(transferBad)returned.transfer_gb=1;
@@ -95,9 +95,20 @@ const returnedTemplate=template=>{
   else returned[field]=field==='cpu_arch'?'arm64':field==='cpu_mfg'?'intel':['SSE2'];
   return returned;
 };
-const responseVm=vm=>({...vm,template:returnedTemplate(vm.template),image:{...vm.image,popularity:popularityDrift?0.1001:vm.image.popularity},host_ssh_keys:publication?[hostKey]:[]});
+const responseVm=vm=>({...vm,template:returnedTemplate(vm.template),image:{...vm.image,popularity:popularityDrift?0.1001:vm.image.popularity},host_ssh_keys:publication?publishedHostKeys():[]});
 const renewalQuote=()=>({amount:quoteVersion?1000000*(quoteVersion+1):changePrice&&planCurrency==='BTC'?2000000:1000000,tax:230000,processing_fee:10000,currency:'BTC',time:periodSeconds});
-const makePayment=()=>({id:'aabb',vm_id:11,created:iso(),expires:new Date(providerNow()+(scenario==='expired-invoice'?1000:86400000)).toISOString(),...renewalQuote(),is_paid:paid,data:{lightning:'lnbc1fixtureinvoice'},is_upgrade:false});
+const nanoseconds=ms=>new Date(ms).toISOString().replace(/\.\d{3}Z$/,'.999999999Z');
+const databasePayment=p=>({...p,created:p.created.replace(/\.\d+Z$/,'Z'),expires:p.expires.replace(/\.\d+Z$/,'Z')});
+const makePayment=()=>{const now=providerNow();return {id:'aabb',vm_id:11,created:nanoseconds(now),expires:nanoseconds(now+(scenario==='expired-invoice'?1000:86400000)),...renewalQuote(),is_paid:paid,data:{lightning:'lnbc1fixtureinvoice'},is_upgrade:false};};
+const syntheticHostKey=(keyType,fields)=>{
+  const blob=Buffer.concat([Buffer.from(keyType),...fields].map(field=>{const bytes=Buffer.from(field),length=Buffer.alloc(4);length.writeUInt32BE(bytes.length);return Buffer.concat([length,bytes]);}));
+  return {key_type:keyType,public_key:blob.toString('base64'),fingerprint_sha256:'SHA256:'+digest(blob).toString('base64url').replace(/-/g,'+').replace(/_/g,'/')};
+};
+const publishedHostKeys=()=>[
+  syntheticHostKey('ecdsa-sha2-nistp256',['nistp256',Buffer.from('046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5','hex')]),
+  hostKey,
+  syntheticHostKey('ssh-rsa',[Buffer.from([1,0,1]),Buffer.concat([Buffer.from([0]),Buffer.alloc(256,0xb1)])]),
+];
 const watchdog=setTimeout(()=>{if(browser?.exitCode===null)browser.kill('SIGKILL');},240000);
 try {
   const cert=join(temp,'cert.pem'),key=join(temp,'key.pem');
@@ -166,10 +177,10 @@ try {
           if(lostCreate){res.destroy();return;}break;
         case 'GET /api/v1/vm/11':result=responseVm(machines[0]);break;
         case 'GET /api/v1/vm/12':result={...responseVm(machines[0]),id:12};break;
-        case 'GET /api/v1/vm/11/payments?limit=100&offset=0':{let history=payments.map(p=>({...p}));if(scenario==='empty-invoice')history=[];if(scenario==='multiple-invoice'&&history.length)history.push({...history[0],id:'aacc'});if(scenario==='incomplete-invoice'&&history.length)history=Array.from({length:100},(_,i)=>({...history[0],id:i.toString(16).padStart(4,'0')}));if(scenario==='conflicting-invoice'&&history.length)history[0].vm_id=12;result=history;break;}
+        case 'GET /api/v1/vm/11/payments?limit=100&offset=0':{let history=payments.map(databasePayment);if(scenario==='empty-invoice')history=[];if(scenario==='multiple-invoice'&&history.length)history.push({...history[0],id:'aacc'});if(scenario==='incomplete-invoice'&&history.length)history=Array.from({length:100},(_,i)=>({...history[0],id:i.toString(16).padStart(4,'0')}));if(scenario==='conflicting-invoice'&&history.length)history[0].vm_id=12;result=history;break;}
         case 'GET /api/v1/vm/11/renew/quote?method=lightning&intervals=1':if(unavailableQuote){res.writeHead(503).end();return;}result=quoteResponseMode==='missing'?{currency:'BTC'}:quoteResponseMode==='malformed'?{...renewalQuote(),time:'unknown'}:renewalQuote();break;
         case 'GET /api/v1/vm/11/renew?method=lightning&intervals=1':check(!payments.length||scenario==='counter-fresh','one initial invoice');payments.push({...makePayment(),id:payments.length?'aacc':'aabb'});result=payments.at(-1);accept();effect(route);if(lostInvoice){res.destroy();return;}break;
-        case 'GET /api/v1/payment/aabb':result={...payments[0],is_paid:paid};break;
+        case 'GET /api/v1/payment/aabb':result={...databasePayment(payments[0]),is_paid:paid};break;
         default: throw Error('unapproved provider route');
       }
       accept();res.setHeader('Content-Type','application/json');
@@ -557,6 +568,9 @@ try {
           await reload();await setKey(secret);await action({action:'initial_invoice'});await action({action:'resume'});check((await report()).procurement.phase==='invoice_uncertain','ambiguous invoice evidence stays uncertain');check(!(await report()).procurement.payment,'no ambiguous payment identity associated');
         }else{
           check(current.procurement.payment?.id==='aabb','initial payment linked durably');
+          check(payments[0].created.endsWith('.999999999Z')&&payments[0].expires.endsWith('.999999999Z'),'invoice issuance has nanosecond precision');
+          check(count('GET /api/v1/payment/aabb')>0,'later database payment read crosses the precision change');
+          assert.deepEqual(current.procurement.payment,databasePayment(payments[0]));
           check(current.procurement.payment.currency==='BTC'&&current.procurement.payment.time===periodSeconds,'initial payment matches the provider Lightning quote currency and duration');
           if(planCurrency!=='BTC')check(current.procurement.selection.charge.currency===planCurrency&&current.procurement.billing.terms.currency==='BTC','fiat selected plan uses separately quoted Lightning billing terms');
           check(await evaluate("document.body.textContent.includes('tax 230000')&&document.body.textContent.includes('processing fee 10000')&&document.body.textContent.includes('policy: enabled')"),'invoice tax fee and actual auto-renewal display');
@@ -588,7 +602,9 @@ try {
             }
             if(scenario==='later-image'){check(current.store_error&&!current.poc_targets?.length,'later mismatched image refuses readiness');await reload();await setKey(secret);current=await action({action:'resume'});check(current.store_error&&current.procurement.vm_id===11&&!current.poc_targets?.length,'later mismatch preserves associated identity across replay');}else{
             if(scenario==='publication'){check(current.store_error.includes('published host key'),'empty publication truthfully waits');check(!current.poc_targets?.length,'empty publication cannot contact');publication=true;current=await action({action:'resume'});}
-            check(current.procurement.phase==='handed_off','published pin handoff');check(current.poc_targets[0].pin===hostPin&&current.poc_targets[0].host==='192.0.2.10'&&current.poc_targets[0].user==='arch'&&current.poc_targets[0].elevation==='sudo -n','actual pinned immutable target');assert.deepEqual(current.procurement.identity,identity);
+            check(current.procurement.phase==='handed_off','published pin handoff');
+            assert.deepEqual(current.procurement.publication.host_ssh_keys.map(key=>key.key_type),['ecdsa-sha2-nistp256','ssh-ed25519','ssh-rsa']);
+            assert.deepEqual(current.procurement.publication.selected_key,hostKey);check(current.poc_targets[0].pin===hostPin&&current.poc_targets[0].host==='192.0.2.10'&&current.poc_targets[0].user==='arch'&&current.poc_targets[0].elevation==='sudo -n','actual pinned immutable target');assert.deepEqual(current.procurement.identity,identity);
             check((await control({inspect:true})).contacts===0,'no contact before ordinary relay and runner approvals');
             const savedTarget=structuredClone(current.procurement.target);
             if(originCase)check(current.procurement.publication.origin===providerOrigin,'Handoff provenance uses bound origin');

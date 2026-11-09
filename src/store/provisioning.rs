@@ -591,9 +591,16 @@ impl<S: Storage> Store<S> {
                     timestamp(text(vm, "created", 40)?)?,
                 ) || p.payment.as_ref().is_some_and(|old| {
                     old["id"] != payment["id"]
-                        || old["created"] != payment["created"]
+                        || ["created", "expires"].into_iter().any(|field| {
+                            !matches!(
+                                (
+                                    text(old, field, 40).and_then(timestamp),
+                                    text(payment, field, 40).and_then(timestamp),
+                                ),
+                                (Ok(saved), Ok(reading)) if saved == reading
+                            )
+                        })
                         || old["data"] != payment["data"]
-                        || old["expires"] != payment["expires"]
                         || (old["is_paid"] == true && payment["is_paid"] != true)
                 }) {
                     return Err(REFUSED.into());
