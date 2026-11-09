@@ -381,6 +381,7 @@ pub struct Store<S> {
     reinstall: reinstall::State,
     poc_targets: std::collections::BTreeMap<String, poc_targets::Record>,
     procurement: Option<provisioning::Purchase>,
+    closed_purchases: Vec<provisioning::Purchase>,
     provider_filters: Vec<crate::poc::inference::EchoFilter>,
     procurement_selection: Option<crate::poc::provisioning::Selection>,
     provider_origin: String,
@@ -530,6 +531,7 @@ impl<S: Storage> Store<S> {
             reinstall: Default::default(),
             poc_targets: Default::default(),
             procurement: None,
+            closed_purchases: Vec::new(),
             provider_filters: Vec::new(),
             procurement_selection: None,
             provider_origin: crate::poc::provisioning::default_origin(),
@@ -2425,7 +2427,10 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
                     serde_json::to_value(crate::binding::InferenceApproval::synthetic())
                         .expect("fixture approval");
             }
-            if store.procurement.is_some() || store.procurement_selection.is_some() {
+            if store.procurement.is_some()
+                || store.procurement_selection.is_some()
+                || !store.closed_purchases.is_empty()
+            {
                 report["procurement"] = store.procurement_view();
             }
             if !store.poc_targets.is_empty() {

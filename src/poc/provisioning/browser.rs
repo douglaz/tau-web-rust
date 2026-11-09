@@ -109,6 +109,7 @@ enum Action {
         selection: Selection,
     },
     Resume,
+    Close,
     InitialInvoice {
         billing: crate::store::provisioning::Billing,
     },
@@ -140,6 +141,7 @@ pub async fn provider_request(request: String) -> String {
             prepared: None,
             started: now,
             requests: 0,
+            response_status: 0,
         };
         let action: Action =
             serde_json::from_str(&request).map_err(|_| "Invalid provisioning request.")?;
@@ -168,6 +170,7 @@ pub async fn provider_request(request: String) -> String {
                 }
                 store.procurement_approve(&mut api, approval).await.map(|_| None)
             }
+            Action::Close => store.procurement_close(&mut api).await.map(|_| None),
             Action::Resume => store
                 .procurement_resume(&mut api, false)
                 .await
@@ -228,6 +231,7 @@ struct Browser {
     prepared: Option<Prepared>,
     started: f64,
     requests: u8,
+    response_status: u16,
 }
 impl Browser {
     fn remaining_ms(&self) -> Result<f64, String> {
@@ -244,6 +248,9 @@ impl Browser {
     }
 }
 impl Api for Browser {
+    fn response_status(&self) -> u16 {
+        self.response_status
+    }
     fn prepare(
         &mut self,
         method: &str,
@@ -300,8 +307,9 @@ impl Api for Browser {
         method: &str,
         url: &str,
         body: Option<Value>,
-    ) -> Result<Value, String> {
+    ) -> Result<Value, ReadError> {
         self.current()?;
+        self.response_status = 0;
         self.requests += 1;
         if self.requests > 16 {
             return Err("Provider work paused at the local read bound; Refresh later.".into());
@@ -384,13 +392,19 @@ impl Api for Browser {
                 .dyn_into()
                 .map_err(|_| INCOMPLETE)?;
             self.current()?;
-            if !(200..300).contains(&response.status()) {
-                return Err(if mutation {
+            let status = response.status();
+            self.response_status = status;
+            let refused = || {
+                ReadError::from(if mutation {
                     UNKNOWN_MUTATION
                 } else {
-                    "Provider read refused; saved operation identities remain unchanged."
-                }
-                .into());
+                    READ_REFUSED
+                })
+            };
+            if !(200..300).contains(&status)
+                && !(status == 404 && missing_read(method, url) && !mutation)
+            {
+                return Err(refused());
             }
             let stream = js_sys::Reflect::get(&response, &"body".into()).map_err(|_| INCOMPLETE)?;
             let reader = function(&stream, "getReader")?
@@ -422,17 +436,28 @@ impl Api for Browser {
                 let size = bytes.length() as usize;
                 if output.len().saturating_add(size) > BODY_LIMIT {
                     bytes.fill(0, 0, bytes.length());
-                    return Err("Provider response exceeded the local body bound.".into());
+                    return Err(if status == 404 {
+                        refused()
+                    } else {
+                        "Provider response exceeded the local body bound.".into()
+                    });
                 }
                 output.extend_from_slice(&bytes.to_vec());
                 bytes.fill(0, 0, bytes.length());
+            }
+            if status == 404 {
+                return Err(if decoded_missing(method, url, status, &output) {
+                    ReadError::NotFound
+                } else {
+                    refused()
+                });
             }
             let value: Value = serde_json::from_slice(&output).map_err(|_| REFUSED)?;
             let data = value.get("data").ok_or(REFUSED)?.clone();
             self.current()?;
             Ok(data)
         };
-        let result: Result<Value, String> =
+        let result: Result<Value, ReadError> =
             match futures_util::future::select(Box::pin(exchange), Box::pin(cancelled)).await {
                 futures_util::future::Either::Left((result, _)) => result,
                 _ => Err(INCOMPLETE.into()),
@@ -441,6 +466,11 @@ impl Api for Browser {
         result.map_err(|error| {
             if mutation {
                 UNKNOWN_MUTATION.into()
+            } else if self.response_status == 404
+                && missing_read(method, url)
+                && error != ReadError::NotFound
+            {
+                READ_REFUSED.into()
             } else {
                 error
             }

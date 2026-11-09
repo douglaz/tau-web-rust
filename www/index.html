@@ -43,7 +43,7 @@
 <button type="submit">Set inference configuration</button>
 </form>
 <h2>New machine</h2>
-<p>Use a dedicated, already verified provider account. This PoC uses an operator-supplied account rather than seed-based vendor recovery. It supports one purchase per store, external payment of the initial period, and published Ed25519 host keys. No stock or connectivity is promised.</p>
+<p>Use a dedicated, already verified provider account. This PoC uses an operator-supplied account rather than seed-based vendor recovery. It supports one outstanding purchase per store, external payment of the initial period, and published Ed25519 host keys. No stock or connectivity is promised.</p>
 <p id="tau-provider-key-status" role="status">Provider key unset.</p>
 <form id="tau-provider-key-form" novalidate>
 <label>Provider HTTPS origin <input id="tau-provider-origin" type="text" value="https://api.lnvps.net" autocomplete="off" spellcheck="false" autocapitalize="none"></label>
@@ -70,6 +70,7 @@
 <button type="submit">Approve these exact purchase terms</button>
 </form>
 <button id="tau-provider-resume" type="button">Create approved machine / Refresh saved purchase</button>
+<button id="tau-provider-close" type="button" hidden>Close purchase</button>
 <button id="tau-provider-invoice" type="button">Issue initial Lightning invoice for one approved period</button>
 <div id="tau-provider-progress" aria-live="polite"></div>
 <p>The published pin comes from the provider’s hypervisor scan, rather than attestation. It trusts the provider and whoever can answer the machine address inside its network at scan time.</p>

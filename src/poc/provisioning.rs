@@ -190,6 +190,62 @@ pub(crate) fn request_filter(auth: &str) -> Result<crate::poc::inference::EchoFi
     ]))
 }
 
+pub(crate) const READ_REFUSED: &str =
+    "Provider read refused; saved operation identities remain unchanged.";
+
+/// Missing evidence is distinct from transport, authentication and decoding failures.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ReadError {
+    Refused(String),
+    NotFound,
+}
+impl From<String> for ReadError {
+    fn from(value: String) -> Self {
+        Self::Refused(value)
+    }
+}
+impl From<&str> for ReadError {
+    fn from(value: &str) -> Self {
+        Self::Refused(value.into())
+    }
+}
+impl ReadError {
+    pub(crate) fn message(self) -> String {
+        match self {
+            Self::Refused(message) => message,
+            Self::NotFound => READ_REFUSED.into(),
+        }
+    }
+}
+
+/// Only the existing machine/detail/history and saved-payment read routes qualify.
+pub(crate) fn missing_read(method: &str, url: &str) -> bool {
+    if method != "GET" {
+        return false;
+    }
+    let Some((_, path)) = url.split_once("/api/v1/") else {
+        return false;
+    };
+    if let Some(id) = path.strip_prefix("payment/") {
+        return !id.is_empty() && id.bytes().all(|b| b.is_ascii_hexdigit());
+    }
+    let Some(tail) = path.strip_prefix("vm/") else {
+        return false;
+    };
+    let id = tail
+        .strip_suffix("/payments?limit=100&offset=0")
+        .unwrap_or(tail);
+    !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())
+}
+
+pub(crate) fn decoded_missing(method: &str, url: &str, status: u16, body: &[u8]) -> bool {
+    status == 404
+        && missing_read(method, url)
+        && serde_json::from_slice::<Value>(body)
+            .ok()
+            .is_some_and(|v| v.is_object() && v.get("error").is_some_and(Value::is_string))
+}
+
 #[allow(async_fn_in_trait)]
 pub(crate) trait Api {
     /// Prepare exact request protection before any bytes can leave the browser.
@@ -207,7 +263,10 @@ pub(crate) trait Api {
         method: &str,
         path: &str,
         body: Option<Value>,
-    ) -> Result<Value, String>;
+    ) -> Result<Value, ReadError>;
+    fn response_status(&self) -> u16 {
+        200
+    }
     fn account(&self) -> String;
     fn now(&self) -> u64;
     fn current(&self) -> Result<(), String>;

@@ -22,7 +22,7 @@ access, and supply the existing v1 relay URL. Approval re-fetches the offer and 
 requires another review and approval. Approval carries the displayed configuration snapshot;
 missing or stale consent cannot approve a newer selection still waiting for its page report.
 Approval reserves the machine and relay identities durably.
-An existing enrolled machine or outstanding purchase prevents a new purchase.
+An existing enrolled machine or outstanding purchase prevents a new purchase. A closed purchase no longer blocks a new approval; its allocated machine identity stays consumed.
 
 Create / Refresh registers only the derived SSH public half, refreshes the selected catalogue,
 image and custom quote as applicable, then saves a pre-order inventory and create intent before
@@ -160,6 +160,25 @@ documentation says `null/omitted if never paid`. The page does not treat that fi
 evidence. Any payment-history row follows the existing suitability rules, a saved invoice intent
 prevents reissuance, and a present, non-null `expires` on the VM status read at the invoice click
 prevents initial issuance even with empty history.
+
+LNVPS `10266e58` purges an hour-old unpaid machine and its payment rows when its sweep's
+payment check permits it. Refresh pauses on a decoded JSON 404 for the associated machine,
+its payment history or saved payment. **Close purchase** is explicit: the purchase must have
+an associated VM, no handoff, no recorded paid reading, and no unexpired saved invoice.
+An invoice intent without a saved reply is eligible. Closure freshly requires a complete
+inventory omitting that VM, a decoded JSON 404 with a string `error` on its detail, and the
+same decoded 404 on its payment history, under the saved origin and account. A soft-deleted
+VM with readable history cannot close. The close is durable and final; earlier encrypted
+records and saved invoices remain, and neither the machine allocation nor closed VM/payment
+identities can be reused. Closing changes no provider state or registered SSH key.
+
+These reads trust the provider database. They establish neither non-payment nor guaranteed
+host destruction: administrative purges, deletion with a failed subscription read, account
+purges, late settlement, invoice/sweep races and failed payment-list reads can erase payment
+records too. Database loss or replacement and the staff-transfer races accepted by STG-21a
+and TRU-E1 may satisfy the reads while a host survives. Retain proof of payment for any saved
+invoice. A restored provider database requires manual handling from the retained journal;
+closure adds no automatic recovery or reorder. The ADR-0042 departure above still applies.
 
 LNVPS `10266e58` returns nanosecond payment timestamps in the invoice reply and whole seconds
 in later reads. The page compares `created` and `expires` to the whole UTC second, dropping

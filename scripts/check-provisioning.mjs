@@ -27,7 +27,9 @@ if(scenario==='protocol-controls'){
   const forms=signatureForms(event.sig);assert.deepEqual(forms.map(value=>value.length),[88,128,128]);
   console.log(JSON.stringify({scenario,identicalReplay:1,nonReplayRefusals:6,freshAccepted:1,clockSkewAccepted:2,clockSkewRefused:2,signatureEncodings:3,checks:'passed'}));process.exit(0);
 }
-const scenarios=['origin-entry','custom-origin-entry','origin-stale-review','origin-validation','fixed','pending-custody','custom','lost-create','empty-create','incomplete-create','multiple-create','lost-invoice','empty-invoice','expired-invoice','publication','pre-send-reload','associated-reload','registration','failed-write','credentials','transport','refusals','mismatched-host','multiple-invoice','incomplete-invoice','conflicting-invoice','conflicting-create','popularity','popularity-lost','mismatched-image','fixed-terms','fixed-terms-reload','fixed-config','custom-terms','custom-terms-reload','custom-config','counter-identical','counter-fresh','lifecycle','fixed-unavailable','custom-unavailable','later-image','fixed-config-reload','custom-config-reload','custom-resource','fixed-cpu-direct','custom-cpu-direct','fixed-cpu-lost','custom-cpu-lost','fixed-cpu-later','custom-cpu-later','clock-ahead','custom-clock-behind','clock-lost-behind','custom-clock-lost-ahead','clock-old-evidence','custom-clock-future-evidence','fixed-eur','custom-usd','existing-paid','existing-unpaid','unknown-quote','quote-change','quote-unavailable','lost-invoice-quote-reload','signature-encodings','approval-authority','custom-caps-mismatched','custom-caps-missing','custom-caps-lost-mismatched','custom-caps-lost-missing','custom-caps-later','custom-caps-matching','custom-caps-network','custom-caps-uncapped','missing-limits','fixed-caps-mismatched','fixed-caps-missing','custom-deadline-headers','custom-deadline-body','custom-deadline-inside','custom-deadline-clock','fixed-transfer-direct','fixed-transfer-lost','fixed-transfer-later','custom-transfer-direct','custom-transfer-lost','custom-transfer-later'];
+const closeScenarios=['close-no-invoice','close-invoice','close-intent','close-soft-deleted','close-404-bodies','close-refresh-paid'];
+const closeCase=closeScenarios.includes(scenario);
+const scenarios=[...closeScenarios,'origin-entry','custom-origin-entry','origin-stale-review','origin-validation','fixed','pending-custody','custom','lost-create','empty-create','incomplete-create','multiple-create','lost-invoice','empty-invoice','expired-invoice','publication','pre-send-reload','associated-reload','registration','failed-write','credentials','transport','refusals','mismatched-host','multiple-invoice','incomplete-invoice','conflicting-invoice','conflicting-create','popularity','popularity-lost','mismatched-image','fixed-terms','fixed-terms-reload','fixed-config','custom-terms','custom-terms-reload','custom-config','counter-identical','counter-fresh','lifecycle','fixed-unavailable','custom-unavailable','later-image','fixed-config-reload','custom-config-reload','custom-resource','fixed-cpu-direct','custom-cpu-direct','fixed-cpu-lost','custom-cpu-lost','fixed-cpu-later','custom-cpu-later','clock-ahead','custom-clock-behind','clock-lost-behind','custom-clock-lost-ahead','clock-old-evidence','custom-clock-future-evidence','fixed-eur','custom-usd','existing-paid','existing-unpaid','unknown-quote','quote-change','quote-unavailable','lost-invoice-quote-reload','signature-encodings','approval-authority','custom-caps-mismatched','custom-caps-missing','custom-caps-lost-mismatched','custom-caps-lost-missing','custom-caps-later','custom-caps-matching','custom-caps-network','custom-caps-uncapped','missing-limits','fixed-caps-mismatched','fixed-caps-missing','custom-deadline-headers','custom-deadline-body','custom-deadline-inside','custom-deadline-clock','fixed-transfer-direct','fixed-transfer-lost','fixed-transfer-later','custom-transfer-direct','custom-transfer-lost','custom-transfer-later'];
 if(scenario==='list'){console.log(JSON.stringify(scenarios));process.exit(0);}
 if(!scenarios.includes(scenario))throw Error('unknown provisioning case');
 const deadlineCase=scenario.startsWith('custom-deadline-');
@@ -40,7 +42,7 @@ const capsCase=scenario.startsWith('custom-caps-')||scenario.startsWith('fixed-c
 const capsLater=scenario==='custom-caps-later';
 let inheritedCapChecks=0,missingLimitsRefusals=0;
 let capsVariant=scenario.endsWith('missing')?'missing':'mismatched',capsBad=capsCase&&!capsLater&&!['custom-caps-matching','custom-caps-network'].includes(scenario);
-const originCase=scenario.includes('origin-');
+const originCase=scenario.includes('origin-')||closeCase;
 const cpuCase=scenario.match(/^(fixed|custom)-cpu-(direct|lost|later)$/);
 const cpuPhase=cpuCase?.[2];
 let cpuVariant=scenario==='custom-cpu-direct'?'arch-missing':'arch';
@@ -70,13 +72,14 @@ if(capsCase)(scenario.startsWith('custom-')?custom:fixed).limits=scenario==='cus
 if(scenario==='missing-limits'){delete fixed.limits;delete custom.limits;}
 const resources={pricing_id:2,cpu:2,memory:2147483648,disk:21474836480,disk_type:'ssd',disk_interface:'scsi',ip4_count:1,ip6_count:0,transfer_gb:500,network_mbps:500};
 if(transferCase&&scenario.startsWith('custom-')){delete custom.transfer;delete resources.transfer_gb;}
+let purged=false,missingMode='decoded',missingPayment=true;
 let machines=[],payments=[],hostKey,hostPin,fixtureInfo,publication=scenario!=='publication',paid=scenario==='existing-paid',changePrice=false,changeConfig=false,popularityDrift=false,heldProviderResponse=null,failCatalogue=false,raiseMinimum=false,selectedResources=resources,echo=null,echoSignatureMode=null,heldSignatureEcho=null,quoteVersion=0,quoteResponseMode=unknownQuote?'missing':null,unavailableQuote=false,cpuBad=Boolean(cpuCase&&cpuPhase!=='later'),transport=null,modelCalls=0;
 const iso=()=>new Date(providerNow()).toISOString();
 const count=route=>counts[route]??0;
 const effect=route=>effects[route]=(effects[route]??0)+1;
 const isCustom=scenario==='custom'||scenario.startsWith('custom-');
 const lostCreate=transferPhase==='lost'||scenario.includes('caps-lost-')||cpuPhase==='lost'||scenario.includes('clock-lost')||['lost-create','empty-create','incomplete-create','multiple-create','conflicting-create','popularity-lost','mismatched-image'].includes(scenario);
-const lostInvoice=['lost-invoice-quote-reload','lost-invoice','empty-invoice','multiple-invoice','incomplete-invoice','conflicting-invoice'].includes(scenario);
+const lostInvoice=['close-intent','lost-invoice-quote-reload','lost-invoice','empty-invoice','multiple-invoice','incomplete-invoice','conflicting-invoice'].includes(scenario);
 const createRoute='POST /api/v1/vm'+(isCustom?'/custom-template':'');
 const invoiceRoute='GET /api/v1/vm/11/renew?method=lightning&intervals=1';
 const createRoutes=['POST /api/v1/vm','POST /api/v1/vm/custom-template'];
@@ -99,7 +102,7 @@ const responseVm=vm=>({...vm,template:returnedTemplate(vm.template),image:{...vm
 const renewalQuote=()=>({amount:quoteVersion?1000000*(quoteVersion+1):changePrice&&planCurrency==='BTC'?2000000:1000000,tax:230000,processing_fee:10000,currency:'BTC',time:periodSeconds});
 const nanoseconds=ms=>new Date(ms).toISOString().replace(/\.\d{3}Z$/,'.999999999Z');
 const databasePayment=p=>({...p,created:p.created.replace(/\.\d+Z$/,'Z'),expires:p.expires.replace(/\.\d+Z$/,'Z')});
-const makePayment=()=>{const now=providerNow();return {id:'aabb',vm_id:11,created:nanoseconds(now),expires:nanoseconds(now+(scenario==='expired-invoice'?1000:86400000)),...renewalQuote(),is_paid:paid,data:{lightning:'lnbc1fixtureinvoice'},is_upgrade:false};};
+const makePayment=()=>{const now=providerNow();return {id:'aabb',vm_id:11,created:nanoseconds(now),expires:nanoseconds(now+(scenario==='expired-invoice'||scenario==='close-invoice'?1000:86400000)),...renewalQuote(),is_paid:paid,data:{lightning:'lnbc1fixtureinvoice'},is_upgrade:false};};
 const syntheticHostKey=(keyType,fields)=>{
   const blob=Buffer.concat([Buffer.from(keyType),...fields].map(field=>{const bytes=Buffer.from(field),length=Buffer.alloc(4);length.writeUInt32BE(bytes.length);return Buffer.concat([length,bytes]);}));
   return {key_type:keyType,public_key:blob.toString('base64'),fingerprint_sha256:'SHA256:'+digest(blob).toString('base64url').replace(/-/g,'+').replace(/_/g,'/')};
@@ -155,6 +158,16 @@ try {
       if(transport==='stall'&&req.url==='/api/v1/vm/templates'){accept();res.writeHead(200,{'Content-Type':'application/json'});const timer=setTimeout(()=>{fixtureTimers.delete(timer);if(!res.destroyed)res.end(JSON.stringify({data:{templates:[fixed],custom_template:[custom]}}));},16000);fixtureTimers.add(timer);return;}
       if(echoSignatureMode!==null&&req.url==='/api/v1/vm/templates'){heldSignatureEcho??=signatureForms(event.sig)[echoSignatureMode];res.setHeader('Content-Type','application/json');res.end(JSON.stringify({data:{templates:[{...fixed,name:heldSignatureEcho}],custom_template:[custom]}}));return;}
       if(echo&&req.url==='/api/v1/vm/templates'){res.setHeader('Content-Type','application/json');res.end(JSON.stringify({data:{templates:[{...fixed,name:echo}],custom_template:[custom]}}));return;}
+      if(purged && (req.url==='/api/v1/vm/11' || (req.url==='/api/v1/vm/11/payments?limit=100&offset=0' && scenario!=='close-soft-deleted') || (req.url==='/api/v1/payment/aabb' && missingPayment))){
+        accept();
+        let output=missingMode==='bare'?'':missingMode==='malformed'?'{':missingMode==='html'?'<html>missing</html>':missingMode==='wrong-type'?JSON.stringify({error:404}):JSON.stringify({error:'Resource not found'});
+        if(missingMode==='oversized'||missingMode==='at-bound'){
+          const empty=JSON.stringify({error:'Resource not found',padding:''});
+          output=JSON.stringify({error:'Resource not found',padding:'x'.repeat(262144-empty.length+(missingMode==='oversized'?1:0))});
+          check(Buffer.byteLength(output)===(missingMode==='oversized'?262145:262144),'exact missing response body bound');
+        }
+        res.writeHead(404,{'Content-Type':'application/json'});res.end(output);return;
+      }
       let result;
       const value=body.length?JSON.parse(body):null;
       switch(route){
@@ -164,7 +177,7 @@ try {
         case 'POST /api/v1/ssh-key':check(value.key_data.startsWith('ssh-ed25519 '),'derived SSH public key');check(!value.key_data.includes('PRIVATE'),'no private SSH bytes');result={id:7,name:value.name,created:iso()};accept();effect(route);if(scenario==='registration'){res.destroy();return;}break;
         case 'GET /api/v1/ssh-key':result=[{id:7,name:'tau-0',created:iso()}];break;
         case 'GET /api/v1/vm':
-          result=machines.map(responseVm);
+          result=purged?[]:machines.map(responseVm);
           if(['empty-create','pre-send-reload'].includes(scenario))result=[];
           if(scenario==='incomplete-create'&&machines.length)result=[{...responseVm(machines[0]),ssh_key:{id:99,name:'other',created:iso()}}];
           if(scenario==='conflicting-create'&&machines.length)result=[{...responseVm(machines[0]),image:{...image,id:9}}];
@@ -499,6 +512,70 @@ try {
         check((effects[createRoute]??0)===(['pre-send-reload','registration','failed-write'].includes(scenario)?0:1),'uncertainty has no second accepted create');
         check((effects['POST /api/v1/ssh-key']??0)===(scenario==='failed-write'?0:1),'registration accepted at most once');
         check(!(await report()).poc_targets?.length,'no unpinned target');
+      }else if(closeCase){
+        check(current.procurement.vm_id===11&&current.procurement.phase==='initial_invoice','close starts from a confirmed associated purchase');
+        const savedIdentity=structuredClone(current.procurement.identity);
+        if(['close-invoice','close-intent','close-refresh-paid'].includes(scenario)){
+          current=await action({action:'initial_invoice'});
+          if(scenario==='close-intent')check(current.procurement.phase==='invoice_uncertain'&&!current.procurement.payment,'unreceived invoice remains an intent');
+          else check(current.procurement.payment?.id==='aabb','saved invoice retained before disappearance');
+        }
+        purged=true;
+        if(scenario==='close-soft-deleted'){
+          const before=structuredClone(current.procurement),metadata=await journalMetadata(),reads=count('GET /api/v1/vm/11/payments?limit=100&offset=0');
+          payments=[{...makePayment(),is_paid:true}];
+          current=await action({action:'close'});
+          check(current.store_error&&count('GET /api/v1/vm/11/payments?limit=100&offset=0')===reads+1,'2xx history refuses closure of soft-deleted VM');
+          assert.deepEqual(current.procurement,before);
+          const after=await journalMetadata();check(after.records-metadata.records===3&&after.providerProtection-metadata.providerProtection===3,'refused close writes only three dispatched protections');
+        }else if(scenario==='close-refresh-paid'){
+          missingPayment=false;paid=true;
+          const before=await journalMetadata();
+          current=await action({action:'resume'});
+          check(current.store_error===`The provider reports machine 11 or its payment not found. LNVPS deletes a machine left unpaid for about an hour, with its payments. Close purchase checks that the provider has no record of the machine or any payment for it and that this purchase meets the closing conditions, then closes it. These checks cannot establish whether you paid.`,'detail decoded 404 gets precise pause');
+          check(current.procurement.payment.is_paid===true,'earlier paid reading remains committed');
+          const after=await journalMetadata();check(after.records-before.records===3&&after.providerProtection-before.providerProtection===2,'Refresh retains Payment before missing detail');
+          check(await evaluate("document.querySelector('#tau-provider-close').hidden"),'recorded paid reading hides close control');
+          const traffic=Object.values(counts).reduce((a,b)=>a+b,0),journal=await journalMetadata();
+          current=await action({action:'close'});check(current.store_error==='Close is only for a purchase with no recorded payment whose machine the provider no longer has.','paid local refusal');
+          check(Object.values(counts).reduce((a,b)=>a+b,0)===traffic,'paid close sends nothing');assert.deepEqual(await journalMetadata(),journal);
+          await reload();await setKey(secret);check((await report()).procurement.payment.is_paid===true,'paid evidence replays after decoded 404');
+        }else{
+          const pause='The provider reports machine 11 or its payment not found. LNVPS deletes a machine left unpaid for about an hour, with its payments. Close purchase checks that the provider has no record of the machine or any payment for it and that this purchase meets the closing conditions, then closes it. These checks cannot establish whether you paid.';
+          if(scenario==='close-404-bodies'){
+            const beforePurchase=structuredClone(current.procurement);
+            for(const mode of ['bare','malformed','html','wrong-type','oversized']){
+              missingMode=mode;
+              const before=await journalMetadata();current=await action({action:'resume'});
+              check(current.store_error==='Provider read refused; saved operation identities remain unchanged.','nonqualifying 404 keeps generic refusal: '+mode);
+              check(!await evaluate("document.querySelector('#tau-provider-close').hidden"),'close eligibility is independent of diagnostic');
+              current=await action({action:'close'});check(current.store_error&&current.procurement.phase,'nonqualifying detail 404 refuses close: '+mode);
+              assert.deepEqual(current.procurement,beforePurchase);
+              const after=await journalMetadata();check(after.records-before.records===3&&after.providerProtection-before.providerProtection===3,'404 refusals append protection only');
+            }
+            missingMode='at-bound';
+          }
+          current=await action({action:'resume'});check(current.store_error===pause,'own history or saved-payment decoded 404 gets precise pause');
+          check(!await evaluate("document.querySelector('#tau-provider-close').hidden||document.querySelector('#tau-provider-close').disabled"),'eligible explicit close control shown');
+          await reload();await setOrigin(alternateOrigin);await setKey(secret);
+          const before=await journalMetadata(),beforeEffects=structuredClone(effects),beforeCounts=structuredClone(counts);
+          await collectDispatches();const beforeDispatch=dispatches.length;
+          await sleep(1100);const reportsBefore=await evaluate('reports.length');await click('#tau-provider-close');await wait(`reports.length>${reportsBefore}`);current=await report();await collectDispatches();
+          check(!current.store_error&&!current.procurement.phase,'explicit close ends outstanding purchase');
+          check(current.procurement.closed==='Closed: the provider no longer has machine 11 or any payment record for it, and this purchase recorded no payment. You can approve a new purchase.'+(scenario==='close-invoice'?' If you paid invoice aabb, the provider no longer has a record of that payment; keep your proof of payment.':''),'retained close and invoice proof text');
+          check(await evaluate("document.querySelector('#tau-provider-progress').textContent.includes('You can approve a new purchase.')&&!document.querySelector('#tau-provider-selection-form button').disabled"),'returns to offer selection');
+          assert.deepEqual(effects,beforeEffects,'closing sends no provider mutation');
+          const closeReads=dispatches.slice(beforeDispatch);assert.deepEqual(closeReads.map(d=>d.method+' '+d.path),['GET /api/v1/vm','GET /api/v1/vm/11','GET /api/v1/vm/11/payments?limit=100&offset=0']);
+          check(closeReads.every(d=>d.origin===providerOrigin),'three signed close reads use bound origin after conflicting re-entry');
+          for(const route of mutationRoutes)check(count(route)===(beforeCounts[route]??0),'close emits no raw mutation');
+          const after=await journalMetadata();check(after.records-before.records===4&&after.providerProtection-before.providerProtection===3,'three protections precede exactly one durable close');
+          check(after.machines===before.machines&&after.passes===before.passes,'closed allocation stays consumed');
+          const closed=current.procurement.closed;await reload();await setOrigin(providerOrigin);await setKey(secret);check((await report()).procurement.closed===closed,'closure and invoice proof survive replay');
+          current=await action({action:'select',choice});check(!current.store_error,'closed purchase permits offer selection');
+          current=await action({action:'approve',approval});check(!current.store_error&&current.procurement.phase==='approved','new explicit approval after close');
+          check(current.procurement.identity.index===savedIdentity.index+1,'new purchase never reuses closed machine allocation');
+          await reload();await setKey(secret);check((await report()).procurement.phase==='approved'&&(await report()).procurement.identity.index===savedIdentity.index+1,'second purchase replays without reviving closed purchase');
+        }
       }else if(existingHistory){
         check(current.procurement.vm_id===11&&current.procurement.payment?.id==='aabb','complete initial history reuses the existing payment');
         check(current.procurement.billing?.vm_id===11,'existing history has same-VM quote evidence');

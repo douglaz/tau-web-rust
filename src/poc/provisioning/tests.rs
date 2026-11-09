@@ -638,3 +638,57 @@ fn provisioning_origin_strict_grammar_and_normalization() {
         assert!(reason.contains("HTTPS provider origin"));
     }
 }
+
+#[test]
+fn provisioning_decoded_missing_is_bounded_to_read_only_routes_and_error_objects() {
+    let paths = [
+        "/api/v1/vm/11",
+        "/api/v1/vm/11/payments?limit=100&offset=0",
+        "/api/v1/payment/aabb",
+    ];
+    for path in paths {
+        for body in [
+            br#"{"error":"Resource not found"}"#.as_slice(),
+            br#"{"error":"VM not found"}"#,
+            br#"{"error":""}"#,
+        ] {
+            assert!(decoded_missing("GET", path, 404, body));
+            for status in [200, 401, 403, 500] {
+                assert!(!decoded_missing("GET", path, status, body));
+            }
+        }
+        for body in [
+            b"".as_slice(),
+            b"missing",
+            b"<html>missing</html>",
+            b"{",
+            br#"{"error":null}"#,
+            br#"{"error":404}"#,
+            br#"{"error":{}}"#,
+            br#"{"data":{"error":"missing"}}"#,
+            br#"[{"error":"missing"}]"#,
+        ] {
+            assert!(!decoded_missing("GET", path, 404, body));
+        }
+    }
+    for path in [
+        "/api/v1/vm",
+        "/api/v1/vm/templates",
+        "/api/v1/ssh-key",
+        "/api/v1/vm/11/renew?method=lightning&intervals=1",
+        "/api/v1/vm/11/renew/quote?method=lightning&intervals=1",
+    ] {
+        assert!(!decoded_missing(
+            "GET",
+            path,
+            404,
+            br#"{"error":"missing"}"#
+        ));
+    }
+    assert!(!decoded_missing(
+        "POST",
+        "/api/v1/vm/11",
+        404,
+        br#"{"error":"missing"}"#
+    ));
+}

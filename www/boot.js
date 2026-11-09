@@ -495,6 +495,7 @@ const renderProvider = (store, enabled) => {
     const exact = document.createElement('pre'); exact.textContent = JSON.stringify(purchase.selection, null, 2); selection.append(exact);
   }
   const progress = $('provider-progress'); progress.replaceChildren();
+  if (purchase.closed) paragraph(progress, purchase.closed);
   if (purchase.phase) {
     paragraph(progress, `Saved purchase ${purchase.machine}: ${purchase.phase}. VM ${purchase.vm_id ?? 'not associated'}; SSH registration ${purchase.ssh_key_id ?? 'not established'}.`);
     paragraph(progress, `Bound provider origin: ${purchase.origin}`);
@@ -521,6 +522,9 @@ const renderProvider = (store, enabled) => {
   if (renewal) {
     for (const name of ['provider-machine', 'provider-relay', 'provider-class']) $(name).disabled = true;
   }
+  const closeEligible = Boolean(purchase.vm_id) && !purchase.target && (!purchase.payment || (purchase.payment.is_paid === false && Math.floor(Date.parse(purchase.payment.expires) / 1000) <= Math.floor(Date.now() / 1000)));
+  $('provider-close').hidden = !closeEligible;
+  $('provider-close').disabled = !enabled || !closeEligible;
   $('provider-resume').disabled = !enabled || !purchase.phase;
   $('provider-invoice').disabled = !enabled || purchase.phase !== 'initial_invoice' || !purchase.billing;
 };
@@ -547,6 +551,7 @@ $('provider-approval-form').addEventListener('submit', event => {
   event.preventDefault(); if (providerSelectionDirty) return;
   providerRequest({action: 'approve', selection: providerDisplayedSelection, approval: {origin: providerDisplayedOrigin, machine: $('provider-machine').value, relay: $('provider-relay').value, class_answer: $('provider-class').value, approve_charge: $('provider-approve-charge').checked, approve_maintained_access: $('provider-approve-access').checked}});
 });
+$('provider-close').addEventListener('click', () => providerRequest({action: 'close'}));
 $('provider-resume').addEventListener('click', () => providerRequest({action: 'resume'}));
 $('provider-invoice').addEventListener('click', () => providerRequest({action: 'initial_invoice', billing: providerDisplayedBilling}));
 const clearPocInputs = () => {

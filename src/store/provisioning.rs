@@ -1,4 +1,4 @@
-//! One durable procurement. Possibly-sent intents have no retry or discard transition.
+//! Durable procurement. Possibly-sent intents are never retried.
 use super::*;
 use crate::dispatch::{
     Access, ApprovedEntry, BillingInterval, ClassAnswer, MachineEntry, Period, RecurringCost, Unit,
@@ -8,6 +8,34 @@ use crate::poc::provisioning::{
     text, timestamp, unique_ids,
 };
 use crate::poc::targets::TargetRecord;
+
+const CLOSE_REFUSED: &str = "Close is only for a purchase with no recorded payment whose machine the provider no longer has.";
+
+fn close_eligible(p: &Purchase, now: u64) -> bool {
+    p.vm.is_some()
+        && p.target.is_none()
+        && p.payment.as_ref().is_none_or(|pay| {
+            pay["is_paid"] == false
+                && text(pay, "expires", 40)
+                    .and_then(timestamp)
+                    .is_ok_and(|expires| expires <= now)
+        })
+}
+fn missing_pause(vm: u64) -> String {
+    format!(
+        "The provider reports machine {vm} or its payment not found. LNVPS deletes a machine left unpaid for about an hour, with its payments. Close purchase checks that the provider has no record of the machine or any payment for it and that this purchase meets the closing conditions, then closes it. These checks cannot establish whether you paid."
+    )
+}
+fn closed_message(p: &Purchase) -> String {
+    let vm = &p.vm.as_ref().expect("closed associated purchase")["id"];
+    let mut message = format!(
+        "Closed: the provider no longer has machine {vm} or any payment record for it, and this purchase recorded no payment. You can approve a new purchase."
+    );
+    if let Some(payment) = &p.payment {
+        message.push_str(&format!(" If you paid invoice {}, the provider no longer has a record of that payment; keep your proof of payment.", payment["id"].as_str().expect("saved payment id")));
+    }
+    message
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -61,6 +89,13 @@ pub enum Record {
     Reapproved {
         selected: Selection,
         approved_at: u64,
+    },
+    Closed {
+        vm_id: u64,
+        inventory_status: u16,
+        detail_status: u16,
+        history_status: u16,
+        checked_at: u64,
     },
     RegistrationSent,
     Registered(Value),
@@ -162,13 +197,13 @@ impl<S: Storage> Store<S> {
         api.current()?;
         self.procurement_account(&api.account())
     }
-    async fn provider_read(
+    async fn provider_response(
         &mut self,
         api: &mut impl Api,
         method: &str,
         path: &str,
         body: Option<Value>,
-    ) -> Result<Value, String> {
+    ) -> Result<(u16, Value), protocol::ReadError> {
         self.check_api(api)?;
         let url = protocol::request_url(self.procurement_origin(), path)?;
         if let Some(fingerprints) = api.prepare(method, &url, body.as_ref())? {
@@ -184,7 +219,79 @@ impl<S: Storage> Store<S> {
         if !crate::poc::inference::safe(self, &value, &[]) {
             return Err(REFUSED.into());
         }
-        Ok(value)
+        Ok((api.response_status(), value))
+    }
+    async fn provider_read(
+        &mut self,
+        api: &mut impl Api,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<Value, String> {
+        match self.provider_response(api, method, path, body).await {
+            Ok((_, value)) => Ok(value),
+            Err(protocol::ReadError::NotFound) => {
+                let p = self.procurement.as_ref();
+                if let Some(vm) = p.and_then(|p| p.vm.as_ref()).and_then(|vm| id(vm).ok()) {
+                    let own = path == format!("/api/v1/vm/{vm}")
+                        || path == format!("/api/v1/vm/{vm}/payments?limit=100&offset=0")
+                        || p.and_then(|p| p.payment.as_ref())
+                            .and_then(|pay| payment_id(pay).ok())
+                            .is_some_and(|pay| path == format!("/api/v1/payment/{pay}"));
+                    if method == "GET" && own {
+                        return Err(missing_pause(vm));
+                    }
+                }
+                Err(protocol::READ_REFUSED.into())
+            }
+            Err(error) => Err(error.message()),
+        }
+    }
+    /// Fresh absence evidence is usable only by this explicit action.
+    pub(crate) async fn procurement_close(&mut self, api: &mut impl Api) -> Result<(), String> {
+        self.check_api(api)?;
+        let p = self
+            .procurement
+            .as_ref()
+            .filter(|p| close_eligible(p, api.now()))
+            .ok_or(CLOSE_REFUSED)?;
+        let vm_id = id(p.vm.as_ref().ok_or(CLOSE_REFUSED)?)?;
+        let (inventory_status, inventory) = self
+            .provider_response(api, "GET", "/api/v1/vm", None)
+            .await
+            .map_err(protocol::ReadError::message)?;
+        if !(200..300).contains(&inventory_status) || unique_ids(&inventory)?.contains(&vm_id) {
+            return Err(REFUSED.into());
+        }
+        for vm in array(&inventory)? {
+            protocol::validate_vm(vm)?;
+        }
+        for path in [
+            format!("/api/v1/vm/{vm_id}"),
+            format!("/api/v1/vm/{vm_id}/payments?limit=100&offset=0"),
+        ] {
+            match self.provider_response(api, "GET", &path, None).await {
+                Err(protocol::ReadError::NotFound) => (),
+                _ => return Err(REFUSED.into()),
+            }
+        }
+        self.check_api(api)?;
+        let checked_at = api.now();
+        if self
+            .procurement
+            .as_ref()
+            .is_none_or(|p| !close_eligible(p, checked_at))
+        {
+            return Err(CLOSE_REFUSED.into());
+        }
+        self.procurement_commit(Record::Closed {
+            vm_id,
+            inventory_status,
+            detail_status: 404,
+            history_status: 404,
+            checked_at,
+        })
+        .await
     }
     pub(crate) fn procurement_review_selection(&self) -> Option<&Selection> {
         match &self.procurement {
@@ -197,7 +304,7 @@ impl<S: Storage> Store<S> {
     }
     pub(crate) fn procurement_view(&self) -> Value {
         let Some(p) = &self.procurement else {
-            return json!({"origin":self.procurement_origin(),"selection":self.procurement_selection});
+            return json!({"origin":self.procurement_origin(),"selection":self.procurement_selection,"closed":self.closed_purchases.last().map(closed_message)});
         };
         let phase = if p.pending_selection.is_some() {
             "terms_changed"
@@ -486,8 +593,42 @@ impl<S: Storage> Store<S> {
             return Ok(*p.clone());
         }
         let mut p = self.procurement.clone().ok_or(REFUSED)?;
+        // Closed identities remain consumed even when a new purchase uses the same entry name.
+        for closed in &self.closed_purchases {
+            let reused = match record {
+                Record::Associated(vm) => {
+                    closed.vm.as_ref().is_some_and(|old| old["id"] == vm["id"])
+                }
+                Record::Payment(payment) => closed
+                    .payment
+                    .as_ref()
+                    .and_then(|old| payment_id(old).ok())
+                    .zip(payment_id(payment).ok())
+                    .is_some_and(|(old, new)| old.eq_ignore_ascii_case(new)),
+                _ => false,
+            };
+            if closed.origin == p.origin && reused {
+                return Err(REFUSED.into());
+            }
+        }
         match record {
             Record::Approved(_) => unreachable!(),
+            Record::Closed {
+                vm_id,
+                inventory_status,
+                detail_status,
+                history_status,
+                checked_at,
+            } => {
+                if !close_eligible(&p, *checked_at)
+                    || p.vm.as_ref().and_then(|vm| id(vm).ok()) != Some(*vm_id)
+                    || !(200..300).contains(inventory_status)
+                    || *detail_status != 404
+                    || *history_status != 404
+                {
+                    return Err(REFUSED.into());
+                }
+            }
             Record::TermsChanged(selected) => {
                 if p.create.is_some() || p.vm.is_some() || p.target.is_some() {
                     return Err(REFUSED.into());
@@ -667,6 +808,17 @@ impl<S: Storage> Store<S> {
         record: &Record,
         p: Purchase,
     ) -> Result<(), String> {
+        if matches!(record, Record::Closed { .. }) {
+            self.dispatch.approved_entries.remove(&p.machine);
+            self.dispatch.associations.retain(|a| a.entry != p.machine);
+            self.dispatch.current_installations.remove(&p.machine);
+            self.dispatch.setup_approval = None;
+            self.provider_origin = p.origin.clone();
+            self.procurement = None;
+            self.procurement_selection = None;
+            self.closed_purchases.push(p);
+            return Ok(());
+        }
         if matches!(record, Record::Approved(_) | Record::Reapproved { .. }) {
             let charge = &p.selected.charge;
             let approved = ApprovedEntry {

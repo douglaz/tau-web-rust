@@ -33,6 +33,8 @@ struct Fixture {
     protection_fault: Option<(String, MemoryStorage, Fault)>,
     prepared_protection: Option<crate::poc::inference::EchoFingerprints>,
     response_filter: Option<crate::poc::inference::EchoFilter>,
+    observe_dispatch: Option<Box<dyn Fn()>>,
+    after_read_clock: Option<(String, u64)>,
     response_echo: Option<String>,
     vm_change: Option<(String, Value)>,
     created: Option<String>,
@@ -44,6 +46,9 @@ struct Fixture {
     machines: Vec<Value>,
     payments: Vec<Value>,
     history_response: Option<Value>,
+    read_errors: std::collections::BTreeMap<String, protocol::ReadError>,
+    read_values: std::collections::BTreeMap<String, Value>,
+    status: u16,
     lose_create: bool,
     lose_invoice: bool,
     invoice_nanoseconds: bool,
@@ -64,6 +69,8 @@ impl Fixture {
             protection_fault: None,
             prepared_protection: None,
             response_filter: None,
+            observe_dispatch: None,
+            after_read_clock: None,
             response_echo: None,
             vm_change: None,
             created: None,
@@ -75,6 +82,9 @@ impl Fixture {
             machines: Vec::new(),
             payments: Vec::new(),
             history_response: None,
+            read_errors: Default::default(),
+            read_values: Default::default(),
+            status: 200,
             lose_create: false,
             lose_invoice: false,
             invoice_nanoseconds: false,
@@ -89,6 +99,9 @@ impl Fixture {
     }
 }
 impl Api for Fixture {
+    fn response_status(&self) -> u16 {
+        self.status
+    }
     fn prepare(
         &mut self,
         method: &str,
@@ -131,7 +144,11 @@ impl Api for Fixture {
                     .fingerprints(),
             ));
         }
-        Ok(self.prepared_protection.take())
+        Ok(if self.observe_dispatch.is_some() {
+            self.prepared_protection.clone()
+        } else {
+            self.prepared_protection.take()
+        })
     }
 
     fn account(&self) -> String {
@@ -151,7 +168,7 @@ impl Api for Fixture {
         method: &str,
         path: &str,
         _body: Option<Value>,
-    ) -> Result<Value, String> {
+    ) -> Result<Value, protocol::ReadError> {
         self.urls.push(path.into());
         if self.record_signatures {
             assert_eq!(
@@ -164,92 +181,103 @@ impl Api for Fixture {
             .map(|(_, p)| format!("/api/v1/{p}"))
             .ok_or(REFUSED)?;
         self.calls.push(format!("{method} {path}"));
-        let result = match (method, path.as_str()) {
-            ("GET", "/api/v1/vm/templates") => {
-                if self.fail_catalogue {
-                    return Err("catalogue unavailable".into());
+        if let Some(observe) = &self.observe_dispatch {
+            observe();
+        }
+        let result = if let Some(error) = self.read_errors.remove(&path) {
+            Err(error)
+        } else if let Some(value) = self.read_values.remove(&path) {
+            Ok(value)
+        } else {
+            let result: Result<Value, String> = match (method, path.as_str()) {
+                ("GET", "/api/v1/vm/templates") => {
+                    if self.fail_catalogue {
+                        return Err("catalogue unavailable".into());
+                    }
+                    let mut fixed = if self.custom {
+                        fixtures::offer()
+                    } else {
+                        self.current_selection.offer.clone()
+                    };
+                    if let Some(echo) = &self.response_echo {
+                        fixed["name"] = echo.clone().into();
+                    }
+                    Ok(
+                        json!({"templates":[fixed],"custom_template":[if self.custom { self.current_selection.offer.clone() } else { fixtures::custom() }]}),
+                    )
                 }
-                let mut fixed = if self.custom {
-                    fixtures::offer()
-                } else {
-                    self.current_selection.offer.clone()
-                };
-                if let Some(echo) = &self.response_echo {
-                    fixed["name"] = echo.clone().into();
+                ("GET", "/api/v1/image") => Ok(json!([self.current_selection.image])),
+                ("POST", "/api/v1/vm/custom-template/price") => {
+                    Ok(serde_json::to_value(&self.current_selection.charge).unwrap())
                 }
-                Ok(
-                    json!({"templates":[fixed],"custom_template":[if self.custom { self.current_selection.offer.clone() } else { fixtures::custom() }]}),
-                )
-            }
-            ("GET", "/api/v1/image") => Ok(json!([self.current_selection.image])),
-            ("POST", "/api/v1/vm/custom-template/price") => {
-                Ok(serde_json::to_value(&self.current_selection.charge).unwrap())
-            }
-            ("POST", "/api/v1/ssh-key") => {
-                if self.lose_registration {
-                    Err("lost".into())
-                } else {
-                    Ok(json!({"id":7,"name":"tau-0","created":"2026-11-06T14:00:00Z"}))
+                ("POST", "/api/v1/ssh-key") => {
+                    if self.lose_registration {
+                        Err("lost".into())
+                    } else {
+                        Ok(json!({"id":7,"name":"tau-0","created":"2026-11-06T14:00:00Z"}))
+                    }
                 }
-            }
-            ("GET", "/api/v1/ssh-key") => {
-                Ok(json!([{"id":7,"name":"tau-0","created":"2026-11-06T14:00:00Z"}]))
-            }
-            ("GET", "/api/v1/vm") => Ok(json!(self.machines)),
-            ("POST", "/api/v1/vm" | "/api/v1/vm/custom-template") => {
-                self.clock += self.advance_before_create;
-                self.advance_before_create = 0;
-                let mut vm = fixtures::vm(&self.current_selection, 11);
-                if let Some(popularity) = self.returned_popularity {
-                    vm["image"]["popularity"] = json!(popularity);
+                ("GET", "/api/v1/ssh-key") => {
+                    Ok(json!([{"id":7,"name":"tau-0","created":"2026-11-06T14:00:00Z"}]))
                 }
-                if let Some(created) = &self.created {
-                    vm["created"] = created.clone().into();
+                ("GET", "/api/v1/vm") => Ok(json!(self.machines)),
+                ("POST", "/api/v1/vm" | "/api/v1/vm/custom-template") => {
+                    self.clock += self.advance_before_create;
+                    self.advance_before_create = 0;
+                    let mut vm = fixtures::vm(&self.current_selection, 11);
+                    if let Some(popularity) = self.returned_popularity {
+                        vm["image"]["popularity"] = json!(popularity);
+                    }
+                    if let Some(created) = &self.created {
+                        vm["created"] = created.clone().into();
+                    }
+                    if let Some((pointer, value)) = &self.vm_change {
+                        *vm.pointer_mut(pointer).unwrap() = value.clone();
+                    }
+                    self.machines.push(vm.clone());
+                    if self.lose_create {
+                        Err("lost".into())
+                    } else {
+                        Ok(vm)
+                    }
                 }
-                if let Some((pointer, value)) = &self.vm_change {
-                    *vm.pointer_mut(pointer).unwrap() = value.clone();
+                ("GET", "/api/v1/vm/11/payments?limit=100&offset=0") => Ok(self
+                    .history_response
+                    .clone()
+                    .unwrap_or_else(|| json!(self.payments))),
+                ("GET", "/api/v1/vm/11/renew/quote?method=lightning&intervals=1") => {
+                    if self.fail_quote {
+                        Err("quote unavailable".into())
+                    } else {
+                        Ok(serde_json::to_value(&self.billing_terms).unwrap())
+                    }
                 }
-                self.machines.push(vm.clone());
-                if self.lose_create {
-                    Err("lost".into())
-                } else {
-                    Ok(vm)
+                ("GET", "/api/v1/vm/11/renew?method=lightning&intervals=1") => {
+                    let mut p = fixtures::payment(11);
+                    if let Some(created) = &self.created {
+                        p["created"] = created.clone().into();
+                    }
+                    for field in ["amount", "currency", "tax", "processing_fee", "time"] {
+                        p[field] =
+                            serde_json::to_value(&self.billing_terms).unwrap()[field].clone();
+                    }
+                    if self.invoice_nanoseconds {
+                        p["created"] = json!("2026-11-06T14:00:00.999999999Z");
+                        p["expires"] = json!("2026-11-07T14:00:00.841873964Z");
+                    }
+                    self.payments.push(p.clone());
+                    if self.lose_invoice {
+                        Err("lost".into())
+                    } else {
+                        Ok(p)
+                    }
                 }
-            }
-            ("GET", "/api/v1/vm/11/payments?limit=100&offset=0") => Ok(self
-                .history_response
-                .clone()
-                .unwrap_or_else(|| json!(self.payments))),
-            ("GET", "/api/v1/vm/11/renew/quote?method=lightning&intervals=1") => {
-                if self.fail_quote {
-                    Err("quote unavailable".into())
-                } else {
-                    Ok(serde_json::to_value(&self.billing_terms).unwrap())
-                }
-            }
-            ("GET", "/api/v1/vm/11/renew?method=lightning&intervals=1") => {
-                let mut p = fixtures::payment(11);
-                if let Some(created) = &self.created {
-                    p["created"] = created.clone().into();
-                }
-                for field in ["amount", "currency", "tax", "processing_fee", "time"] {
-                    p[field] = serde_json::to_value(&self.billing_terms).unwrap()[field].clone();
-                }
-                if self.invoice_nanoseconds {
-                    p["created"] = json!("2026-11-06T14:00:00.999999999Z");
-                    p["expires"] = json!("2026-11-07T14:00:00.841873964Z");
-                }
-                self.payments.push(p.clone());
-                if self.lose_invoice {
-                    Err("lost".into())
-                } else {
-                    Ok(p)
-                }
-            }
-            ("GET", "/api/v1/vm/11") => Ok(self.machines[0].clone()),
-            ("GET", "/api/v1/vm/12") => Ok(self.machines[1].clone()),
-            ("GET", "/api/v1/payment/aabb") => Ok(self.payments[0].clone()),
-            _ => Err("unexpected fixture route".into()),
+                ("GET", "/api/v1/vm/11") => Ok(self.machines[0].clone()),
+                ("GET", "/api/v1/vm/12") => Ok(self.machines[1].clone()),
+                ("GET", "/api/v1/payment/aabb") => Ok(self.payments[0].clone()),
+                _ => Err("unexpected fixture route".into()),
+            };
+            result.map_err(Into::into)
         };
         if self
             .fault_after
@@ -258,6 +286,13 @@ impl Api for Fixture {
         {
             let (_, storage, fault) = self.fault_after.take().unwrap();
             storage.fault(fault);
+        }
+        if self
+            .after_read_clock
+            .as_ref()
+            .is_some_and(|(route, _)| route == &path)
+        {
+            self.clock = self.after_read_clock.take().unwrap().1;
         }
         result
     }
@@ -2810,4 +2845,541 @@ fn provisioning_origin_normalization_cannot_introduce_candidate_key_material() {
     assert_eq!(s.storage.files(), before);
     assert_eq!(s.allocation(), &allocation);
     assert!(s.procurement.is_none());
+}
+
+#[test]
+#[ignore = "requires an explicitly supplied synthetic base-written fixture"]
+fn provisioning_base_compatibility_fixture() {
+    let path = std::env::var("PURCHASE_COMPAT_FIXTURE")
+        .expect("explicit synthetic base-written fixture path");
+    let files = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let s = block_on(unlock(MemoryStorage::with_files(files), &Fixed, pass())).unwrap();
+    let loaded = reopen(&s);
+    assert_eq!(loaded.procurement, s.procurement);
+    assert_eq!(loaded.poc_target("machine-a"), s.poc_target("machine-a"));
+    assert_eq!(loaded.procurement_view(), s.procurement_view());
+    assert_eq!(
+        loaded.dispatch.approved_entries["machine-a"]
+            .approved
+            .identity,
+        s.procurement.as_ref().unwrap().identity
+    );
+    assert_eq!(
+        serde_json::to_value(loaded.sessions()).unwrap(),
+        serde_json::to_value(s.sessions()).unwrap()
+    );
+    assert_eq!(loaded.poc_targets_view(), s.poc_targets_view());
+    let snapshot = json!({"procurement":s.procurement_view(),"sessions":s.sessions(),"targets":s.poc_targets_view(),"setup":s.dispatch.setup_view(),"tasks":s.poc.values().map(poc::Task::view).collect::<Vec<_>>()});
+    let expected = format!("{path}.expected");
+    assert_eq!(
+        snapshot,
+        serde_json::from_slice::<Value>(&std::fs::read(expected).unwrap()).unwrap()
+    );
+}
+
+fn purchase_events(s: &Store<MemoryStorage>) -> Vec<Event> {
+    let mut reader = Store::new(s.storage.clone(), DataKey(s.key.0), s.id.clone());
+    s.records()
+        .map(|n| {
+            let bytes = &s.storage.files()[&n.to_string()];
+            let event = reader.open(n, bytes).unwrap();
+            reader.previous = Address(Sha256::digest(bytes).into());
+            event
+        })
+        .collect()
+}
+fn associated_purchase() -> (Store<MemoryStorage>, Fixture) {
+    let mut s = ready();
+    let mut api = Fixture::new(false);
+    approve(&mut s, &mut api);
+    assert!(block_on(s.procurement_resume(&mut api, false)).is_err());
+    assert!(s.procurement.as_ref().unwrap().vm.is_some());
+    (s, api)
+}
+fn disappear(api: &mut Fixture) {
+    api.machines.clear();
+    for path in ["/api/v1/vm/11", "/api/v1/vm/11/payments?limit=100&offset=0"] {
+        api.read_errors
+            .insert(path.into(), protocol::ReadError::NotFound);
+    }
+    api.calls.clear();
+    api.urls.clear();
+}
+fn observe_protection(s: &Store<MemoryStorage>, api: &mut Fixture) {
+    let storage = s.storage.clone();
+    let key = s.key.0;
+    let id = s.id.clone();
+    let baseline = s.next;
+    let dispatches = std::cell::Cell::new(0u64);
+    api.prepared_protection = Some(
+        crate::poc::inference::EchoFilter::new(&[b"synthetic close request material"])
+            .fingerprints(),
+    );
+    api.observe_dispatch = Some(Box::new(move || {
+        let mut reader = Store::new(storage.clone(), DataKey(key), id.clone());
+        let files = storage.files();
+        let mut protections = 0;
+        let mut last_protection = false;
+        for n in 0..baseline + dispatches.get() + 1 {
+            let bytes = &files[&n.to_string()];
+            let event = reader.open(n, bytes).unwrap();
+            last_protection = matches!(event, Event::ProviderProtection(_));
+            if n >= baseline {
+                assert!(last_protection);
+                protections += 1;
+            }
+            reader.previous = Address(Sha256::digest(bytes).into());
+        }
+        assert!(
+            last_protection,
+            "dispatch requires a committed protection event"
+        );
+        dispatches.set(dispatches.get() + 1);
+        assert_eq!(protections, dispatches.get());
+    }));
+}
+
+#[test]
+fn provisioning_close_success_releases_setup_and_consumes_identities() {
+    for stage in 0..3 {
+        let (mut s, mut api) = associated_purchase();
+        if stage > 0 {
+            api.lose_invoice = stage == 1;
+            assert!(issue_invoice(&mut s, &mut api).is_err());
+            assert!(s.procurement.as_ref().unwrap().invoice.is_some());
+        }
+        if stage == 2 {
+            api.clock = timestamp(
+                s.procurement.as_ref().unwrap().payment.as_ref().unwrap()["expires"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+        }
+        let old = s.procurement.clone().unwrap();
+        let allocation = s.allocation().clone();
+        let prior = purchase_events(&s);
+        let prior_files = s.storage.files();
+        let before = s.next;
+        disappear(&mut api);
+        observe_protection(&s, &mut api);
+        block_on(s.procurement_close(&mut api)).unwrap();
+        assert_eq!(
+            api.calls,
+            [
+                "GET /api/v1/vm",
+                "GET /api/v1/vm/11",
+                "GET /api/v1/vm/11/payments?limit=100&offset=0"
+            ]
+        );
+        assert!(api.urls.iter().all(|u| u.starts_with(&old.origin)));
+        assert_eq!(s.next, before + 4);
+        let events = purchase_events(&s);
+        for (name, bytes) in prior_files {
+            assert_eq!(s.storage.files()[&name], bytes);
+        }
+        assert_eq!(
+            serde_json::to_value(&events[..prior.len()]).unwrap(),
+            serde_json::to_value(&prior).unwrap()
+        );
+        for event in &events[prior.len()..prior.len() + 3] {
+            assert!(matches!(event, Event::ProviderProtection(_)));
+        }
+        assert!(
+            matches!(events.last().unwrap(), Event::Procurement(Record::Closed {vm_id:11, inventory_status:200, detail_status:404, history_status:404, checked_at}) if *checked_at == api.clock)
+        );
+        assert!(s.procurement.is_none());
+        assert!(s.dispatch.approved_entries.is_empty());
+        assert!(s.dispatch.associations.is_empty());
+        assert!(s.dispatch.current_installations.is_empty());
+        assert!(s.dispatch.setup_approval.is_none());
+        assert_eq!(s.allocation(), &allocation);
+        assert!(
+            s.procurement_view()["closed"]
+                .as_str()
+                .unwrap()
+                .contains("recorded no payment")
+        );
+        assert_eq!(
+            s.procurement_view()["closed"]
+                .as_str()
+                .unwrap()
+                .contains("keep your proof of payment"),
+            stage == 2
+        );
+        let mut loaded = reopen(&s);
+        assert!(loaded.procurement.is_none());
+        assert!(
+            block_on(loaded.procurement_close(&mut api)).is_err(),
+            "closure is final"
+        );
+        api.observe_dispatch = None;
+        api.prepared_protection = None;
+        approve(&mut loaded, &mut api);
+        let new = loaded.procurement.as_ref().unwrap();
+        assert_ne!(new.identity, old.identity);
+        assert_eq!(new.identity.index, old.identity.index + 1);
+        assert!(loaded.closed_purchases.iter().any(|p| p == &old));
+        let replayed = reopen(&loaded);
+        assert_eq!(replayed.procurement, loaded.procurement);
+        assert_eq!(replayed.closed_purchases, loaded.closed_purchases);
+        assert_eq!(
+            replayed.dispatch.approved_entries["machine-a"]
+                .approved
+                .identity,
+            new.identity
+        );
+    }
+}
+
+#[test]
+fn provisioning_close_local_refusals_write_and_send_nothing() {
+    for case in [
+        "paid",
+        "unexpired",
+        "handoff",
+        "unsent",
+        "uncertain",
+        "wrong-account",
+    ] {
+        let (mut s, mut api) = if case == "unsent" || case == "uncertain" {
+            let mut s = ready();
+            let mut api = Fixture::new(false);
+            approve(&mut s, &mut api);
+            if case == "uncertain" {
+                api.lose_create = true;
+                assert!(block_on(s.procurement_resume(&mut api, false)).is_err());
+            }
+            (s, api)
+        } else {
+            associated_purchase()
+        };
+        if ["paid", "unexpired", "handoff"].contains(&case) {
+            assert!(issue_invoice(&mut s, &mut api).is_err());
+            if case != "unexpired" {
+                api.payments[0]["is_paid"] = true.into();
+                if case == "paid" {
+                    block_on(s.procurement_commit(Record::Payment(api.payments[0].clone())))
+                        .unwrap();
+                } else {
+                    block_on(s.procurement_resume(&mut api, false)).unwrap();
+                }
+            }
+        }
+        if case == "wrong-account" {
+            api.account = "b".repeat(64);
+        }
+        let files = s.storage.files();
+        let p = s.procurement.clone();
+        let setup = s.dispatch.setup_view();
+        let allocation = s.allocation().clone();
+        api.calls.clear();
+        let error = block_on(s.procurement_close(&mut api)).unwrap_err();
+        if case != "wrong-account" {
+            assert_eq!(error, CLOSE_REFUSED, "{case}");
+        }
+        assert!(api.calls.is_empty(), "{case}");
+        assert_eq!(s.storage.files(), files, "{case}");
+        assert_eq!(s.procurement, p);
+        assert_eq!(s.dispatch.setup_view(), setup);
+        assert_eq!(s.allocation(), &allocation);
+    }
+}
+
+#[test]
+fn provisioning_close_provider_refusals_keep_only_dispatched_protections() {
+    for case in [
+        "detail-ok",
+        "403",
+        "history-ok",
+        "bare-404",
+        "500",
+        "timeout",
+        "transport",
+        "inventory-present",
+        "inventory-refused",
+        "inventory-over-bound",
+        "inventory-malformed",
+    ] {
+        let (mut s, mut api) = associated_purchase();
+        let vm = api.machines[0].clone();
+        disappear(&mut api);
+        let expected = match case {
+            "inventory-present" => {
+                api.machines.push(vm.clone());
+                1
+            }
+            "inventory-over-bound" => {
+                api.machines = (1..=129)
+                    .map(|i| {
+                        let mut v = vm.clone();
+                        v["id"] = json!(100 + i);
+                        v
+                    })
+                    .collect();
+                1
+            }
+            "inventory-malformed" => {
+                api.machines.push(json!({"id":99}));
+                1
+            }
+            "inventory-refused" => {
+                api.read_errors
+                    .insert("/api/v1/vm".into(), "inventory refused".into());
+                1
+            }
+            "history-ok" => {
+                api.read_errors
+                    .remove("/api/v1/vm/11/payments?limit=100&offset=0");
+                3
+            }
+            "detail-ok" => {
+                api.read_errors.remove("/api/v1/vm/11");
+                api.read_values.insert("/api/v1/vm/11".into(), vm);
+                2
+            }
+            other => {
+                api.read_errors.insert(
+                    "/api/v1/vm/11".into(),
+                    protocol::ReadError::Refused(if other == "bare-404" {
+                        protocol::READ_REFUSED.into()
+                    } else {
+                        other.into()
+                    }),
+                );
+                2
+            }
+        };
+        let p = s.procurement.clone();
+        let setup = s.dispatch.setup_view();
+        let allocation = s.allocation().clone();
+        let before = s.next;
+        observe_protection(&s, &mut api);
+        assert!(block_on(s.procurement_close(&mut api)).is_err(), "{case}");
+        assert_eq!(api.calls.len(), expected, "{case}");
+        assert_eq!(s.next, before + expected as u64);
+        assert!(
+            purchase_events(&s)
+                .iter()
+                .skip(before as usize)
+                .all(|e| matches!(e, Event::ProviderProtection(_)))
+        );
+        assert_eq!(s.procurement, p);
+        assert_eq!(s.dispatch.setup_view(), setup);
+        assert_eq!(s.allocation(), &allocation);
+        assert_eq!(reopen(&s).procurement, p);
+    }
+}
+
+#[test]
+fn provisioning_close_append_failures_do_not_release_purchase() {
+    for close_fault in [false, true] {
+        for fault in [Fault::Fail(1), Fault::LandThenFail(3)] {
+            let (mut s, mut api) = associated_purchase();
+            disappear(&mut api);
+            let p = s.procurement.clone();
+            let setup = s.dispatch.setup_view();
+            let allocation = s.allocation().clone();
+            if close_fault {
+                api.fault_after = Some((
+                    "GET /api/v1/vm/11/payments?limit=100&offset=0".into(),
+                    s.storage.clone(),
+                    fault,
+                ));
+            } else {
+                api.protection_fault = Some(("GET /api/v1/vm".into(), s.storage.clone(), fault));
+            }
+            assert!(block_on(s.procurement_close(&mut api)).is_err());
+            assert_eq!(s.procurement, p);
+            assert_eq!(s.dispatch.setup_view(), setup);
+            assert_eq!(s.allocation(), &allocation);
+            assert_eq!(api.calls.len(), if close_fault { 3 } else { 0 });
+        }
+    }
+}
+
+#[test]
+fn provisioning_close_replay_checks_recorded_time_statuses_and_finality() {
+    let (mut s, mut api) = associated_purchase();
+    assert!(issue_invoice(&mut s, &mut api).is_err());
+    let expiry = timestamp(
+        s.procurement.as_ref().unwrap().payment.as_ref().unwrap()["expires"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    let record = Record::Closed {
+        vm_id: 11,
+        inventory_status: 206,
+        detail_status: 404,
+        history_status: 404,
+        checked_at: expiry,
+    };
+    let mut missing_id = serde_json::to_value(&record).unwrap();
+    missing_id["closed"]
+        .as_object_mut()
+        .unwrap()
+        .remove("vm_id");
+    assert!(serde_json::from_value::<Record>(missing_id).is_err());
+    assert!(s.procurement_projection(&record).is_ok());
+    for edit in [
+        json!({"vm_id":12}),
+        json!({"inventory_status":404}),
+        json!({"detail_status":200}),
+        json!({"history_status":200}),
+        json!({"checked_at":expiry-1}),
+    ] {
+        let mut value = serde_json::to_value(&record).unwrap();
+        for (k, v) in edit.as_object().unwrap() {
+            value["closed"][k] = v.clone();
+        }
+        let bad: Record = serde_json::from_value(value).unwrap();
+        assert!(s.procurement_projection(&bad).is_err());
+    }
+    block_on(s.procurement_commit(record.clone())).unwrap();
+    assert!(s.procurement_projection(&record).is_err());
+    for edit in [
+        json!({"vm_id":12}),
+        json!({"inventory_status":404}),
+        json!({"detail_status":200}),
+        json!({"history_status":200}),
+        json!({"checked_at":expiry-1}),
+    ] {
+        let tampered = origin_journal(&s, |event| {
+            if let Some(closed) = event.pointer_mut("/procurement/closed") {
+                for (k, v) in edit.as_object().unwrap() {
+                    closed[k] = v.clone();
+                }
+            }
+        });
+        assert!(block_on(unlock(tampered, &Fixed, pass())).is_err());
+    }
+    let missing_association = origin_journal(&s, |event| {
+        if event.pointer("/procurement/associated").is_some() {
+            *event = json!({"procurement":{"registration_sent":null}});
+        }
+    });
+    assert!(block_on(unlock(missing_association, &Fixed, pass())).is_err());
+    assert!(reopen(&s).procurement.is_none());
+    let mut duplicate = reopen(&s);
+    assert!(
+        duplicate
+            .replay_procurement(duplicate.next, &record)
+            .is_err()
+    );
+    api.account = "b".repeat(64);
+    approve(&mut duplicate, &mut api);
+    assert!(block_on(duplicate.procurement_resume(&mut api, false)).is_err());
+    let p = duplicate.procurement.as_ref().unwrap().clone();
+    let old_vm = fixtures::vm(&p.selected, 11);
+    assert!(
+        duplicate
+            .procurement_projection(&Record::Associated(old_vm))
+            .is_err()
+    );
+    let new_vm = fixtures::vm(&p.selected, 12);
+    block_on(duplicate.procurement_commit(Record::Associated(new_vm))).unwrap();
+    block_on(duplicate.procurement_commit(Record::BillingQuoted(Billing {
+        vm_id: 12,
+        terms: fixtures::billing_terms(),
+    })))
+    .unwrap();
+    for spelling in ["aabb", "AABB"] {
+        let mut reused = fixtures::payment(12);
+        reused["id"] = json!(spelling);
+        assert!(
+            duplicate
+                .procurement_projection(&Record::Payment(reused))
+                .is_err(),
+            "closed payment id cannot enter a new purchase with spelling {spelling}"
+        );
+    }
+    assert_eq!(reopen(&duplicate).procurement_view()["vm_id"], 12);
+    let mut next_payment = fixtures::payment(12);
+    next_payment["id"] = json!("bbcc");
+    next_payment["is_paid"] = json!(true);
+    block_on(duplicate.procurement_commit(Record::Payment(next_payment))).unwrap();
+    let next_handoff = handoff(duplicate.procurement.as_ref().unwrap());
+    block_on(duplicate.procurement_commit(next_handoff)).unwrap();
+    let final_store = reopen(&duplicate);
+    assert_eq!(final_store.procurement_view()["vm_id"], 12);
+    assert_eq!(final_store.procurement_view()["payment"]["id"], "bbcc");
+    assert!(final_store.poc_target("machine-a").is_some());
+    assert_eq!(final_store.closed_purchases.len(), 1);
+    assert_eq!(
+        final_store.closed_purchases[0].vm.as_ref().unwrap()["id"],
+        11
+    );
+}
+
+#[test]
+fn provisioning_close_post_read_recheck_uses_current_time() {
+    let (mut s, mut api) = associated_purchase();
+    assert!(issue_invoice(&mut s, &mut api).is_err());
+    api.clock = timestamp(
+        s.procurement.as_ref().unwrap().payment.as_ref().unwrap()["expires"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    disappear(&mut api);
+    api.after_read_clock = Some((
+        "/api/v1/vm/11/payments?limit=100&offset=0".into(),
+        api.clock - 1,
+    ));
+    observe_protection(&s, &mut api);
+    let before = s.next;
+    let p = s.procurement.clone();
+    assert_eq!(
+        block_on(s.procurement_close(&mut api)).unwrap_err(),
+        CLOSE_REFUSED
+    );
+    assert_eq!(s.next, before + 3);
+    assert_eq!(s.procurement, p);
+}
+
+#[test]
+fn provisioning_missing_refresh_keeps_earlier_paid_reading() {
+    for route in [
+        "/api/v1/vm/11",
+        "/api/v1/vm/11/payments?limit=100&offset=0",
+        "/api/v1/payment/aabb",
+    ] {
+        let (mut s, mut api) = associated_purchase();
+        let saved_payment = route != "/api/v1/vm/11/payments?limit=100&offset=0";
+        if saved_payment {
+            assert!(issue_invoice(&mut s, &mut api).is_err());
+        }
+        if route == "/api/v1/vm/11" {
+            api.payments[0]["is_paid"] = true.into();
+        }
+        api.read_errors
+            .insert(route.into(), protocol::ReadError::NotFound);
+        let before = s.next;
+        let error = block_on(s.procurement_resume(&mut api, false)).unwrap_err();
+        assert_eq!(error, missing_pause(11));
+        assert_eq!(s.next, before + u64::from(route == "/api/v1/vm/11"));
+        if route == "/api/v1/vm/11" {
+            assert_eq!(
+                s.procurement.as_ref().unwrap().payment.as_ref().unwrap()["is_paid"],
+                true
+            );
+            assert!(!close_eligible(s.procurement.as_ref().unwrap(), u64::MAX));
+            assert!(
+                matches!(purchase_events(&s).last().unwrap(),Event::Procurement(Record::Payment(pay)) if pay["is_paid"]==true)
+            );
+        } else if !saved_payment {
+            assert!(close_eligible(s.procurement.as_ref().unwrap(), api.clock));
+        }
+        let before = s.next;
+        api.read_errors.insert(
+            route.into(),
+            protocol::ReadError::Refused(protocol::READ_REFUSED.into()),
+        );
+        assert_eq!(
+            block_on(s.procurement_resume(&mut api, false)).unwrap_err(),
+            protocol::READ_REFUSED
+        );
+        assert_eq!(s.next, before + u64::from(route == "/api/v1/vm/11"));
+    }
 }
