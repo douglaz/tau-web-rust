@@ -43,6 +43,7 @@ struct Fixture {
     record_signatures: bool,
     machines: Vec<Value>,
     payments: Vec<Value>,
+    history_response: Option<Value>,
     lose_create: bool,
     lose_invoice: bool,
     lose_registration: bool,
@@ -72,6 +73,7 @@ impl Fixture {
             record_signatures: false,
             machines: Vec::new(),
             payments: Vec::new(),
+            history_response: None,
             lose_create: false,
             lose_invoice: false,
             lose_registration: false,
@@ -212,9 +214,10 @@ impl Api for Fixture {
                     Ok(vm)
                 }
             }
-            ("GET", "/api/v1/vm/11/payments?limit=100&offset=0") => {
-                Ok(json!({"data":self.payments,"total":self.payments.len(),"offset":0,"limit":100}))
-            }
+            ("GET", "/api/v1/vm/11/payments?limit=100&offset=0") => Ok(self
+                .history_response
+                .clone()
+                .unwrap_or_else(|| json!(self.payments))),
             ("GET", "/api/v1/vm/11/renew/quote?method=lightning&intervals=1") => {
                 if self.fail_quote {
                     Err("quote unavailable".into())
@@ -284,6 +287,160 @@ fn issue_invoice(s: &mut Store<MemoryStorage>, api: &mut Fixture) -> Result<(), 
         }
     }
     block_on(s.procurement_resume(api, true))
+}
+
+fn history_rows(count: usize) -> Vec<Value> {
+    (0..count)
+        .map(|n| {
+            let mut row = fixtures::payment(11);
+            row["id"] = json!(format!("{n:04x}"));
+            row
+        })
+        .collect()
+}
+
+fn assert_history_refused(api: &mut Fixture, reason: &str) {
+    let mut s = ready();
+    approve(&mut s, api);
+    assert_eq!(
+        block_on(s.procurement_resume(api, true)).unwrap_err(),
+        reason
+    );
+    let p = s.procurement.as_ref().unwrap();
+    assert!(p.payment.is_none());
+    assert!(p.invoice.is_none());
+    assert!(p.billing.is_none());
+    assert_eq!(
+        api.count("GET /api/v1/vm/11/payments?limit=100&offset=0"),
+        1
+    );
+    assert_eq!(
+        api.count("GET /api/v1/vm/11/renew?method=lightning&intervals=1"),
+        0
+    );
+    assert_eq!(reopen(&s).procurement, s.procurement);
+}
+
+#[test]
+fn provisioning_history_empty_array_saves_quote_without_issuance() {
+    let mut s = ready();
+    let mut api = Fixture::new(false);
+    approve(&mut s, &mut api);
+    assert_eq!(
+        block_on(s.procurement_resume(&mut api, false)).unwrap_err(),
+        "Review the current initial Lightning quote and explicitly approve issuance for the first approved billing period."
+    );
+    let p = s.procurement.as_ref().unwrap();
+    assert_eq!(p.billing.as_ref().unwrap().terms, fixtures::billing_terms());
+    assert!(p.payment.is_none());
+    assert!(p.invoice.is_none());
+    assert_eq!(
+        api.count("GET /api/v1/vm/11/renew/quote?method=lightning&intervals=1"),
+        1
+    );
+    assert_eq!(
+        api.count("GET /api/v1/vm/11/renew?method=lightning&intervals=1"),
+        0
+    );
+    assert_eq!(reopen(&s).procurement, s.procurement);
+}
+
+#[test]
+fn provisioning_history_exactly_100_rows_is_incomplete() {
+    let mut api = Fixture::new(false);
+    api.payments = history_rows(100);
+    assert_history_refused(
+        &mut api,
+        "Payment history incomplete; Refresh without issuing another invoice.",
+    );
+}
+
+#[test]
+fn provisioning_history_101_through_128_rows_is_incomplete() {
+    for count in [101, 127, 128] {
+        let mut api = Fixture::new(false);
+        api.payments = history_rows(count);
+        assert_history_refused(
+            &mut api,
+            "Payment history incomplete; Refresh without issuing another invoice.",
+        );
+    }
+}
+
+#[test]
+fn provisioning_history_129_rows_exceeds_array_bound() {
+    let mut api = Fixture::new(false);
+    api.payments = history_rows(129);
+    assert_history_refused(&mut api, REFUSED);
+}
+
+#[test]
+fn provisioning_history_nested_pagination_is_refused() {
+    let mut api = Fixture::new(false);
+    api.history_response = Some(json!({"data":[],"total":0,"limit":100,"offset":0}));
+    assert_history_refused(&mut api, REFUSED);
+}
+
+#[test]
+fn provisioning_history_other_nonarrays_are_refused() {
+    for value in [Value::Null, json!(true), json!(0), json!(""), json!({})] {
+        let mut api = Fixture::new(false);
+        api.history_response = Some(value);
+        assert_history_refused(&mut api, REFUSED);
+    }
+}
+
+#[test]
+fn provisioning_history_complete_multiple_rows_remain_ambiguous() {
+    for count in [2, 99] {
+        let mut api = Fixture::new(false);
+        api.payments = history_rows(count);
+        assert_history_refused(
+            &mut api,
+            "Initial payment evidence conflicts or is ambiguous; no invoice issued.",
+        );
+    }
+}
+
+#[test]
+fn provisioning_history_duplicate_wrong_vm_and_missing_identity_are_refused() {
+    for mode in ["duplicate", "wrong_vm", "missing_id", "missing_vm"] {
+        let mut api = Fixture::new(false);
+        api.payments = history_rows(1);
+        match mode {
+            "duplicate" => api.payments.push(api.payments[0].clone()),
+            "wrong_vm" => api.payments[0]["vm_id"] = json!(12),
+            "missing_id" => {
+                api.payments[0].as_object_mut().unwrap().remove("id");
+            }
+            _ => {
+                api.payments[0].as_object_mut().unwrap().remove("vm_id");
+            }
+        }
+        assert_history_refused(&mut api, REFUSED);
+    }
+}
+
+#[test]
+fn provisioning_history_missing_payment_terms_cannot_issue_invoice() {
+    let mut s = ready();
+    let mut api = Fixture::new(false);
+    approve(&mut s, &mut api);
+    api.payments.push(fixtures::payment(11));
+    api.payments[0].as_object_mut().unwrap().remove("time");
+    assert_eq!(
+        block_on(s.procurement_resume(&mut api, true)).unwrap_err(),
+        "Initial payment evidence conflicts or cannot be established from the saved one-period quote; no invoice issued."
+    );
+    let p = s.procurement.as_ref().unwrap();
+    assert_eq!(p.billing.as_ref().unwrap().terms, fixtures::billing_terms());
+    assert!(p.payment.is_none());
+    assert!(p.invoice.is_none());
+    assert_eq!(
+        api.count("GET /api/v1/vm/11/renew?method=lightning&intervals=1"),
+        0
+    );
+    assert_eq!(reopen(&s).procurement, s.procurement);
 }
 
 #[test]

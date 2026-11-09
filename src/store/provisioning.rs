@@ -753,11 +753,8 @@ impl<S: Storage> Store<S> {
                 None,
             )
             .await?;
-        let rows = array(&result["data"])?;
-        if number(&result, "total")? != rows.len() as u64
-            || number(&result, "limit")? != 100
-            || number(&result, "offset")? != 0
-        {
+        let rows = array(&result)?;
+        if rows.len() >= 100 {
             return Err(
                 "Payment history incomplete; Refresh without issuing another invoice.".into(),
             );

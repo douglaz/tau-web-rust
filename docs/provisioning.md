@@ -142,9 +142,20 @@ The consumed success envelope is `{data: ...}`. Routes are:
 | Initial billing quote (read-only) | `GET /api/v1/vm/{id}/renew/quote?method=lightning&intervals=1` |
 | Initial invoice only | `GET /api/v1/vm/{id}/renew?method=lightning&intervals=1` |
 
-Payment history consumes the inner `{data: VmPayment[], total, limit, offset}` pagination object;
-the page requires its complete first page. Truncated or larger history pauses. It does not invent
-a payment-type field: VM linkage, creation, exact saved quote amount/currency/period/fees,
+Only `GET /api/v1/vm/{id}/payments?limit=100&offset=0` consumes a payment-row array inside
+the single response envelope: `{"data":[...]}`. Nested pagination objects are refused, including
+`{data: VmPayment[], total, limit, offset}`. The existing array type and 128-entry bound apply
+first; 129 or more rows receive the generic provider-response refusal. Fewer than 100 rows
+form a complete first page; 100–128 rows pause with "Payment history incomplete; Refresh without
+issuing another invoice." and cannot issue an invoice. Completeness does not establish suitability:
+two or more rows remain ambiguous, and row identity and payment checks still apply.
+
+Vendor documentation describes `PaginatedResponse<VmPayment>`, but LNVPS source at `10266e58`
+and `8352f114` returns `ApiResult<Vec<ApiVmPayment>>` through `ApiData::ok`, with no total.
+The upstream VM payments route is deprecated in favor of `/api/v1/subscriptions/{id}/payments`;
+this PoC keeps the VM route. No other route or response-envelope rule changes.
+
+The page does not invent a payment-type field: VM linkage, creation, exact saved quote amount/currency/period/fees,
 `is_upgrade` and Lightning data establish suitability. Plan-price units are millisats for BTC and
 cents for EUR/USD. The authenticated Lightning quote supplies BTC millisats and the seconds for
 one approved billing interval; the page assumes no day/month/year length and reconstructs no FX.
