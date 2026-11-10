@@ -56,7 +56,9 @@ reviewed against b6d1252 (4d991cde plus ADR-0072) while the compiled pin remains
 ## The harness
 
 The bounded served-page purchase flow and its local HTTPS checks are described in
-[Browser provisioning](docs/provisioning.md).
+[Browser provisioning](docs/provisioning.md). The separate [inference credit path](docs/inference-credit.md)
+adds local encrypted account custody, externally paid invoices and memory-only session keys,
+with its specification departures stated explicitly.
 
 `src/` is the harness worker's wasm module, built for `wasm32-unknown-unknown` on spec ADR-0024's
 configuration, beside the pinned inputs above. It runs in a dedicated worker the page starts,
@@ -149,8 +151,8 @@ outside the seed-backup ceremony accepts it. A missing live session, unknown mem
 type, empty text, non-https source, second goal or ended session changes nothing. The worker
 journals an encrypted `goal` event before applying it. `store_state.goals` shows history;
 `sessions[].goal` and the page show that live session's text and provenance without keys.
-There is no import, export, sharing, stored-goal selector or reuse control. Fresh bindings have
-no goal and empty input fields. Replay restores each original session’s own goal and approvals.
+There is no import, export, sharing, stored-goal selector or reuse control. Fresh BYO bindings have
+no goal and empty input fields. Credit-backed Start records the entered goal for its new session. Replay restores each original session’s own goal and approvals.
 
 **Implementation reading: provenance and lifetime.** The source is the fixed
 `operator_session_goal_card` marker; a session accepts exactly one goal. `document_source` is
@@ -231,8 +233,9 @@ records no tool intent; its next-turn history withholds the call and carries onl
 credential-boundary refusal as untrusted tool output. A JSON escape cannot bypass these checks.
 Tool output and documents change no acceptance, approval,
 binding, disposition, hold, barrier or capability, including when claiming policy authority.
-No vendor credential is held by this build (SEC-5 row 1); the hostile-goal/document tests search
-all credentials the store enumerates, including both inference tiers, with the existing raw,
+The fixture path holds no vendor credential (SEC-5 row 1). The separate credit path holds its
+account pair encrypted in the browser store. The hostile-goal/document tests search
+all credentials the store enumerates, including both inference tiers and the credit account pair, with the existing raw,
 hex, HEX, base64 and base64url needles and embedded alignments. **Implementation reading:
 credential attempt.** The scripted attempt writes
 hex of the actual received completion body to the machine. Planting a held credential into
@@ -404,7 +407,7 @@ The following are **implementation readings**, not claims about the real account
   the recorded case-I envelope with a reported provider and cost, case-H without either, and
   case-C's readable routing refusal, with fixture values and leading whitespace on successes.
   The fixture enforces requested caps, expiry, revocation and management-endpoint separation.
-- **Served procured-inference refusal:** the served build compiles the bundle's origin but has no candidate.
+- **Served fixture-profile refusal:** the served build compiles the bundle's origin but has no candidate for this profile. The separate credit path uses that origin for its own account and key protocol.
   An inference request refuses for missing session-start selection before contact. Only the
   tracer build carries `fixture-model`, `fixture-maker`, `fixture-provider` and the worker-state
   origin switch. In the served no-plaintext case, both new credential needles are vacuous by
@@ -1768,8 +1771,9 @@ and bound set. Session tools run in the harness worker; create/payment remains t
 
 **Implementation readings.** The compiled two-entry setup (`fixture`, `fixture-other`), its
 vendor/product/region labels and 1000/2000 sat per month prices are fixture data, not a vendor's
-price, until a real source exists. Approving in the served build consumes real machine-family
-indices in the operator's store; they are never reused. The question wording is also a
+price. Only test/tracer builds offer that setup card; the served page withholds the fixture offer.
+Controls for an already-approved setup remain available. Any recorded approval consumes real
+machine-family indices in the operator's store; they are never reused. The question wording is also a
 compile-time fixture until twr-ggw.34 supplies the bundle's wording; no page message changes it.
 Connection attempts require a live binding; names with no approved entry keep the write-free
 `no-entry` refusal. Access is checked at binding as an implementation reading of ARC-44's
@@ -2416,8 +2420,8 @@ The cases:
 
 | Case | What the fixtures show |
 |---|---|
-| the served build loads | its worker comes up and nothing errs, and the page has no `tauWeb` global and no global holding the worker. With no store, the page offers Create alone, and a request is refused before any contact. A store is created and refuses dispatch for seed backup without contact or append; after explicit skip an unapproved command refuses as no-entry; after approval through the card, called in its worker on the machine the tracer build pins, it refuses for the missing pin, the relay accepts no connection and the sshd sees none, and nothing is appended |
-| setup batch card and indices, each build | all entries and approved costs, totals and recurring statement precede the click; no approval/reservation before it; unapproved command refuses before contact; one approval records both indices and exactly the offer the worker reported before the click (`setup_offer`) |
+| the served build loads | its worker comes up and nothing errs, and the page has no `tauWeb` global and no global holding the worker. With no store, the page offers Create alone, and a request is refused before any contact. A store is created and refuses dispatch for seed backup without contact or append; after explicit skip an unapproved command refuses as no-entry; after establishing an approved fixture setup through its worker, called on the machine the tracer build pins, it refuses for the missing pin, the relay accepts no connection and the sshd sees none, and nothing is appended |
+| setup batch card and indices, each build | tracer shows all offer facts and terms before approval; served has no fixture offer, card or approval button. No approval/reservation precedes the act; an unapproved command refuses before contact. One approval records both indices and exactly the fixture entries. Served checks establish approval through the worker to exercise retained approved controls. |
 | setup class questions, each build | no checked, selected, autofocus, focus or keyboard default before answering or after reload; Not sure is multi-tenant and No is single-purpose in the independent reader; maintained access with ad-hoc revision; second answer refuses |
 | setup non-operator inputs, each build | extra dispatch/collection members and malformed page messages change no journal or store state, supply no question or answer and seal nothing |
 | setup ceremony refusal, each build | locked and ceremony-active approval attempts append nothing |

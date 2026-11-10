@@ -3053,14 +3053,14 @@ fn poc_configuration_rejects_reference_collisions_without_changing_inventory() {
                     .unwrap_err()
                     .contains("task references")
             );
-            assert!(store.poc_credential_filters.is_empty());
+            assert!(store.poc_credential_filters.borrow().is_empty());
             assert_eq!(store.storage.files(), files);
         }
     }
     store
         .poc_configuration_key(b"ordinary-later-key-482700")
         .unwrap();
-    assert!(store.poc_credential_filters.is_empty());
+    assert!(store.poc_credential_filters.borrow().is_empty());
 }
 
 #[test]
@@ -3170,4 +3170,81 @@ impl Drop for FixedIdentifiers {
 
 pub(in crate::store) fn fixed_seed() -> Option<Seed> {
     IDENTIFIER_DRAW.get().map(|_| Seed::import("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about").unwrap())
+}
+
+#[test]
+fn poc_credit_mint_failure_pauses_without_consuming_requests_or_replacing_genuine_pause() {
+    let mut store = ready();
+    let task = create_task(&mut store);
+    let task = change(&mut store, &task, Change::Request);
+    block_on(store.credit_pause_mint_failure(&task.start_session, crate::poc::credit::MINT_FAILED))
+        .unwrap();
+    let paused = store.poc_task(&task.id).unwrap();
+    assert_eq!(paused.status, Status::Paused);
+    assert_eq!(paused.requests, task.requests);
+    assert_eq!(paused.steps, task.steps);
+    assert_eq!(paused.pending, task.pending);
+    assert_eq!(
+        paused.pause_reason.as_deref(),
+        Some(crate::poc::credit::MINT_FAILED)
+    );
+    block_on(store.credit_pause_mint_failure(&task.start_session, "another failure")).unwrap();
+    assert_eq!(store.poc_task(&task.id).unwrap(), paused);
+    assert_eq!(reopen(&store).poc_task(&task.id).unwrap(), paused);
+}
+
+#[test]
+fn poc_credit_mint_failure_preserves_collection_continuations_and_verification() {
+    for state in ["proposal", "pending", "verifying", "verifying-pending"] {
+        let mut store = ready();
+        let task = create_task(&mut store);
+        let task = if state.starts_with("verifying") {
+            let task = change(&mut store, &task, Change::Request);
+            let task = change(
+                &mut store,
+                &task,
+                Change::Propose {
+                    call_id: "finished".into(),
+                    tool: done(),
+                },
+            );
+            if state.contains("pending") {
+                change(&mut store, &task, Change::PrepareCheck)
+            } else {
+                task
+            }
+        } else {
+            proposal(&mut store, &task)
+        };
+        let expected = if state.contains("pending") {
+            append(&mut store, &task, &task.start_session);
+            store.poc_task(&task.id).unwrap()
+        } else {
+            task.clone()
+        };
+        let records = store.next;
+        block_on(
+            store.credit_pause_mint_failure(&task.start_session, crate::poc::credit::MINT_FAILED),
+        )
+        .unwrap();
+        assert_eq!(store.poc_task(&task.id).unwrap(), expected, "{state}");
+        assert_eq!(
+            store.next, records,
+            "no revision or journal change beneath permitted work: {state}"
+        );
+    }
+}
+
+#[test]
+fn poc_payment_scheduler_checks_dispatch_time_state() {
+    let output = std::process::Command::new("node")
+        .arg("scripts/check-payment-scheduler.mjs")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

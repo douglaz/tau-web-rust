@@ -72,7 +72,7 @@ async fn document(run: &Run<'_>, tab: &Tab) -> Result<Value, String> {
             for(const a of Array.from(node.attributes)) node.removeAttribute(a.name);
             for(const [name,value] of attributes) node.setAttribute(name,value);
         }
-        return {html:root.outerHTML, fields:Array.from(document.querySelectorAll('input,textarea,select'), n=>n.value)};
+        return {html:root.outerHTML, fields:Array.from(document.querySelectorAll('input,textarea,select'), n=>[n.id,n.value])};
     })()"#).await
 }
 
@@ -86,6 +86,24 @@ struct Documents {
     wrong_pass: Value,
 }
 
+fn retained_public_configuration(baseline: &Value, tracer: bool) -> Value {
+    let mut expected = baseline.clone();
+    if tracer {
+        for (id, value) in [
+            ("tau-poc-endpoint", "https://fixture.invalid/completions"),
+            ("tau-poc-model", "fixture"),
+        ] {
+            let field = expected["fields"]
+                .as_array_mut()
+                .expect("field snapshot")
+                .iter_mut()
+                .find(|field| field[0] == id)
+                .expect("public inference field");
+            field[1] = json!(value);
+        }
+    }
+    expected
+}
 async fn absent(run: &Run<'_>, tab: &Tab, expected: &Value) -> Result<bool, String> {
     Ok(document(run, tab).await? == *expected)
 }
@@ -998,11 +1016,7 @@ file_inputs::equal_primary("seed_cases.a032.1", "seed_cases.a032", &(store_files
         .await?;
         click(run, tab, "seed-backup-answer").await?;
         wait_stage("seed.redisplay.answering", run, tab, "answering").await?;
-        let mut expected = documents.redisplay.clone();
-        if tracer {
-            expected["fields"][3] = json!("https://fixture.invalid/completions");
-            expected["fields"][4] = json!("fixture");
-        }
+        let expected = retained_public_configuration(&documents.redisplay, tracer);
         case.check(
             "seed_cases.a037",
             "re-display removes words while retaining exactly the admitted public endpoint and model",
@@ -1057,7 +1071,12 @@ file_inputs::equal_primary("seed_cases.a032.1", "seed_cases.a032", &(store_files
             "seed_cases.a041",
             "wrong passphrase shows no word and journals nothing",
             crate::state_inputs::all!(
-                absent(run, tab, &documents.wrong_pass).await?,
+                absent(
+                    run,
+                    tab,
+                    &retained_public_configuration(&documents.wrong_pass, tracer)
+                )
+                .await?,
                 file_inputs::equal_primary(
                     "seed_cases.a041.1",
                     "seed_cases.a041",

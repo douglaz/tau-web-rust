@@ -517,7 +517,7 @@ fn poc_machine_launch_and_collection_evidence_protect_key_echoes_after_rotation_
     assert_poc_decrypted_journal_private(&store, &[OLD, NEW]);
     let reopened = reopen(&store).unwrap();
     assert!(
-        reopened.poc_credential_filters.is_empty(),
+        reopened.poc_credential_filters.borrow().is_empty(),
         "fingerprints are never journaled"
     );
     assert_poc_decrypted_journal_private(&reopened, &[OLD, NEW]);
@@ -637,7 +637,7 @@ fn poc_rotated_marker_credentials_refuse_job_and_operation_evidence_without_appe
     store.remember_poc_credential(OLD);
     store.remember_poc_credential(NEW);
     assert_eq!(
-        store.poc_credential_filters.len(),
+        store.poc_credential_filters.borrow().len(),
         1,
         "retained generations share a single boundary"
     );
@@ -1000,7 +1000,7 @@ fn poc_isolated_encoding_evidence_journal_and_replay_regressions() {
             reader.previous = Address(Sha256::digest(bytes).into());
         }
         let replayed = reopen(&store).unwrap();
-        assert!(replayed.poc_credential_filters.is_empty());
+        assert!(replayed.poc_credential_filters.borrow().is_empty());
         assert_eq!(replayed.storage.files(), files);
     }
 }

@@ -34,14 +34,27 @@
 <section id="tau-setup" hidden aria-label="Setup machines"></section>
 <section id="tau-poc" hidden aria-label="Connection configuration">
 <h2>Inference</h2>
+<details><summary>Details</summary><p id="tau-defaults-status">Reading deployment defaults…</p></details>
+<section id="tau-credit" aria-label="Inference credit">
+<p id="tau-credit-status" role="status">No inference credit yet.</p>
+<p>This credit is kept only in this browser's encrypted store. If the store is lost, the credit is lost.</p>
+<label>Top-up sat <input id="tau-credit-amount" type="number" min="100" max="5000" step="1" value="1000"></label>
+<button id="tau-credit-invoice" type="button">Get an invoice</button>
+<button id="tau-credit-check" type="button" hidden>Check now</button>
+<div id="tau-credit-invoices"></div>
+<details><summary>Details</summary><p id="tau-credit-details"></p></details>
+</section>
+<p><label>HTTPS chat completions endpoint <input id="tau-poc-endpoint" form="tau-poc-inference-form" type="url" required autocomplete="off"></label></p>
+<p><label>Model identifier <input id="tau-poc-model" form="tau-poc-inference-form" required autocomplete="off"></label></p>
+<button id="tau-credit-configure" type="button">Use inference credit with this configuration</button>
+<details><summary>Use your own inference endpoint instead</summary>
 <p>The key stays in this worker's memory. App Lock, reload or worker loss clears it; re-enter it after unlocking. Switching apps retains it if the worker survives. Freezing aborts a request. Provider billing limits remain the provider's responsibility.</p>
 <p id="tau-poc-key-status" role="status">Key unset.</p>
 <form id="tau-poc-inference-form" novalidate>
-<p><label>HTTPS chat completions endpoint <input id="tau-poc-endpoint" type="url" required autocomplete="off"></label></p>
-<p><label>Model identifier <input id="tau-poc-model" required autocomplete="off"></label></p>
 <p><label>Key <input id="tau-poc-key" type="password" required autocomplete="off"></label></p>
 <button type="submit">Set inference configuration</button>
 </form>
+</details>
 <h2>New machine</h2>
 <p>Use a dedicated, already verified provider account. This PoC uses an operator-supplied account rather than seed-based vendor recovery. It supports one outstanding purchase per store, external payment of the initial period, and published Ed25519 host keys. No stock or connectivity is promised.</p>
 <p id="tau-provider-key-status" role="status">Provider key unset.</p>

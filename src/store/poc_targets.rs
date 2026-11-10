@@ -245,7 +245,11 @@ impl<S: Storage> Store<S> {
         let approval = crate::binding::InferenceApproval::synthetic();
         #[cfg(all(not(target_arch = "wasm32"), not(any(test, feature = "tracer"))))]
         let approval = native_approval()?;
-        self.admit(machine, &[], approval).await
+        #[cfg(target_arch = "wasm32")]
+        let credit = crate::poc::credit::browser::selected();
+        #[cfg(not(target_arch = "wasm32"))]
+        let credit = false;
+        self.admit_with_credit(machine, &[], approval, credit).await
     }
 
     /// Operator-authored declaration candidate. It uses the ordinary goal/session,
@@ -389,6 +393,9 @@ impl<S: Storage + Clone> Store<S> {
         let mut contains = false;
         let mut provider_protection = 0;
         let mut poc_pauses = 0;
+        let mut account_records = 0;
+        let mut account_contains = false;
+        let mut mint_names = Vec::new();
         for number in 0..self.next {
             let bytes = self.storage.read(&number.to_string()).await?;
             let event = reader.open(number, &bytes)?;
@@ -400,13 +407,29 @@ impl<S: Storage + Clone> Store<S> {
                     ..
                 })
             ));
-            contains |= serde_json::to_string(&event)
-                .map_err(|_| "fixture event encoding")?
-                .contains(needle);
+            let encoded = Zeroizing::new(
+                serde_json::to_string(&event).map_err(|_| "fixture event encoding")?,
+            );
+            if let Event::PocCreditAccount(account) = &event {
+                account_records += 1;
+                if !needle.is_empty()
+                    && (account.credit_id.0.as_str() == needle
+                        || account.default_key.0.as_str() == needle)
+                {
+                    account_contains = true;
+                } else {
+                    contains |= encoded.contains(needle);
+                }
+            } else {
+                contains |= encoded.contains(needle);
+            }
+            if let Event::PocCredit(crate::store::credit::Record::MintName(mint)) = &event {
+                mint_names.push(mint.name.clone());
+            }
             reader.previous = Address(Sha256::digest(&bytes).into());
         }
         Ok(
-            json!({"contains":contains,"records":self.next,"provider_protection":provider_protection,"poc_pauses":poc_pauses,"machines":self.allocation().next_unused().machines,"passes":self.allocation().next_unused().passes,"targets":self.poc_targets.len()}),
+            json!({"contains":contains,"account_records":account_records,"account_contains":account_contains,"mint_names":mint_names,"records":self.next,"provider_protection":provider_protection,"poc_pauses":poc_pauses,"machines":self.allocation().next_unused().machines,"passes":self.allocation().next_unused().passes,"targets":self.poc_targets.len()}),
         )
     }
 }

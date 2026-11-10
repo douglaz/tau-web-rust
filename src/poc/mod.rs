@@ -20,3 +20,9 @@ pub mod targets;
 pub(crate) mod web;
 
 pub(crate) mod wait;
+
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    allow(dead_code, reason = "credit is driven by the browser worker")
+)]
+pub mod credit;

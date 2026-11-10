@@ -2,6 +2,7 @@
 // carries words to the page; re-entry and passphrase buffers are zero-filled by the module.
 import init, { spec_commit, open, create, unlock, seed_backup_display, seed_backup_answer, seed_backup_reentry, seed_backup_skip, seed_backup_redisplay, setup_approve, setup_answer, bind, goal_request, accept_page_goal, TaskPublication, requirements_answer, delivery_request, retire_runtime, sweep_inference, lifecycle_transition, publication_generation, publish_report, verify_inference_clock, withdraw_reinstall } from './pkg/tau_web.js';
 import { identify_execution, wake_tasks, poc_configure, poc_key_is_set, poc_enroll, poc_bind, poc_public_keys, poc_accept, poc_propose_requirements } from './pkg/tau_web.js';
+import { credit_request } from './pkg/tau_web.js';
 import { provider_configure, provider_key_is_set, provider_request } from './pkg/tau_web.js';
 
 const clearInput = request => {
@@ -62,8 +63,42 @@ if (retirementRequested) {
   // The page terminates this incarnation. It never opens the store or grants authority.
   await new Promise(() => {});
 }
+let paymentTimer = null;
+let pageVisible = true;
+let lastReport = null;
+const paymentsEligible = () => !retirementRequested && pageVisible && lastReport?.state === 'unlocked' && !['suspended','reconciling','ended'].includes(lastReport?.lifecycle_state);
+const pendingCredit = () => {
+  const invoice = lastReport?.credit?.invoices?.at(-1);
+  return paymentsEligible() && invoice && !['paid','expired_unpaid','abandoned'].includes(invoice.outcome) && Date.now()/1000 <= invoice.expires_at + 60 ? invoice.id : null;
+};
+const pendingMachine = () => {
+  const machine = lastReport?.procurement?.payment;
+  return paymentsEligible() && machine && !machine.is_paid && !lastReport.procurement?.target && provider_key_is_set() && Date.now() <= Date.parse(machine.expires) + 60000 ? machine.id : null;
+};
+const schedulePayments = () => {
+  if (paymentTimer || !paymentsEligible()) return;
+  const creditPending = pendingCredit();
+  const machinePending = pendingMachine();
+  if (!creditPending && !machinePending) return;
+  paymentTimer = setTimeout(async () => {
+    paymentTimer = null;
+    if (!paymentsEligible()) return;
+    const generation = publication_generation();
+    if (creditPending && pendingCredit() === creditPending) await reportStore(await credit_request(JSON.stringify({action:'poll'})), generation);
+    if (machinePending && pendingMachine() === machinePending) await reportStore(await provider_request(JSON.stringify({action:'payment_check'})), generation);
+    schedulePayments();
+  }, 5000);
+};
+const refreshPayments = async () => {
+  if (retirementRequested || !pageVisible || lastReport?.state !== 'unlocked') return;
+  const generation = publication_generation();
+  if (lastReport.credit?.account) await reportStore(await credit_request(JSON.stringify({action:'refresh'})),generation);
+  if (!retirementRequested && pageVisible && lastReport?.state === 'unlocked' && lastReport.procurement?.payment && provider_key_is_set()) await reportStore(await provider_request(JSON.stringify({action:'payment_check'})),generation);
+};
 const reportStore = (report, generation = publication_generation(), session = '') => {
   const value = JSON.parse(report);
+  lastReport = value;
+  schedulePayments();
   value.poc_configuration = { key_set: poc_key_is_set() };
   value.provider_configuration = { key_set: provider_key_is_set() };
   return publish_report(generation, session, JSON.stringify(value));
@@ -82,12 +117,17 @@ onmessage = async ({ data: envelope }) => {
     return;
   }
   if (data.retire_runtime === true) {
+    retirementRequested = true;
+    clearTimeout(paymentTimer); paymentTimer = null;
     await retire_runtime();
     postMessage({ runtime_retired: true });
     return;
   }
   if (typeof data.lifecycle === 'string') {
+    if (data.lifecycle === 'hidden' || data.lifecycle === 'freeze') { pageVisible = false; clearTimeout(paymentTimer); paymentTimer = null; }
+    if (data.lifecycle === 'visible' || data.lifecycle === 'resume') pageVisible = true;
     await reportStore(await lifecycle_transition(data.lifecycle));
+    if (data.lifecycle === 'visible' || data.lifecycle === 'resume') await refreshPayments();
     return;
   }
   const generation = publication_generation();
@@ -115,6 +155,11 @@ onmessage = async ({ data: envelope }) => {
       if (config.key instanceof Uint8Array) config.key.fill(0);
       delete config.key;
     }
+  }
+  else if (data.credit_request && typeof data.credit_request === 'object') {
+    const value = JSON.parse(await credit_request(JSON.stringify(data.credit_request)));
+    if (data.credit_request.action === 'start' && !value.credit_error) value.credit_started_machine = data.credit_request.machine;
+    report = JSON.stringify(value);
   }
   else if (data.provider_configure !== undefined) {
     const config = data.provider_configure;
@@ -193,12 +238,14 @@ onmessage = async ({ data: envelope }) => {
   await reportStore(report, generation, session);
   if (data.unlock instanceof Uint8Array || data.seed_backup_redisplay instanceof Uint8Array) {
     setTimeout(() => sweep_inference(), 0);
+    wake_tasks();
+    await refreshPayments();
   }
   const display = JSON.parse(await seed_backup_display());
   if (display) postMessage(display);
   } finally {
     // Prerequisite changes wake interrupted work; task controls retain their explicit workflow.
-    if (data && (data.unlock instanceof Uint8Array || data.poc_configure || data.lifecycle === 'resume' ||
+    if (data && (data.unlock instanceof Uint8Array || data.poc_configure || data.credit_request || data.lifecycle === 'resume' ||
         Object.keys(data).some(name => name.startsWith('seed_backup_')))) wake_tasks();
   }
 };

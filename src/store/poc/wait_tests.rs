@@ -112,11 +112,11 @@ fn poc_wait_admission_prevents_resume_stranding() {
         let next = store.next;
         let previous = store.previous.0;
         let tasks = store.poc.clone();
-        let filters = store.poc_credential_filters.len();
+        let filters = store.poc_credential_filters.borrow().len();
         let admission = store.poc_configuration_key(key.as_bytes());
         super::journal_tests::unchanged(&store, &files, next, previous);
         assert_eq!(store.poc, tasks);
-        assert_eq!(store.poc_credential_filters.len(), filters);
+        assert_eq!(store.poc_credential_filters.borrow().len(), filters);
         if let Err(error) = &admission {
             assert!(!error.contains(key));
         }

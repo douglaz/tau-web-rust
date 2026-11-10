@@ -1,9 +1,11 @@
 import {createServer} from 'node:http';
+import assert from 'node:assert/strict';
 import {readFile, mkdtemp, rm} from 'node:fs/promises';
 import {spawn, spawnSync} from 'node:child_process';
 import {once} from 'node:events';
 import {createInterface} from 'node:readline';
 import {join} from 'node:path';
+import {creditCases, creditId, fixtureCredit, creditProof} from './credit-page.mjs';
 
 async function resumeProof(c) {
  const {name,info,inferenceEndpoint,call,sessionId,evaluate,invoke,wait,click,message,hold,point,release,configure,check,control,observerSource,pageOrigin}=c;
@@ -252,6 +254,9 @@ async function resumeProof(c) {
 }
 
 const name = process.argv[2] ?? 'interruption';
+if (name === 'list-credit') { console.log(JSON.stringify(creditCases)); process.exit(0); }
+const creditCase = creditCases.includes(name);
+const credit = fixtureCredit();
 if (name==='wire') {
   for (const row of ['wire-12000','wire-largest','wire-too-long']) {
     const result=spawnSync(process.execPath,[new URL(import.meta.url).pathname,row],{stdio:'inherit',env:process.env});
@@ -260,8 +265,8 @@ if (name==='wire') {
   process.exit(0);
 }
 const resumeCases=['resume-lock','resume-reload','resume-loss','resume-stale-fetch','resume-freeze','resume-append','resume-approval','resume-end','resume-configuration'];
-const realResume=resumeCases.includes(name);
-if (![...resumeCases,'resume-envelopes','approval-refusal','goal-span','job-span','future-revision','metadata-key','mismatched-terminal','first-key','rotation','publication','progress','interruption','aggregate','resolver','configuration','wire-12000','wire-largest','wire-too-long','first-key-checks','reload-key','reload-control','keyless-collection','reload-progress'].includes(name)) throw Error('unknown page case');
+const realResume=resumeCases.includes(name) || creditCase;
+if (![...creditCases,...resumeCases,'resume-envelopes','approval-refusal','goal-span','job-span','future-revision','metadata-key','mismatched-terminal','first-key','rotation','publication','progress','interruption','aggregate','resolver','configuration','wire-12000','wire-largest','wire-too-long','first-key-checks','reload-key','reload-control','keyless-collection','reload-progress'].includes(name)) throw Error('unknown page case');
 const keyless=['goal-span','job-span','first-key','first-key-checks','reload-key','reload-control','keyless-collection','reload-progress','mismatched-terminal'].includes(name);
 const fixture = spawn(process.env.TAU_POC_TRACER ?? 'target/debug/tracer', ['poc-fixtures'], {stdio:['pipe','pipe','inherit']});
 const lines = createInterface({input:fixture.stdout});
@@ -274,12 +279,23 @@ const inferenceEndpoint = realResume ? info.inference : 'https://inference.inval
 const injection = `
 import * as fixtureApi from './pkg/tau_web.js';
 const fixtureHolds=new Map();
+globalThis.fixtureCreditRelease=name=>fixtureHolds.get(name)?.release();
 let fixtureCommand='true', fixtureCalls=0, fixtureCommands=['true'];
 const fixturePoint=async name=>{const held=fixtureHolds.get(name);if(held){postMessage({fixture_point:name});await held.promise;}};
 const originalFetch=globalThis.fetch.bind(globalThis);
 globalThis.fetch=async(input,options)=>{
  const request=input instanceof Request?input:new Request(input,options);
+ const creditOrigin='https://127.0.0.1:'+new URL(location.href).port;
+ if(${creditCase} && request.url.startsWith(creditOrigin+'/')){
+  const url=new URL(request.url),headers=new Headers(request.headers);
+  if(request.method==='POST' && (url.pathname==='/keys'||url.pathname==='/topup/create/btc-lightning')){
+   const evidence=JSON.parse(await fixtureApi.test_poc_journal(${JSON.stringify(creditId)}));
+   headers.set('x-fixture-credit-evidence',JSON.stringify(evidence));
+  }
+  return originalFetch(new Request(location.origin+'/credit'+url.pathname+url.search,{method:request.method,headers,body:['GET','HEAD'].includes(request.method)?undefined:await request.arrayBuffer(),credentials:'omit',cache:'no-store',redirect:'error',signal:request.signal}));
+ }
  if(request.url.startsWith(location.origin+'/'))return originalFetch(input,options);
+ if(globalThis.fixtureCreditRefusal && request.url===${JSON.stringify(inferenceEndpoint)})return new Response(JSON.stringify({error:fixtureCreditRefusal.error}),{status:fixtureCreditRefusal.status});
  if(${realResume} && request.url===${JSON.stringify(inferenceEndpoint)})return originalFetch(input,options);
  if(request.url!=='https://inference.invalid/v1/chat/completions')throw Error('external request refused');
  const body=JSON.parse(await request.text());
@@ -290,10 +306,12 @@ globalThis.fetch=async(input,options)=>{
 `;
 const hook = `
 fixtureApi.test_poc_configuration(${JSON.stringify(inferenceEndpoint)},'model-a');
+if(${creditCase})fixtureApi.test_credit_origin('https://127.0.0.1:'+new URL(location.href).port);
 const productionMessage=onmessage;
 onmessage=async event=>{
  const value=event.data?.request?.fixture;
- if(!value){const result=await productionMessage(event);if(event.data?.request?.task||event.data?.request?.goal_accept||event.data?.request?.requirements_answer)postMessage({fixture_action_complete:true,fixture_action:event.data.request.task?.action??(event.data.request.requirements_answer?'requirements':'goal')});return result;}
+ if(!value){const result=await productionMessage(event);if(event.data?.request?.credit_request)postMessage({fixture_credit_complete:event.data.request.credit_request.action});if(event.data?.request?.unlock)postMessage({fixture_unlock_complete:true});if(event.data?.request?.lifecycle)postMessage({fixture_lifecycle_complete:event.data.request.lifecycle});if(event.data?.request?.task||event.data?.request?.goal_accept||event.data?.request?.requirements_answer)postMessage({fixture_action_complete:true,fixture_action:event.data.request.task?.action??(event.data.request.requirements_answer?'requirements':'goal')});return result;}
+ if(value.append_credit_probe){postMessage({fixture_credit_probe:JSON.parse(await fixtureApi.test_credit_append_probe(value.append_credit_probe))});return;}
  if(value.publish){const report=JSON.parse(await fixtureApi.open());report.goal_outcome={session:value.publish,outcome:{done:true}};await fixtureApi.publish_report(fixtureApi.publication_generation(),value.publish,JSON.stringify(report));return;}
  if(value.probe){postMessage({fixture_protected:JSON.parse(await fixtureApi.test_poc_protect_output(JSON.stringify(value.probe)))});return;}
  if(value.credential){await fixtureApi.test_poc_register_credential(new TextEncoder().encode(value.credential));postMessage({fixture_registered:true});return;}
@@ -314,7 +332,17 @@ onmessage=async event=>{
 // Only the loopback fixture response is instrumented; the shipped page/worker stay intact.
 const server=createServer(async(req,res)=>{
  try {
-  const path=new URL(req.url,'http://fixture.invalid').pathname;
+  const requestUrl=new URL(req.url,'http://fixture.invalid');
+  if(requestUrl.pathname.endsWith('/poc-defaults.json'))credit.state.defaultsPaths.push(requestUrl.pathname);
+  if(name==='credit-defaults-directory'&&!requestUrl.pathname.startsWith('/nested/')){res.writeHead(404).end();return;}
+  const path=name==='credit-defaults-directory'?requestUrl.pathname.slice('/nested'.length):requestUrl.pathname;
+  if(await credit.handler(req,res,path+requestUrl.search))return;
+  if(path==='/poc-defaults.json' && name!=='credit-defaults-missing'){
+    const value={provider_origin:'https://provider.example',relay_url:'wss://relay.example/',chat_endpoint:'https://credit.example/v1/chat/completions',model:'example-model',topup_sat:name==='credit-defaults-invalid'?99:1200,...credit.state.defaultsOverride};
+    if(!name.startsWith('credit-defaults')){res.writeHead(404).end();return;}
+    if(name==='credit-defaults-late')await new Promise(resolve=>{credit.state.releaseDefaults=resolve;});
+    res.setHeader('Content-Type','application/json');res.end(JSON.stringify(value));return;
+  }
   const file=path==='/'?'index.html':path.slice(1);
   if(!/^(index.html|boot.js|worker.js|pkg\/[a-zA-Z0-9_.-]+)$/.test(file)){res.writeHead(404).end();return;}
   let data=await readFile(new URL('../'+(file.startsWith('pkg/')?'dist/tracer/':'www/')+file,import.meta.url));
@@ -343,9 +371,18 @@ try{
  const {targetId}=await call('Target.createTarget',{url:'about:blank'});
  const {sessionId}=await call('Target.attachToTarget',{targetId,flatten:true});
  await call('Page.enable',{},sessionId);
- const observerSource=`window.fixtureReports=[];window.fixtureEvents=[];window.fixtureWorkers=[];const OriginalWorker=Worker;window.Worker=class extends OriginalWorker{constructor(...args){super(...args);fixtureWorkers.push(this);this.addEventListener('message',event=>{if(event.data.store)fixtureReports.push(event.data.store);else {fixtureEvents.push(event.data);if(Object.keys(event.data).some(key=>key.startsWith('fixture_')))event.stopImmediatePropagation();}});}terminate(){this.fixtureTerminated=true;super.terminate();}};`;
+ if(creditCase){await call('Target.setDiscoverTargets',{discover:true});await call('Target.setAutoAttach',{autoAttach:true,waitForDebuggerOnStart:false,flatten:true},sessionId);}
+ const observerSource=`const pageFetch=fetch.bind(window);window.fetch=(input,options)=>{const u=new URL(input instanceof Request?input.url:input,location.href);if(!['127.0.0.1','localhost','[::1]'].includes(u.hostname))throw Error('external page request refused');return pageFetch(input,options);};window.fixtureReports=[];window.fixtureEvents=[];window.fixtureWorkers=[];const OriginalWorker=Worker;window.Worker=class extends OriginalWorker{constructor(...args){super(...args);fixtureWorkers.push(this);this.addEventListener('message',event=>{if(event.data.store)fixtureReports.push(event.data.store);else {fixtureEvents.push(event.data);if(Object.keys(event.data).some(key=>key.startsWith('fixture_')))event.stopImmediatePropagation();}});}terminate(){this.fixtureTerminated=true;super.terminate();}};`;
  await call('Page.addScriptToEvaluateOnNewDocument',{source:observerSource},sessionId);
  const evaluate=async expression=>{const result=await call('Runtime.evaluate',{expression,awaitPromise:true,returnByValue:true},sessionId);if(result.exceptionDetails)throw Error(result.exceptionDetails.exception?.description??JSON.stringify(result.exceptionDetails));return result.result.value;};
+ const workerEvaluate=async expression=>{
+  const {targetInfos}=await call('Target.getTargets');
+  const target=targetInfos.find(t=>t.type==='worker'&&t.url.startsWith(`http://127.0.0.1:${server.address().port}/`));
+  if(!target)throw Error('fixture worker unavailable: '+JSON.stringify(targetInfos.map(t=>({type:t.type,url:t.url}))));
+  const attached=await call('Target.attachToTarget',{targetId:target.targetId,flatten:true});
+  try{const result=await call('Runtime.evaluate',{expression,awaitPromise:true,returnByValue:true},attached.sessionId);if(result.exceptionDetails)throw Error(result.exceptionDetails.exception?.description??JSON.stringify(result.exceptionDetails));return result.result.value;}
+  finally{await call('Target.detachFromTarget',{sessionId:attached.sessionId});}
+ };
  const invoke=async(fn,...args)=>evaluate(`(${fn.toString()})(...${JSON.stringify(args)})`);
  const wait=async expression=>evaluate(`new Promise((resolve,reject)=>{const start=performance.now();const poll=()=>{const value=(${expression});if(value)return resolve(value);if(performance.now()-start>60000)return reject(Error('page wait: '+${JSON.stringify(expression)}));setTimeout(poll,25);};poll();})`);
  const click=async selector=>invoke(selector=>{const e=document.querySelector(selector);if(!e)throw Error('missing '+selector);e.click();},selector);
@@ -355,7 +392,15 @@ try{
  const release=async name=>message({fixture:{release:name}});
  const configure=async key=>{await invoke((key,endpoint)=>{for(const [id,value]of [['endpoint',endpoint],['model','model-a'],['key',key]])document.querySelector('#tau-poc-'+id).value=value;document.querySelector('#tau-poc-inference-form').requestSubmit();},key,inferenceEndpoint);};
  const check=(ok,label)=>{if(!ok)throw Error(label);console.log(JSON.stringify({case:name,check:label}));};
- if(realResume){
+ if(creditCase){
+  try { await creditProof({name,info,inferenceEndpoint,call,sessionId,evaluate,workerEvaluate,invoke,wait,click,message,hold,point,release,configure,check,control,credit,pageOrigin:`http://127.0.0.1:${server.address().port}`}); }
+  catch(error){console.error(JSON.stringify({last:await evaluate('(()=>{const r=fixtureReports.at(-1);return {tasks:r?.tasks,error:r?.store_error,credit_error:r?.credit_error,lifecycle:r?.lifecycle_state,sessions:r?.sessions?.map(s=>({identity:s.identity,state:s.session_state,pending:s.pending_requirements}))};})()'),counts:{mints:credit.state.mintCalls,deletes:credit.state.deletes.length},fixture:await control({inspect:true})}));throw error;}
+  assert.deepEqual(credit.state.orderingFailures,[], 'mint name committed before request');
+  for(const needle of [creditId,'synthetic-default-credential-482700',...credit.state.keys.map(k=>k.api_key)]){
+   check(!await evaluate(`JSON.stringify(fixtureEvents).includes(${JSON.stringify(needle)}) || JSON.stringify(fixtureReports).includes(${JSON.stringify(needle)}) || document.body.textContent.includes(${JSON.stringify(needle)})`),'credit credentials stay out of page, messages and reports');
+  }
+  await evaluate('fixtureWorkers.at(-1).terminate()');await call('Browser.close');await once(browser,'exit');
+ } else if(realResume){
   try { await resumeProof({name,info,inferenceEndpoint,call,sessionId,evaluate,invoke,wait,click,message,hold,point,release,configure,check,control,observerSource,pageOrigin:`http://127.0.0.1:${server.address().port}`}); }
   catch(error) {
    console.error(JSON.stringify({last:await evaluate('(()=>{const r=fixtureReports.at(-1);return {tasks:r?.tasks,error:r?.store_error,lifecycle:r?.lifecycle_state,sessions:r?.sessions?.map(s=>({identity:s.identity,state:s.session_state,pending:s.pending_requirements}))};})()'),fixture:await control({inspect:true})}));

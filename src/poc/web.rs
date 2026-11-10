@@ -540,6 +540,9 @@ async fn request_with_mode(request: String, response: Response, automatic: bool)
                 store.check_task_session(&task, session)?;
                 task
             };
+            if !automatic {
+                crate::poc::credit::browser::retry_mint(session);
+            }
             let resolved = {
                 let local = local();
                 let mut writer = local.lock().await;
@@ -576,6 +579,7 @@ async fn request_with_mode(request: String, response: Response, automatic: bool)
                         &mut Configured {
                             response: response.clone(),
                             automatic,
+                            continuation: continuation.clone(),
                         },
                         response.clone(),
                         continuation.clone(),
@@ -646,6 +650,7 @@ async fn request_with_mode(request: String, response: Response, automatic: bool)
 }
 
 struct Configured {
+    continuation: crate::lifecycle::Continuation,
     response: Response,
     automatic: bool,
 }
@@ -655,7 +660,21 @@ impl run::Model for Configured {
         if crate::testonly::poc_model_configured() {
             return Ok(());
         }
-        let _ = task;
+        self.continuation.check()?;
+        let credit = {
+            let local = local();
+            let mut writer = local.lock().await;
+            self.continuation.check()?;
+            writer.store().ok_or("locked")?.credit_session(session)
+        };
+        if credit && (task.steps >= task.limits.steps || task.requests >= task.limits.requests) {
+            // Let the runner record its budget pause without requesting another allowance.
+            return Ok(());
+        }
+        if credit && !crate::poc::credit::browser::has_key(session) {
+            self.response.borrow_mut().take();
+        }
+        crate::poc::credit::browser::ensure(session, &self.continuation).await?;
         if !crate::poc::inference::key_is_set() {
             return Err("waiting for the admitted inference key; no request consumed".into());
         }

@@ -144,13 +144,13 @@ impl<S: Storage> Store<S> {
     }
     /// Remember only scan fingerprints, without extending the usable credential's lifetime.
     /// Keep prior generations until this store drops so late machine evidence remains protected.
-    #[cfg(any(target_arch = "wasm32", test))]
     pub(crate) fn remember_poc_credential(&mut self, key: &[u8]) {
         let next = crate::poc::inference::EchoFilter::new(&[key]);
-        if let Some(combined) = self.poc_credential_filters.first_mut() {
+        let mut filters = self.poc_credential_filters.borrow_mut();
+        if let Some(combined) = filters.first_mut() {
             combined.merge(next);
         } else {
-            self.poc_credential_filters.push(next);
+            filters.push(next);
         }
     }
 
@@ -195,12 +195,14 @@ impl<S: Storage> Store<S> {
             let size = chunks.iter().map(|c| c.len()).sum::<usize>();
             crate::poc::inference::work::charge(self.scans.work_cost(size))?;
             let mut safe = self.scans.scan(chunks)?;
+            let filters = self.poc_credential_filters.borrow();
             cache.resize_with(
-                self.poc_credential_filters.len() + self.provider_filters.len(),
+                filters.len() + self.provider_filters.len(),
                 Default::default,
             );
             for (filter, cache) in self
                 .poc_credential_filters
+                .borrow()
                 .iter()
                 .chain(&self.provider_filters)
                 .zip(cache)
@@ -214,6 +216,7 @@ impl<S: Storage> Store<S> {
     pub(crate) fn poc_output_is_safe(&self, bytes: &[u8]) -> Result<bool, String> {
         for filter in self
             .poc_credential_filters
+            .borrow()
             .iter()
             .chain(&self.provider_filters)
         {

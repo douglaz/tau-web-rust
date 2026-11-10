@@ -1015,7 +1015,7 @@ fn provisioning_provider_echoes_never_enter_journal_or_public_context() {
         assert_ne!(s.protect_output(&value).unwrap(), value);
     }
     // Hexadecimal account custody must not activate inference structural refusal.
-    assert!(s.poc_credential_filters.is_empty());
+    assert!(s.poc_credential_filters.borrow().is_empty());
     let mut api = Fixture::new(false);
     approve(&mut s, &mut api);
     let mut echoed = fixtures::vm(&fixtures::selection(false), 11);
@@ -1758,7 +1758,7 @@ fn provisioning_actual_request_signature_encodings_never_reach_response_journal_
         );
         assert_eq!(s.next, next);
         assert!(
-            s.poc_credential_filters.is_empty(),
+            s.poc_credential_filters.borrow().is_empty(),
             "Provider request custody is separate from inference admission"
         );
     }
@@ -2426,7 +2426,7 @@ fn provisioning_request_protection_survives_worker_loss_before_response() {
             reader.previous = Address(Sha256::digest(&bytes).into());
         }
     }
-    assert!(loaded.poc_credential_filters.is_empty());
+    assert!(loaded.poc_credential_filters.borrow().is_empty());
 }
 
 #[test]
@@ -2549,6 +2549,7 @@ fn provisioning_origin_invalid_configuration_is_atomic_and_credential_safe() {
     let allocation = s.allocation().clone();
     let requests = api.calls.len();
     s.poc_credential_filters
+        .borrow_mut()
         .push(crate::poc::inference::EchoFilter::new(&[b"guarded-origin"]));
     for input in [
         "https://@second.invalid",
@@ -3382,4 +3383,26 @@ fn provisioning_missing_refresh_keeps_earlier_paid_reading() {
         );
         assert_eq!(s.next, before + u64::from(route == "/api/v1/vm/11"));
     }
+}
+
+#[test]
+fn poc_machine_payment_poll_reads_only_saved_payment_without_effects() {
+    let (mut store, mut api) = nanosecond_invoice();
+    let before = api.calls.len();
+    let saved = store.procurement.as_ref().unwrap().clone();
+    for _ in 0..3 {
+        block_on(store.procurement_payment_check(&mut api)).unwrap();
+    }
+    assert_eq!(&api.calls[before..], &["GET /api/v1/payment/aabb"; 3]);
+    assert_eq!(store.procurement.as_ref().unwrap().invoice, saved.invoice);
+    assert_eq!(store.procurement.as_ref().unwrap().vm, saved.vm);
+    assert!(store.procurement.as_ref().unwrap().target.is_none());
+    api.payments[0]["is_paid"] = json!(true);
+    block_on(store.procurement_payment_check(&mut api)).unwrap();
+    let after = api.calls.len();
+    block_on(store.procurement_payment_check(&mut api)).unwrap();
+    assert_eq!(api.calls.len(), after);
+    let mut replayed = reopen(&store);
+    block_on(replayed.procurement_payment_check(&mut api)).unwrap();
+    assert_eq!(api.calls.len(), after);
 }

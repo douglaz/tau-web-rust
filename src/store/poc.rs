@@ -266,7 +266,6 @@ impl<S: Storage> Store<S> {
             Err(crate::poc::wait::TASK_BOUNDARY.into())
         }
     }
-    #[cfg(any(target_arch = "wasm32", test))]
     pub(crate) fn poc_configuration_key(&self, key: &[u8]) -> Result<(), String> {
         let filter = crate::poc::inference::EchoFilter::new(&[key]);
         self.poc_admission(&filter, None, None)?;
@@ -296,7 +295,7 @@ impl<S: Storage> Store<S> {
         task: Option<&Task>,
         exposure: Option<&Exposure>,
     ) -> Result<(), String> {
-        for filter in &self.poc_credential_filters {
+        for filter in self.poc_credential_filters.borrow().iter() {
             self.poc_admission(filter, task, exposure)
                 .map_err(|_| "task refused".to_string())?;
         }

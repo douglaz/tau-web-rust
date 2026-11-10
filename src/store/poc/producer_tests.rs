@@ -91,7 +91,7 @@ fn producer_regression(mismatched: bool) {
         let next = store.next;
         let previous = store.previous.0;
         let tasks = store.poc.clone();
-        let inventory = store.poc_credential_filters.len();
+        let inventory = store.poc_credential_filters.borrow().len();
         let prior_protection = store
             .protect_output(&json!(String::from_utf8_lossy(safe_key)))
             .unwrap();
@@ -101,7 +101,7 @@ fn producer_regression(mismatched: bool) {
         assert_eq!(store.next, next);
         assert_eq!(store.previous.0, previous);
         assert_eq!(store.poc, tasks);
-        assert_eq!(store.poc_credential_filters.len(), inventory);
+        assert_eq!(store.poc_credential_filters.borrow().len(), inventory);
         assert_eq!(
             store
                 .protect_output(&json!(String::from_utf8_lossy(safe_key)))

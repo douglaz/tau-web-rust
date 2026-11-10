@@ -22,7 +22,10 @@ const document = {
 const source = fs.readFileSync('www/boot.js', 'utf8');
 const prefix = source.slice(0, source.indexOf('\nlet worker;'));
 const messages = [];
-const context = { document, payload, messages };
+const context = { document, payload, messages, AbortController, URL,
+  location: {href:'https://page.example/path/index.html',origin:'https://page.example'},
+  fetch: async () => ({ok:false}), setTimeout: () => 0, clearTimeout: () => {}, setInterval: () => 0,
+};
 vm.createContext(context);
 vm.runInContext(`${prefix}\nconst worker = {postMessage: value => messages.push(value)}; renderSetup(payload); renderTasks(payload);`, context);
 const all = element => [element, ...element.children.flatMap(all)];

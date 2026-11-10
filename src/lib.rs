@@ -288,6 +288,19 @@ mod worker {
             .to_string()
     }
 
+    #[cfg(feature = "tracer")]
+    #[wasm_bindgen]
+    pub async fn test_credit_append_probe(value: String) -> String {
+        let local = local();
+        let mut local = local.lock().await;
+        let result = local
+            .store()
+            .expect("fixture unlocked")
+            .test_credit_append_probe(value)
+            .await;
+        serde_json::json!({"refused":result.is_err()}).to_string()
+    }
+
     /// Fixture-only corruption of the access projection to exercise the real admission
     /// path. Nothing is appended and the valid projection is restored before returning.
     #[cfg(feature = "tracer")]

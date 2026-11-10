@@ -109,6 +109,7 @@ enum Action {
         selection: Selection,
     },
     Resume,
+    PaymentCheck,
     Close,
     InitialInvoice {
         billing: crate::store::provisioning::Billing,
@@ -170,6 +171,7 @@ pub async fn provider_request(request: String) -> String {
                 }
                 store.procurement_approve(&mut api, approval).await.map(|_| None)
             }
+            Action::PaymentCheck => store.procurement_payment_check(&mut api).await.map(|_| None),
             Action::Close => store.procurement_close(&mut api).await.map(|_| None),
             Action::Resume => store
                 .procurement_resume(&mut api, false)

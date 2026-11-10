@@ -121,7 +121,7 @@ fn poc_journal_admission_is_symbolic_across_decimal_widths_and_upper_domain() {
             "future decimal envelope admitted"
         );
         assert_eq!(s.storage.files(), files);
-        assert!(s.poc_credential_filters.is_empty());
+        assert!(s.poc_credential_filters.borrow().is_empty());
     }
     s.poc_configuration_key(b"ordinary-later-key-482700")
         .unwrap();
@@ -240,7 +240,7 @@ fn poc_journal_arbitrary_payload_refusal_keeps_abandon_effective() {
 #[test]
 fn poc_journal_no_key_store_preserves_seed_account_and_replay() {
     let mut s = ready();
-    assert!(s.poc_credential_filters.is_empty());
+    assert!(s.poc_credential_filters.borrow().is_empty());
     let task = create_task(&mut s);
     let seed = s.seed().unwrap().id();
     let reopened = reopen(&s);
@@ -302,12 +302,12 @@ fn poc_journal_resume_wait_admission_and_adoption_are_atomic() {
             let next = s.next;
             let previous = s.previous.0;
             let tasks = s.poc.clone();
-            let filters = s.poc_credential_filters.len();
+            let filters = s.poc_credential_filters.borrow().len();
             let error = s.poc_configuration_key(key.as_bytes()).unwrap_err();
             assert!(!error.contains(key));
             unchanged(&s, &files, next, previous);
             assert_eq!(s.poc, tasks);
-            assert_eq!(s.poc_credential_filters.len(), filters);
+            assert_eq!(s.poc_credential_filters.borrow().len(), filters);
         }
         // An independently registered prior generation must gate adoption before Create.
         let mut s = ready();
@@ -374,11 +374,11 @@ fn poc_journal_resume_command_admission_and_adoption_are_atomic() {
             let files = s.storage.files();
             let next = s.next;
             let previous = s.previous.0;
-            let filters = s.poc_credential_filters.len();
+            let filters = s.poc_credential_filters.borrow().len();
             let error = s.poc_configuration_key(key.as_bytes()).unwrap_err();
             assert!(!error.contains(key));
             unchanged(&s, &files, next, previous);
-            assert_eq!(s.poc_credential_filters.len(), filters);
+            assert_eq!(s.poc_credential_filters.borrow().len(), filters);
         }
         let mut s = ready();
         let session = s.sessions[0].identity.clone();

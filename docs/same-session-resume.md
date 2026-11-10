@@ -11,14 +11,21 @@ endpoint/model in Exposure before granting authority. A bare bind grants nothing
 reload or worker loss, the replacement starts locked. Unlock validates the entire journal before
 restoring the original session, immutable binding, goal, approvals, task and consumed budgets.
 Missing keys or connection readiness withhold execution while the dormant session keeps its machine.
-Key re-entry restores custody without approving a new session. Endpoint validation remains;
+For BYO inference, key re-entry restores custody without approving a new session.
+For the [credit path](inference-credit.md), replay restores the encrypted account pair and its
+filters before writes; eligible inference automatically mints a new memory-only session key
+without typing, after collecting recorded work. Ordinary hide/return keeps a held key. Endpoint validation remains;
 re-entry must match the admitted model name, which does not prove actual model weights. Automatic
 inference also requires the admitted endpoint; an explicit Resume may use an edited endpoint
 without End. This prevents one restored session from silently using another public configuration.
 Collection and evidence settlement do not require inference configuration.
+Credit-key failures also leave authorized command continuation and independent verification
+eligible. A failure pauses at the next inference boundary without consuming a Request; explicit
+Resume or New key retries. Required credit refreshes and automatic key work wait through credit
+operation contention rather than losing the continuation.
 
 Eligible running, waiting and verifying tasks wake after unlock, revalidation and needed key
-resupply. A pending job is collected by its original identity first. Committed terminal evidence
+resupply on the BYO path, or automatic credit-key restoration on the credit path. A pending job is collected by its original identity first. Committed terminal evidence
 settles without another launch. Possibly sent effects retain existing reconciliation holds.
 Missing inference credentials consume no new Request and need not prevent permitted collection
 or evidence settlement. An interrupted model response remains uncertain and counted; a later
@@ -65,7 +72,9 @@ without implicitly ending the session, erasing uncertain effects or stopping bil
   failure, says bytes are unchanged and warns that clearing site data permanently deletes the
   store including its seed. There is no migration, reset control, import or snapshot support.
 - **D2:** The BYO disclosure implements the STA-23 subset, omitting only the paid-key-at-rest
-  clause. BYO keys remain memory-only and retirement clears them. Paid-key recovery is deferred.
+  clause. BYO keys remain memory-only and retirement clears them. The separate lite credit
+  path restores the account and mints fresh memory-only session keys; its accepted departures
+  are listed in [inference credit](inference-credit.md#accepted-specification-departures).
 - **D3:** The existing writable local-envelope-v1 deviation remains for fresh stores. Journal
   format 2 does not relabel an old key or change outer serialization, AAD, nonce or chain bytes.
   No canonical key/encryption migration is implemented.

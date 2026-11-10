@@ -133,6 +133,10 @@ pub fn needles() -> Vec<(String, Vec<u8>)> {
         "poc_model_configured",
         "test_poc_profile",
         "test_poc_register_credential",
+        "credit_mint_writer",
+        "credit_mint_return",
+        "test_credit_origin",
+        "test_credit_append_probe",
         "test_procurement_origin",
         "procurement_create_intent",
         "procurement_associated",
@@ -480,6 +484,10 @@ mod tests {
         }
         assert!(super::absence(&dir).is_ok());
         for needle in [
+            "test_credit_origin",
+            "test_credit_append_probe",
+            "credit_mint_writer",
+            "credit_mint_return",
             "test_poc_prepare_release",
             "test_poc_release_counts",
             "prepare_poc_release",

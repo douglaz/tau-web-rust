@@ -62,6 +62,7 @@ impl Pending {
 }
 
 pub(crate) fn freeze() {
+    crate::poc::credit::browser::freeze();
     REQUESTS.with_borrow_mut(|requests| {
         requests.retain(|pending| {
             if let Some(pending) = pending.upgrade() {
@@ -74,6 +75,7 @@ pub(crate) fn freeze() {
     });
 }
 pub(crate) fn stop_session(session: &str) {
+    crate::poc::credit::browser::stop_session(session);
     REQUESTS.with_borrow(|requests| {
         for pending in requests.iter().filter_map(std::rc::Weak::upgrade) {
             if pending.session == session {
@@ -86,6 +88,7 @@ pub(crate) fn configuration() -> Option<Configuration> {
     CONFIG.with_borrow(Clone::clone)
 }
 pub(crate) fn end() {
+    crate::poc::credit::browser::retire();
     freeze();
     KEY.with_borrow_mut(|key| *key = None);
     CONFIG.with_borrow_mut(|config| *config = None);
@@ -103,12 +106,22 @@ pub(crate) fn approval() -> Result<crate::binding::InferenceApproval, String> {
     })
 }
 
+pub(crate) fn restore_credit(configuration: Configuration) {
+    REQUESTS.with_borrow(|requests| {
+        for pending in requests.iter().filter_map(std::rc::Weak::upgrade) {
+            pending.stop();
+        }
+    });
+    KEY.with_borrow_mut(|key| *key = None);
+    REVISION.set(REVISION.get().wrapping_add(1));
+    restore(configuration);
+}
 pub(crate) fn restore(configuration: Configuration) {
     CONFIG.with_borrow_mut(|current| *current = Some(configuration));
 }
 
 pub(crate) fn key_is_set() -> bool {
-    KEY.with_borrow(Option::is_some)
+    KEY.with_borrow(Option::is_some) || crate::poc::credit::browser::key_present()
 }
 pub(crate) fn response_pending() -> bool {
     COMMAND_RESPONSES.get() != 0
@@ -158,11 +171,24 @@ pub(crate) async fn configure(
         return Err("inference configuration contains protected material".into());
     }
     store.remember_poc_credential(&key);
+    crate::poc::credit::browser::select_byo();
     freeze();
     REVISION.set(REVISION.get().wrapping_add(1));
     KEY.with_borrow_mut(|held| *held = Some(InferenceAccountCredential::new(key.to_vec())));
     CONFIG.with_borrow_mut(|held| *held = Some(config));
     Ok(())
+}
+
+fn with_request_key<T>(
+    session: &str,
+    credit: bool,
+    use_key: impl FnOnce(&[u8]) -> Result<T, String>,
+) -> Result<T, String> {
+    if credit {
+        crate::poc::credit::browser::with_key(session, use_key)
+    } else {
+        KEY.with_borrow(|key| use_key(&key.as_ref().ok_or("inference key missing")?.0))
+    }
 }
 
 struct Registration {
@@ -278,7 +304,7 @@ pub(crate) async fn next(
     };
     REQUESTS.with_borrow_mut(|requests| requests.push(Rc::downgrade(&pending)));
 
-    let (promise, filter) = {
+    let (promise, filter, is_credit) = {
         let mut local = pending.until(local.lock()).await?;
         continuation.check()?;
         if revision != REVISION.get() {
@@ -295,10 +321,9 @@ pub(crate) async fn next(
         if revision != REVISION.get() || pending.stopped.get() {
             return Err(INCOMPLETE.into());
         }
-        KEY.with_borrow(|key| {
-            let key = key.as_ref().ok_or("inference key missing")?;
-            let body = request(store, &config, goal, machine, steps, &[&key.0])?;
-            let filter = EchoFilter::new(&[&key.0]);
+        with_request_key(session, store.credit_session(session), |key| {
+            let body = request(store, &config, goal, machine, steps, &[key])?;
+            let filter = EchoFilter::new(&[key]);
             let init = web_sys::RequestInit::new();
             init.set_method("POST");
             init.set_signal(Some(&pending.controller.signal()));
@@ -312,7 +337,7 @@ pub(crate) async fn next(
                 .map_err(|_| INCOMPLETE)?;
             let authorization = Zeroizing::new(format!(
                 "Bearer {}",
-                std::str::from_utf8(&key.0).map_err(|_| "inference key invalid")?
+                std::str::from_utf8(key).map_err(|_| "inference key invalid")?
             ));
             headers
                 .set("Authorization", &authorization)
@@ -326,7 +351,11 @@ pub(crate) async fn next(
             let _ = headers.delete("Authorization");
             continuation.check()?;
             store.check_inference_request(task, session)?;
-            Ok::<_, String>((worker.fetch_with_request(&request), filter))
+            Ok::<_, String>((
+                worker.fetch_with_request(&request),
+                filter,
+                store.credit_session(session),
+            ))
         })?
     };
 
@@ -348,15 +377,28 @@ pub(crate) async fn next(
             return Err(INCOMPLETE.into());
         }
         // Authentication refusal is established by the status, even if its body never ends.
-        let bytes = if matches!(status, 401 | 403) {
+        let bytes = if matches!(status, 401 | 403) && !is_credit {
             Zeroizing::new(Vec::new())
         } else {
             match body(&response, &pending).await {
                 Ok(body) => body,
-                Err(_) if !(200..300).contains(&status) => return Err(http_failure(status)),
+                Err(_) if !(200..300).contains(&status) => {
+                    return Err(if is_credit && matches!(status, 401 | 402 | 403 | 429) {
+                        crate::poc::credit::REFUSED.into()
+                    } else {
+                        http_failure(status)
+                    });
+                }
                 Err(why) => return Err(why),
             }
         };
+        if is_credit && !(200..300).contains(&status) {
+            return Err(if matches!(status, 401 | 402 | 403 | 429) {
+                crate::poc::credit::browser::refusal(status, &bytes, session).await
+            } else {
+                http_failure(status)
+            });
+        }
         // Only these envelopes can reach normalization/release. Unused provider metadata
         // has no durable or publication sink; discard it before repeated protection. The
         // full response read remains bounded, and model values are still refused, not repaired.
@@ -400,10 +442,8 @@ pub(crate) async fn next(
         }
         let store = local.store().ok_or(INCOMPLETE)?;
         store.check_inference_request(task, session)?;
-        KEY.with_borrow(|key| {
-            let key = key.as_ref().ok_or("inference key missing")?;
-            // The shared completion boundary classifies HTTP failures before JSON decoding.
-            complete_response(store, status, &bytes, machine, steps, &[&key.0], &filter)
+        with_request_key(session, is_credit, |key| {
+            complete_response(store, status, &bytes, machine, steps, &[key], &filter)
         })
     };
     let result = match futures_util::future::select(Box::pin(exchange), Box::pin(ready)).await {
@@ -418,7 +458,17 @@ pub(crate) async fn next(
                     .get()
                     .is_some_and(|status| status != 0 && !(200..300).contains(&status)) =>
         {
-            Err(http_failure(received_status.get().expect("known status")))
+            Err(
+                if is_credit
+                    && received_status
+                        .get()
+                        .is_some_and(|s| matches!(s, 401 | 402 | 403 | 429))
+                {
+                    crate::poc::credit::REFUSED.into()
+                } else {
+                    http_failure(received_status.get().expect("known status"))
+                },
+            )
         }
         result => result,
     }

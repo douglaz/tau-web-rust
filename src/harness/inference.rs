@@ -109,6 +109,9 @@ async fn publication(generation: u64, session: String, report: String, post: boo
                 }
                 current["goal_outcome"] = outcome.clone();
             }
+            if let Some(error) = safe.get("credit_error") {
+                current["credit_error"] = error.clone();
+            }
             if let Some(error) = safe.get("error") {
                 current["error"] = error.clone();
             }
@@ -127,6 +130,22 @@ async fn publication(generation: u64, session: String, report: String, post: boo
                 }
                 if safe["provider_selection_reviewed"] == true {
                     current["provider_selection_reviewed"] = true.into();
+                }
+                if let Some(machine) = safe["credit_started_machine"].as_str()
+                    && current["sessions"].as_array().is_some_and(|sessions| {
+                        sessions.iter().any(|s| {
+                            s["credit_backed"] == true
+                                && s["session_state"] != "ended"
+                                && s["bound_set"]
+                                    .as_array()
+                                    .is_some_and(|set| set.iter().any(|m| m == machine))
+                                && s["identity"]
+                                    .as_str()
+                                    .is_some_and(crate::poc::credit::browser::has_key)
+                        })
+                    })
+                {
+                    current["credit_started_machine"] = machine.into();
                 }
             }
             Ok(current)
@@ -185,11 +204,12 @@ async fn publication(generation: u64, session: String, report: String, post: boo
         let final_check = (|| {
             if value.get("provider_catalogue").is_some()
                 || value.get("provider_selection_reviewed").is_some()
+                || value.get("credit_started_machine").is_some()
             {
                 let owner = crate::lifecycle::owner();
                 owner.ordinary()?;
                 if generation != owner.generation() {
-                    return Err("stale provider publication".into());
+                    return Err("stale configuration publication".into());
                 }
             }
             if carries_result {

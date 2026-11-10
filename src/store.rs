@@ -56,6 +56,11 @@ use zeroize::{Zeroize, Zeroizing};
 pub mod opfs;
 
 pub(crate) mod authority;
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    allow(dead_code, reason = "credit is driven by the browser worker")
+)]
+pub(crate) mod credit;
 pub mod delivery;
 mod goals;
 mod journal;
@@ -231,6 +236,9 @@ pub(crate) enum Event {
     PocTarget(poc_targets::Record),
     Procurement(provisioning::Record),
     ProviderProtection(crate::poc::inference::EchoFingerprints),
+    PocCreditAccount(crate::poc::credit::AccountRecord),
+    PocCredit(credit::Record),
+    PocCreditExposure(Exposure),
 }
 
 impl Drop for Event {
@@ -377,6 +385,7 @@ pub struct Store<S> {
     delivery: delivery::State,
     sessions: Vec<Rc<Session>>,
     inference: inference::State,
+    credit: credit::State,
     scans: crate::scan::References,
     reinstall: reinstall::State,
     poc_targets: std::collections::BTreeMap<String, poc_targets::Record>,
@@ -386,7 +395,7 @@ pub struct Store<S> {
     procurement_selection: Option<crate::poc::provisioning::Selection>,
     provider_origin: String,
     /// Memory-only credential fingerprints continue protecting late evidence after key disposal.
-    poc_credential_filters: Vec<crate::poc::inference::EchoFilter>,
+    poc_credential_filters: Rc<std::cell::RefCell<Vec<crate::poc::inference::EchoFilter>>>,
     authority: Rc<crate::lifecycle::Authority>,
     response_calls: std::collections::BTreeSet<u64>,
     exposure_ledger: Vec<Exposure>,
@@ -527,6 +536,7 @@ impl<S: Storage> Store<S> {
             delivery: delivery::State::default(),
             sessions: Vec::new(),
             inference: inference::State::default(),
+            credit: credit::State::default(),
             scans: Default::default(),
             reinstall: Default::default(),
             poc_targets: Default::default(),
@@ -535,7 +545,7 @@ impl<S: Storage> Store<S> {
             provider_filters: Vec::new(),
             procurement_selection: None,
             provider_origin: crate::poc::provisioning::default_origin(),
-            poc_credential_filters: Vec::new(),
+            poc_credential_filters: Default::default(),
             authority,
             response_calls: std::collections::BTreeSet::new(),
             exposure_ledger: Vec::new(),
@@ -731,7 +741,21 @@ impl<S: Storage> Store<S> {
         modes: &[Mode],
         inference_approval: crate::binding::InferenceApproval,
     ) -> Result<String, String> {
+        self.admit_with_credit(machine, modes, inference_approval, false)
+            .await
+    }
+
+    pub(crate) async fn admit_with_credit(
+        &mut self,
+        machine: &str,
+        modes: &[Mode],
+        inference_approval: crate::binding::InferenceApproval,
+        credit: bool,
+    ) -> Result<String, String> {
         self.authority.ordinary()?;
+        if credit && !self.credit_can_start() {
+            return Err("Read a positive inference credit balance before Start.".into());
+        }
         inference_approval.validate()?;
         self.ensure_scan_references().await?;
         if !crate::poc::inference::safe(
@@ -775,7 +799,15 @@ impl<S: Storage> Store<S> {
             }],
         };
         self.poc_adoption_safe(None, Some(&exposure))?;
-        self.commit(&Event::Exposure(exposure.clone())).await?;
+        let event = if credit {
+            Event::PocCreditExposure(exposure.clone())
+        } else {
+            Event::Exposure(exposure.clone())
+        };
+        self.commit(&event).await?;
+        if credit {
+            self.credit.sessions.insert(session.clone());
+        }
         self.pending_requirements.retain(|owner, _| {
             self.sessions
                 .iter()
@@ -798,6 +830,7 @@ impl<S: Storage> Store<S> {
                     serde_json::to_value(self.session_configuration(&s.identity).ok())
                         .expect("configuration serializes");
                 view["inference_limits"] = self.limit_state(&s.identity);
+                if self.credit_session(&s.identity) { view["credit_backed"] = true.into(); }
                 view["session_state"] = if s.ended.get() {
                     json!("ended")
                 } else if readiness.is_err() {
@@ -1385,6 +1418,10 @@ impl<S: Storage> Store<S> {
         if let Some(account) = &self.inference.account {
             held.borrowed.push(&account.0);
         }
+        if let Some(account) = &self.credit.account {
+            held.borrowed.push(&account.credit_id.0);
+            held.borrowed.push(&account.default_key.0);
+        }
         for session in &self.sessions {
             let bindings = session.given.borrow();
             for holding in bindings.iter() {
@@ -1567,6 +1604,8 @@ impl<S: Storage> Store<S> {
                     self.apply_inference(number, &event)
                         .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
                 }
+                (_, Event::PocCreditAccount(account)) => self.replay_credit_account(account)?,
+                (_, Event::PocCredit(record)) => self.replay_credit(record)?,
                 (_, Event::PocTarget(record)) => {
                     self.replay_poc_target(number, record)
                         .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
@@ -1579,7 +1618,13 @@ impl<S: Storage> Store<S> {
                     self.replay_reinstall(number, record)?;
                 }
                 (_, Event::End(end)) => self.apply_end(end)?,
-                (_, Event::Exposure(exposure)) => {
+                (_, Event::Exposure(exposure) | Event::PocCreditExposure(exposure)) => {
+                    if matches!(event, Event::PocCreditExposure(_))
+                        && (self.credit.account.is_none()
+                            || !self.credit.sessions.insert(exposure.session.clone()))
+                    {
+                        return Err("Credit session replay refused.".into());
+                    }
                     self.replay_exposure(number, exposure)
                         .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
                 }
@@ -1888,7 +1933,10 @@ impl<S: Storage> Store<S> {
         }
         if matches!(
             event,
-            Event::InferenceAccount { .. }
+            Event::PocCreditAccount(_)
+                | Event::PocCredit(_)
+                | Event::PocCreditExposure(_)
+                | Event::InferenceAccount { .. }
                 | Event::InferenceIntent(_)
                 | Event::InferenceTerminal(_)
         ) {
@@ -1941,7 +1989,7 @@ impl<S: Storage> Store<S> {
                 return Err("protected provider material refused before encryption".into());
             }
         }
-        for filter in &self.poc_credential_filters {
+        for filter in self.poc_credential_filters.borrow().iter() {
             if filter
                 .literal_match(&plaintext)
                 .map_err(|_| crate::poc::wait::JOURNAL_REFUSED.to_string())?
@@ -2416,7 +2464,7 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
                 "installations": store.dispatch.approved_entries.keys().filter(|m| store.installation_unpinned(m)).map(|m| json!({"machine":m,"installation":"unpinned"})).collect::<Vec<_>>(),
                 "exposure_ledger": store.exposure_ledger().iter().map(|e| json!({"session":e.session,"bound_set":e.bound_set.iter().map(|b| json!({"machine":b.machine,"family":b.identity.family,"index":b.identity.index})).collect::<Vec<_>>()})).collect::<Vec<_>>(),
                 "connection_refusals": store.connection_refusals(),
-                "setup_offer": if store.dispatch.approved_entries.is_empty() { serde_json::to_value(crate::dispatch::fixture_setup()).expect("fixture serializes") } else { Value::Null },
+                "setup_offer": if cfg!(any(test, feature = "tracer")) && store.dispatch.approved_entries.is_empty() { serde_json::to_value(crate::dispatch::fixture_setup()).expect("fixture serializes") } else { Value::Null },
             }),
             State::Refused(why) => json!({ "state": "refused", "reason": why }),
         };
@@ -2426,6 +2474,9 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
                 report["fixture_admission"] =
                     serde_json::to_value(crate::binding::InferenceApproval::synthetic())
                         .expect("fixture approval");
+            }
+            if store.credit.account.is_some() {
+                report["credit"] = store.credit_view();
             }
             if store.procurement.is_some()
                 || store.procurement_selection.is_some()

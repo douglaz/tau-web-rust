@@ -1015,6 +1015,28 @@ impl<S: Storage> Store<S> {
         self.procurement_commit(Record::Payment(payment)).await
     }
     /// Explicit bounded progress. Refresh never sends a create or invoice whose intent exists.
+    /// Automatic observation can only read the saved payment, never issue an invoice.
+    pub(crate) async fn procurement_payment_check(
+        &mut self,
+        api: &mut impl Api,
+    ) -> Result<(), String> {
+        self.check_api(api)?;
+        let purchase = self.procurement.as_ref().ok_or(REFUSED)?;
+        if purchase.target.is_some() {
+            return Ok(());
+        }
+        let payment = purchase
+            .payment
+            .as_ref()
+            .ok_or("No saved machine invoice to check.")?;
+        if payment["is_paid"] == true {
+            return Ok(());
+        }
+        let path = format!("/api/v1/payment/{}", payment_id(payment)?);
+        let updated = self.provider_read(api, "GET", &path, None).await?;
+        self.procurement_commit(Record::Payment(updated)).await
+    }
+
     pub(crate) async fn procurement_resume(
         &mut self,
         api: &mut impl Api,

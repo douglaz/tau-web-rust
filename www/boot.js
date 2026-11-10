@@ -7,6 +7,75 @@ const show = (state, text) => {
   status.textContent = text;
 };
 
+// One same-directory object is validated before any value is applied.
+const defaultsFields = ['provider_origin', 'relay_url', 'chat_endpoint', 'model', 'topup_sat'];
+const defaultsInputs = ['provider-origin', 'provider-relay', 'poc-relay', 'poc-endpoint', 'poc-model', 'credit-amount'];
+const defaultsEdited = new Set();
+for (const id of defaultsInputs) $(id).addEventListener('input', () => defaultsEdited.add(id));
+const validDefaults = value => {
+  if (!value || typeof value !== 'object' || Array.isArray(value) ||
+      Object.keys(value).length !== defaultsFields.length || !defaultsFields.every(k => Object.hasOwn(value, k))) return false;
+  const ipv4 = host => host.split('.').length === 4 && host.split('.').every(p => /^(0|[1-9][0-9]{0,2})$/.test(p) && Number(p) <= 255);
+  const dns = host => host.length > 0 && host.length <= 253 && host.split('.').every(p =>
+    p.length <= 63 && /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/.test(p));
+  const url = (text, kind) => {
+    const prefix = kind === 'relay' ? 'wss://' : 'https://';
+    if (typeof text !== 'string' || !text.startsWith(prefix) || text.length > (kind === 'provider' ? 320 : 2048) || /[^\x21-\x7e]|[\\?@#%]/.test(text)) return false;
+    const rest = text.slice(prefix.length), slash = rest.indexOf('/');
+    const authority = slash < 0 ? rest : rest.slice(0, slash), path = slash < 0 ? '' : rest.slice(slash);
+    let host, port;
+    if (kind === 'provider' && authority.startsWith('[')) {
+      const match = authority.match(/^(\[[0-9a-fA-F:.]+\])(?::([0-9]+))?$/);
+      if (!match) return false;
+      [, host, port] = match;
+    } else {
+      const match = authority.match(/^([^:]+)(?::([0-9]+))?$/);
+      if (!match) return false;
+      [, host, port] = match;
+      const name = kind === 'provider' ? host.replace(/\.$/, '') : host;
+      if (!dns(name)) return false;
+      if (kind === 'provider') {
+        const last = name.split('.').at(-1).toLowerCase();
+        if ((/^[0-9]+$/.test(last) || /^0x[0-9a-f]*$/.test(last)) && (!ipv4(host) || host !== name)) return false;
+      } else if (kind === 'chat' && (name.split('.').some(p => p.toLowerCase().startsWith('xn--')) || (!ipv4(name) && !/^[A-Za-z]/.test(name.split('.').at(-1))))) return false;
+    }
+    if (port !== undefined && (Number(port) > 65535 || (kind !== 'provider' && Number(port) === 0))) return false;
+    if (kind === 'provider' && path !== '' && path !== '/') return false;
+    if (kind === 'relay' && (!path.endsWith('/') || path.split('/').some(p => p === '.' || p === '..' || !/^[A-Za-z0-9_.-]*$/.test(p)))) return false;
+    if (kind === 'chat' && !/^[A-Za-z0-9/\-._~!$&'()*+,;=:]*$/.test(path)) return false;
+    try { return new URL(text).protocol === (kind === 'relay' ? 'wss:' : 'https:'); } catch { return false; }
+  };
+  return url(value.provider_origin, 'provider') && url(value.relay_url, 'relay') &&
+    url(value.chat_endpoint, 'chat') && typeof value.model === 'string' && value.model.trim() === value.model &&
+    value.model.length > 0 && value.model.length <= 128 && /^[A-Za-z0-9._/:\-]+$/.test(value.model) &&
+    Number.isInteger(value.topup_sat) && value.topup_sat >= 100 && value.topup_sat <= 5000;
+};
+const loadDefaults = async () => {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 3000);
+  try {
+    const response = await fetch(new URL('poc-defaults.json', location.href), {credentials: 'omit', cache: 'no-store', redirect: 'error', signal: controller.signal});
+    if (!response.ok || new URL(response.url).origin !== location.origin) throw Error();
+    const reader = response.body.getReader();
+    const chunks = []; let size = 0;
+    while (true) {
+      const {done, value} = await reader.read(); if (done) break;
+      size += value.byteLength; if (size > 16384) { controller.abort(); throw Error(); } chunks.push(value);
+    }
+    const bytes = new Uint8Array(size); let offset = 0;
+    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+    const value = JSON.parse(new TextDecoder('utf-8', {fatal:true}).decode(bytes));
+    if (!validDefaults(value)) throw Error();
+    for (const [id, field] of [['provider-origin', 'provider_origin'], ['provider-relay', 'relay_url'], ['poc-relay', 'relay_url'], ['poc-endpoint', 'chat_endpoint'], ['poc-model', 'model'], ['credit-amount', 'topup_sat']]) {
+      if ($(id) && !defaultsEdited.has(id) && !providerReviewToken) $(id).value = value[field];
+    }
+    $('defaults-status').textContent = 'Deployment defaults loaded. Public fields remain editable; review and approval use the displayed values.';
+  } catch {
+    $('defaults-status').textContent = 'Deployment defaults are missing or invalid. All fallback values remain in use.';
+  } finally { clearTimeout(timer); }
+};
+void loadDefaults();
+
 const texts = {
   starting: 'Opening the local store…',
   working: 'Working…',
@@ -22,6 +91,7 @@ let ceremony = false;
 let suspended = false;
 const goalOutcomes = new Map();
 const pocDeclarationDrafts = new Map();
+const creditGoalDrafts = new Map();
 const snapshotWorker = () => {
   const current = worker;
   const generation = current?.generation;
@@ -197,12 +267,12 @@ const renderSetup = (store) => {
       paragraph(section, `Inference model: ${session.inference_configuration?.model ?? 'unavailable'}; machine: ${machine.entry.machine}.`);
       addEnd(section, session.identity);
       const limits = session.inference_limits;
-      if (limits) {
+      if (limits && !session.credit_backed) {
         paragraph(section, `Confirmed limit: ${(BigInt(limits.confirmed.cap_hundredths) / 100n)}.${String(BigInt(limits.confirmed.cap_hundredths) % 100n).padStart(2, '0')} ${limits.confirmed.unit}; lifetime ${limits.confirmed.lifetime_seconds / 60} minutes. No renewal; observed spend ${limits.observed_spend}. Unaccounted spend is not zero or refunded.`);
         paragraph(section, limits.original_expiry ? `Original requested expiry: ${new Date(limits.original_expiry * 1000).toISOString()} (UTC). All delays and hidden or frozen time consume this lifetime.` : 'Lifetime has not started.');
         if (limits.state === 'clock-withheld') paragraph(section, 'Clock validity unknown; verification required. The original expiry has not changed.');
       }
-      if (limits?.state === 'clock-withheld') {
+      if (limits?.state === 'clock-withheld' && !session.credit_backed) {
         if (session.goal) paragraph(section, session.goal.text);
         const verify = document.createElement('button');
         verify.type = 'button'; verify.dataset.verifyClock = session.identity;
@@ -437,6 +507,46 @@ const renderDelivery = (section, machine, store) => {
   }
   section.append(card);
 };
+const invoiceControls = (parent, savedInvoice, expires) => {
+  const wallet = document.createElement('a'); wallet.textContent = 'Open in wallet'; wallet.href = `lightning:${savedInvoice}`;
+  const copy = document.createElement('button'); copy.type = 'button'; copy.textContent = 'Copy';
+  copy.addEventListener('click', async () => {
+    try { await navigator.clipboard.writeText(savedInvoice); copy.textContent = 'Copied'; }
+    catch { copy.textContent = 'Copy unavailable'; }
+  });
+  const remaining = document.createElement('span'); remaining.dataset.invoiceExpires = String(expires);
+  remaining.textContent = `${Math.max(0, Math.ceil((expires - Date.now() / 1000) / 60))} minutes left`;
+  parent.append(wallet, ' ', copy, ' ', remaining);
+};
+setInterval(() => {
+  for (const node of document.querySelectorAll('[data-invoice-expires]')) node.textContent = `${Math.max(0, Math.ceil((Number(node.dataset.invoiceExpires) - Date.now() / 1000) / 60))} minutes left`;
+}, 1000);
+const renderCredit = (store, enabled) => {
+  const credit = store.credit;
+  const invoices = credit?.invoices ?? [];
+  const latest = invoices.at(-1);
+  const unresolved = latest && !['paid', 'expired_unpaid', 'abandoned'].includes(latest.outcome);
+  $('credit-status').textContent = store.credit_error || credit?.balance_text || (!credit?.account ? 'No inference credit yet.' : 'Inference credit balance not read yet.');
+  $('credit-invoice').disabled = !enabled || Boolean(unresolved);
+  $('credit-invoice').textContent = ['expired_unpaid','abandoned'].includes(latest?.outcome) ? 'New invoice' : credit?.account ? 'Add credit' : 'Get an invoice';
+  $('credit-check').hidden = !credit?.account;
+  $('credit-check').disabled = !enabled;
+  $('credit-configure').disabled = !enabled || !credit?.can_start;
+  $('credit-details').textContent = latest ? `Last saved status: ${latest.last_status}` : '';
+  const slot = $('credit-invoices'); slot.replaceChildren();
+  for (const invoice of invoices) {
+    const row = document.createElement('section'); row.dataset.creditInvoice = invoice.id;
+    paragraph(row, `${invoice.amount_sat} sat. ${({abandoned:'Invoice marked abandoned.',pending:'Waiting for external payment.',paid:'Payment seen; inference credit read.',expired_unpaid:'This invoice expired unpaid, according to the credit service.',unknown:'Payment status unknown.',seen:'Payment seen; balance not read yet.'})[invoice.outcome]}`);
+    invoiceControls(row, invoice.bolt11, invoice.expires_at); slot.append(row);
+  }
+};
+$('credit-invoice').addEventListener('click', () => {
+  $('credit-invoice').disabled = true;
+  worker.postMessage({credit_request:{action:'invoice',amount:Number($('credit-amount').value)}});
+});
+$('credit-check').addEventListener('click', () => worker.postMessage({credit_request:{action:'check'}}));
+$('credit-configure').addEventListener('click', () => worker.postMessage({credit_request:{action:'configure',endpoint:$('poc-endpoint').value,model:$('poc-model').value}}));
+
 let providerCatalogue = null;
 let providerSelectionDirty = true;
 let providerReviewToken = null;
@@ -508,7 +618,9 @@ const renderProvider = (store, enabled) => {
     if (purchase.payment) {
       const pay = purchase.payment;
       paragraph(progress, `Payment ${pay.id} for VM ${pay.vm_id}: ${pay.is_paid ? 'paid' : 'payment pending'}; expires ${pay.expires}. Amount ${pay.amount}, tax ${pay.tax}, processing fee ${pay.processing_fee} (${pay.currency === 'BTC' ? 'millisats' : pay.currency + ' cents'}).`);
-      const invoice = document.createElement('pre'); invoice.textContent = pay.data.lightning; progress.append(invoice);
+      invoiceControls(progress, pay.data.lightning, Math.floor(Date.parse(pay.expires) / 1000));
+      const check = document.createElement('button'); check.type = 'button'; check.textContent = 'Check now'; check.disabled = !enabled;
+      check.addEventListener('click', () => providerRequest({action:'payment_check'})); progress.append(check);
     }
     if (purchase.public_keys) {
       paragraph(progress, 'Relay public key — enroll this separately with the relay operator:');
@@ -565,20 +677,23 @@ const clearPocInputs = () => {
   $('provider-progress').replaceChildren();
   $('provider-key').value = '';
   pocDeclarationDrafts.clear();
+  creditGoalDrafts.clear();
   for (const field of $('poc').querySelectorAll('input')) {
     if (field.type === 'checkbox') field.checked = false;
-    else field.value = '';
+    else if (!defaultsInputs.includes(field.id.replace('tau-', ''))) field.value = '';
   }
   $('poc-elevation').value = $('poc-class').value = '';
   $('poc-public-keys').replaceChildren();
 };
 const renderPoc = (store) => {
+  if (typeof store.credit_started_machine === 'string') creditGoalDrafts.delete(store.credit_started_machine);
   const worker = snapshotWorker();
   const enabled = store.state === 'unlocked' && !ceremony &&
     !['suspended', 'reconciling', 'ended'].includes(store.lifecycle_state);
   $('poc').hidden = store.state !== 'unlocked';
   for (const control of $('poc').querySelectorAll('input, select, button')) control.disabled = !enabled;
   renderProvider(store, enabled);
+  renderCredit(store, enabled);
   const restored = (store.sessions ?? []).find(s => s.session_state !== 'ended')?.inference_configuration;
   if (restored && store.poc_configuration?.key_set !== true) { $('poc-endpoint').value = restored.endpoint; $('poc-model').value = restored.model; }
   $('poc-key-status').textContent = store.poc_configuration?.key_set === true ? 'Key set.' : store.poc_configuration?.key_set === false ? 'Key unset.' : 'Key status unavailable.';
@@ -598,16 +713,31 @@ const renderPoc = (store) => {
     paragraph(row, `${target.machine}: relay profile ${target.profile}; elevation ${target.elevation}.`);
     paragraph(row, `Host ${target.host}, port ${target.port}, user ${target.user}; relay ${target.relay}.`);
     paragraph(row, `Independent host pin: ${target.pin}`);
-    paragraph(row, `Start session approves inference using ${store.poc_configuration?.configuration?.model || 'the configured model'} on ${target.machine}.`);
+    const useCredit = store.credit?.can_start && (store.credit.selected || !store.poc_configuration?.key_set);
+    paragraph(row, useCredit ? `Start session approves the endpoint and model shown above for ${target.machine}.` : `Start session approves inference using ${store.poc_configuration?.configuration?.model || 'the configured model'} on ${target.machine}.`);
+    let creditGoal;
+    if (useCredit) {
+      creditGoal = document.createElement('textarea'); creditGoal.dataset.creditGoal = target.machine;
+      creditGoal.setAttribute('aria-label', 'Goal before Start session'); creditGoal.value = creditGoalDrafts.get(target.machine) ?? '';
+      creditGoal.addEventListener('input', () => creditGoalDrafts.set(target.machine, creditGoal.value)); row.append(creditGoal);
+      paragraph(row, store.credit.disclosure);
+    }
     for (const [kind, label] of [['poc_bind', 'Start session'], ['poc_public_keys', 'Show public keys']]) {
       const button = document.createElement('button');
       button.type = 'button';
-      button.disabled = !enabled || (kind === 'poc_bind' && !store.poc_configuration?.configuration);
+      button.disabled = !enabled || (kind === 'poc_bind' && !useCredit && !store.poc_configuration?.configuration);
       button.textContent = `${label} ${target.machine}`;
       button.addEventListener('click', () => {
         button.disabled = true;
-        worker.postMessage({ [kind]: { machine: target.machine } });
+        if (kind === 'poc_bind' && useCredit) worker.postMessage({credit_request:{action:'start',machine:target.machine,goal:creditGoal.value,endpoint:$('poc-endpoint').value,model:$('poc-model').value}});
+        else worker.postMessage({ [kind]: { machine: target.machine } });
       });
+      row.append(button);
+    }
+    for (const session of store.sessions ?? []) {
+      if (!session.credit_backed || session.session_state === 'ended' || !(session.bound_set ?? []).includes(target.machine)) continue;
+      const button = document.createElement('button'); button.type = 'button'; button.textContent = 'New key'; button.dataset.creditNewKey = session.identity; button.disabled = !enabled;
+      button.addEventListener('click', () => { button.disabled = true; worker.postMessage({credit_request: {action:'new_key', session:session.identity}}); });
       row.append(button);
     }
     for (const session of store.sessions ?? []) {

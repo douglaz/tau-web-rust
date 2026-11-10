@@ -78,7 +78,7 @@ fn valid_path(endpoint: &str) -> bool {
     true
 }
 
-fn valid_key(key: &[u8]) -> Result<(), String> {
+pub(crate) fn valid_key(key: &[u8]) -> Result<(), String> {
     if key.is_empty() {
         return Err("inference key missing".into());
     }
@@ -1088,7 +1088,7 @@ pub(crate) use browser::next;
 #[cfg(target_arch = "wasm32")]
 pub(crate) use browser::{
     CommandResponse, approval, configuration, configure, end, freeze, key_is_set, response_pending,
-    restore, stop_session,
+    restore, restore_credit, stop_session,
 };
 
 #[cfg(all(test, not(target_arch = "wasm32")))]

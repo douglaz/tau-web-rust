@@ -1074,7 +1074,10 @@ fn errors_since(browser: &cdp::Browser, from: usize, sessions: &[&str]) -> Vec<S
                 Some(e["params"]["args"].to_string())
             }
             "Log.entryAdded" if e["params"]["entry"]["level"] == "error" => {
-                Some(e["params"]["entry"]["text"].to_string())
+                let entry = &e["params"]["entry"];
+                // Missing optional deployment defaults are an exercised fallback, not a page exception.
+                if entry["source"] == "network" && entry["url"].as_str().is_some_and(|u|u.ends_with("/poc-defaults.json")) && entry["text"] == "Failed to load resource: the server responded with a status of 404 (Not Found)" { None }
+                else { Some(entry["text"].to_string()) }
             }
             _ => None,
         })

@@ -18,14 +18,29 @@ pub(super) async fn approve(
 ) -> Result<(), String> {
     let observer = observer::Call::begin(site, "setup.approve", Some(&tab.session), json!({}));
 
-    let existing = observer.inspect(run, worker).await?["setup"]
-        .as_array()
-        .is_some_and(|m| !m.is_empty());
+    let before = observer.inspect(run, worker).await?;
+    let existing = before["setup"].as_array().is_some_and(|m| !m.is_empty());
     observer.domain(json!({"existing":existing,"required_setup_count":2}));
     if existing {
         return Ok(());
     }
-    click(run, tab, "#tau-setup-approve").await?;
+    if run
+        .browser
+        .evaluate(
+            &tab.session,
+            "document.querySelector('#tau-setup-approve') !== null",
+        )
+        .await?
+        == true
+    {
+        click(run, tab, "#tau-setup-approve").await?;
+    } else {
+        // Exercise already-approved fixture controls without restoring a served-page offer.
+        if !before["setup_offer"].is_null() {
+            return Err("served fixture offer must be absent".into());
+        }
+        run.browser.evaluate(&worker.session, "(async()=>{const m=await import(new URL('./pkg/tau_web.js',self.location.href).href);const r=await m.setup_approve();await m.publish_report(m.publication_generation(),'',r);return true;})()").await?;
+    }
     for poll in 0..300 {
         observer.attempt(poll + 1);
         if observer.poll(
@@ -122,28 +137,41 @@ pub(super) async fn run(
     let text = rendered.as_str().unwrap_or("");
     card.check(
         "setup_cases.a003",
-        "all fixture entries, facts, cost and recurring meaning appear before approval",
-        [
-            "fixture:",
-            "fixture-other:",
-            "Fixture vendor",
-            "Fixture machine",
-            "Fixture region",
-            "1000 sat per month",
-            "2000 sat per month",
-            "3000 sat per month",
-            "36000 sat per year",
-            "bound alone in its own session",
-            "from the moment it is created",
-            "destroyed or abandoned",
-            "whether or not setup finishes",
-            "never pays",
-            "cannot stop",
-            "only you can",
-            "fixture data",
-        ]
-        .iter()
-        .all(|s| text.contains(s)),
+        "fixture build shows exact offer facts; served build withholds the fixture offer",
+        if !tracer {
+            before["setup_offer"].is_null()
+                && text.is_empty()
+                && run
+                    .browser
+                    .evaluate(
+                        &tab.session,
+                        "document.querySelector('#tau-setup-approve') === null",
+                    )
+                    .await?
+                    == true
+        } else {
+            [
+                "fixture:",
+                "fixture-other:",
+                "Fixture vendor",
+                "Fixture machine",
+                "Fixture region",
+                "1000 sat per month",
+                "2000 sat per month",
+                "3000 sat per month",
+                "36000 sat per year",
+                "bound alone in its own session",
+                "from the moment it is created",
+                "destroyed or abandoned",
+                "whether or not setup finishes",
+                "never pays",
+                "cannot stop",
+                "only you can",
+                "fixture data",
+            ]
+            .iter()
+            .all(|s| text.contains(s))
+        },
     );
     let opened = reader::read_at(
         "reader.call.setup.pre_approval",
@@ -191,7 +219,14 @@ pub(super) async fn run(
             && approval["entries"].as_array().is_some_and(|entries| {
                 entries.iter().enumerate().all(|(i, a)| {
                     let _source_slot = semantic::Slot::new("reader.aux.setup_approved", i);
-                    a["entry"] == before["setup_offer"][i]
+                    a["entry"]
+                        == if tracer {
+                            before["setup_offer"][i].clone()
+                        } else {
+                            serde_json::to_value(tau_web::dispatch::fixture_setup())
+                                .expect("fixture setup")[i]
+                                .clone()
+                        }
                         && a["identity"]["index"] == i
                         && a["identity"]["family"] == "machines"
                         && a["identity"]["seed"]

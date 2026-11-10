@@ -237,3 +237,30 @@ The local relay fixture maps only the documentation address `192.0.2.10:22` to i
 loopback sshd. It separately enrolls the public relay key, checks the actual host pin and executes
 the existing sudo-wrapped runner in its own scratch directory. A fixture-only sudo shim models
 the approved elevation without changing the product's emitted bytes. No external VM is contacted.
+
+## Deployment defaults and invoice controls
+
+The page reads a same-directory, same-origin deployment defaults object at boot. Its exact
+format, fallback behavior and absence from served build artifacts are documented in
+[inference credit](inference-credit.md#deployment-defaults). Provider fallback remains
+`https://api.lnvps.net`. Public origin and relay fields stay editable; the review shows the
+bound origin and exact price, and the approval shows the relay being approved. A fresh class
+question has no answer preselected. A later defaults response cannot replace operator edits
+or a reviewed selection. The saved purchase's origin and review-snapshot checks still govern.
+
+Both machine and credit invoices show amount, a saved `lightning:` wallet link, Copy, minutes
+remaining and Check now. While visible, unlocked and holding the provider key, the worker
+automatically checks a pending saved machine payment every **five seconds**, until its expiry
+plus 60 seconds. At dispatch it rechecks that deadline, the current saved payment and lifecycle,
+including after awaited credit work; a stale timer cannot read a retired or replaced payment.
+It also checks on visibility return when eligible. This uses only
+`GET /api/v1/payment/{id}` and the existing authenticated payment/provenance validator. It
+never calls the mutating invoice route, issues an invoice, orders a machine, approves changed
+terms or runs general Resume. A paid reading ends automatic checks; explicit Refresh continues
+readiness/handoff. Unknown outcomes retain the same VM/payment and explicit recovery controls.
+The existing one-second action floor, exchange/action bounds and lifecycle fences apply.
+Lock/retirement cancels timers and prevents further automatic checks. Provider-key re-entry
+after Unlock restores checking; it cannot redirect the saved purchase.
+
+A fresh served store has no fixture setup offer. Tests retain the offer; already-approved
+machine, session, goal and End controls remain visible.
