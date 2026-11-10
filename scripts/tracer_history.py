@@ -1331,6 +1331,7 @@ def _validate_counter_inputs(report,inventory):
         'inference.held_completion.wait':('inference_cases.run','inference_cases.c005.p001',0,0),
         'inference.late_mint.wait':('inference_cases.run','inference_cases.c009.p001',1,1),
         'inference.withheld_sweep.wait':('inference_cases.run','inference_cases.c011.p001',2,3),
+        'inference.bounded_revoke.wait':('inference_cases.run','inference_cases.c012.p001',0,0),
         'lifecycle.boundaries.wait_completion':('lifecycle_cases.run','lifecycle_cases.c004.p001',0,0),
         'lifecycle.aggregate_cap.wait_completion':('lifecycle_cases.run','lifecycle_cases.c009.p001',0,0),
     }

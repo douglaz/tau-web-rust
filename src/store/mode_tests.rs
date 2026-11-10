@@ -241,12 +241,13 @@ fn mode_trust_display_lists_every_mode_without_artifact_claims() {
             surface["installations"],
             json!([{"machine":"fixture","installation":"unpinned"}])
         );
-        assert_eq!(surface["sessions"], json!([]));
+        assert_eq!(surface["sessions"][0]["standing_modes"], expected);
         assert_eq!(surface["mode_acceptances"][0]["standing"], true);
-        assert_eq!(surface["mode_acceptances"][1]["standing"], false);
+        assert_eq!(surface["mode_acceptances"][1]["standing"], true);
     }
-    let (store, _) = both();
+    let (store, session) = both();
     let mut replayed = reopen(&store);
+    block_on(replayed.end_session(&session)).unwrap();
     block_on(replayed.admit_fixture("fixture")).unwrap();
     assert_eq!(
         replayed.sessions()[0]["standing_modes"],
@@ -307,15 +308,16 @@ fn mode_restatement_uses_target_set_at_destroy_and_reinstall() {
         );
         assert_eq!(
             replayed.standing_modes("fixture"),
-            vec![Mode::NoArtifactPin]
+            vec![Mode::NoArtifactPin, Mode::NoBrief]
         );
     }
     for requester in [Requester::Operator, Requester::HarnessFlow] {
         for operation in [Operation::Destroy, Operation::Reinstall] {
             for live in [true, false] {
-                let (mut store, _) = both();
+                let (mut store, session) = both();
                 if !live {
                     store = reopen(&store);
+                    block_on(store.end_session(&session)).unwrap();
                 }
                 let expected = if live {
                     vec![Mode::NoArtifactPin, Mode::NoBrief]
@@ -637,7 +639,6 @@ fn mode_lowering_refuses_each_form_before_intent_and_records_it() {
         let (mut store, _) = both();
         if restarted {
             store = reopen(&store);
-            block_on(store.admit_fixture("fixture")).unwrap();
         }
         assert!(matches!(
             block_on(store.append(&command("fixture", None, b"SigLevel=Never"), &approval())),

@@ -342,3 +342,24 @@ pub fn validate(report: &Value, key: &Value) -> Result<(), String> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refusal_bodies_match_the_exact_inventory_contracts() {
+        for (body, key) in [
+            (APPROVE, "approve"),
+            (ANSWER, "answer"),
+            (PAGE, "page"),
+            (RUN, "run"),
+            (COLLECT, "collect"),
+            (BIND_AGAIN, "bind_again"),
+            (BIND_INVALID, "bind_invalid"),
+        ] {
+            assert!(hash_matches(body, key), "{key}");
+            assert!(!hash_matches(&format!("{body} "), key), "{key}");
+        }
+    }
+}

@@ -1808,7 +1808,7 @@ async fn run_cases(
         &store_files(&run.dump_at("file.main.dump.007", &tab).await?),
         PASSPHRASE,
     )?;
-    let intent: Value = serde_json::from_slice(
+    let intent: Value = crate::journal::event(
         &journal
             .records
             .iter()
@@ -2759,12 +2759,11 @@ async fn run_cases(
         .await?;
     run.submit(&other, "unlock", PASSPHRASE).await?;
     let successor = run.inspect(&other_worker).await?;
-    let mut durable = held_by_holder.clone();
-    durable["sessions"] = json!([]);
+    let durable = held_by_holder.clone();
     case.check(
         "main.a098",
-        "and unlocks the same durable store without inheriting runtime session authority",
-        successor == durable && successor["sessions"] == json!([]),
+        "and unlocks the same durable store with the original logical sessions",
+        successor == durable,
     );
     (tab, worker) = (other, other_worker);
     case.finish(cases);
@@ -3403,9 +3402,8 @@ fn binaries(value: &Value, payloads: &mut Vec<Vec<u8>>, opaque: &mut Vec<String>
 
 /// What a recorded message carries: every needle in its text and in each binary payload's bytes,
 /// every one of `passphrases` in either, and every object the hook could not read. The one
-/// create or unlock message, exactly
-/// `{"to": {"create" or "unlock": <a passphrase's UTF-8 bytes>}}`, carries its passphrase and
-/// is no finding.
+/// current request envelope for create, unlock or re-display may carry the exact passphrase.
+/// Its transport metadata is still checked for secrets.
 fn findings(
     message: &Value,
     needles: &[(String, Vec<u8>)],
@@ -3415,13 +3413,32 @@ fn findings(
     let mut payloads = Vec::new();
     let mut opaque = Vec::new();
     let rest = binaries(message, &mut payloads, &mut opaque);
+    let request = rest
+        .as_object()
+        .filter(|o| o.len() == 1)
+        .and_then(|o| o.get("to"))
+        .and_then(Value::as_object)
+        .filter(|o| {
+            o.len() == 3
+                && o.get("incarnation").is_some_and(Value::is_string)
+                && o.get("generation").is_some_and(Value::is_string)
+        })
+        .and_then(|o| o.get("request"));
+    let has = |bytes: &[u8], p: &str| bytes.windows(p.len()).any(|w| w == p.as_bytes());
+    let text = rest.to_string();
+    let metadata_clear = || {
+        opaque.is_empty()
+            && reader::found(needles, text.as_bytes()).is_empty()
+            && !passphrases.iter().any(|p| has(text.as_bytes(), p))
+    };
     if let [bytes] = payloads.as_slice()
         && ["create", "unlock", "seed_backup_redisplay"]
             .iter()
-            .any(|kind| rest == json!({ "to": { *kind: null } }))
+            .any(|kind| request == Some(&json!({ *kind: null })))
         && let Some(carried) = passphrases
             .iter()
             .find(|p| p.as_bytes() == bytes.as_slice())
+        && metadata_clear()
     {
         return (Some(carried.to_string()), Vec::new());
     }
@@ -3440,7 +3457,8 @@ fn findings(
                         })
             });
     let reentry = matches!(payloads.as_slice(), [bytes] if std::str::from_utf8(bytes).is_ok())
-        && rest == json!({"to":{"seed_backup_reentry":null}});
+        && request == Some(&json!({"seed_backup_reentry":null}))
+        && metadata_clear();
     let filtered;
     let needles = if display || reentry {
         filtered = needles
@@ -3452,8 +3470,6 @@ fn findings(
     } else {
         needles
     };
-    let has = |bytes: &[u8], p: &str| bytes.windows(p.len()).any(|w| w == p.as_bytes());
-    let text = rest.to_string();
     let mut found: Vec<String> = reader::found(needles, text.as_bytes())
         .into_iter()
         .map(|w| format!("text: {w}"))
@@ -3491,8 +3507,10 @@ fn seed_backup_exceptions_exempt_only_displayed_mnemonics() {
     needles.extend(reader::seed_needles(controls[1]).unwrap());
     needles.extend(reader::encodings("the data key", &[42; 32]));
     needles.extend(reader::encodings("the passphrase", PASSPHRASE.as_bytes()));
-    let binary =
-        |text: &str| json!({"to":{"seed_backup_reentry":{"__tracerBinary":STANDARD.encode(text)}}});
+    let binary = |text: &str| {
+        json!({"to":{"incarnation":"fixture-execution","generation":"0",
+        "request":{"seed_backup_reentry":{"__tracerBinary":STANDARD.encode(text)}}}})
+    };
     for message in [
         json!({"from":{"seed_backup_display":controls[0]}}),
         binary(controls[0]),
@@ -3535,6 +3553,75 @@ fn seed_backup_exceptions_exempt_only_displayed_mnemonics() {
         .1
         .iter()
         .any(|f| f == "text: the passphrase, raw")
+    );
+}
+
+#[test]
+fn credential_message_exceptions_require_exact_current_envelopes() {
+    let needles = reader::encodings("the passphrase", PASSPHRASE.as_bytes());
+    let binary = || json!({"__tracerBinary":STANDARD.encode(PASSPHRASE)});
+    for kind in ["create", "unlock", "seed_backup_redisplay"] {
+        let message = json!({"to":{"incarnation":"fixture-execution","generation":"0",
+            "request":{kind:binary()}}});
+        let result = findings(&message, &needles, &[PASSPHRASE], &[]);
+        assert_eq!(result.0.as_deref(), Some(PASSPHRASE));
+        assert!(result.1.is_empty());
+        let mut controls = vec![json!({"to":{kind:binary()}})];
+        for field in ["incarnation", "generation"] {
+            let mut secret_metadata = message.clone();
+            secret_metadata["to"][field] = json!(PASSPHRASE);
+            controls.push(secret_metadata);
+            let mut missing = message.clone();
+            missing["to"].as_object_mut().unwrap().remove(field);
+            controls.push(missing);
+            let mut invalid = message.clone();
+            invalid["to"][field] = json!(0);
+            controls.push(invalid);
+        }
+        let mut extra = message.clone();
+        extra["to"]["request"]["also"] = json!(true);
+        controls.push(extra);
+        let mut extra = message.clone();
+        extra["to"]["also"] = json!(true);
+        controls.push(extra);
+        let mut extra = message.clone();
+        extra["from"] = json!({});
+        controls.push(extra);
+        let mut wrong_kind = message.clone();
+        wrong_kind["to"]["request"] = json!({"seed_backup_reentry":binary()});
+        controls.push(wrong_kind);
+        let mut extended = message.clone();
+        extended["to"]["request"][kind] =
+            json!({"__tracerBinary":STANDARD.encode(format!("{PASSPHRASE}extra"))});
+        controls.push(extended);
+        for control in controls {
+            let result = findings(&control, &needles, &[PASSPHRASE], &[]);
+            assert!(result.0.is_none());
+            assert!(!result.1.is_empty());
+        }
+    }
+    let phrase = include_str!("../../tests/vectors/seed-backup-collisions.txt")
+        .lines()
+        .next()
+        .unwrap();
+    let displayed = reader::mnemonic_needles(phrase);
+    let mut needles = reader::seed_needles(phrase).unwrap();
+    needles.extend(reader::encodings("the passphrase", PASSPHRASE.as_bytes()));
+    for field in ["incarnation", "generation"] {
+        let mut message = json!({"to":{"incarnation":"fixture-execution","generation":"0",
+            "request":{"seed_backup_reentry":{"__tracerBinary":STANDARD.encode(phrase)}}}});
+        message["to"][field] = json!(phrase);
+        assert!(
+            !findings(&message, &needles, &[PASSPHRASE], &displayed)
+                .1
+                .is_empty()
+        );
+    }
+    let legacy = json!({"to":{"seed_backup_reentry":{"__tracerBinary":STANDARD.encode(phrase)}}});
+    assert!(
+        !findings(&legacy, &needles, &[PASSPHRASE], &displayed)
+            .1
+            .is_empty()
     );
 }
 
@@ -3598,12 +3685,7 @@ async fn relocked(
     case.check(
         "main.a119",
         "after unlock, the replayed state lists every command recorded before",
-        view["store"] == "unlocked"
-            && replayed == {
-                let mut expected = before.clone();
-                expected["sessions"] = json!([]);
-                expected
-            },
+        view["store"] == "unlocked" && replayed == *before,
     );
     binding_cases::prepare(run, tab, worker, PASSPHRASE).await?;
     Ok(())

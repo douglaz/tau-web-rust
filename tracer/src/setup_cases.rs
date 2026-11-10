@@ -163,7 +163,12 @@ pub(super) async fn run(
     card.check(
         "setup_cases.a005",
         "unapproved command refuses before contact with no append",
-        report["outcome"] == json!({"refused":"no-entry","machine":"fixture"})
+        report["outcome"]
+            == if tracer {
+                json!({"refused":"no-entry","machine":"fixture"})
+            } else {
+                json!({"refused":"machine has no stored target or pin"})
+            }
             && seen.relay_accepted == 0
             && seen.ssh_connections == 0
             && run.inspect(worker).await? == before,

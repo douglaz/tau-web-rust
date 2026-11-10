@@ -210,7 +210,9 @@ fn declaration_pending_is_not_authority_and_exact_approval_survives_reopen() {
     assert_eq!(s.storage.files(), committed);
     let r = reopen(&s).unwrap();
     assert_eq!(r.dispatch.setup_view(), s.dispatch.setup_view());
-    assert!(r.sessions.is_empty() && r.pending_requirements.is_empty());
+    assert_eq!(r.sessions.len(), 1);
+    assert_eq!(r.sessions[0].identity, identity);
+    assert!(r.pending_requirements.is_empty());
 }
 
 #[test]
@@ -408,17 +410,27 @@ fn declaration_failures_and_landed_errors_release_no_authority_or_continuation()
     ] {
         let mut s = start();
         propose(&mut s, proposal(minimum()));
+        let identity = session(&s);
+        let pending = s.pending_requirements[&identity].proposal.clone();
         s.storage.fault(fault);
-        assert!(block_on(s.approve_requirements(&session(&s), "fixture", 42)).is_err());
+        assert!(block_on(s.approve_requirements(&identity, "fixture", 42)).is_err());
         assert!(s.dispatch.approved_entries["fixture"].declaration.is_none());
-        assert!(s.pending_requirements.is_empty());
+        assert_eq!(s.pending_requirements.len(), 1);
+        assert_eq!(s.pending_requirements[&identity].candidate, 42);
+        assert_eq!(s.pending_requirements[&identity].proposal, pending);
         assert!(s.failed.is_some());
+        let failed_files = s.storage.files();
+        assert!(block_on(s.approve_requirements(&identity, "fixture", 42)).is_err());
+        assert_eq!(s.storage.files(), failed_files);
         let r = reopen(&s).unwrap();
         assert_eq!(
             r.dispatch.approved_entries["fixture"].declaration.is_some(),
             matches!(fault, Fault::LandThenFail(3))
         );
-        assert!(r.pending_requirements.is_empty() && r.sessions.is_empty());
+        assert!(r.pending_requirements.is_empty());
+        assert_eq!(r.sessions.len(), 1);
+        assert_eq!(r.sessions[0].identity, identity);
+        assert!(!r.sessions[0].ended.get());
     }
 }
 

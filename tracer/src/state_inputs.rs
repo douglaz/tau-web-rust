@@ -182,29 +182,10 @@ impl State {
         }
     }
     pub fn same_at(&self, predicate: &'static str, other: &Self, fields: &[&str]) -> Predicate {
-        self.compare(predicate, other, fields, false)
+        self.compare_value(predicate, other, fields, "identity", other)
     }
     pub fn replayed_at(&self, predicate: &'static str, other: &Self) -> Predicate {
-        self.compare(predicate, other, &[""], true)
-    }
-    fn compare(
-        &self,
-        predicate: &'static str,
-        other: &Self,
-        fields: &[&str],
-        replay: bool,
-    ) -> Predicate {
-        let mut right = (**other).clone();
-        if replay {
-            right["sessions"] = json!([]);
-        }
-        self.compare_value(
-            predicate,
-            other,
-            fields,
-            if replay { "clear_sessions" } else { "identity" },
-            &right,
-        )
+        self.same_at(predicate, other, &[""])
     }
     fn compare_value(
         &self,
@@ -256,8 +237,15 @@ impl State {
         replayed: &Self,
     ) -> Predicate {
         let mut comparisons = Vec::new();
-        let result = self.compare_field(before, "", before, "identity", &mut comparisons)
-            && self.compare_field(replayed, "/records", replayed, "identity", &mut comparisons);
+        let mut expected = (**before).clone();
+        for session in expected["sessions"].as_array_mut().expect("sessions") {
+            session["session_state"] = json!("waiting");
+            session["readiness_reason"] =
+                json!("journal append outcome uncertain; reopen to validate before further work");
+        }
+        let result =
+            self.compare_field(before, "", &expected, "append_fail_stop", &mut comparisons)
+                && self.compare_field(replayed, "/records", replayed, "identity", &mut comparisons);
         let mut uses = USES.lock().unwrap();
         let index = uses.len();
         uses.push(json!({"predicate":predicate,"sources":[self.original.source,before.original.source,replayed.original.source],"paths":[[self.path.clone()],[before.path.clone()],[format!("{}/records",replayed.path)]],"transform":"failed_append","comparisons":comparisons,"result":result,"case":history::active_case_id(),"at_ns":completion::now(),"history_cursor":history::cursor(),"check_ns":null,"check_cursor":null,"instance":null}));
@@ -525,7 +513,7 @@ fn validate_with(report: &Value, key: &Value) -> Result<(), String> {
             || !rule["result"].is_boolean()
             || !matches!(
                 rule["transform"].as_str(),
-                Some("identity" | "clear_sessions" | "goal_usage" | "failed_append")
+                Some("identity" | "goal_usage" | "failed_append")
             )
             || !matches!(
                 rule["page_role"].as_str(),
@@ -670,7 +658,7 @@ fn validate_with(report: &Value, key: &Value) -> Result<(), String> {
             || row["result"] != rule["result"]
             || !matches!(
                 rule["transform"].as_str(),
-                Some("identity" | "clear_sessions" | "goal_usage" | "failed_append")
+                Some("identity" | "goal_usage" | "failed_append")
             )
         {
             return Err(ERROR.into());
@@ -985,7 +973,7 @@ fn expected_comparisons(rule: &Value, row: &Value) -> Result<Value, String> {
                 1,
                 paths[0][0].as_str().ok_or(ERROR)?,
                 paths[1][0].as_str().ok_or(ERROR)?,
-                "identity",
+                "append_fail_stop",
                 true
             ),
             component(
@@ -1211,6 +1199,10 @@ mod tests {
         let key = &f["inventory"];
         validate_with(report, key).unwrap();
         for (path, value) in [
+            (
+                "/state_inputs/uses/0/comparisons/0/transform",
+                json!("identity"),
+            ),
             ("/state_inputs/uses/0/sources", json!([2, 2, 1])),
             ("/state_inputs/uses/0/sources", json!([3, 1, 2])),
             (

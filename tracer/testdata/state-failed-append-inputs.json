@@ -538,7 +538,7 @@
                 "",
                 ""
               ],
-              "transform": "identity",
+              "transform": "append_fail_stop",
               "result": true
             },
             {

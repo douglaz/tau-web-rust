@@ -60,7 +60,22 @@ pub(super) fn last_key(run: &Run<'_>) -> String {
 async fn restart(run: &Run<'_>, tab: &Tab, worker: &mut Worker) -> Result<(), String> {
     setup_cases::click(run, tab, "#tau-lock").await?;
     *worker = run.worker(tab, Some(worker), false).await?;
-    resume(run, tab, worker).await
+    origin(run, worker).await?;
+    run.submit(tab, "unlock", PASSPHRASE).await?;
+    end_replayed_paid(run, worker).await?;
+    binding_cases::prepare(run, tab, worker, PASSPHRASE).await
+}
+
+pub(super) async fn end_replayed_paid(run: &Run<'_>, worker: &Worker) -> Result<(), String> {
+    // Paid fixtures need an explicit End and new admission after replay.
+    module(run, worker, r#"for (const s of JSON.parse(await m.store_state()).sessions) {
+        if (s.readiness_reason !== 'paid session readiness withheld after replay') continue;
+        const report=await m.task_request(JSON.stringify({action:'end-session',session:s.identity}));
+        const result=JSON.parse(report);
+        if (result.error) throw new Error(result.error);
+        await m.publish_report(m.publication_generation(),'',report);
+    } return true;"#).await?;
+    Ok(())
 }
 
 pub(super) fn request_body(raw: &[u8]) -> Option<Value> {
@@ -871,8 +886,10 @@ pub(super) async fn run(
     // key_status above is an explicit tracer request, distinct from a replay send.
     case.check(
         "inference_cases.a036",
-        "new request dispatches after crash",
-        infer(run, worker).await?["finished"] == true,
+        "replayed paid session refuses a new request without another completion",
+        infer(run, worker).await?
+            == json!({"refused":"paid session readiness withheld after replay"})
+            && run.aggregator.count("/completion") == before + 1,
     );
     wait_refused("inference.core_sweep.wait", run, &key).await?;
     let id = key_inputs::id(run, &key);
@@ -979,6 +996,12 @@ pub(super) async fn run(
             "reload" => *worker = key_inputs::reload(run, tab, worker, &key).await?,
             "hidden" => {
                 let before = run.inspect(worker).await?;
+                let original = before["sessions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|s| s["session_state"] != "ended" && s["bound_set"] == json!(["fixture"]))
+                    .ok_or("missing live hidden fixture session")?;
                 let mints = run.aggregator.count("/keys");
                 let revokes = run.aggregator.count("/revoke");
                 let other = run
@@ -992,12 +1015,21 @@ pub(super) async fn run(
                     infer(run, worker).await?["finished"] == true,
                 );
                 let after = run.inspect(worker).await?;
+                let retained = after["sessions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|s| s["identity"] == original["identity"]);
                 case.check(
                     "inference_cases.a040",
                     "hide retains original session and limits without mint/revoke",
-                    after["sessions"][0]["identity"] == before["sessions"][0]["identity"]
-                        && after["sessions"][0]["inference_limits"]["original_expiry"]
-                            == before["sessions"][0]["inference_limits"]["original_expiry"]
+                    original["inference_limits"]["original_expiry"].is_u64()
+                        && retained.is_some_and(|s| {
+                            s["session_state"] != "ended"
+                                && s["bound_set"] == original["bound_set"]
+                                && s["inference_limits"]["original_expiry"]
+                                    == original["inference_limits"]["original_expiry"]
+                        })
                         && run.aggregator.count("/keys") == mints
                         && run.aggregator.count("/revoke") == revokes
                         && run.aggregator.state.lock().unwrap().accepts(&key),
@@ -1125,10 +1157,35 @@ pub(super) async fn run(
         } else {
             case.check(
                 "inference_cases.a045",
-                "the tracer uses the ended session's key and the fixture refuses it",
-                run.aggregator.key_status(&key).await? == 402,
+                "runtime retirement leaves the remote key usable until unlock or its original expiry",
+                run.aggregator.key_status(&key).await? == 200,
             );
+            let completions = run.aggregator.count("/completion");
             resume(run, tab, worker).await?;
+            // Observe the worker's unlock sweep without initiating revocation or sending probes.
+            let mut revoked = false;
+            for _ in 0..100 {
+                revoked = run
+                    .aggregator
+                    .state
+                    .lock()
+                    .unwrap()
+                    .keys
+                    .iter()
+                    .find(|candidate| candidate.value == *key)
+                    .is_some_and(|original| original.revoked);
+                if revoked {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            case.check(
+                "inference_cases.a045",
+                "unlock sweeps the original key without another completion",
+                revoked
+                    && run.aggregator.key_status(&key).await? == 402
+                    && run.aggregator.count("/completion") == completions + 1,
+            );
         }
         if end == "reload" {
             key_inputs::expiry(run, &key, &mut case).await?;
@@ -1291,6 +1348,14 @@ pub(super) async fn run(
             "inference_cases.c010",
             "identifier-only mint is revoked at session end",
         );
+        let before_mint = run.inspect(worker).await?;
+        let mint_session = before_mint["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["session_state"] != "ended" && s["bound_set"] == json!(["fixture"]))
+            .ok_or("missing identifier-only fixture session")?["identity"]
+            .clone();
         run.aggregator.state.lock().unwrap().identifier_only = true;
         let result = infer(run, worker).await?;
         run.aggregator.state.lock().unwrap().identifier_only = false;
@@ -1300,8 +1365,11 @@ pub(super) async fn run(
             "inference_cases.a051",
             "identifier-only response installs no row-2 holding and ends missing acceptance",
             result.get("refused").is_some()
-                && state["sessions"][0]["session_state"] == "ended"
-                && state["sessions"][0]["given"] == json!([]),
+                && state["sessions"].as_array().unwrap().iter().any(|s| {
+                    s["identity"] == mint_session
+                        && s["session_state"] == "ended"
+                        && s["given"] == json!([])
+                }),
         );
         setup_cases::click(run, tab, "#tau-lock").await?;
         *worker = run.worker(tab, Some(worker), false).await?;
@@ -1310,7 +1378,10 @@ pub(super) async fn run(
             "identifier-only key is refused immediately after end, before unlock",
             run.aggregator.key_status(&key).await? == 402,
         );
-        resume(run, tab, worker).await?;
+        origin(run, worker).await?;
+        run.submit(tab, "unlock", PASSPHRASE).await?;
+        end_replayed_paid(run, worker).await?;
+        binding_cases::prepare(run, tab, worker, PASSPHRASE).await?;
         case.finish(cases);
 
         let mut case = Case::new(
@@ -1358,6 +1429,7 @@ pub(super) async fn run(
             run.aggregator.key_status(&key).await? == 200,
         );
         run.aggregator.state.lock().unwrap().hold_revoke = false;
+        end_replayed_paid(run, worker).await?;
         binding_cases::prepare(run, tab, worker, PASSPHRASE).await?;
         case.check(
             "inference_cases.a056",
@@ -1383,7 +1455,17 @@ pub(super) async fn run(
         "bounded revoke stays unresolved and is never swept twice",
     );
     run.aggregator.state.lock().unwrap().hold_revoke = true;
-    let before = run.aggregator.count("/revoke");
+    let before = counter_inputs::baseline("inference.bounded_revoke.wait", run, "/revoke");
+    observer::counter_input("inference.bounded_revoke.wait", "/revoke", before + 1);
+    // Observe the held revoke transmission before retiring its worker.
+    counter_inputs::module(
+        "inference.bounded_revoke.wait",
+        run,
+        worker,
+        "self.boundedEnd=m.end_sessions();return true;",
+    )
+    .await?;
+    wait_count("inference.bounded_revoke.wait", run, "/revoke", before + 1).await?;
     setup_cases::click(run, tab, "#tau-lock").await?;
     *worker = run.worker(tab, Some(worker), false).await?;
     run.aggregator.state.lock().unwrap().hold_revoke = false;

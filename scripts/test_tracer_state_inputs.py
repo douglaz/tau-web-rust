@@ -41,6 +41,10 @@ class WorkerResultUses(unittest.TestCase):
             with self.subTest(path=path), self.assertRaises(ValueError):
                 tracer_state_inputs.validate(bad,key)
         bad=copy.deepcopy(report)
+        bad['state_inputs']['uses'][0]['comparisons'][0]['transform']='identity'
+        with self.assertRaisesRegex(ValueError, 'inner comparison'):
+            tracer_state_inputs.validate(bad,key)
+        bad=copy.deepcopy(report)
         bad['state_inputs']['uses'][0]['comparisons'].pop()
         with self.assertRaisesRegex(ValueError, 'inner comparison'):
             tracer_state_inputs.validate(bad,key)

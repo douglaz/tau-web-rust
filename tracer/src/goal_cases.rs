@@ -1385,7 +1385,7 @@ run.inspect_state_at("state.goal.held.after", worker).await?.same_at("goal_cases
 
     let mut case = Case::new(
         "goal_cases.c012",
-        "goals stay historical after replay and failed documents supply no context",
+        "replay restores the original goal and failed documents supply no context",
     );
     *worker = run.reload("goal_cases.rs::reload#3", tab, worker).await?;
     module(
@@ -1416,7 +1416,11 @@ run.inspect_state_at("state.goal.held.after", worker).await?.same_at("goal_cases
         ),
     );
     binding_cases::prepare(run, tab, worker, PASSPHRASE).await?;
-    case.check("goal_cases.a049", "fresh bindings have no goal and no prefilled goal input",run.inspect(worker).await?["sessions"].as_array().unwrap().iter().all(|s|s["goal"].is_null()) && run.browser.evaluate(&tab.session,"(()=>{const fields=Array.from(document.querySelectorAll('[data-goal-text]'));return fields.length>0&&fields.every(e=>e.value==='');})()").await?==true);
+    let expected_goal = json!({"session":session,"text":"goal awaiting a document","document_source":source,"source":"operator_session_goal_card"});
+    case.check("goal_cases.a049", "original session restores its exact goal; unrelated empty goal fields stay blank",
+        run.inspect(worker).await?["sessions"].as_array().unwrap().iter().any(|s|
+            s["identity"] == *session && s["bound_set"] == json!(["fixture"]) && s["goal"] == expected_goal)
+            && run.browser.evaluate(&tab.session,&format!("(()=>{{const fields=Array.from(document.querySelectorAll('[data-goal-text]'));return document.querySelector('[data-goal-enter=\"{}\"]')===null&&fields.length>0&&fields.every(e=>e.value==='');}})()", session)).await?==true);
     for status in [307, 503] {
         let session = reset(run, tab, worker, &initial).await?;
         run.aggregator.state.lock().unwrap().document_status = status;

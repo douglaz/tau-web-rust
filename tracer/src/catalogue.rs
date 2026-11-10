@@ -379,11 +379,11 @@ const CASES: &[(&str, &str)] = &[
     ),
     (
         "binding_cases.c003.p001",
-        "exposure ledger survives restart without live bindings: tracer",
+        "exposure ledger and original bindings survive restart: tracer",
     ),
     (
         "binding_cases.c004.p001",
-        "seed-backup re-display ends bindings: tracer",
+        "seed-backup re-display retires execution and retains bindings: tracer",
     ),
     (
         "binding_cases.c001.p002",
@@ -395,11 +395,11 @@ const CASES: &[(&str, &str)] = &[
     ),
     (
         "binding_cases.c003.p002",
-        "exposure ledger survives restart without live bindings: served",
+        "exposure ledger and original bindings survive restart: served",
     ),
     (
         "binding_cases.c004.p002",
-        "seed-backup re-display ends bindings: served",
+        "seed-backup re-display retires execution and retains bindings: served",
     ),
     (
         "mode_cases.c001.p001",
@@ -615,11 +615,11 @@ const CASES: &[(&str, &str)] = &[
     ),
     (
         "lifecycle_cases.c008.p001",
-        "dedicated Lock ends old approval; a separately admitted successor alone can reset (CNF-86)",
+        "dedicated Lock preserves approval until explicit End; only a new session can reset (CNF-86)",
     ),
     (
         "lifecycle_cases.c008.p002",
-        "dedicated worker restart ends old approval; a separately admitted successor alone can reset (CNF-86)",
+        "dedicated worker restart preserves approval until explicit End; only a new session can reset (CNF-86)",
     ),
     (
         "lifecycle_cases.c009.p001",
@@ -947,7 +947,7 @@ const CASES: &[(&str, &str)] = &[
     ),
     (
         "goal_cases.c012.p001",
-        "goals stay historical after replay and failed documents supply no context",
+        "replay restores the original goal and failed documents supply no context",
     ),
     (
         "declaration_cases.c001.p001",

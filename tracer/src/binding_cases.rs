@@ -169,11 +169,10 @@ async fn prepare_with_enrolment(
         let name = machine["entry"]["machine"].as_str().unwrap();
         observer::binding_input(call.id(), slot + 1, name);
         let state = run.inspect(worker).await?;
-        let bound = state["sessions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|s| s["bound_set"].as_array().unwrap().iter().any(|m| m == name));
+        let bound = state["sessions"].as_array().unwrap().iter().any(|s| {
+            s["session_state"] != "ended"
+                && s["bound_set"].as_array().unwrap().iter().any(|m| m == name)
+        });
         call.observe("binding_input", json!({"slot":slot+1,"bound":bound}));
         if bound {
             continue;
@@ -193,7 +192,7 @@ async fn prepare_with_enrolment(
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|s| s["bound_set"] == json!([name]))
+                .any(|s| s["session_state"] != "ended" && s["bound_set"] == json!([name]))
         })
         .await?;
     }

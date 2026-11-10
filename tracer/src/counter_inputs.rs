@@ -21,7 +21,7 @@ fn record_count(count: usize) {
 fn path(site: &str) -> &str {
     match site {
         "inference.late_mint.wait" => "/keys",
-        "inference.withheld_sweep.wait" => "/revoke",
+        "inference.withheld_sweep.wait" | "inference.bounded_revoke.wait" => "/revoke",
         "inference.held_completion.wait"
         | "lifecycle.boundaries.wait_completion"
         | "lifecycle.aggregate_cap.wait_completion" => "/completion",
@@ -81,6 +81,7 @@ fn triggered(site: &str, start: (u64, usize, Value)) {
 fn expression(site: &str) -> String {
     match site {
  "inference.held_completion.wait"=>format!("self.heldCompletion=m.inference_request({});return true;",json!(json!({"machine":"fixture","messages":[{"role":"user","content":"held completion"}]}).to_string())),
+ "inference.bounded_revoke.wait"=>"self.boundedEnd=m.end_sessions();return true;".into(),
  "inference.late_mint.wait"=>format!("self.lateMint=m.inference_request({});return true;",json!(json!({"machine":"fixture","messages":[{"role":"user","content":"late mint"}]}).to_string())),
  "lifecycle.boundaries.wait_completion"=>"self.pendingLifecycle=m.inference_request(JSON.stringify({machine:'fixture',messages:[{role:'user',content:'late fixture turn'}]}));self.oldGeneration=m.publication_generation();return true;".into(),
  "lifecycle.aggregate_cap.wait_completion"=>"self.capInFlight=m.inference_request(JSON.stringify({machine:'fixture',messages:[{role:'user',content:'in flight charge'}]}));return true;".into(),_=>String::new()}
@@ -188,6 +189,9 @@ fn owner_position(site: &str) -> Option<(&str, &str, usize, usize)> {
         }
         "inference.withheld_sweep.wait" => {
             Some(("inference_cases.run", "inference_cases.c011.p001", 2, 3))
+        }
+        "inference.bounded_revoke.wait" => {
+            Some(("inference_cases.run", "inference_cases.c012.p001", 0, 0))
         }
         "lifecycle.boundaries.wait_completion" => {
             Some(("lifecycle_cases.run", "lifecycle_cases.c004.p001", 0, 0))

@@ -76,16 +76,35 @@ async fn inject(run: &Run<'_>, worker: &Worker, session: &str, m: &Value) -> Res
     .await?;
     Ok(())
 }
-async fn action(run: &Run<'_>, worker: &Worker, v: Value) -> Result<Value, String> {
-    module(
-        run,
-        worker,
-        &format!(
-            "const post=self.postMessage;let report;self.postMessage=(data,...args)=>{{if(data.store)report=data.store;return post.call(self,data,...args);}};try{{await self.onmessage({{data:{{delivery:{v}}}}});}}finally{{self.postMessage=post;}}if(!report)throw new Error('no worker delivery response');return {{...report,state:report.store_state,...(report.store_error?{{error:report.store_error}}:{{}})}};"
-        ),
-    )
-    .await
+async fn action(run: &Run<'_>, tab: &Tab, worker: &Worker, v: Value) -> Result<Value, String> {
+    observed_action(run, tab, worker, v, None).await
 }
+async fn observed_action(
+    run: &Run<'_>,
+    tab: &Tab,
+    worker: &Worker,
+    v: Value,
+    operation: Option<&operation_windows::Operation>,
+) -> Result<Value, String> {
+    const IDENTITY: &str =
+        "__tracerMessages.findLast(message=>message.to?.initialize)?.to.initialize";
+    if let Some(operation) = operation {
+        operation.page(&tab.session, IDENTITY);
+    }
+    let incarnation = run.browser.evaluate(&tab.session, IDENTITY).await?;
+    if !incarnation.is_string() {
+        return Err("missing current page execution identity".into());
+    }
+    let body = format!(
+        "const post=self.postMessage;let report;self.postMessage=(data,...args)=>{{if(data.store)report=data.store;return post.call(self,data,...args);}};try{{await self.onmessage({{data:{{incarnation:{},generation:String(m.publication_generation()),request:{{delivery:{v}}}}}}});}}finally{{self.postMessage=post;}}if(!report)throw new Error('no worker delivery response');return {{...report,state:report.store_state,...(report.store_error?{{error:report.store_error}}:{{}})}};",
+        json!(incarnation)
+    );
+    if let Some(operation) = operation {
+        operation.module(worker, &body);
+    }
+    module(run, worker, &body).await
+}
+
 fn request(session: &str) -> Value {
     json!({"action":"check","session":session,"machine":"fixture"})
 }
@@ -156,8 +175,13 @@ async fn card(
     }
     Err(format!("delivery card did not display {needle}"))
 }
-async fn refresh(run: &Run<'_>, worker: &Worker) -> Result<(), String> {
-    module(run,worker,"await self.onmessage({data:{delivery:{action:'check',machine:'fixture',session:'absent'}}});return true;").await?;
+async fn refresh(run: &Run<'_>, tab: &Tab, worker: &Worker) -> Result<(), String> {
+    let report = action(run, tab, worker, request("absent")).await?;
+    if report["error"] != "no live session" {
+        return Err(format!(
+            "refresh did not publish the absent-session refusal: {report}"
+        ));
+    }
     Ok(())
 }
 
@@ -206,8 +230,7 @@ pub(super) async fn run(
     let before = run.dump_at("file.delivery_cases.dump.002", tab).await?;
     let operation =
         operation_windows::Operation::begin("delivery.absent", worker, session.original_matches());
-    operation.module(worker, &format!("const post=self.postMessage;let report;self.postMessage=(data,...args)=>{{if(data.store)report=data.store;return post.call(self,data,...args);}};try{{await self.onmessage({{data:{{delivery:{v}}}}});}}finally{{self.postMessage=post;}}if(!report)throw new Error('no worker delivery response');return {{...report,state:report.store_state,...(report.store_error?{{error:report.store_error}}:{{}})}};",v=json!({"action":"check","session":session,"machine":"fixture"})));
-    let response = action(run, worker, request(&session)).await?;
+    let response = observed_action(run, tab, worker, request(&session), Some(&operation)).await?;
     operation.finish();
     let mut case = Case::new(
         "delivery_cases.c001",
@@ -261,7 +284,7 @@ pub(super) async fn run(
             response.get("error").is_some(),
         );
     }
-    let state = action(run, worker, request(&session)).await?;
+    let state = action(run, tab, worker, request(&session)).await?;
     case.check(
         "delivery_cases.a003",
         "no supplied fixture evidence remains unavailable",
@@ -295,6 +318,7 @@ pub(super) async fn run(
     for name in ["Hermes", "<b data-delivery-injected>application</b>"] {
         let v = action(
             run,
+            tab,
             worker,
             json!({"action":"application","session":session,"machine":"fixture","name":name}),
         )
@@ -313,11 +337,12 @@ pub(super) async fn run(
         worker,
         session.original_matches(),
     );
-    operation.module(worker, &format!("const post=self.postMessage;let report;self.postMessage=(data,...args)=>{{if(data.store)report=data.store;return post.call(self,data,...args);}};try{{await self.onmessage({{data:{{delivery:{v}}}}});}}finally{{self.postMessage=post;}}if(!report)throw new Error('no worker delivery response');return {{...report,state:report.store_state,...(report.store_error?{{error:report.store_error}}:{{}})}};",v=json!({"action":"application","session":session,"machine":"fixture","name":"Hermes"})));
-    let duplicate = action(
+    let duplicate = observed_action(
         run,
+        tab,
         worker,
         json!({"action":"application","session":session,"machine":"fixture","name":"Hermes"}),
+        Some(&operation),
     )
     .await?;
     operation.finish();
@@ -409,9 +434,15 @@ pub(super) async fn run(
     .await?;
     case.check(
         "delivery_cases.a009",
-        "reopen restores card with no running session",
+        "reopen restores card and original ready session",
         restored["delivery"][0]["verdict"] == "Delivered"
-            && restored["sessions"] == json!([])
+            && restored["sessions"].as_array().is_some_and(|sessions| {
+                sessions.len() == 1
+                    && sessions[0]["identity"] == session
+                    && sessions[0]["bound_set"] == json!(["fixture"])
+                    && sessions[0]["session_state"] == "running"
+                    && sessions[0]["readiness_reason"].is_null()
+            })
             && text.contains("Fixture"),
     );
     case.finish(cases);
@@ -599,6 +630,7 @@ pub(super) async fn run(
     for act in ["accept_finding", "waive_finding"] {
         let v = action(
             run,
+            tab,
             worker,
             json!({"action":act,"session":session,"machine":"fixture"}),
         )
@@ -664,7 +696,7 @@ pub(super) async fn run(
             == "Delivered",
     );
     module(run,worker,"await m.test_delivery_state(JSON.stringify({kind:'findings_unknown',machine:'fixture'}));return true;").await?;
-    refresh(run, worker).await?;
+    refresh(run, tab, worker).await?;
     let state = run.inspect(worker).await?;
     case.check(
         "delivery_cases.a019",
@@ -984,10 +1016,9 @@ async fn amendment(
         }})],
     )
     .await?;
-    let pending =
-        declaration_cases::wait_card("delivery.amendment.wait_card", run, tab, worker, &session)
-            .await?;
-    let refusal = action(run, worker, request(&session)).await?;
+    declaration_cases::wait_card("delivery.amendment.wait_card", run, tab, worker, &session)
+        .await?;
+    let refusal = action(run, tab, worker, request(&session)).await?;
     let mut case = Case::new(
         "delivery_cases.c008",
         "delivery amendment retains findings and rejects stale measurement authority before recheck",
@@ -997,13 +1028,7 @@ async fn amendment(
         "pending amendment supplies no delivery authority",
         refusal.get("error").is_some() && refusal["delivery"][0]["findings"] == before["findings"],
     );
-    let answer = json!({"session":session,"machine":"fixture","candidate":pending["candidate"],"decision":"approve"});
-    module(
-        run,
-        worker,
-        &format!("await self.onmessage({{data:{{requirements_answer:{answer}}}}});return true;"),
-    )
-    .await?;
+    setup_cases::click(run, tab, "[data-requirements-decision=approve]").await?;
     declaration_cases::outcome("delivery.amendment.outcome", run, tab, &session).await?;
     let state = run.inspect(worker).await?;
     case.check(
@@ -1012,7 +1037,7 @@ async fn amendment(
         state["delivery"][0]["findings"] == before["findings"]
             && state["delivery"][0]["current_declaration_checked"] == false,
     );
-    let refusal = action(run, worker, request(&session)).await?;
+    let refusal = action(run, tab, worker, request(&session)).await?;
     case.check(
         "delivery_cases.a029",
         "old-declaration fixture cannot become new-declaration evidence",
@@ -1134,7 +1159,7 @@ async fn reports(
             &["/verdict", "/findings", "/placement_eligible"],
         ),
     );
-    refresh(run, worker).await?;
+    refresh(run, tab, worker).await?;
     let text = card(
         "delivery.report_success.card",
         run,

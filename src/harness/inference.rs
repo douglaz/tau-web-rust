@@ -926,7 +926,7 @@ pub async fn test_reinstall(action: String, input: String) -> Result<String, JsV
     let store = local.store().ok_or("locked")?;
     let result: Result<Value,String> = async {
         let entry="fixture";
-        let session=store.sessions().into_iter().find(|s| s["bound_set"]==json!([entry]))
+        let session=store.sessions().into_iter().find(|s| s["session_state"]!="ended" && s["bound_set"]==json!([entry]))
             .and_then(|s|s["identity"].as_str().map(str::to_owned)).ok_or("fixture binding")?;
         let id=value["approval"].as_u64().unwrap_or(0);
         let reset=value["reset"].as_str().unwrap_or("synthetic-reset");

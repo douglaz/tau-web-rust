@@ -19,7 +19,7 @@ def validate(report, inventory):
         return phase in ('inside', 'outside') or type(phase) is str and phase.startswith('case:') and any(c['id'] == phase[5:] for c in inventory['cases'])
     kinds = ('run', 'collect', 'reload', 'goal.drive', 'goal.turn', 'declaration.outcome', 'binding.prepare', 'file:setup.request', 'file:setup.message', 'window:hold.evidence', 'window:main.hidden')
     for rule in rules.values():
-        if type(rule) is not dict or set(rule) != {'sources', 'paths', 'transform', 'result', 'operation', 'page_role', 'operations'} or type(rule['sources']) is not list or not 2 <= len(rule['sources']) <= 3 or not valid_paths(rule['paths']) or type(rule['result']) is not bool or rule['transform'] not in ('identity', 'clear_sessions', 'goal_usage', 'failed_append') or rule['page_role'] not in ('tracer', 'served', 'invocation') or rule['operation'] not in kinds:
+        if type(rule) is not dict or set(rule) != {'sources', 'paths', 'transform', 'result', 'operation', 'page_role', 'operations'} or type(rule['sources']) is not list or not 2 <= len(rule['sources']) <= 3 or not valid_paths(rule['paths']) or type(rule['result']) is not bool or rule['transform'] not in ('identity', 'goal_usage', 'failed_append') or rule['page_role'] not in ('tracer', 'served', 'invocation') or rule['operation'] not in kinds:
             raise ValueError(error)
         for source in rule['sources']:
             if type(source) is not list or not 3 <= len(source) <= 4 or type(source[0]) is not str or source[1] not in ('once', 'each', 'saved') or not valid_phase(source[2]) or len(source) == 4 and type(source[3]) is not str:
@@ -85,7 +85,7 @@ def validate(report, inventory):
         if type(paths) is dict:
             if not 1 <= instance <= len(paths['by_instance']): raise ValueError(error)
             paths = paths['by_instance'][instance-1]
-        if row['predicate'] != predicate or row['case'] != check['case'] or instance < 1 or check['id'] != f'{predicate}.i{instance:03}' or row['check_ns'] != check['at_ns'] or row['check_cursor'] != check['history_cursor'] or row['paths'] != paths or row['transform'] != rule['transform'] or row['result'] is not rule['result'] or rule['transform'] not in ('identity', 'clear_sessions', 'goal_usage', 'failed_append'):
+        if row['predicate'] != predicate or row['case'] != check['case'] or instance < 1 or check['id'] != f'{predicate}.i{instance:03}' or row['check_ns'] != check['at_ns'] or row['check_cursor'] != check['history_cursor'] or row['paths'] != paths or row['transform'] != rule['transform'] or row['result'] is not rule['result'] or rule['transform'] not in ('identity', 'goal_usage', 'failed_append'):
             raise ValueError(error)
         if not previous <= at <= check['at_ns'] or cursor != row['check_cursor'] or not 0 <= cursor < len(states):
             raise ValueError(error)
@@ -181,7 +181,7 @@ def expected_comparisons(rule, row):
     if rule['transform']=='failed_append':
         if len(sources)!=3 or len(paths)!=3 or any(len(p)!=1 for p in paths) or rule['result'] is not True:
             raise ValueError('invalid original failed-append comparison domain')
-        expected=[component(0,1,paths[0][0],paths[1][0],'identity',True),component(0,2,paths[0][0]+'/records',paths[2][0],'identity',True)]
+        expected=[component(0,1,paths[0][0],paths[1][0],'append_fail_stop',True),component(0,2,paths[0][0]+'/records',paths[2][0],'identity',True)]
     else:
         if len(sources)!=2 or len(paths)!=2 or not paths[0] or len(paths[0])!=len(paths[1]) or rule['result'] is False and len(paths[0])!=1:
             raise ValueError('invalid original field comparison domain')

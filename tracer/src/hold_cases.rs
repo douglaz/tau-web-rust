@@ -513,11 +513,15 @@ run.inspect(&worker).await?["calls"].as_array().unwrap().iter().any(|c|c["call"]
         });
         println!("   completed historical read: {entry}");
         let mut observed_record = entry["job_record"].clone();
-        let historical = [&entry, &observed_record].into_iter().all(|value| {
-            value["historical"] == true
-                && value["actionable"] == false
-                && value.get("done").is_none()
-                && value["refused"].as_str().is_some_and(|why| !why.is_empty())
+        let classification = [&entry, &observed_record].into_iter().all(|value| {
+            if mode == "writer-stop" {
+                ["historical", "actionable", "done", "refused"].iter().all(|field| value.get(field).is_none())
+            } else {
+                value["historical"] == true
+                    && value["actionable"] == false
+                    && value.get("done").is_none()
+                    && value["refused"] == "journal append outcome uncertain; reopen to validate before further work"
+            }
         });
         if let Some(fields) = observed_record.as_object_mut() {
             for field in ["historical", "actionable", "refused"] {
@@ -525,7 +529,7 @@ run.inspect(&worker).await?["calls"].as_array().unwrap().iter().any(|c|c["call"]
             }
         }
         case.check("hold_cases.a012", &format!("criterion 8: {mode} reports not_journaled with the completed job_record and why, without not_read"),
-            historical && report["outcome"]["held"] == true && entry["not_journaled"] == true
+            classification && report["outcome"]["held"] == true && entry["not_journaled"] == true
             && entry.get("not_read").is_none()
             && observed_record == json!({"number":null,"call":call,"job":id,
                 "record":expected_record,"state":"finished","agreement":"advisory_match",

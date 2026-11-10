@@ -933,7 +933,15 @@ async fn status_carriers(
                         ss.iter().any(|s| {
                             s["identity"] == session
                                 && s["session_state"]
-                                    == if kind == "ended" { "ended" } else { "running" }
+                                    == match kind {
+                                        "ended" => "ended",
+                                        "uncertain" => "waiting",
+                                        _ => "running",
+                                    }
+                                && (kind != "uncertain"
+                                    || (s["readiness_reason"]
+                                        == "clock uncertain; verification required"
+                                        && s["inference_limits"]["state"] == "clock-withheld"))
                         })
                     }),
             );

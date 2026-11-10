@@ -213,6 +213,17 @@ fn selected<'a>(report: &Value, key: &'a Value) -> Result<Vec<&'a Value>, String
         .filter(|c| ids.contains(&c["id"]))
         .collect())
 }
+fn restored_goal_preparation(owner: &Context) -> bool {
+    owner.0 == "goal_admission_cases.run"
+        && owner.1 == "after"
+        && matches!(
+            owner.2.as_str(),
+            "goal_admission_cases.c001.p003"
+                | "goal_admission_cases.c001.p004"
+                | "goal_admission_cases.c001.p005"
+        )
+}
+
 pub fn validate(report: &Value, key: &Value) -> Result<(), String> {
     let states = reader_checks::caller_states(report);
     let workers = history::worker_states(report);
@@ -387,7 +398,8 @@ pub fn validate(report: &Value, key: &Value) -> Result<(), String> {
         observed.entry(owner.clone()).or_default().push(kind);
         let ordinal = ordinals.entry((owner.clone(), kind)).or_insert(0usize);
         *ordinal += 1;
-        let (domain, refused) = policy(kind, &owner.0, case, *ordinal).ok_or(ERROR)?;
+        let (domain, fresh_refused) = policy(kind, &owner.0, case, *ordinal).ok_or(ERROR)?;
+        let refused = fresh_refused || restored_goal_preparation(&owner);
         let origin = pool
             .iter()
             .rev()
@@ -427,6 +439,28 @@ pub fn validate(report: &Value, key: &Value) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_original_job_preparations_require_duplicate_act_refusals() {
+        for ordinal in 1..=6 {
+            for phase in ["inside", "after"] {
+                for scope in ["goal_admission_cases.run", "goal_cases.run"] {
+                    let owner = (
+                        scope.into(),
+                        phase.into(),
+                        format!("goal_admission_cases.c001.p{ordinal:03}"),
+                        1,
+                    );
+                    assert_eq!(
+                        restored_goal_preparation(&owner),
+                        scope == "goal_admission_cases.run"
+                            && phase == "after"
+                            && (3..=5).contains(&ordinal)
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn evaluated_body_is_the_original_request_under_the_original_method() {
         let expected = json!({"session":"fixture-session","text":TEXT,"document_source":null});

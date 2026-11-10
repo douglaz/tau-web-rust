@@ -46,7 +46,15 @@ pub(super) async fn prepare(
     )
     .await?;
     run.submit(tab, "unlock", PASSPHRASE).await?;
-    setup_cases::click(run, tab, "[data-bind=fixture]").await?;
+    inference_cases::end_replayed_paid(run, worker).await?;
+    let existing = run.inspect(worker).await?["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s["session_state"] != "ended" && s["bound_set"] == json!(["fixture"]));
+    if !existing {
+        setup_cases::click(run, tab, "[data-bind=fixture]").await?;
+    }
     let binding_observer = observer::Call::begin(
         "declaration.prepare.binding",
         "declaration.prepare.binding",
@@ -57,7 +65,11 @@ pub(super) async fn prepare(
     for poll in 0..300 {
         binding_observer.attempt(poll + 1);
         let state = binding_observer.inspect(run, worker).await?;
-        let first = state["sessions"].as_array().and_then(|s| s.first());
+        let first = state["sessions"].as_array().and_then(|sessions| {
+            sessions
+                .iter()
+                .find(|s| s["session_state"] != "ended" && s["bound_set"] == json!(["fixture"]))
+        });
         if binding_observer.poll(poll + 1, first.is_some()) {
             let s = first.unwrap();
             identity = s["identity"].as_str().map(str::to_owned);
@@ -561,7 +573,11 @@ file_inputs::equal_primary("declaration_cases.a012.1", "declaration_cases.a012",
         state["setup"][0]["answer"] == "no"
             && state["setup"][0]["class"] == "multi_tenant"
             && state["setup"][0]["declaration"] == d
-            && state["sessions"] == json!([]),
+            && state["sessions"].as_array().unwrap().iter().any(|s| {
+                s["identity"] == json!(session)
+                    && s["pending_requirements"].is_null()
+                    && s["readiness_reason"] == "paid session readiness withheld after replay"
+            }),
     );
     reader::read_at("reader.call.declaration.tightened", &files, PASSPHRASE)?;
     case.finish(cases);
@@ -744,6 +760,7 @@ file_inputs::equal_primary("declaration_cases.a018.1", "declaration_cases.a018",
         } else {
             module(run,worker,&format!("self.approvalPoint=new Promise(ready=>m.test_hold_session_point({},new Promise(release=>self.releaseApproval=release),ready));return true;",json!(phase))).await?;
         }
+        let completions_before_answer = run.aggregator.count("/completion");
         let act = json!({"session":session,"machine":"fixture","candidate":pending["candidate"],"decision":"approve"});
         module(
             run,
@@ -769,7 +786,15 @@ file_inputs::equal_primary("declaration_cases.a018.1", "declaration_cases.a018",
         case.check(
             "declaration_cases.a022",
             "no companion done dispatch after cancellation or failed append",
-            result["done"] != true && result.get("refused").is_some(),
+            if phase == "failed_append" {
+                // Internal proposal retention is checked by poc_session_approval_append_failure_preserves_pending_and_replay_resolves_commit.
+                result == json!({"test_timeout":true})
+                    && run.inspect(worker).await?["sessions"].as_array().unwrap().iter().any(|s|
+                        s["identity"] == json!(session) && s["bound_set"] == json!(["fixture"])
+                            && s["session_state"] == "waiting" && s["pending_requirements"].is_null()
+                            && s["readiness_reason"] == "journal append outcome uncertain; reopen to validate before further work")
+                    && run.aggregator.count("/completion") == completions_before_answer
+            } else { result["done"] != true && result.get("refused").is_some() },
         );
         if !["failed_append", "requirements_dispatch"].contains(&phase) {
             case.check(
@@ -804,9 +829,13 @@ file_inputs::equal_primary("declaration_cases.a018.1", "declaration_cases.a018",
         let state = run.inspect(worker).await?;
         case.check(
             "declaration_cases.a025",
-            "unlock restores facts only and no live waiter or goal loop",
-            state["sessions"] == json!([])
-                && state["setup"][0]["declaration"].is_object() == approved,
+            "unlock restores original session and committed facts without a pending waiter or another completion",
+            state["sessions"].as_array().unwrap().iter().any(|s|
+                s["identity"] == json!(session) && s["goal"].is_object()
+                    && s["pending_requirements"].is_null()
+                    && s["readiness_reason"] == "paid session readiness withheld after replay")
+                && state["setup"][0]["declaration"].is_object() == approved
+                && run.aggregator.count("/completion") == completions_before_answer,
         );
         case.finish(cases);
     }

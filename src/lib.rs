@@ -522,6 +522,8 @@ mod worker {
             origin.clone()
         } else {
             store.synthetic_session_transition(&session, &transition)?;
+            // Re-entry requires durable End even after synthetic readiness loss.
+            store.end_session(&session).await?;
             store.admit_fixture(&origin.bound_set[0]).await?;
             store
                 .connection_session(&origin.bound_set[0])

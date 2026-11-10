@@ -23,6 +23,12 @@ def _policy(kind, scope, case, n):
     return None
 
 
+def _restored_goal_preparation(owner):
+    return owner[0] == 'goal_admission_cases.run' and owner[1] == 'after' and owner[2] in (
+        'goal_admission_cases.c001.p003', 'goal_admission_cases.c001.p004',
+        'goal_admission_cases.c001.p005')
+
+
 def validate(report, key):
     from tracer_history import _observer_sources
     from tracer_history import _same_json
@@ -80,7 +86,8 @@ def validate(report, key):
         ordinals[index] = ordinals.get(index, 0) + 1
         policy = _policy(kind, owner[0], owner[2] if owner[1] == 'inside' else '', ordinals[index])
         if policy is None: raise ValueError(error)
-        domain, refused = policy
+        domain, fresh_refused = policy
+        refused = fresh_refused or _restored_goal_preparation(owner)
         origin = next((p for p in reversed(pool) if p[1] <= row['start_ns']), None)
         if origin is None or not _same_json(row['input_source'], origin[2]) or row['domain'] != domain or row['input_ok'] is not True or row['refused'] is not refused or row['response_ok'] is not True or origin[3]['page'] != row['page']: raise ValueError(error)
         if domain == 'old_session':

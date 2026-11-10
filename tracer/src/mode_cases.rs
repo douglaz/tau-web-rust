@@ -35,7 +35,7 @@ pub(super) async fn run(
     }
     let identity = events[2]["setup"]["approval"]["entries"][0]["identity"].clone();
     let session = format!("session-{}", events.len());
-    events.push(json!({"exposure":{"session":session,"bound_set":[{"machine":"fixture","identity":identity}],"accepted_modes":["no_artifact_pin"]}}));
+    events.push(json!({"exposure":{"inference_approval":crate::file_recipes::synthetic_approval(),"session":session,"bound_set":[{"machine":"fixture","identity":identity}],"accepted_modes":["no_artifact_pin"]}}));
     run.put(
         tab,
         &reader::build_at("file.mode_cases.build.001", pass, &events),
@@ -53,7 +53,7 @@ pub(super) async fn run(
     let labels = json!(["An installation with no artifact pin"]);
     case.check(
         "mode_cases.a001",
-        "the rebound session lists exactly the installation mode",
+        "the restored session lists exactly the installation mode",
         before["sessions"]
             .as_array()
             .unwrap()
@@ -136,9 +136,17 @@ pub(super) async fn run(
         let seen = take(run.seen);
         case.check(
             "mode_cases.a005",
-            "lowering refused before relay or SSH contact and exec",
+            if tracer {
+                "lowering refused before relay or SSH contact and exec"
+            } else {
+                "missing stored target and pin refuses before the lowering gate or any contact"
+            },
             report["outcome"]
-                == json!({"refused":"signature-lowering","machine":"fixture","form":form})
+                == if tracer {
+                    json!({"refused":"signature-lowering","machine":"fixture","form":form})
+                } else {
+                    json!({"refused":"machine has no stored target or pin"})
+                }
                 && seen.relay_accepted == 0
                 && seen.ssh_connections == 0
                 && seen.ssh_exec.is_empty(),
@@ -146,15 +154,23 @@ pub(super) async fn run(
         let after = run.inspect(worker).await?;
         case.check(
             "mode_cases.a006",
-            "exactly one refusal, no intent, unchanged modes",
-            after["records"].as_array().unwrap().len()
-                == before["records"].as_array().unwrap().len() + 1
-                && after["calls"] == before["calls"]
-                && after["commands"] == before["commands"]
-                && after["mode_acceptances"] == before["mode_acceptances"]
-                && after["sessions"] == before["sessions"]
-                && after["signature_refusals"].as_array().unwrap().last()
-                    == Some(&json!({"machine":"fixture","form":form})),
+            if tracer {
+                "exactly one refusal, no intent, unchanged modes"
+            } else {
+                "target resolution refuses without any append or state change"
+            },
+            if tracer {
+                after["records"].as_array().unwrap().len()
+                    == before["records"].as_array().unwrap().len() + 1
+                    && after["calls"] == before["calls"]
+                    && after["commands"] == before["commands"]
+                    && after["mode_acceptances"] == before["mode_acceptances"]
+                    && after["sessions"] == before["sessions"]
+                    && after["signature_refusals"].as_array().unwrap().last()
+                        == Some(&json!({"machine":"fixture","form":form}))
+            } else {
+                after == before
+            },
         );
         let opened = reader::read_at(
             "reader.call.mode.signature_refusal",
@@ -165,8 +181,20 @@ pub(super) async fn run(
             crate::journal::event(&opened.records.last().unwrap().1).map_err(|e| e.to_string())?;
         case.check(
             "mode_cases.a007",
-            "independent reader reads the exact refusal record",
-            event == json!({"signature_refusal":{"machine":"fixture","form":form}}),
+            if tracer {
+                "independent reader reads the exact refusal record"
+            } else {
+                "independent reader confirms unchanged record count and no signature refusal"
+            },
+            if tracer {
+                event == json!({"signature_refusal":{"machine":"fixture","form":form}})
+            } else {
+                opened.records.len() == before["records"].as_array().unwrap().len()
+                    && opened.records.iter().all(|(_, bytes)| {
+                        crate::journal::event(bytes)
+                            .is_ok_and(|event| event.get("signature_refusal").is_none())
+                    })
+            },
         );
     }
     if tracer {

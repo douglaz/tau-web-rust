@@ -6,6 +6,19 @@ import unittest
 import tracer_file_windows
 
 
+class RestoredGoalPreparations(unittest.TestCase):
+    def test_only_original_job_preparations_refuse_duplicate_acts(self):
+        from tracer_goal_inputs import _restored_goal_preparation
+        for ordinal in range(1, 7):
+            for phase in ('inside', 'after'):
+                for scope in ('goal_admission_cases.run', 'goal_cases.run'):
+                    owner = (scope, phase, f'goal_admission_cases.c001.p{ordinal:03}', 1)
+                    with self.subTest(owner=owner):
+                        self.assertEqual(_restored_goal_preparation(owner),
+                                         scope == 'goal_admission_cases.run' and
+                                         phase == 'after' and ordinal in (3, 4, 5))
+
+
 class RefusalWindows(unittest.TestCase):
     def test_saved_and_fresh_sides_must_bracket_real_request(self):
         fixture = json.loads((Path(__file__).resolve().parents[1] / 'tracer/testdata/file-refusal-windows.json').read_text())

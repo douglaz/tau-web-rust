@@ -163,7 +163,11 @@ pub fn files_match(site: &str, call: usize, v: &super::reader::Files) -> bool {
 pub fn candidate(call: usize, state: &Value) {
     let raw = state["sessions"]
         .as_array()
-        .and_then(|s| s.first())
+        .and_then(|sessions| {
+            sessions
+                .iter()
+                .find(|s| s["session_state"] != "ended" && s["bound_set"] == json!(["fixture"]))
+        })
         .and_then(|s| s["identity"].as_str())
         .map(str::to_owned);
     CANDIDATES

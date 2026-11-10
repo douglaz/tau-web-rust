@@ -1065,7 +1065,7 @@ pub(super) async fn run(
     let files = reader::build_at("file.session_end_cases.build.001", PASSPHRASE, &events);
     let identity = events[2]["setup"]["approval"]["entries"][0]["identity"].clone();
     let session = format!("session-{}", events.len());
-    events.push(json!({"exposure":{"session":session,"bound_set":[{"machine":"fixture","identity":identity}],"accepted_modes":["no_artifact_pin"]}}));
+    events.push(json!({"exposure":{"inference_approval":crate::file_recipes::synthetic_approval(),"session":session,"bound_set":[{"machine":"fixture","identity":identity}],"accepted_modes":["no_artifact_pin"]}}));
     let unpinned = reader::build_at("file.session_end_cases.build.002", PASSPHRASE, &events);
     cold_probe(run, tab, worker, &files, cases).await?;
     revoke_probe_control(run, tab, worker, &files, cases).await?;
