@@ -131,7 +131,7 @@ pub(super) async fn run(
         .browser
         .evaluate(
             &tab.session,
-            "document.getElementById('tau-setup').textContent",
+            "document.getElementById('tau-setup-facts').textContent",
         )
         .await?;
     let text = rendered.as_str().unwrap_or("");

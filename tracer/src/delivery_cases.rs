@@ -941,8 +941,7 @@ async fn incomplete_attempts(
                     && text.contains("Latest attempt incomplete; no final demonstration recorded.")
                     && text.contains("Last completed check (historical result):")
                     && text.contains("enabled, restart not demonstrated")
-                    && text.contains(&format!("\"services\":{{\"read\":\"{unavailable}\"}}"))
-                    && text.contains("\"inbound\":{\"read\":\"value\"")
+                    && run.browser.evaluate(&tab.session,"JSON.parse(document.querySelector('details[data-delivery-measurements=fixture] > pre[data-raw-json]')?.textContent ?? 'null')").await? == attempt["measurements"]
                     && run.browser.evaluate(&tab.session,"document.querySelector('[data-delivery-verdict=fixture]')?.textContent").await? == verdict);
             }
             let opened = reader::read_at(

@@ -1,0 +1,217 @@
+{
+  "controls": {
+    "tau-passphrase": "input",
+    "tau-confirm": "input",
+    "tau-create": "button",
+    "tau-unlock": "button",
+    "tau-lock": "button",
+    "tau-redisplay": "button",
+    "tau-seed-backup-answer": "button",
+    "tau-seed-backup-input": "textarea",
+    "tau-seed-backup-check": "button",
+    "tau-seed-backup-skip": "button",
+    "tau-credit-amount": "input",
+    "tau-credit-invoice": "button",
+    "tau-credit-check": "button",
+    "tau-poc-endpoint": "input",
+    "tau-poc-model": "input",
+    "tau-credit-configure": "button",
+    "tau-poc-inference-form": "form",
+    "tau-poc-key": "input",
+    "tau-provider-key-form": "form",
+    "tau-provider-origin": "input",
+    "tau-provider-key": "input",
+    "tau-provider-catalogue": "button",
+    "tau-provider-selection-form": "form",
+    "tau-provider-offer": "select",
+    "tau-provider-image": "select",
+    "tau-provider-resources": "textarea",
+    "tau-provider-approval-form": "form",
+    "tau-provider-machine": "input",
+    "tau-provider-relay": "input",
+    "tau-provider-class": "select",
+    "tau-provider-approve-charge": "input",
+    "tau-provider-approve-access": "input",
+    "tau-provider-resume": "button",
+    "tau-provider-close": "button",
+    "tau-provider-invoice": "button",
+    "tau-poc-target-form": "form",
+    "tau-poc-machine": "input",
+    "tau-poc-relay": "input",
+    "tau-poc-profile": "select",
+    "tau-poc-host": "input",
+    "tau-poc-port": "input",
+    "tau-poc-user": "input",
+    "tau-poc-elevation": "select",
+    "tau-poc-pin": "input",
+    "tau-poc-class": "select",
+    "tau-poc-approve-existing": "input",
+    "tau-poc-approve-access": "input"
+  },
+  "providerParagraph": "<p>Use a dedicated, already confirmed provider account. This PoC uses an operator-supplied account rather than seed-based vendor recovery. It supports one outstanding purchase per store, external payment of the initial period, and published Ed25519 host keys. No stock or connectivity is promised.</p>",
+  "csp": "<meta http-equiv=\"Content-Security-Policy\" content=\"script-src 'self' 'wasm-unsafe-eval'; object-src 'none'; base-uri 'self'; connect-src https: wss:\">",
+  "formOwners": {
+    "tau-passphrase": null,
+    "tau-confirm": null,
+    "tau-create": null,
+    "tau-unlock": null,
+    "tau-lock": null,
+    "tau-redisplay": null,
+    "tau-seed-backup-answer": null,
+    "tau-seed-backup-input": null,
+    "tau-seed-backup-check": null,
+    "tau-seed-backup-skip": null,
+    "tau-credit-amount": null,
+    "tau-credit-invoice": null,
+    "tau-credit-check": null,
+    "tau-poc-endpoint": "tau-poc-inference-form",
+    "tau-poc-model": "tau-poc-inference-form",
+    "tau-credit-configure": null,
+    "tau-poc-key": "tau-poc-inference-form",
+    "tau-provider-origin": "tau-provider-key-form",
+    "tau-provider-key": "tau-provider-key-form",
+    "tau-provider-catalogue": null,
+    "tau-provider-offer": "tau-provider-selection-form",
+    "tau-provider-image": "tau-provider-selection-form",
+    "tau-provider-resources": "tau-provider-selection-form",
+    "tau-provider-machine": "tau-provider-approval-form",
+    "tau-provider-relay": "tau-provider-approval-form",
+    "tau-provider-class": "tau-provider-approval-form",
+    "tau-provider-approve-charge": "tau-provider-approval-form",
+    "tau-provider-approve-access": "tau-provider-approval-form",
+    "tau-provider-resume": null,
+    "tau-provider-close": null,
+    "tau-provider-invoice": null,
+    "tau-poc-machine": "tau-poc-target-form",
+    "tau-poc-relay": "tau-poc-target-form",
+    "tau-poc-profile": "tau-poc-target-form",
+    "tau-poc-host": "tau-poc-target-form",
+    "tau-poc-port": "tau-poc-target-form",
+    "tau-poc-user": "tau-poc-target-form",
+    "tau-poc-elevation": "tau-poc-target-form",
+    "tau-poc-pin": "tau-poc-target-form",
+    "tau-poc-class": "tau-poc-target-form",
+    "tau-poc-approve-existing": "tau-poc-target-form",
+    "tau-poc-approve-access": "tau-poc-target-form"
+  },
+  "dynamicControls": [
+    {
+      "selector": "#tau-setup-approve",
+      "tag": "button",
+      "type": "button"
+    },
+    {
+      "selector": "[data-end-session]",
+      "tag": "button",
+      "type": "button"
+    },
+    {
+      "selector": "[data-answer]",
+      "tag": "button",
+      "type": "button"
+    },
+    {
+      "selector": "[data-withdraw-reinstall]",
+      "tag": "button",
+      "type": "button"
+    },
+    {
+      "selector": "[data-verify-clock]",
+      "tag": "button",
+      "type": "button"
+    },
+    {
+      "selector": "[data-goal-accept]",
+      "tag": "button",
+      "type": "button"
+    },
+    {
+      "selector": "[data-poc-accept]",
+      "tag": "button",
+      "type": "button"
+    },
+    {
+      "selector": "[data-goal-enter]",
+      "tag": "button",
+      "type": "button"
+    },
+    {
+      "selector": "[data-goal-text]",
+      "tag": "textarea"
+    },
+    {
+      "selector": "[data-document-source]",
+      "tag": "input",
+      "type": "url"
+    },
+    {
+      "selector": "[data-requirements-decision]",
+      "tag": "button",
+      "type": "button"
+    },
+    {
+      "selector": "[data-bind]",
+      "tag": "button",
+      "type": "button"
+    },
+    {
+      "selector": "[data-delivery-check]",
+      "tag": "button",
+      "type": "button"
+    },
+    {
+      "selector": "[data-credit-goal]",
+      "tag": "textarea"
+    },
+    {
+      "selector": "[data-credit-new-key]",
+      "tag": "button",
+      "type": "button"
+    },
+    {
+      "selector": "[data-poc-declaration]",
+      "tag": "textarea"
+    },
+    {
+      "selector": "[data-poc-propose]",
+      "tag": "button",
+      "type": "button"
+    },
+    {
+      "selector": "[data-task] button",
+      "tag": "button",
+      "type": "button"
+    },
+    {
+      "selector": "[data-task] input",
+      "tag": "input",
+      "type": "number"
+    },
+    {
+      "selector": "a[href^=\"lightning:\"]",
+      "tag": "a"
+    },
+    {
+      "selector": "[data-credit-invoice] button",
+      "tag": "button",
+      "type": "button"
+    },
+    {
+      "selector": "#tau-provider-progress button",
+      "tag": "button",
+      "type": "button"
+    },
+    {
+      "selector": "#tau-poc-public-keys button",
+      "tag": "button",
+      "type": "button"
+    }
+  ],
+  "fixtureLimit": "Fixture measurements and fixed lockdown fixture checks only; no live machine was read. The bundle's lockdown checklist and real observation paths are not implemented.",
+  "checkboxTerms": {
+    "tau-provider-approve-charge": "Approve the exact displayed machine configuration, region, image, resources and recurring charge terms.",
+    "tau-provider-approve-access": "Approve maintained, ad-hoc access, Arch user and whole-script sudo -n.",
+    "tau-poc-approve-existing": "Approve this existing machine. This does not order a machine or assert installation facts.",
+    "tau-poc-approve-access": "Approve maintained, ad-hoc access to this machine."
+  }
+}

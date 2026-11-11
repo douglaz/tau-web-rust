@@ -439,7 +439,7 @@ async fn publications(
             "self.raceRelease();await self.raceWork;return true;",
         )
         .await?;
-        let dom=run.browser.evaluate(&tab.session,"({state:document.getElementById('tau-store').dataset.state,lock:!document.getElementById('tau-lock').hidden,text:document.getElementById('tau-setup').textContent,verify:!!document.querySelector('[data-verify-clock]'),other:!!document.querySelector('[data-machine=fixture-other] [data-goal-card]')})").await?;
+        let dom=run.browser.evaluate(&tab.session,"({state:document.getElementById('tau-store').dataset.state,lock:!document.getElementById('tau-lock').hidden,text:document.getElementById('tau-task-setup').textContent,verify:!!document.querySelector('[data-verify-clock]'),other:!!document.querySelector('[data-machine=fixture-other] [data-goal-card]')})").await?;
         let mut case = Case::new(
             "lifecycle_repairs.c004",
             &format!("actual final postMessage and DOM keep current state after session {kind}"),

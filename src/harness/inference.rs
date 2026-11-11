@@ -155,10 +155,23 @@ async fn publication(generation: u64, session: String, report: String, post: boo
     })();
     let mut carries_result = result.is_ok() && !session.is_empty();
     let mut value = result.unwrap_or_else(|why| local.report(Some(&why)));
+    let display_step = serde_json::from_str::<Value>(&report)
+        .ok()
+        .and_then(|value| match value["page_error_step"].as_str() {
+            Some("store") => Some("store"),
+            Some("credit") => Some("credit"),
+            Some("machine") => Some("machine"),
+            Some("task") => Some("task"),
+            _ => None,
+        })
+        .unwrap_or(if session.is_empty() { "store" } else { "task" });
     #[cfg(feature = "tracer")]
     crate::testonly::session_point("publication_prepared").await;
     let mut last_refusal = None;
     loop {
+        if value.get("error").is_some() {
+            value["page_error_step"] = display_step.into();
+        }
         if !carries_result && let Some(history) = &history {
             value["goal_history"] = history.clone();
         }

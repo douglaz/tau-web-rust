@@ -533,7 +533,7 @@ pub(super) async fn run(
         .browser
         .evaluate(
             &tab.session,
-            "document.getElementById('tau-setup').textContent",
+            "document.getElementById('tau-task-setup').textContent",
         )
         .await?;
     case.check(
@@ -725,7 +725,7 @@ async fn boundaries(
             && stale.get("error").is_some(),
     );
     module(run,worker,&format!("const current=JSON.parse(await m.open());current.goal_outcome={{session:{},outcome:{{done:true}}}};await m.publish_report(self.oldGeneration,{},JSON.stringify(current));return true;",json!(session),json!(session))).await?;
-    case.check("lifecycle_cases.a031", "actual posted store message cannot render a stale done result",!run.browser.evaluate(&tab.session,"document.getElementById('tau-setup').textContent.includes('Goal loop ended: done.')").await?.as_bool().unwrap_or(true));
+    case.check("lifecycle_cases.a031", "actual posted store message cannot render a stale done result",!run.browser.evaluate(&tab.session,"document.getElementById('tau-task-setup').textContent.includes('Goal loop ended: done.')").await?.as_bool().unwrap_or(true));
     case.check(
         "lifecycle_cases.a032",
         "next eligible inference uses the original key without retrying lost request",

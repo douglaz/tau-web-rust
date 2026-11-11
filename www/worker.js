@@ -84,18 +84,24 @@ const schedulePayments = () => {
     paymentTimer = null;
     if (!paymentsEligible()) return;
     const generation = publication_generation();
-    if (creditPending && pendingCredit() === creditPending) await reportStore(await credit_request(JSON.stringify({action:'poll'})), generation);
-    if (machinePending && pendingMachine() === machinePending) await reportStore(await provider_request(JSON.stringify({action:'payment_check'})), generation);
+    if (creditPending && pendingCredit() === creditPending) await reportStore(await credit_request(JSON.stringify({action:'poll'})), generation, '', 'credit');
+    if (machinePending && pendingMachine() === machinePending) await reportStore(await provider_request(JSON.stringify({action:'payment_check'})), generation, '', 'machine');
     schedulePayments();
   }, 5000);
 };
 const refreshPayments = async () => {
   if (retirementRequested || !pageVisible || lastReport?.state !== 'unlocked') return;
   const generation = publication_generation();
-  if (lastReport.credit?.account) await reportStore(await credit_request(JSON.stringify({action:'refresh'})),generation);
-  if (!retirementRequested && pageVisible && lastReport?.state === 'unlocked' && lastReport.procurement?.payment && provider_key_is_set()) await reportStore(await provider_request(JSON.stringify({action:'payment_check'})),generation);
+  if (lastReport.credit?.account) await reportStore(await credit_request(JSON.stringify({action:'refresh'})),generation, '', 'credit');
+  if (!retirementRequested && pageVisible && lastReport?.state === 'unlocked' && lastReport.procurement?.payment && provider_key_is_set()) await reportStore(await provider_request(JSON.stringify({action:'payment_check'})),generation, '', 'machine');
 };
-const reportStore = (report, generation = publication_generation(), session = '') => {
+const presentationReport = (report, step) => {
+  const value = JSON.parse(report);
+  if (value.error) value.page_error_step = step;
+  return JSON.stringify(value);
+};
+const reportStore = (report, generation = publication_generation(), session = '', step = 'store') => {
+  report = presentationReport(report, step);
   const value = JSON.parse(report);
   lastReport = value;
   schedulePayments();
@@ -132,6 +138,9 @@ onmessage = async ({ data: envelope }) => {
   }
   const generation = publication_generation();
   let report;
+  const step = data.poc_configure || data.credit_request ? 'credit'
+    : data.provider_configure || data.provider_request || data.poc_enroll || data.setup_approve || data.setup_answer ? 'machine'
+    : data.poc_bind || data.poc_public_keys || data.poc_accept || data.poc_propose_requirements || data.bind || data.verify_clock || data.withdraw_reinstall || data.task || data.goal || data.requirements_answer || data.delivery || data.goal_accept ? 'task' : 'store';
   const session = data.task?.action === 'end-session' ? '' : data.goal?.session ?? data.goal_accept?.session ?? data.requirements_answer?.session ?? data.delivery?.session ?? data.task?.session ?? '';
   if (data.create instanceof Uint8Array) report = await create(data.create);
   else if (data.unlock instanceof Uint8Array) report = await unlock(data.unlock);
@@ -211,6 +220,7 @@ onmessage = async ({ data: envelope }) => {
     const publication = new TaskPublication();
     try {
       report = await publication.request(JSON.stringify(data.task));
+      report = presentationReport(report, step);
       await publication.publish(generation, session, report);
     } finally { publication.free(); }
     return;
@@ -220,7 +230,7 @@ onmessage = async ({ data: envelope }) => {
   else if (data.delivery && typeof data.delivery === 'object') report = await delivery_request(JSON.stringify(data.delivery));
   else if (data.goal_accept && typeof data.goal_accept === 'object') {
     report = await accept_page_goal(data.goal_accept.session, JSON.stringify(data.goal_accept.checks ?? []));
-    await reportStore(report, generation, session);
+    await reportStore(report, generation, session, step);
     if (!JSON.parse(report).error) {
       const publication = new TaskPublication();
       try {
@@ -229,13 +239,13 @@ onmessage = async ({ data: envelope }) => {
         const current = JSON.parse(await open());
         if (outcome.task && outcome.refused) current.error = outcome.refused;
         if (!outcome.task) current.goal_outcome = { session: data.goal_accept.session, outcome };
-        await publication.publish(finalGeneration, data.goal_accept.session, JSON.stringify(current));
+        await publication.publish(finalGeneration, data.goal_accept.session, presentationReport(JSON.stringify(current), step));
       } finally { publication.free(); }
     }
     return;
   }
   else return;
-  await reportStore(report, generation, session);
+  await reportStore(report, generation, session, step);
   if (data.unlock instanceof Uint8Array || data.seed_backup_redisplay instanceof Uint8Array) {
     setTimeout(() => sweep_inference(), 0);
     wake_tasks();

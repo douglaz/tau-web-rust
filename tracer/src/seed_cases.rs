@@ -148,19 +148,13 @@ async fn collision_controls(
                 .await?
                 .collision(&observer::collision_phrase(index + 1, words)),
         );
-        // Class (b): seed_cases.a011 disabled: the provider-account text violates CNF-44.
-        let claims_before = language_claims(run, tab).await?;
+        language(run, tab, &mut case).await?;
         run.browser.evaluate(&tab.session,
             "window.__seedLanguageLeak=document.createElement('span'); window.__seedLanguageLeak.hidden=true; window.__seedLanguageLeak.textContent='proven'; document.body.append(window.__seedLanguageLeak)").await?;
         case.check(
             "seed_cases.a002",
-            "whole-document scan gains exactly the planted hidden reserved claim",
-            !claims_before.iter().any(|claim| claim == "proven")
-                && language_claims(run, tab).await?
-                    == claims_before
-                        .into_iter()
-                        .chain(["proven".into()])
-                        .collect::<Vec<_>>(),
+            "language check reports a planted hidden reserved claim with words displayed",
+            !language_clear(run, tab).await?,
         );
         run.browser
             .evaluate(
@@ -168,10 +162,10 @@ async fn collision_controls(
                 "window.__seedLanguageLeak.remove(); delete window.__seedLanguageLeak",
             )
             .await?;
-        // Class (b): seed_cases.a011 disabled: the provider-account text violates CNF-44.
+        language(run, tab, &mut case).await?;
         click(run, tab, "seed-backup-answer").await?;
         wait_stage("seed.collision.initial_answering", run, tab, "answering").await?;
-        // Class (b): seed_cases.a011 disabled: the provider-account text violates CNF-44.
+        language(run, tab, &mut case).await?;
         let answering = document(run, tab).await?;
         run.browser.evaluate(&tab.session,&format!(r#"(() => {{
             window.__seedLeak={}.split(' ').map(word=>{{const n=document.createElement('span'); n.hidden=true;n.textContent=word;document.body.append(n);return n;}});
@@ -222,14 +216,14 @@ async fn collision_controls(
         *worker = run.worker(tab, Some(&old), false).await?;
         run.settled(tab, false).await?;
         let locked = document(run, tab).await?;
-        // Class (b): seed_cases.a011 disabled: the provider-account text violates CNF-44.
+        language(run, tab, &mut case).await?;
         run.submit(tab, "unlock", pass).await?;
         phrase("seed.collision.unlock_phrase", run, tab).await?;
         click(run, tab, "seed-backup-answer").await?;
         wait_stage("seed.collision.unlock_answering", run, tab, "answering").await?;
         reenter("seed.collision.complete_entry", run, tab, words).await?;
         wait_stage("seed.collision.completed", run, tab, "inactive").await?;
-        // Class (b): seed_cases.a011 disabled: the provider-account text violates CNF-44.
+        language(run, tab, &mut case).await?;
         case.check(
             "seed_cases.a006",
             "control full re-entry is durably recorded",
@@ -254,7 +248,7 @@ async fn collision_controls(
         click(run, tab, "seed-backup-answer").await?;
         wait_stage("seed.collision.redisplay_answering", run, tab, "answering").await?;
         let redisplay = document(run, tab).await?;
-        // Class (b): seed_cases.a011 disabled: the provider-account text violates CNF-44.
+        language(run, tab, &mut case).await?;
         click(run, tab, "seed-backup-skip").await?;
         wait_stage("seed.collision.redisplay_inactive", run, tab, "inactive").await?;
         let old = worker.clone();
@@ -292,20 +286,28 @@ async fn collision_controls(
         } else {
             baseline = Some(documents);
         }
-        // Class (b): seed_cases.a011 disabled: the provider-account text violates CNF-44.
+        language(run, tab, &mut case).await?;
         case.finish(cases);
     }
     Ok(baseline.expect("four controls"))
 }
 
 // Remove only the mnemonic list. Hidden interface text elsewhere must still be checked.
-async fn language_claims(run: &Run<'_>, tab: &Tab) -> Result<Vec<String>, String> {
-    let claims = run.browser.evaluate(&tab.session, r#"(() => {
+async fn language_clear(run: &Run<'_>, tab: &Tab) -> Result<bool, String> {
+    Ok(run.browser.evaluate(&tab.session, r#"(() => {
         const body=document.body.cloneNode(true);
         body.querySelector('#tau-seed-backup-words')?.remove();
-        return [...body.textContent.matchAll(/verified|no anomalies found|proven|formally verified|machine-checked/gi)].map(match=>match[0].toLowerCase());
-    })()"#).await?;
-    serde_json::from_value(claims).map_err(|e| e.to_string())
+        return !(/verified|no anomalies found|proven|formally verified|machine-checked/i).test(body.textContent);
+    })()"#).await? == true)
+}
+
+async fn language(run: &Run<'_>, tab: &Tab, case: &mut Case) -> Result<(), String> {
+    case.check(
+        "seed_cases.a011",
+        "CNF-44: page text makes none of the reserved claims",
+        language_clear(run, tab).await?,
+    );
+    Ok(())
 }
 
 async fn reenter(site: &'static str, run: &Run<'_>, tab: &Tab, words: &str) -> Result<(), String> {
@@ -465,7 +467,7 @@ pub(super) async fn run(
                 &(before),
             ),
         );
-        // Class (b): seed_cases.a011 disabled: the provider-account text violates CNF-44.
+        language(run, tab, &mut case).await?;
         click(run, tab, "seed-backup-answer").await?;
         wait_stage("seed.create.answering", run, tab, "answering").await?;
         case.check(
@@ -473,7 +475,7 @@ pub(super) async fn run(
             "answering document and fields equal an independent seed's document",
             absent(run, tab, &documents.answering).await?,
         );
-        // Class (b): seed_cases.a011 disabled: the provider-account text violates CNF-44.
+        language(run, tab, &mut case).await?;
         let different = bip39::Mnemonic::from_entropy(&[17; 16])
             .map_err(|e| e.to_string())?
             .to_string();
@@ -513,7 +515,7 @@ pub(super) async fn run(
         if tracer {
             gated("seed.create.mismatch_allocations", run, worker, &mut case).await?;
         }
-        // Class (b): seed_cases.a011 disabled: the provider-account text violates CNF-44.
+        language(run, tab, &mut case).await?;
         case.finish(cases);
     }
     if full_run {
@@ -569,7 +571,7 @@ pub(super) async fn run(
                 "page states which completion was recorded",
                 text.completion_text(full),
             );
-            // Class (b): seed_cases.a011 disabled: the provider-account text violates CNF-44.
+            language(run, tab, &mut case).await?;
             if tracer {
                 for family in FAMILIES {
                     case.check(
@@ -698,7 +700,7 @@ pub(super) async fn run(
                 }),
             );
             gated("seed.failed_append.allocations", run, worker, &mut case).await?;
-            // Class (b): seed_cases.a011 disabled: the provider-account text violates CNF-44.
+            language(run, tab, &mut case).await?;
             *worker = run.reload("seed_cases.rs::reload#6", tab, worker).await?;
             run.submit(tab, "unlock", pass).await?;
             case.check(
@@ -909,7 +911,7 @@ crate::state_inputs::all!(
 phrase("seed.interrupt.reopened_phrase", run,tab).await?.same_as(&words),
 file_inputs::equal_primary("seed_cases.a032.1", "seed_cases.a032", &(store_files(&run.dump_at("file.seed_cases.dump.014", tab).await?)), &(before))
 ));
-                // Class (b): seed_cases.a011 disabled: the provider-account text violates CNF-44.
+                language(run, tab, &mut case).await?;
                 case.finish(cases);
             }
         }
@@ -1005,7 +1007,7 @@ file_inputs::equal_primary("seed_cases.a032.1", "seed_cases.a032", &(store_files
         drop(socket_input);
         run.submit(tab, "unlock", pass).await?;
         let words = phrase("seed.redisplay.phrase", run, tab).await?;
-        // Class (b): seed_cases.a011 disabled: the provider-account text violates CNF-44.
+        language(run, tab, &mut case).await?;
         refused_dispatch(
             "seed.reentry.displayed_refusal",
             run,

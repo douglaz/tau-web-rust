@@ -5,6 +5,14 @@ const status = $('status');
 const show = (state, text) => {
   status.dataset.state = state === 'ready' ? 'harness-ready' : state;
   status.textContent = text;
+  if (state === 'ready') {
+    $('harness-details').hidden = false;
+    $('harness-details').open = false;
+    $('harness-details').append(status);
+  } else {
+    $('store').before(status);
+    $('harness-details').hidden = true;
+  }
 };
 
 // One same-directory object is validated before any value is applied.
@@ -69,6 +77,7 @@ const loadDefaults = async () => {
     for (const [id, field] of [['provider-origin', 'provider_origin'], ['provider-relay', 'relay_url'], ['poc-relay', 'relay_url'], ['poc-endpoint', 'chat_endpoint'], ['poc-model', 'model'], ['credit-amount', 'topup_sat']]) {
       if ($(id) && !defaultsEdited.has(id) && !providerReviewToken) $(id).value = value[field];
     }
+    updateInferenceFacts();
     $('defaults-status').textContent = 'Deployment defaults loaded. Public fields remain editable; review and approval use the displayed values.';
   } catch {
     $('defaults-status').textContent = 'Deployment defaults are missing or invalid. All fallback values remain in use.';
@@ -92,30 +101,130 @@ let suspended = false;
 const goalOutcomes = new Map();
 const pocDeclarationDrafts = new Map();
 const creditGoalDrafts = new Map();
+const setupDrafts = new Map();
+const taskLimitDrafts = new Map();
+let pocKeyRefusal = '';
 const snapshotWorker = () => {
   const current = worker;
   const generation = current?.generation;
   return { postMessage: (data, transfer) => current?.sendAt ? current.sendAt(data, transfer, generation) : current?.postMessage(data, transfer) };
 };
+const stepNames = ['store', 'credit', 'machine', 'task'];
+const foldChoices = new Map();
+const rawFoldChoices = new Map();
+let previousStep;
+for (const name of stepNames) {
+  const fold = $(`step-${name}-fold`);
+  fold.querySelector('summary').addEventListener('click', () => foldChoices.set(name, !fold.open));
+}
+const startDisclosure = parent => {
+  const disclosure = document.createElement('p');
+  disclosure.dataset.startDisclosure = '';
+  disclosure.textContent = $('lifecycle-disclosure').textContent;
+  parent.append(disclosure);
+};
+const mainHomes = new Map();
+const restoreMainActions = () => {
+  for (const [button, {parent, next, form}] of mainHomes) {
+    if (parent.isConnected) parent.insertBefore(button, next?.parentNode === parent ? next : null);
+    else button.remove();
+    if (form === null) button.removeAttribute('form'); else button.setAttribute('form', form);
+    for (const control of [button, ...button.querySelectorAll('.main-action')]) {
+      control.classList.remove('main-action');
+      if (!control.className) control.removeAttribute('class');
+    }
+  }
+  mainHomes.clear();
+};
+const renderSteps = store => {
+  const unlocked = store.state === 'unlocked';
+  const active = unlocked && !ceremony;
+  const sessions = (store.sessions ?? []).filter(session => session.session_state !== 'ended');
+  const current = !active ? 'store' : sessions.length || store.tasks?.length ? 'task'
+    : !store.credit?.can_start && !store.poc_configuration?.key_set ? 'credit'
+    : store.poc_targets?.length ? 'task' : 'machine';
+  if (current !== previousStep) {
+    if (foldChoices.get(current) === false) foldChoices.delete(current);
+    previousStep = current;
+  }
+  const messages = {
+    store: texts[store.state] ?? store.state,
+    credit: store.credit_error || store.credit?.balance_text || (!store.credit?.account ? 'No inference credit yet.' : 'Inference credit balance not read yet.'),
+    machine: store.procurement?.phase ? `Saved purchase: ${store.procurement.phase}.` : store.poc_targets?.length ? 'Machine saved. Review it before Start session.' : 'Choose a new or existing machine.',
+    task: store.tasks?.map(task => `${task.machine}: ${task.status}${task.pause_reason ? ' — ' + task.pause_reason : ''}`).join(' ') || (store.lifecycle_state === 'reconciling' ? 'Waiting to revalidate the saved session.' : sessions.length ? 'Session open. Set or continue its goal.' : 'No session started.'),
+  };
+  if (!active) for (const name of ['credit', 'machine', 'task'].filter(name => name !== 'credit' || !unlocked)) messages[name] = unlocked ? 'Record the seed backup to continue.' : 'Open the local store to view this step.';
+  for (const name of stepNames) {
+    const step = document.querySelector(`[data-step="${name}"]`);
+    step.dataset.current = String(current === name);
+    $(name === 'credit' ? 'credit-status' : `step-${name}-status`).textContent = messages[name];
+    const errors = [name === (store.page_error_step ?? 'store') ? store.error : '', name === 'task' ? pocKeyRefusal : ''];
+    $(`step-${name}-error`).textContent = [...new Set(errors.filter(Boolean))].join(' ');
+    $(`step-${name}-fold`).open = foldChoices.get(name) ?? current === name;
+    step.querySelectorAll('.main-action').forEach(button => { button.classList.remove('main-action'); if (!button.className) button.removeAttribute('class'); });
+  }
+  const emphasize = (name, controls) => {
+    const offered = controls.filter(button => button && !button.closest('[hidden]') && button.closest('[data-step]')?.dataset.step === name);
+    const button = offered.find(button => !button.disabled) ?? offered[0];
+    if (!button) return;
+    button.classList.add('main-action');
+    // Move the existing form intact when its action is inside optional settings.
+    // Controls already beside their required facts keep their original container.
+    if (!button.closest(`#tau-step-${name}-fold`)) return;
+    const node = button.form ?? button;
+    mainHomes.set(node, {parent: node.parentNode, next: node.nextSibling, form: node.getAttribute('form')});
+    $(`step-${name}-action`).append(node);
+  };
+  emphasize('store', [$('create'), $('unlock'), $('seed-backup-answer'), $('seed-backup-check'), $('redisplay')]);
+  emphasize('credit', [$('credit-invoice'), $('credit-check'), $('credit-configure'), $('poc-inference-form').querySelector('button')]);
+  const purchase = store.procurement;
+  const machineAction = !store.provider_configuration?.key_set ? $('provider-key-form').querySelector('button')
+    : purchase?.phase === 'initial_invoice' ? $('provider-invoice')
+    : purchase?.phase && purchase.phase !== 'terms_changed' ? $('provider-resume')
+    : purchase?.selection ? $('provider-approval-form').querySelector('button')
+    : providerCatalogue ? $('provider-selection-form').querySelector('button') : $('provider-catalogue');
+  emphasize('machine', [machineAction, $('setup-approve')]);
+  const taskControls = selector => [...document.querySelector('[data-step="task"]').querySelectorAll(selector)];
+  const needsDeclaration = (store.setup ?? []).some(machine => !machine.declaration);
+  emphasize('task', [
+    ...taskControls('[data-verify-clock]'),
+    ...taskControls('[data-requirements-decision="approve"]'),
+    ...(needsDeclaration ? taskControls('[data-poc-propose]') : []),
+    ...taskControls('[data-task] button').filter(button => button.textContent === 'Resume'),
+    ...taskControls('[data-goal-accept], [data-goal-enter], [data-bind]'),
+    ...taskControls('#tau-poc-targets button').filter(button => button.textContent.startsWith('Start session ') &&
+      !sessions.some(session => session.bound_set.some(machine => button.textContent === `Start session ${machine}`))),
+    ...taskControls('[data-poc-propose], [data-end-session], [data-delivery-check], [data-task] button, #tau-poc-targets button'),
+  ]);
+};
 const render = (store) => {
+  const focused = document.activeElement;
+  const selection = [focused?.selectionStart, focused?.selectionEnd, focused?.selectionDirection];
+  for (const details of document.querySelectorAll('details[data-fold-key]')) {
+    rawFoldChoices.set(details.dataset.foldKey, details.open);
+  }
+  restoreMainActions();
   const { state } = store;
   if (state !== 'unlocked') $('task-results')?.replaceChildren();
   $('store-state').dataset.lifecycle = store.lifecycle_state ?? '';
   if (store.seed_backup_stage !== undefined) ceremony = state === 'unlocked' && store.seed_backup_stage !== 'inactive';
   if (['locked', 'none', 'refused'].includes(state)) ceremony = false;
+  $('session-controls').replaceChildren();
   renderSetup(store);
   renderPoc(store);
   renderTasks(store);
   $('store').dataset.state = state;
-  $('store-state').textContent = state === 'refused'
-    ? `The local store is refused: ${store.reason}. Reload the page to try again.`
-    : [texts[state] ?? state, store.error].filter(Boolean).join(' ');
+  $('store-state').textContent = texts[state] ?? state;
+  $('store-explanation').textContent = state === 'refused'
+    ? `The local store is refused: ${store.reason}. Reload the page to try again.` : '';
   if (store.lifecycle_state) $('store-state').textContent += ` Session state: ${store.lifecycle_state}.`;
   $('create-help').hidden = $('confirm-field').hidden = $('create').hidden = state !== 'none';
   $('passphrase-field').hidden = state !== 'none' && state !== 'locked';
   $('passphrase').autocomplete = state === 'none' ? 'new-password' : 'current-password';
   $('unlock').hidden = state !== 'locked';
   $('lock').hidden = state !== 'unlocked';
+  if ($('lock').hidden) $('store-disclosure-slot').append($('lifecycle-disclosure'));
+  else $('lifecycle-line').after($('lifecycle-disclosure'));
   const stage = store.seed_backup_stage;
   const active = state === 'unlocked' && typeof stage === 'string' && stage !== 'inactive';
   clearWords();
@@ -124,8 +233,9 @@ const render = (store) => {
   $('seed-backup-entry').hidden = stage !== 'answering';
   $('redisplay').hidden = state !== 'unlocked' || active;
   const completion = store.seed_backup_completion;
+  $('seed-completion').textContent = '';
   if (state === 'unlocked' && completion) {
-    $('store-state').textContent += completion === 'full_reentry'
+    $('seed-completion').textContent = completion === 'full_reentry'
       ? ' Seed-backup record: all twelve words re-entered.'
       : ' Seed-backup record: re-entry check skipped.';
   }
@@ -135,7 +245,20 @@ const render = (store) => {
       : stage !== 'append_failed' && 'Re-display: record a new full re-entry or skip.',
     'Dispatch is stopped.', store.error].filter(Boolean).join(' ')
     : '';
-  if (state === 'locked' && redisplay) $('store-state').textContent += ' Enter the local passphrase again to show the seed backup.';
+  if (state === 'locked' && redisplay) $('store-explanation').textContent += ' Enter the local passphrase again to show the seed backup.';
+  renderSteps(store);
+  for (const details of document.querySelectorAll('details[data-fold-key]')) {
+    details.open = rawFoldChoices.get(details.dataset.foldKey) ?? false;
+  }
+  // Revalidation temporarily withholds cards without retiring their records.
+  if (state === 'unlocked' && store.lifecycle_state !== 'reconciling' && Array.isArray(store.tasks)) {
+    const offered = new Set([...document.querySelectorAll('details[data-fold-key]')].map(details => details.dataset.foldKey));
+    for (const key of rawFoldChoices.keys()) if (!offered.has(key)) rawFoldChoices.delete(key);
+  }
+  if (focused?.isConnected && document.activeElement !== focused && focused.getClientRects().length) {
+    focused.focus({preventScroll: true});
+    if (Number.isInteger(selection[0])) focused.setSelectionRange(...selection);
+  }
 };
 
 // Fixture wording until the signed bundle supplies it. No message supplies question text.
@@ -147,6 +270,35 @@ const paragraph = (parent, text) => {
   p.textContent = text;
   parent.append(p);
 };
+const rawDetails = (parent, value, identity) => {
+  const details = document.createElement('details');
+  const record = parent.closest('[data-machine], [data-task], [data-delivery-card], [id]');
+  details.dataset.foldKey = JSON.stringify([identity ?? (record ? [...record.attributes]
+    .filter(attribute => ['id', 'data-machine', 'data-task', 'data-delivery-card'].includes(attribute.name))
+    .map(attribute => [attribute.name, attribute.value]) : []), value]);
+  const summary = document.createElement('summary'); summary.textContent = 'Details';
+  const text = document.createElement('pre'); text.dataset.rawJson = ''; text.textContent = JSON.stringify(value, null, 2);
+  details.append(summary, text); parent.append(details);
+  return details;
+};
+const readableFacts = (parent, value) => {
+  const list = document.createElement('dl');
+  for (const [key, item] of Object.entries(value)) {
+    const label = document.createElement('dt'); label.textContent = key.replaceAll('_', ' ');
+    const fact = document.createElement('dd');
+    if (item !== null && typeof item === 'object' && Object.keys(item).length) readableFacts(fact, item);
+    else fact.textContent = item === null ? 'None' : typeof item === 'object'
+      ? (Array.isArray(item) ? 'Empty list' : key === 'limits' ? 'No caps (empty limits)' : 'Empty set') : String(item);
+    list.append(label, fact);
+  }
+  parent.append(list);
+};
+const updateInferenceFacts = () => {
+  for (const node of document.querySelectorAll('[data-inference-approval]')) {
+    node.textContent = `Inference endpoint: ${$('poc-endpoint').value}; model: ${$('poc-model').value}.`;
+  }
+};
+for (const name of ['poc-endpoint', 'poc-model']) $(name).addEventListener('input', updateInferenceFacts);
 const renderDeclaration = (parent, d) => {
   paragraph(parent, `Delivery declaration version ${d.version}.`);
   const list = (label, value, empty, entry) => {
@@ -159,47 +311,68 @@ const renderDeclaration = (parent, d) => {
   list('Services', d.services, 'no service obligation declared', e => `${e.name}, ${e.scope.kind}${e.scope.kind === 'user' ? ` account ${e.scope.account}` : ' (no account)'}, ${e.lifecycle === 'running-at-delivery' ? 'running at delivery' : 'enabled and survives reboot'}`);
   paragraph(parent, `Spendable tenant material: ${d.key_material.spendable === 'unspecified' ? 'unspecified (not stated)' : d.key_material.spendable ? 'permitted' : 'forbidden'}.`);
   list('Permitted tenant material', d.key_material.permitted, 'no tenant material may be present; application secrets are classified separately', e => `${e.kind} at ${e.where}`);
-  list('Drift checks on re-entry', d.drift_checks, 'no re-entry checks declared', e => JSON.stringify(e));
-  list('Required checks', d.required, 'no delivery checks declared', e => JSON.stringify(e));
+  for (const [label, value, empty] of [['Drift checks on re-entry', d.drift_checks, 'no re-entry checks declared'], ['Required checks', d.required, 'no delivery checks declared']]) {
+    if (value === 'unspecified') paragraph(parent, `${label}: unspecified (not stated).`);
+    else if (!value.length) paragraph(parent, `${label}: explicit empty set; ${empty}.`);
+    else { paragraph(parent, label); for (const entry of value) readableFacts(parent, entry); rawDetails(parent, value, ['declaration', parent.dataset.machine, label]); }
+  }
   if (d.default_credentials === 'none') paragraph(parent, 'Default credentials: none.');
   else list('Default credentials to change', d.default_credentials, 'none declared', e => e);
 };
 const renderSetup = (store) => {
   const worker = snapshotWorker();
   const slot = $('setup');
+  const facts = $('setup-facts');
+  if (store.state === 'unlocked') {
+    for (const card of document.querySelectorAll('[data-goal-card]')) {
+      const fields = [...card.querySelectorAll('textarea, input')].filter(field => !field.dataset.pocDeclaration);
+      setupDrafts.set(card.dataset.goalCard, fields.map(field => field.value));
+    }
+    if (Array.isArray(store.sessions)) {
+      const live = new Set(store.sessions.filter(session => session.session_state !== 'ended').map(session => session.identity));
+      for (const identity of setupDrafts.keys()) if (!live.has(identity)) setupDrafts.delete(identity);
+    }
+  }
   slot.replaceChildren();
+  $('task-setup').replaceChildren();
   slot.hidden = store.state !== 'unlocked' || store.seed_backup_stage !== 'inactive';
+  facts.replaceChildren(); facts.hidden = slot.hidden;
+  // Approval facts and their press stay together; accepted prices remain openable.
+  if (!slot.hidden && store.setup?.length) $('step-machine-fold').append(facts);
+  else slot.append(facts);
   if (slot.hidden) return;
-  const addEnd = (parent, identity) => {
+  const addEnd = identity => {
     const end = document.createElement('button');
     end.type = 'button'; end.textContent = 'End session'; end.dataset.endSession = identity;
     end.addEventListener('click', () => { end.disabled = true; worker.postMessage({task: {action: 'end-session', session: identity}}); });
-    parent.append(end);
+    const binding = [...(store.sessions ?? []), ...(store.endable_sessions ?? [])].find(session => session.identity === identity);
+    paragraph($('session-controls'), `Session ${identity}: bound machines ${(binding?.bound_set ?? []).join(', ')}.`);
+    $('session-controls').append(end);
   };
   if (store.lifecycle_state === 'reconciling') {
     for (const session of store.endable_sessions ?? []) {
-      paragraph(slot, `Session ${session.identity}: waiting for revalidation; bound machine ${session.bound_set.join(', ')}.`);
-      addEnd(slot, session.identity);
+      paragraph($('session-controls'), `Session ${session.identity}: waiting for revalidation; bound machine ${session.bound_set.join(', ')}.`);
+      addEnd(session.identity);
     }
     return;
   }
   const approved = store.setup ?? [];
   const entries = approved.length ? approved.map(m => m.entry) : store.setup_offer ?? [];
   if (!entries.length) return;
-  paragraph(slot, approved.length ? 'Approved setup' : 'Approve the setup');
+  paragraph(facts, approved.length ? 'Approved setup' : 'Approve the setup');
   const purchase = Boolean(store.procurement?.phase);
-  if (!purchase) paragraph(slot, "Prices are fixture data, not a vendor's price.");
+  if (!purchase) paragraph(facts, "Prices are fixture data, not a vendor's price.");
   for (const entry of entries) {
     const billing = entry.cost.period.billing;
     const period = billing ? `${billing.count} ${billing.interval}` : entry.cost.period;
-    paragraph(slot, `${entry.machine}: ${entry.vendor}; ${entry.product}; ${entry.region}; ${entry.cost.amount} ${entry.cost.unit} per ${period}.`);
+    paragraph(facts, `${entry.machine}: ${entry.vendor}; ${entry.product}; ${entry.region}; ${entry.cost.amount} ${entry.cost.unit} per ${period}.`);
   }
   if (!purchase) {
     const monthly = entries.reduce((sum, entry) => sum + BigInt(entry.cost.amount), 0n);
-    paragraph(slot, `Setup total: ${monthly} sat per month; ${monthly * 12n} sat per year.`);
+    paragraph(facts, `Setup total: ${monthly} sat per month; ${monthly * 12n} sat per year.`);
   }
-  paragraph(slot, 'Each machine will be bound alone in its own session.');
-  paragraph(slot, purchase ? 'The purchase card records the approved billing interval and currency. App Lock and Stop task do not cancel the VM or its billing. Payment remains external, and this page does not change automatic renewal.' : "Recurring means each machine is billed by its vendor every month from the moment it is created until it is destroyed or abandoned, whether or not setup finishes. tau-web never pays for a machine and cannot stop a vendor's billing; only you can.");
+  paragraph(facts, 'Each machine will be bound alone in its own session.');
+  paragraph(facts, purchase ? 'The purchase card records the approved billing interval and currency. App Lock and Stop task do not cancel the VM or its billing. Payment remains external, and this page does not change automatic renewal.' : "Recurring means each machine is billed by its vendor every month from the moment it is created until it is destroyed or abandoned, whether or not setup finishes. tau-web never pays for a machine and cannot stop a vendor's billing; only you can.");
   if (!approved.length) {
     if (store.lifecycle_state === 'ended') return;
     const button = document.createElement('button');
@@ -241,7 +414,7 @@ const renderSetup = (store) => {
     const access = machine.access;
     if (access) paragraph(section, `Access model: ${access.model}; profile ${access.profile}, revision ${access.revision}.`);
     if (machine.declaration) renderDeclaration(section, machine.declaration);
-    renderDelivery(section, machine.entry.machine, store);
+    renderDelivery($('task-setup'), machine.entry.machine, store);
     for (const approval of (store.reinstall_approvals ?? []).filter(a => a.entry === machine.entry.machine)) {
       paragraph(section, `Dedicated reinstall reset ${approval.reset}: ${approval.state}; rendering session ${approval.session}.`);
       if (approval.state === 'no longer usable') paragraph(section, 'Approve again in this session to proceed; the new reset requires a newer rescue activation and a confirming read.');
@@ -265,7 +438,7 @@ const renderSetup = (store) => {
       paragraph(section, `Session ${session.identity}: bound set ${session.bound_set.join(', ')}; ${session.inference_limits?.state ?? session.session_state ?? 'running'}.`);
       if (session.readiness_reason) paragraph(section, session.readiness_reason);
       paragraph(section, `Inference model: ${session.inference_configuration?.model ?? 'unavailable'}; machine: ${machine.entry.machine}.`);
-      addEnd(section, session.identity);
+      addEnd(session.identity);
       const limits = session.inference_limits;
       if (limits && !session.credit_backed) {
         paragraph(section, `Confirmed limit: ${(BigInt(limits.confirmed.cap_hundredths) / 100n)}.${String(BigInt(limits.confirmed.cap_hundredths) % 100n).padStart(2, '0')} ${limits.confirmed.unit}; lifetime ${limits.confirmed.lifetime_seconds / 60} minutes. No renewal; observed spend ${limits.observed_spend}. Unaccounted spend is not zero or refunded.`);
@@ -278,7 +451,7 @@ const renderSetup = (store) => {
         verify.type = 'button'; verify.dataset.verifyClock = session.identity;
         verify.textContent = 'Verify issuer clock';
         verify.addEventListener('click', () => { verify.disabled = true; worker.postMessage({ verify_clock: session.identity }); });
-        section.append(verify); slot.append(section); continue;
+        section.append(verify); $('task-setup').append(section); continue;
       }
       const card = document.createElement('section');
       card.dataset.goalCard = session.identity;
@@ -295,6 +468,7 @@ const renderSetup = (store) => {
           paragraph(card, accepted ? 'Start was accepted. Continue with verification commands for this same goal and machine.' : 'No brief is available.');
           const checks = document.createElement('textarea');
           checks.setAttribute('aria-label', 'Verification commands, one per line');
+          checks.value = setupDrafts.get(session.identity)?.[0] ?? '';
           paragraph(card, 'Verification commands, one per line. Choose checks that establish the requested service is working. Empty checks cannot establish success.');
           card.append(checks);
           const accept = document.createElement('button');
@@ -316,6 +490,7 @@ const renderSetup = (store) => {
         source.type = 'url';
         source.dataset.documentSource = '';
         source.setAttribute('aria-label', 'Optional document source (https URL)');
+        [words.value, source.value] = setupDrafts.get(session.identity) ?? ['', ''];
         const enter = document.createElement('button');
         enter.type = 'button';
         enter.dataset.goalEnter = session.identity;
@@ -374,12 +549,14 @@ const renderSetup = (store) => {
         button.disabled = true;
         worker.postMessage({ bind: { machine: machine.entry.machine, inference_approval: store.fixture_admission } });
       });
+      paragraph(section, `Inference endpoint: ${store.fixture_admission.configuration.endpoint}; model: ${store.fixture_admission.configuration.model}.`);
+      startDisclosure(section);
       section.append(button);
     }
-    slot.append(section);
+    (session || (store.sessions ?? []).some(history => history.bound_set.includes(machine.entry.machine)) || (store.fixture_admission && machine.class !== null && access) ? $('task-setup') : slot).append(section);
   }
   if (store.lifecycle_state === 'ended') {
-    for (const control of slot.querySelectorAll('button, input, textarea')) control.remove();
+    for (const control of [...slot.querySelectorAll('button, input, textarea'), ...$('task-setup').querySelectorAll('button, input, textarea')]) control.remove();
   }
 };
 
@@ -389,14 +566,14 @@ const renderCommandResult = (result) => {
   let slot = $('task-results');
   if (!slot) {
     slot = document.createElement('section'); slot.id = 'tau-task-results';
-    $('setup').after(slot);
+    $('task-progress').append(slot);
   }
   const card = document.createElement('section');
   card.dataset.commandResult = String(result.call);
   paragraph(card, `Recorded call ${result.call}; job ${result.job}; exit ${result.exit_status ?? 'unknown'}.${result.historical ? ' Historical result; no current action authority.' : ''}`);
   for (const field of ['stdout', 'stderr']) {
     paragraph(card, field);
-    const output = document.createElement('pre'); output.textContent = result[field] ?? ''; card.append(output);
+    const output = document.createElement('pre'); output.dataset.commandOutput = ''; output.textContent = result[field] ?? ''; card.append(output);
   }
   const previous = slot.querySelector(`[data-command-result="${Number(result.call)}"]`);
   if (previous) previous.replaceWith(card); else slot.append(card);
@@ -408,7 +585,18 @@ const renderTasks = (store) => {
   if (!slot) {
     slot = document.createElement('section');
     slot.id = 'tau-tasks';
-    $('setup').after(slot);
+    $('task-progress').append(slot);
+  }
+  if (store.state === 'unlocked') {
+    for (const card of slot.querySelectorAll('[data-task]')) {
+      const requests = card.querySelector('[aria-label="Task request limit"]');
+      const steps = card.querySelector('[aria-label="Task step limit"]');
+      if (requests && steps) taskLimitDrafts.set(card.dataset.task, [requests.value, steps.value]);
+    }
+    if (Array.isArray(store.tasks)) {
+      const active = new Set(store.tasks.filter(task => !['complete', 'abandoned'].includes(task.status)).map(task => task.id));
+      for (const identity of taskLimitDrafts.keys()) if (!active.has(identity)) taskLimitDrafts.delete(identity);
+    }
   }
   slot.replaceChildren();
   slot.hidden = store.state !== 'unlocked' || store.seed_backup_stage !== 'inactive';
@@ -419,8 +607,8 @@ const renderTasks = (store) => {
     paragraph(card, `Task ${task.id}: ${task.status}; machine ${task.machine}.`);
     paragraph(card, task.goal);
     paragraph(card, `Requests ${task.requests}/${task.limits.requests}; steps ${task.steps}/${task.limits.steps}. Verification commands count as steps.`);
-    for (const [id, tool, outcome] of task.completed) paragraph(card, `${id}: ${JSON.stringify(tool)} → ${JSON.stringify(outcome)}`);
-    if (task.proposal) paragraph(card, `Next ${task.proposal.call_id}: ${JSON.stringify(task.proposal.tool)}`);
+    for (const [id, tool, outcome] of task.completed) { paragraph(card, `Completed call ${id}.`); rawDetails(card, {tool, outcome}, ['task', task.id, 'completed', id]); }
+    if (task.proposal) { paragraph(card, `Next call ${task.proposal.call_id}.`); rawDetails(card, task.proposal.tool, ['task', task.id, 'proposal', task.proposal.call_id]); }
     if (task.pending) paragraph(card, `Pending job ${task.pending.job}; journal call ${task.pending.call}. Resume inspects this job without launching it again.`);
     if (task.pause_reason) paragraph(card, task.pause_reason);
     for (const check of task.verification) paragraph(card, `Verification: ${check.command}; job ${check.job}; exit ${check.exit_status ?? 'unknown'}; ${check.excerpt}`);
@@ -442,11 +630,13 @@ const renderTasks = (store) => {
     }
     paragraph(card, 'Stop task stops local orchestration; remote effects and billing continue.');
     action('Stop task', { action: 'abandon' });
-    const requests = document.createElement('input'); requests.type = 'number'; requests.min = task.limits.requests; requests.max = 1000; requests.value = task.limits.requests; requests.setAttribute('aria-label', 'Task request limit');
-    const steps = document.createElement('input'); steps.type = 'number'; steps.min = task.limits.steps; steps.max = 2000; steps.value = task.limits.steps; steps.setAttribute('aria-label', 'Task step limit');
+    const requests = document.createElement('input'); requests.type = 'number'; requests.min = task.limits.requests; requests.max = 1000; requests.value = taskLimitDrafts.get(task.id)?.[0] ?? task.limits.requests; requests.setAttribute('aria-label', 'Task request limit');
+    const steps = document.createElement('input'); steps.type = 'number'; steps.min = task.limits.steps; steps.max = 2000; steps.value = taskLimitDrafts.get(task.id)?.[1] ?? task.limits.steps; steps.setAttribute('aria-label', 'Task step limit');
     const raise = document.createElement('button'); raise.type = 'button'; raise.textContent = 'Raise limits';
     raise.addEventListener('click', () => { raise.disabled = true; worker.postMessage({ task: { action: 'raise', id: task.id, limits: { requests: Number(requests.value), steps: Number(steps.value) } } }); });
-    card.append(requests, steps, raise);
+    const requestLabel = document.createElement('label'); requestLabel.textContent = 'Request limit'; requestLabel.append(requests);
+    const stepLabel = document.createElement('label'); stepLabel.textContent = 'Step limit'; stepLabel.append(steps);
+    card.append(requestLabel, stepLabel, raise);
     slot.append(card);
   }
 };
@@ -457,6 +647,9 @@ const renderDelivery = (section, machine, store) => {
   if (!delivery) return;
   const card = document.createElement('section');
   card.dataset.deliveryCard = machine;
+  const heading = document.createElement('h3');
+  heading.textContent = `Delivery for ${machine}`;
+  card.append(heading);
   paragraph(card, delivery.fixture_limit);
   const verdict = document.createElement('p');
   verdict.dataset.deliveryVerdict = machine;
@@ -477,7 +670,7 @@ const renderDelivery = (section, machine, store) => {
       if (!delivery.last_check.result.complete) paragraph(card, note.service.name + ': ' + note.text);
     }
     for (const result of delivery.last_check.result.fields) paragraph(card, result.field + ': ' + result.status);
-    if (!delivery.last_check.result.complete) paragraph(card, 'Latest attempt measurements: ' + JSON.stringify(delivery.last_check.measurements));
+    if (!delivery.last_check.result.complete) { paragraph(card, 'Latest attempt measurements:'); rawDetails(card, delivery.last_check.measurements).dataset.deliveryMeasurements = machine; }
   }
   if (delivery.findings_unknown) paragraph(card, 'Findings unknown until a complete re-check.');
   for (const finding of delivery.findings ?? []) paragraph(card, finding.class + ': ' + finding.detail);
@@ -491,7 +684,7 @@ const renderDelivery = (section, machine, store) => {
   for (const session of delivery.subsequent_placement_sessions ?? []) paragraph(card, 'Placement since the last check in session ' + session + '; final lifecycle demonstration not supplied.');
   if (delivery.reports?.length) {
     paragraph(card, delivery.report_label);
-    for (const report of delivery.reports) paragraph(card, JSON.stringify(report));
+    for (const [index, report] of delivery.reports.entries()) rawDetails(card, report, ['delivery', machine, 'report', index]);
   }
   const session = (store.sessions ?? []).find(s => s.session_state !== 'ended' && s.bound_set.includes(machine));
   if (session && session.inference_limits?.state !== 'clock-withheld') {
@@ -526,7 +719,6 @@ const renderCredit = (store, enabled) => {
   const invoices = credit?.invoices ?? [];
   const latest = invoices.at(-1);
   const unresolved = latest && !['paid', 'expired_unpaid', 'abandoned'].includes(latest.outcome);
-  $('credit-status').textContent = store.credit_error || credit?.balance_text || (!credit?.account ? 'No inference credit yet.' : 'Inference credit balance not read yet.');
   $('credit-invoice').disabled = !enabled || Boolean(unresolved);
   $('credit-invoice').textContent = ['expired_unpaid','abandoned'].includes(latest?.outcome) ? 'New invoice' : credit?.account ? 'Add credit' : 'Get an invoice';
   $('credit-check').hidden = !credit?.account;
@@ -558,6 +750,13 @@ const renderProvider = (store, enabled) => {
   const worker = snapshotWorker();
   $('provider-key-status').textContent = store.provider_configuration?.key_set ? 'Provider key set.' : 'Provider key unset; re-entry is required.';
   const purchase = store.procurement ?? {};
+  if (!$('purchase-review-home')) {
+    const home = document.createElement('span'); home.id = 'tau-purchase-review-home';
+    $('purchase-review').before(home);
+  }
+  if (purchase.selection) $('purchase-review-slot').append($('purchase-review'));
+  else $('purchase-review-home').after($('purchase-review'));
+  $('purchase-review-slot').hidden = store.state !== 'unlocked';
   if (!$('provider-origin').value && (store.provider_configuration?.origin ?? purchase.origin)) $('provider-origin').value = store.provider_configuration?.origin ?? purchase.origin;
   providerDisplayedOrigin = purchase.origin ?? null;
   providerDisplayedBilling = purchase.billing ? structuredClone(purchase.billing) : null;
@@ -585,7 +784,7 @@ const renderProvider = (store, enabled) => {
         const label = `${kind}: ${offer.name}; ${offer.region?.name}; ${kind === 'fixed' ? `${offer.cpu} CPU, ${offer.memory} memory bytes, ${offer.disk_size} disk bytes; ${terms.amount} ${terms.currency} smallest units; ` : 'choose resources and request price; '}${terms.interval_amount} ${terms.interval_type}${hourly ? ' — unsupported credit-only hourly plan' : ''}`;
         paragraph(catalogue, label);
         const option = new Option(label, `${kind}:${offer.id}`); option.disabled = hourly; offerSelect.add(option);
-        if (kind === 'custom') { const bounds = document.createElement('pre'); bounds.textContent = JSON.stringify(offer, null, 2); catalogue.append(bounds); }
+        if (kind === 'custom') { readableFacts(catalogue, offer); rawDetails(catalogue, offer); }
       }
     }
     const images = $('provider-image'); images.replaceChildren(new Option('Choose a fetched image', ''));
@@ -602,7 +801,8 @@ const renderProvider = (store, enabled) => {
     paragraph(selection, `Provider origin: ${purchase.origin}`);
     const c = purchase.selection.charge;
     paragraph(selection, `Recurring charge: ${c.amount} ${c.currency === 'BTC' ? 'millisats' : c.currency + ' cents'} per ${c.interval_amount} ${c.interval_type}. Tax and processing fee are shown on the initial invoice.`);
-    const exact = document.createElement('pre'); exact.textContent = JSON.stringify(purchase.selection, null, 2); selection.append(exact);
+    readableFacts(selection, purchase.selection);
+    rawDetails(selection, purchase.selection, ['purchase', purchase.origin, purchase.account ?? null]);
   }
   const progress = $('provider-progress'); progress.replaceChildren();
   if (purchase.closed) paragraph(progress, purchase.closed);
@@ -623,10 +823,11 @@ const renderProvider = (store, enabled) => {
       check.addEventListener('click', () => providerRequest({action:'payment_check'})); progress.append(check);
     }
     if (purchase.public_keys) {
+      paragraph(progress, 'Registering the machine SSH public key with the provider does not enroll the relay. Copy the separate relay public key and ask your relay operator to enroll it before configuration.');
       paragraph(progress, 'Relay public key — enroll this separately with the relay operator:');
       const publicKey = document.createElement('pre'); publicKey.textContent = purchase.public_keys.relay_pubkey; progress.append(publicKey);
     }
-    if (purchase.target) paragraph(progress, `Published pin saved for VM ${purchase.vm_id}: ${purchase.target.pin}. Bind ${purchase.machine} below to use the existing configuration runner.`);
+    if (purchase.target) paragraph(progress, `Published pin saved for VM ${purchase.vm_id}: ${purchase.target.pin}. Press Start session ${purchase.machine} below to continue configuration.`);
   }
   const canReview = !purchase.phase || ['approved', 'registered', 'terms_changed'].includes(purchase.phase);
   for (const control of $('provider-selection-form').elements) control.disabled = !enabled || !canReview;
@@ -657,7 +858,7 @@ $('provider-selection-form').addEventListener('submit', event => {
   try {
     const [kind, id] = $('provider-offer').value.split(':');
     providerRequest({action: 'select', choice: {offer_id: Number(id), image_id: Number($('provider-image').value), resources: kind === 'custom' ? JSON.parse($('provider-resources').value) : null}});
-  } catch { paragraph($('provider-selection-view'), 'Enter valid custom resource JSON.'); }
+  } catch { $('step-machine-error').textContent = 'Enter valid custom resource JSON.'; }
 });
 $('provider-approval-form').addEventListener('submit', event => {
   event.preventDefault(); if (providerSelectionDirty) return;
@@ -667,6 +868,7 @@ $('provider-close').addEventListener('click', () => providerRequest({action: 'cl
 $('provider-resume').addEventListener('click', () => providerRequest({action: 'resume'}));
 $('provider-invoice').addEventListener('click', () => providerRequest({action: 'initial_invoice', billing: providerDisplayedBilling}));
 const clearPocInputs = () => {
+  rawFoldChoices.clear();
   providerCatalogue = null;
   providerSelectionDirty = true;
   providerReviewToken = null;
@@ -678,7 +880,11 @@ const clearPocInputs = () => {
   $('provider-key').value = '';
   pocDeclarationDrafts.clear();
   creditGoalDrafts.clear();
+  setupDrafts.clear();
+  taskLimitDrafts.clear();
+  pocKeyRefusal = '';
   for (const field of $('poc').querySelectorAll('input')) {
+    if (field.closest('#tau-setup, #tau-task-setup, #tau-task-progress, #tau-session-controls')) continue;
     if (field.type === 'checkbox') field.checked = false;
     else if (!defaultsInputs.includes(field.id.replace('tau-', ''))) field.value = '';
   }
@@ -690,8 +896,10 @@ const renderPoc = (store) => {
   const worker = snapshotWorker();
   const enabled = store.state === 'unlocked' && !ceremony &&
     !['suspended', 'reconciling', 'ended'].includes(store.lifecycle_state);
-  $('poc').hidden = store.state !== 'unlocked';
-  for (const control of $('poc').querySelectorAll('input, select, button')) control.disabled = !enabled;
+  for (const content of document.querySelectorAll('.requires-store')) content.hidden = store.state !== 'unlocked';
+  for (const control of $('poc').querySelectorAll('input, select, button')) {
+    if (!control.closest('#tau-setup, #tau-task-setup, #tau-task-progress, #tau-session-controls')) control.disabled = !enabled;
+  }
   renderProvider(store, enabled);
   renderCredit(store, enabled);
   const restored = (store.sessions ?? []).find(s => s.session_state !== 'ended')?.inference_configuration;
@@ -714,7 +922,11 @@ const renderPoc = (store) => {
     paragraph(row, `Host ${target.host}, port ${target.port}, user ${target.user}; relay ${target.relay}.`);
     paragraph(row, `Independent host pin: ${target.pin}`);
     const useCredit = store.credit?.can_start && (store.credit.selected || !store.poc_configuration?.key_set);
-    paragraph(row, useCredit ? `Start session approves the endpoint and model shown above for ${target.machine}.` : `Start session approves inference using ${store.poc_configuration?.configuration?.model || 'the configured model'} on ${target.machine}.`);
+    const configuration = document.createElement('p');
+    if (useCredit) configuration.dataset.inferenceApproval = '';
+    else configuration.textContent = `Inference endpoint: ${store.poc_configuration?.configuration?.endpoint ?? 'unavailable'}; model: ${store.poc_configuration?.configuration?.model ?? 'unavailable'}.`;
+    row.append(configuration);
+    paragraph(row, useCredit ? `Start session approves this inference endpoint and model for ${target.machine}.` : `Start session approves inference using ${store.poc_configuration?.configuration?.model || 'the configured model'} on ${target.machine}.`);
     let creditGoal;
     if (useCredit) {
       creditGoal = document.createElement('textarea'); creditGoal.dataset.creditGoal = target.machine;
@@ -732,6 +944,7 @@ const renderPoc = (store) => {
         if (kind === 'poc_bind' && useCredit) worker.postMessage({credit_request:{action:'start',machine:target.machine,goal:creditGoal.value,endpoint:$('poc-endpoint').value,model:$('poc-model').value}});
         else worker.postMessage({ [kind]: { machine: target.machine } });
       });
+      if (kind === 'poc_bind') startDisclosure(row);
       row.append(button);
     }
     for (const session of store.sessions ?? []) {
@@ -765,12 +978,14 @@ const renderPoc = (store) => {
     }
     targets.append(row);
   }
+  updateInferenceFacts();
   if (store.poc_keys && enabled) {
     const slot = $('poc-public-keys');
     slot.replaceChildren();
-    if (store.poc_keys.refused) paragraph(slot, store.poc_keys.refused);
-    else {
+    pocKeyRefusal = store.poc_keys.refused ?? '';
+    if (!store.poc_keys.refused) {
       paragraph(slot, `Public keys for ${store.poc_keys.machine}`);
+      paragraph(slot, 'Registering the machine SSH public key with the provider does not enroll the relay. Copy the separate relay public key and ask your relay operator to enroll it before configuration.');
       for (const [field, label] of [['authorized_keys', 'SSH authorized_keys line'], ['relay_pubkey', 'Relay AUTH public key']]) {
         const value = String(store.poc_keys[field] ?? '');
         paragraph(slot, label);
@@ -786,7 +1001,10 @@ const renderPoc = (store) => {
         slot.append(text, copy);
       }
     }
-  } else if (!enabled) $('poc-public-keys').replaceChildren();
+  } else if (!enabled) {
+    $('poc-public-keys').replaceChildren();
+    pocKeyRefusal = '';
+  }
 };
 $('poc-inference-form').addEventListener('submit', event => {
   event.preventDefault();
@@ -887,7 +1105,7 @@ const lock = () => {
   $('confirm').value = '';
   render({state: 'locking'});
   const timer = setTimeout(() => {
-    if (!worker) $('store-state').textContent = 'Still locking while the worker finishes a write. You can reload or close the page to stop it and recover at the next unlock.';
+    if (!worker) $('store-explanation').textContent = 'Still locking while the worker finishes a write. You can reload or close the page to stop it and recover at the next unlock.';
   }, RETIRE_EXPLANATION_MS);
   previous.addEventListener('message', ({data}) => {
     if (data?.runtime_retired === true) {

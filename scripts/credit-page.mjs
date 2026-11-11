@@ -1,3 +1,4 @@
+import {phoneSnapshot} from './layout-page.mjs';
 import assert from 'node:assert/strict';
 export const creditCases = ['credit-funding','credit-expiry','credit-failures','credit-key','credit-lock','credit-reload','credit-loss','credit-defaults','credit-defaults-invalid','credit-defaults-missing','credit-control-account','credit-control-key','credit-control-name','credit-lifecycle','credit-refusals','credit-account-write','credit-double-press','credit-late-lock','credit-late-end','credit-poll-bounds','credit-defaults-directory','credit-defaults-late','credit-mint-pause','credit-existing-balance','credit-defaults-urls','credit-new-balance-failure','credit-resolved-history','credit-goal-drafts','credit-refresh-contention','credit-ensure-contention','credit-balance-loss-refresh','credit-balance-loss-mint',...['collection','verification'].flatMap(phase=>['refused','lost','wrong-cap'].map(mode=>`credit-mint-${phase}-${mode}`))];
 export const creditId = 'synthetic-credit-identity-482700';
@@ -292,6 +293,15 @@ export async function creditProof(c) {
   await request({action:'check'});
   assert.equal(await evaluate("document.querySelector('[data-credit-goal]').value"),'Install and check a small service');
  }
+ if(process.env.TAU_LAYOUT_CREDIT==='1') {
+  await invoke(()=>{for(const id of ['tau-poc-endpoint','tau-poc-model'])document.getElementById(id).dispatchEvent(new Event('input',{bubbles:true}));});
+  const disclosure="Inference uses a key capped at 0.25 USD of your credit and valid 24 hours (requested limits, per key). A new key with the same limits is made after each Unlock or New key press, so a session can use more than 0.25 USD in total; your credit balance is the overall limit.";
+  assert.ok(await evaluate(`document.querySelector('#tau-poc-targets').innerText.includes(${JSON.stringify(disclosure)})`),'exact credit Start disclosure stays visible');
+  assert.ok(await evaluate("document.querySelector('[data-inference-approval]').innerText.includes(document.querySelector('#tau-poc-endpoint').value) && document.querySelector('[data-inference-approval]').innerText.includes(document.querySelector('#tau-poc-model').value)"),'Start shows its exact endpoint and model');
+  await phoneSnapshot(c,'credit-before-start');
+  await call('Emulation.setDeviceMetricsOverride',{width:360,height:844,deviceScaleFactor:1,mobile:true},sessionId);
+  await phoneSnapshot(c,'credit-before-start-360');
+ }
  if(name==='credit-lifecycle')state.delay=1200;
  if(name==='credit-late-lock'||name==='credit-late-end')await hold('credit_mint_return');
  if(name==='credit-late-lock')await workerEvaluate(`globalThis.fixtureOriginalSend=self.postMessage.bind(self);self.postMessage=(value,...transfer)=>{if(value?.runtime_retired===true)globalThis.fixtureRetirementAck=value;else fixtureOriginalSend(value,...transfer);};`);
@@ -321,6 +331,7 @@ export async function creditProof(c) {
  }
  await wait('fixtureReports.at(-1)?.sessions?.[0]?.credit_backed && fixtureReports.at(-1)?.poc_configuration?.key_set');
  const session=(await report()).sessions[0].identity;
+ if(process.env.TAU_LAYOUT_CREDIT==='1'){assert.equal(await evaluate("document.querySelector('[data-credit-new-key]')?.tagName"),'BUTTON');await phoneSnapshot(c,'credit-session');}
  assert.equal(state.mintCalls,1);assert.equal((await journal(state.keys[0].api_key)).contains,false);
  assert.ok((await journal('')).mint_names.includes(state.keys[0].name));
  if(name==='credit-control-name'||name==='credit-control-key'){assert.deepEqual(state.orderingFailures,[],'mint name committed before actual request');check(true,name==='credit-control-name'?'mint name committed before actual request':'session key absent from every decrypted record');return;}

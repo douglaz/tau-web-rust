@@ -554,7 +554,7 @@ const VIEW: &str = "(() => {
     return {
         status: ($('status').dataset.state ?? '').replace('harness-', ''),
         store: $('store').dataset.state ?? '',
-        text: $('store-state').textContent,
+        text: ['store-state', 'store-explanation', 'step-store-error', 'seed-completion'].map(id => $(id).textContent).filter(Boolean).join(' '),
         create: !$('create').hidden,
         unlock: !$('unlock').hidden,
         lock: !$('lock').hidden,

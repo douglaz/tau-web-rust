@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import {purchaseSnapshot} from './layout-page.mjs';
+const layoutProof=process.env.TAU_LAYOUT_PROOF==='1';
 import {createServer} from 'node:https';
 import {readFile, writeFile, mkdtemp, rm, mkdir} from 'node:fs/promises';
 import {spawn, spawnSync} from 'node:child_process';
@@ -59,7 +61,7 @@ const secret='31'.repeat(32), other='32'.repeat(32), inference='fixture~inferenc
 const account=publicIdentity(secret), used=new Map(), counts={}, replays={}, effects={}, refusals={}, errors=[], authForms=new Set(), dispatches=[];
 let browser,socket,provider,alternateProvider,page,fixture,temp;let alternateContacts=0,allowedAlternateContacts=0,originChecks=0;const fixtureTimers=new Set();
 await mkdir('target',{recursive:true});
-temp=await mkdtemp(resolve('target/provisioning-'));
+temp=await mkdtemp(process.env.TMPDIR?join(process.env.TMPDIR,'provisioning-'):resolve('target/provisioning-'));
 const check=(condition,label)=>assert.ok(condition,label);
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 const image={id:3,distribution:'archlinux',flavour:'base',version:'rolling',release_date:'2026-10-01T00:00:00Z',cpu_arch:'x86_64',default_username:'arch',encrypted:false,popularity:0.1};
@@ -234,6 +236,7 @@ try {
   const call=(method,params={},sessionId)=>new Promise((resolve,reject)=>{const id=++sequence;calls.set(id,{resolve,reject});socket.send(JSON.stringify({id,method,params,...(sessionId?{sessionId}:{})}));});
   const {targetId}=await call('Target.createTarget',{url:'about:blank'}),{sessionId}=await call('Target.attachToTarget',{targetId,flatten:true});
   await call('Page.enable',{},sessionId);
+  if(layoutProof)await call('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true},sessionId);
   await call('Page.addScriptToEvaluateOnNewDocument',{source:`window.reports=[];window.events=[];window.workers=[];window.sinkLogs=[];window.addEventListener('error',()=>sinkLogs.push('page error'));const Original=Worker;window.Worker=class extends Original{constructor(...args){super(...args);workers.push(this);this.addEventListener('message',e=>{if(e.data.store)reports.push(e.data.store);else if(Object.keys(e.data).some(k=>k.startsWith('fixture_'))){events.push(e.data);e.stopImmediatePropagation();}});}};`},sessionId);
   const evaluate=async expression=>{
     const r=await call('Runtime.evaluate',{expression,awaitPromise:true,returnByValue:true},sessionId);
@@ -259,13 +262,15 @@ try {
   const click=selector=>invoke(s=>document.querySelector(s).click(),selector);
   const message=data=>invoke(d=>workers.at(-1).postMessage(d),data);
   const report=()=>evaluate('reports.at(-1)');
+  let snapshotIndex=0;
+  const layout=async(value,state)=>{if(layoutProof)await purchaseSnapshot({name:scenario,call,sessionId,evaluate,check,message,wait},value,`${String(++snapshotIndex).padStart(3,'0')}-${state}`);};
   const action=async value=>{
     const request={...value};
     if(value.action==='approve'&&!Object.hasOwn(value,'selection'))request.selection=structuredClone((await report()).procurement?.selection??null);
     if(value.action==='initial_invoice'&&!Object.hasOwn(value,'billing'))request.billing=structuredClone((await report()).procurement?.billing??null);
-    await sleep(1100);const n=await evaluate('reports.length');await message({provider_request:request});await wait(`reports.length>${n}`);const result=await report();if(['origin-entry','custom-origin-entry'].includes(scenario)&&result.procurement?.phase)check(alternateContacts===allowedAlternateContacts,'wrong origin receives no bound-Purchase traffic');return result;
+    await sleep(1100);const n=await evaluate('reports.length');await message({provider_request:request});await wait(`reports.length>${n}`);const result=await report();await layout(result,value.action);if(['origin-entry','custom-origin-entry'].includes(scenario)&&result.procurement?.phase)check(alternateContacts===allowedAlternateContacts,'wrong origin receives no bound-Purchase traffic');return result;
   };
-  const clickInitialInvoice=async()=>{await sleep(1100);const n=await evaluate('reports.length');await click('#tau-provider-invoice');await wait(`reports.length>${n}`);return report();};
+  const clickInitialInvoice=async()=>{await sleep(1100);const n=await evaluate('reports.length');await click('#tau-provider-invoice');await wait(`reports.length>${n}`);const value=await report();await layout(value,'invoice');return value;};
   const journalMetadata=async()=>{
     await evaluate('events=events.filter(e=>!e.fixture_journal)');
     await message({fixture:{journal:'fixture-journal-inspection-marker'}});
@@ -285,10 +290,24 @@ try {
   check(!(await setKey(secret)).store_error,'provider key accepted');
   if(originCase){check((await report()).provider_configuration.origin===providerOrigin,'entered origin normalized by worker');originChecks++;}
   assert.deepEqual(await journalMetadata(),beforeAccountEntry,'account entry keeps private-key scan material out of the journal');
+  if(layoutProof){
+    await invoke((url,key)=>{document.querySelector('#tau-poc-endpoint').value=url;document.querySelector('#tau-poc-model').value='fixture-a';document.querySelector('#tau-poc-key').value=key;document.querySelector('#tau-poc-inference-form').requestSubmit();},providerOrigin+'/inference',inference);
+    await wait('reports.at(-1)?.poc_configuration?.key_set');
+  }
   let current=await action({action:'catalogue'});if(scenario==='missing-limits'){check(current.store_error&&!current.provider_catalogue,'missing limits object refuses catalogue before approval');check(!Object.values(effects).some(Boolean),'missing limits creates no provider effect');missingLimitsRefusals++;fixed.limits={};current=await action({action:'catalogue'});check(current.store_error&&!current.provider_catalogue,'missing custom limits object refuses catalogue before approval');missingLimitsRefusals++;custom.limits={};current=await action({action:'catalogue'});}if(!current.provider_catalogue)throw Error(JSON.stringify({reason:current.store_error,counts,errors}));  check(current.provider_catalogue.offers.templates.length===2,'actual catalogue fetched');
   check(await evaluate("[...document.querySelectorAll('#tau-provider-offer option')].some(o=>o.textContent.includes('London'))"),'London selectable');
   check(await evaluate("[...document.querySelectorAll('#tau-provider-offer option')].find(o=>o.textContent.includes('Hourly')).disabled"),'hourly unsupported before approval');
   check(await evaluate("[...document.querySelectorAll('#tau-provider-image option')].find(o=>o.value==='4').disabled"),'encrypted image unsupported before approval');
+  if(layoutProof){
+    const traffic=Object.values(counts).reduce((a,b)=>a+b,0);
+    await invoke(()=>{const fold=document.querySelector('#tau-step-machine-fold');if(fold.open)fold.querySelector('summary').click();document.querySelector('#tau-provider-offer').value='custom:2';document.querySelector('#tau-provider-image').value='3';document.querySelector('#tau-provider-resources').value='{';document.querySelector('#tau-provider-selection-form').requestSubmit();});
+    check(await evaluate("document.querySelector('#tau-step-machine-error').innerText==='Enter valid custom resource JSON.' && !document.querySelector('#tau-step-machine-error').closest('details:not([open])')"),'custom JSON failure stays visible beside Machine');
+    check(Object.values(counts).reduce((a,b)=>a+b,0)===traffic,'invalid custom JSON sends no request');
+    await layout(await report(),'resources-error');
+    await invoke(()=>{const input=document.querySelector('#tau-provider-resources');input.focus();input.setSelectionRange(1,1);});
+    const reportsBefore=await evaluate('reports.length');await message({lifecycle:'hidden'});await message({lifecycle:'visible'});await wait(`reports.length>${reportsBefore}`);
+    check(await evaluate("document.activeElement.id==='tau-provider-resources' && document.activeElement.selectionStart===1 && document.activeElement.value==='{'"),'ordinary reports keep the edited form and cursor');
+  }
   let signatureEncodingChecks=0,signatureReloadChecks=0;
   if(scenario==='signature-encodings'){
     const nonProtectionJournal=({records,providerProtection,...allocation})=>({records:records-providerProtection,...allocation});
@@ -331,7 +350,7 @@ try {
   } else {
     const choice={offer_id:isCustom?2:1,image_id:3,resources:isCustom?resources:null};
     await sleep(1100);let submitted=await evaluate('reports.length');
-    await invoke((choice,kind)=>{document.querySelector('#tau-provider-offer').value=kind+':'+choice.offer_id;document.querySelector('#tau-provider-image').value=String(choice.image_id);document.querySelector('#tau-provider-resources').value=JSON.stringify(choice.resources??{});document.querySelector('#tau-provider-selection-form').requestSubmit();},choice,isCustom?'custom':'fixed');await wait(`reports.length>${submitted}`);current=await report();check(!current.store_error&&current.procurement.selection,'selected current price');
+    await invoke((choice,kind)=>{document.querySelector('#tau-provider-offer').value=kind+':'+choice.offer_id;document.querySelector('#tau-provider-image').value=String(choice.image_id);document.querySelector('#tau-provider-resources').value=JSON.stringify(choice.resources??{});document.querySelector('#tau-provider-selection-form').requestSubmit();},choice,isCustom?'custom':'fixed');await wait(`reports.length>${submitted}`);current=await report();check(!current.store_error&&current.procurement.selection,'selected current price');await layout(current,'review');
     const approval={origin:current.procurement.origin,machine:'machine-a',relay:fixtureInfo.relay,class_answer:'no',approve_charge:true,approve_maintained_access:true};
     if(originCase){
       check(await invoke(origin=>document.querySelector('#tau-provider-selection-view').textContent.includes(origin),providerOrigin),'plan review names normalized origin');

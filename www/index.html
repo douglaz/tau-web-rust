@@ -7,19 +7,66 @@
 <title>tau-web</title>
 <link rel="icon" href="data:,">
 <script type="module" src="boot.js"></script>
+<style>
+:root { color-scheme: light; font: 17px/1.5 system-ui, sans-serif; color: #172b36; background: #f1f5f5; }
+* { box-sizing: border-box; }
+body { max-width: 860px; margin: auto; padding: 16px; overflow-wrap: anywhere; }
+h1 { font-size: 1.6rem; margin: 0 0 12px; }
+h2 { font-size: 1.2rem; margin: 0; }
+h3 { font-size: 1.05rem; }
+p { margin: 12px 0; }
+.step { background: white; border: 1px solid #c9d8dc; border-radius: 14px; padding: 18px; margin: 18px 0; min-width: 0; }
+.step[data-current="true"] { border: 2px solid #176363; }
+.step-status { color: #36535f; margin: 6px 0 12px; }
+.step-error { color: #8c2424; font-weight: 600; }
+.step-error:empty { display: none; }
+summary { cursor: pointer; min-height: 44px; padding: 10px 0; font-weight: 600; }
+details { min-width: 0; margin: 10px 0; }
+label { display: block; margin: 12px 0; }
+input, select, textarea, button { font: inherit; max-width: 100%; }
+input:not([type="checkbox"]), select, textarea { display: block; width: 100%; min-width: 0; padding: 10px; border: 1px solid #8299a2; border-radius: 6px; background: white; color: inherit; }
+textarea { min-height: 110px; }
+input[type="checkbox"] { width: 22px; height: 22px; vertical-align: middle; margin-right: 8px; }
+button, a[href^="lightning:"] { display: inline-block; min-height: 44px; padding: 10px 14px; border: 1px solid #718c96; border-radius: 8px; background: #f5f8f9; color: #173d4a; margin: 5px 6px 5px 0; cursor: pointer; }
+button.main-action { background: #175b5b; border-color: #175b5b; color: white; font-weight: 700; }
+button:disabled { opacity: .55; cursor: default; }
+button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus-visible, select:focus-visible { outline: 3px solid #d48516; outline-offset: 3px; }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; overflow-x: auto; max-width: 100%; padding: 12px; background: #f1f5f6; border-radius: 6px; font-size: .85rem; }
+dl { margin: 12px 0; border-left: 3px solid #d7e4e7; padding-left: 12px; }
+dt { font-weight: 600; }
+dd { margin: 0 0 8px; }
+section section { min-width: 0; }
+#tau-lifecycle-line { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
+#tau-store-state { flex: 1; min-width: 200px; }
+#tau-session-controls:empty { display: none; }
+#tau-lifecycle-disclosure, [data-start-disclosure] { font-size: .9rem; color: #354d58; }
+#tau-status[data-state="harness-ready"] { font-size: .85rem; color: #536970; }
+[hidden] { display: none !important; }
+@media (max-width: 430px) { body { padding: 12px; } .step { padding: 14px; } }
+</style>
 </head>
 <body>
-<p id="tau-status" role="status">Starting the harness…</p>
+<h1>Set up your machine</h1>
+
 <section id="tau-store" aria-live="polite">
-<p id="tau-store-state"></p>
+<div id="tau-lifecycle-line"><p id="tau-store-state"></p>
+<button id="tau-lock" type="button" hidden>Lock</button></div>
+<p id="tau-lifecycle-disclosure">Switching apps or locking the device screen may leave data-key, seed, account and machine authority unlocked in memory indefinitely. Permitted work, including already approved destructive actions such as a disk wipe, may run unseen. End is the kill switch; Lock pauses, and dormant sessions retain their machines. An already approved destructive action may run after reload or worker loss without a new tap. Already accepted remote work may continue after End. The phone may freeze or discard this page without a final callback.</p>
+<section class="step" data-step="store">
+<h2>1 Local store</h2>
+<p id="tau-step-store-status" class="step-status"></p>
+<p id="tau-step-store-error" class="step-error" role="status"></p>
+<div id="tau-step-store-action"></div>
+<p id="tau-seed-completion"></p>
+<p id="tau-store-explanation"></p>
 <p id="tau-create-help" hidden>Choose a local passphrase of at least 16 characters (Unicode code points). It unlocks this device's store and cannot be reset; a password manager is encouraged.</p>
 <p id="tau-passphrase-field" hidden><label>Passphrase <input id="tau-passphrase" type="password" autocomplete="current-password"></label></p>
 <p id="tau-confirm-field" hidden><label>Confirm <input id="tau-confirm" type="password" autocomplete="new-password"></label></p>
 <button id="tau-create" type="button" hidden>Create</button>
 <button id="tau-unlock" type="button" hidden>Unlock</button>
-<p id="tau-lifecycle-disclosure">Switching apps or locking the device screen may leave data-key, seed, account and machine authority unlocked in memory indefinitely. Permitted work, including already approved destructive actions such as a disk wipe, may run unseen. End is the kill switch; Lock pauses, and dormant sessions retain their machines. An already approved destructive action may run after reload or worker loss without a new tap. Already accepted remote work may continue after End. The phone may freeze or discard this page without a final callback.</p>
-<button id="tau-lock" type="button" hidden>Lock</button>
-<button id="tau-redisplay" type="button" hidden>Show seed backup again</button>
+<div id="tau-store-disclosure-slot"></div>
+
+
 <section id="tau-seed-backup" hidden aria-label="Seed-backup ceremony">
 <p id="tau-seed-backup-state"></p>
 <div id="tau-seed-backup-words-slot"></div>
@@ -30,20 +77,33 @@
 <button id="tau-seed-backup-skip" type="button">Skip the re-entry check</button>
 </div>
 </section>
+<details id="tau-step-store-fold" open><summary>Local store options</summary>
+<button id="tau-redisplay" type="button" hidden>Show seed backup again</button>
+
+</details>
+<p id="tau-persist" role="status"></p>
+<details id="tau-harness-details" open><summary>Details</summary><p id="tau-status" role="status">Starting the harness…</p></details>
 </section>
-<section id="tau-setup" hidden aria-label="Setup machines"></section>
-<section id="tau-poc" hidden aria-label="Connection configuration">
-<h2>Inference</h2>
-<details><summary>Details</summary><p id="tau-defaults-status">Reading deployment defaults…</p></details>
-<section id="tau-credit" aria-label="Inference credit">
-<p id="tau-credit-status" role="status">No inference credit yet.</p>
+</section>
+<div id="tau-poc">
+<section class="step" data-step="credit">
+<h2>2 Inference credit</h2>
+<p id="tau-credit-status" class="step-status" role="status">No inference credit yet.</p>
+<p id="tau-step-credit-error" class="step-error" role="status"></p>
+<div id="tau-step-credit-action"></div>
+<div class="requires-store" hidden><section id="tau-credit" aria-label="Inference credit">
+
 <p>This credit is kept only in this browser's encrypted store. If the store is lost, the credit is lost.</p>
 <label>Top-up sat <input id="tau-credit-amount" type="number" min="100" max="5000" step="1" value="1000"></label>
 <button id="tau-credit-invoice" type="button">Get an invoice</button>
 <button id="tau-credit-check" type="button" hidden>Check now</button>
 <div id="tau-credit-invoices"></div>
 <details><summary>Details</summary><p id="tau-credit-details"></p></details>
-</section>
+</section></div>
+<details id="tau-step-credit-fold"><summary>Inference credit options</summary>
+<div class="requires-store" hidden>
+<details><summary>Details</summary><p id="tau-defaults-status">Reading deployment defaults…</p></details>
+
 <p><label>HTTPS chat completions endpoint <input id="tau-poc-endpoint" form="tau-poc-inference-form" type="url" required autocomplete="off"></label></p>
 <p><label>Model identifier <input id="tau-poc-model" form="tau-poc-inference-form" required autocomplete="off"></label></p>
 <button id="tau-credit-configure" type="button">Use inference credit with this configuration</button>
@@ -55,15 +115,35 @@
 <button type="submit">Set inference configuration</button>
 </form>
 </details>
-<h2>New machine</h2>
-<p>Use a dedicated, already verified provider account. This PoC uses an operator-supplied account rather than seed-based vendor recovery. It supports one outstanding purchase per store, external payment of the initial period, and published Ed25519 host keys. No stock or connectivity is promised.</p>
+</div>
+</details>
+</section>
+<section class="step" data-step="machine">
+<h2>3 Machine</h2>
+<p id="tau-step-machine-status" class="step-status"></p>
+<p id="tau-step-machine-error" class="step-error" role="status"></p>
+<div id="tau-step-machine-action"></div>
+<div id="tau-provider-progress" aria-live="polite"></div>
+<div id="tau-purchase-review-slot"></div>
+<section id="tau-setup" hidden aria-label="Setup machines"></section>
+<details id="tau-step-machine-fold"><summary>Machine options</summary>
+<div class="requires-store" hidden><p>The published pin comes from the provider’s hypervisor scan, rather than attestation. It trusts the provider and whoever can answer the machine address inside its network at scan time.</p></div>
+<div class="requires-store" hidden>
+<p>Use a dedicated, already confirmed provider account. This PoC uses an operator-supplied account rather than seed-based vendor recovery. It supports one outstanding purchase per store, external payment of the initial period, and published Ed25519 host keys. No stock or connectivity is promised.</p>
 <p id="tau-provider-key-status" role="status">Provider key unset.</p>
+<p>App Lock, reload and worker loss clear the provider key. Re-enter the same account to resume the saved purchase.</p>
+</div>
+<div id="tau-setup-facts"></div>
+<div class="requires-store" hidden>
+<h3>New machine</h3>
+
+
 <form id="tau-provider-key-form" novalidate>
 <label>Provider HTTPS origin <input id="tau-provider-origin" type="text" value="https://api.lnvps.net" autocomplete="off" spellcheck="false" autocapitalize="none"></label>
 <label>Provider account private key (64 hex) <input id="tau-provider-key" type="password" autocomplete="off" spellcheck="false" autocapitalize="none"></label>
 <button type="submit">Set provider account</button>
 </form>
-<p>App Lock, reload and worker loss clear the provider key. Re-enter the same account to resume the saved purchase.</p>
+
 <button id="tau-provider-catalogue" type="button">Fetch offers and images</button>
 <div id="tau-provider-catalogue-view"></div>
 <form id="tau-provider-selection-form">
@@ -72,7 +152,9 @@
 <p><label>Custom resources JSON (custom offers only; bytes for memory/disk) <textarea id="tau-provider-resources" autocomplete="off" spellcheck="false">{}</textarea></label></p>
 <button type="submit">Review selected configuration and price</button>
 </form>
+<div id="tau-purchase-review">
 <div id="tau-provider-selection-view"></div>
+<p>Registering the machine SSH public key with the provider does not enroll the relay. Before configuration, copy the separate relay public key and ask your relay operator to enroll it. You still need published pins and approvals for the goal, class, access and installation declaration.</p>
 <form id="tau-provider-approval-form">
 <p><label>Machine name <input id="tau-provider-machine" required autocomplete="off"></label></p>
 <p><label>Existing v1 relay URL (wss://, ending in /) <input id="tau-provider-relay" type="url" required autocomplete="off"></label></p>
@@ -85,10 +167,9 @@
 <button id="tau-provider-resume" type="button">Create approved machine / Refresh saved purchase</button>
 <button id="tau-provider-close" type="button" hidden>Close purchase</button>
 <button id="tau-provider-invoice" type="button">Issue initial Lightning invoice for one approved period</button>
-<div id="tau-provider-progress" aria-live="polite"></div>
-<p>The published pin comes from the provider’s hypervisor scan, rather than attestation. It trusts the provider and whoever can answer the machine address inside its network at scan time.</p>
-<p>Registering the machine SSH public key at the provider does not enroll the relay. Copy the separate relay public key below and enroll it with your relay operator before configuration. Published pins and ordinary goal, class, access and declaration approvals are required by the existing runner.</p>
-<h2>Existing machine</h2>
+
+</div>
+<details id="tau-existing-machine"><summary>Existing machine</summary>
 <p>This PoC supports one existing machine per fresh local store. Each machine name permanently binds these connection fields, pin, profile and elevation. To change them, use a fresh local store and a new name; keep the current store for its task history. Obtain the host fingerprint independently; a presented SSH key is never accepted here.</p>
 <form id="tau-poc-target-form">
 <p><label>Machine name <input id="tau-poc-machine" required autocomplete="off"></label></p>
@@ -106,10 +187,27 @@
 <p><label><input id="tau-poc-approve-access" type="checkbox" required>Approve maintained, ad-hoc access to this machine.</label></p>
 <button type="submit">Enroll existing machine</button>
 </form>
-<p>After enrollment, configure inference and Start session for the displayed model and machine and copy its public keys. Install the SSH line and enroll the relay public key separately. Set the bound session’s goal below. Accept the goal below with verification commands. Edit and propose the installation declaration candidate here, explicitly approve its requirements card, then Resume the task. Command admission requires that approval.</p>
-<div id="tau-poc-targets"></div>
-<div id="tau-poc-public-keys" aria-live="polite"></div>
+</details>
+</div>
+</details>
 </section>
-<p id="tau-persist" role="status"></p>
+<section class="step" data-step="task">
+<h2>4 Task</h2>
+<p id="tau-step-task-status" class="step-status"></p>
+<p id="tau-step-task-error" class="step-error" role="status"></p>
+<div id="tau-step-task-action"></div>
+<div id="tau-session-controls"></div>
+<div id="tau-task-setup"></div>
+<div id="tau-task-progress"></div>
+<div class="requires-store" hidden><div id="tau-poc-targets"></div></div>
+<div class="requires-store" hidden><div id="tau-poc-public-keys" aria-live="polite"></div></div>
+<details id="tau-step-task-fold"><summary>Task options</summary>
+<div class="requires-store" hidden>
+<p>After enrollment, configure inference, then press Start session for the displayed model and machine. Copy its public keys. Install the SSH line and enroll the separate relay public key with the relay operator.</p>
+<p>Set the session’s goal. Accept it with commands that check the result. Edit and propose the installation declaration, then approve its requirements card. Press Resume to continue. Commands require that approval.</p>
+</div>
+</details>
+</section>
+</div>
 </body>
 </html>
